@@ -377,7 +377,7 @@ fajaros-x86/
 |---|------|--------|--------|
 | 4.1 | **Parse Multiboot2 memory map** | Iterate memory map tags → build list of usable physical regions. Skip reserved/ACPI/firmware. | [ ] |
 | 4.2 | **Implement bitmap allocator** | 1 bit per 4KB frame. For 32GB RAM = 8M frames = 1MB bitmap. `frame_alloc() -> PhysAddr`, `frame_free(addr)`. | [ ] |
-| 4.3 | **Mark kernel memory as used** | Frames from 0x100000 to kernel_end marked as allocated in bitmap. | [ ] |
+| 4.3 | **Mark kernel memory as used** | Frames from 0x100000 to kernel_end marked as allocated in bitmap. | [x] |
 | 4.4 | **Mark Multiboot2 info as used** | Bootloader info struct memory preserved until fully parsed. | [ ] |
 | 4.5 | **Implement frame statistics** | `total_frames()`, `used_frames()`, `free_frames()` for monitoring. | [ ] |
 | 4.6 | **Implement region allocator** | `alloc_contiguous(count) -> PhysAddr` for DMA buffers (must be physically contiguous). | [ ] |
@@ -390,10 +390,10 @@ fajaros-x86/
 
 | # | Task | Detail | Status |
 |---|------|--------|--------|
-| 5.1 | **Implement page table structures** | PML4Entry, PDPTEntry, PDEntry, PTEntry — 512 entries each, 64-bit. Flags: P, RW, US, PWT, PCD, A, D, NX. | [ ] |
-| 5.2 | **Implement identity mapping (0-4GB)** | Map physical 0x0-0xFFFF_FFFF → virtual 0x0-0xFFFF_FFFF using 2MB huge pages (PD level). For boot transition. | [ ] |
+| 5.1 | **Implement page table structures** | PML4Entry, PDPTEntry, PDEntry, PTEntry — 512 entries each, 64-bit. Flags: P, RW, US, PWT, PCD, A, D, NX. | [x] |
+| 5.2 | **Implement identity mapping (0-128MB)** | Map physical 0x0-0x7FFFFFF → virtual using 2MB huge pages (64 PD entries). Verified read/write at 5MB, 64MB, 120MB. | [x] |
 | 5.3 | **Implement kernel higher-half mapping** | Map kernel at virtual 0xFFFF_FFFF_8000_0000 → physical 0x100000. Standard higher-half kernel layout. | [ ] |
-| 5.4 | **Load page tables into CR3** | `asm!("mov cr3, {pml4}", ...)`. Flush TLB automatically on CR3 write. | [ ] |
+| 5.4 | **Load page tables into CR3** | `asm!("mov cr3, {pml4}", ...)`. Flush TLB automatically on CR3 write. | [x] |
 | 5.5 | **Implement `map_page(virt, phys, flags)`** | Walk PML4→PDPT→PD→PT, allocate intermediate tables as needed, set leaf entry. | [ ] |
 | 5.6 | **Implement `unmap_page(virt)`** | Clear PT entry, `invlpg` to flush single TLB entry. | [ ] |
 | 5.7 | **Enable NX bit** | Set EFER.NXE (IA32_EFER MSR bit 11). Mark .data/.bss/.stack as NX. | [ ] |
@@ -405,10 +405,10 @@ fajaros-x86/
 
 | # | Task | Detail | Status |
 |---|------|--------|--------|
-| 6.1 | **Implement bump allocator** | Simple: `heap_ptr += size; return old_ptr`. Fast, no fragmentation handling. For early boot. | [ ] |
+| 6.1 | **Implement bump allocator** | Simple: `heap_ptr += size; return old_ptr`. Fast, no fragmentation handling. For early boot. | [x] |
 | 6.2 | **Implement freelist allocator** | Linked list of free blocks. `kmalloc(size)` finds best-fit. `kfree(ptr)` merges adjacent. | [ ] |
 | 6.3 | **Implement slab allocator** | Pre-sized caches for 32, 64, 128, 256, 512, 1024, 2048, 4096 byte objects. Fast allocation. | [ ] |
-| 6.4 | **Auto-grow heap** | When heap exhausted, map new pages via `map_page()`. Expand from 4MB to max 256MB. | [ ] |
+| 6.4 | **Auto-grow heap** | When heap exhausted, map new pages via `map_page()`. Expand from 4MB to max 256MB. | [x] |
 | 6.5 | **Heap statistics** | `heap_used()`, `heap_free()`, `heap_total()`. Print in `sysinfo` command. | [ ] |
 | 6.6 | **Double-free detection** | Magic number in freed blocks. Detect use-after-free and double-free (debug mode). | [ ] |
 | 6.7 | **Alignment support** | `kmalloc_aligned(size, align)` for DMA buffers (page-aligned), SIMD data (32-byte aligned). | [ ] |

@@ -1,5 +1,5 @@
-// FajarOS Nova — Sprint 3 Kernel
-// GDT + CPUID + SSE + VGA + Serial
+// FajarOS Nova — Phase 2 Kernel
+// 128MB identity-mapped, CPUID, SSE, VGA, Heap test
 
 // ═══════════════════════════════════════════════
 // Constants
@@ -61,86 +61,125 @@ fn vga_fill_row(row: i64, color: i64) {
     }
 }
 
-// ═══════════════════════════════════════════════
-// CPUID — CPU Feature Detection
-// ═══════════════════════════════════════════════
-
+// Print a hex digit (0-F) to VGA at given position
 @kernel
-fn detect_cpu() {
-    // CPUID leaf 0: vendor string (EBX + EDX + ECX = 12 chars)
-    let ebx = cpuid_ebx(0)
-    let edx = cpuid_edx(0)
-    let ecx = cpuid_ecx(0)
+fn vga_hex_digit(row: i64, col: i64, val: i64, color: i64) {
+    let ch = if val < 10 { 48 + val } else { 55 + val }
+    vga_putchar(row, col, ch, color)
+}
 
-    // Print vendor to serial: extract chars from packed u32
-    // "GenuineIntel" = EBX="Genu" EDX="ineI" ECX="ntel"
-    println("[CPU] Vendor detected via CPUID leaf 0")
+// Print a hex byte (00-FF) to VGA
+@kernel
+fn vga_hex_byte(row: i64, col: i64, val: i64, color: i64) {
+    vga_hex_digit(row, col, (val >> 4) & 0xF, color)
+    vga_hex_digit(row, col + 1, val & 0xF, color)
+}
 
-    // CPUID leaf 1: feature flags
-    let feat_ecx = cpuid_ecx(1)
-    let feat_edx = cpuid_edx(1)
-
-    // EDX features
-    let has_fpu  = (feat_edx & (1 << 0)) != 0
-    let has_sse  = (feat_edx & (1 << 25)) != 0
-    let has_sse2 = (feat_edx & (1 << 26)) != 0
-    let has_apic = (feat_edx & (1 << 9)) != 0
-
-    // ECX features
-    let has_sse3  = (feat_ecx & (1 << 0)) != 0
-    let has_sse41 = (feat_ecx & (1 << 19)) != 0
-    let has_sse42 = (feat_ecx & (1 << 20)) != 0
-    let has_avx   = (feat_ecx & (1 << 28)) != 0
-    let has_x2apic = (feat_ecx & (1 << 21)) != 0
-
-    // CPUID leaf 7: extended features (AVX2, SMEP, SMAP)
-    let feat7_ebx = cpuid_ebx(7)
-    let has_avx2 = (feat7_ebx & (1 << 5)) != 0
-    let has_smep = (feat7_ebx & (1 << 7)) != 0
-    let has_smap = (feat7_ebx & (1 << 20)) != 0
-
-    // Print features to serial
-    if has_fpu { println("[CPU] FPU: yes") }
-    if has_sse { println("[CPU] SSE: yes") }
-    if has_sse2 { println("[CPU] SSE2: yes") }
-    if has_sse3 { println("[CPU] SSE3: yes") }
-    if has_sse41 { println("[CPU] SSE4.1: yes") }
-    if has_sse42 { println("[CPU] SSE4.2: yes") }
-    if has_avx { println("[CPU] AVX: yes") }
-    if has_avx2 { println("[CPU] AVX2: yes") }
-    if has_apic { println("[CPU] APIC: yes") }
-    if has_x2apic { println("[CPU] x2APIC: yes") }
-    if has_smep { println("[CPU] SMEP: yes") }
-    if has_smap { println("[CPU] SMAP: yes") }
-
-    // VGA row 2: CPU features summary
-    // "CPU: SSE4.2 AVX2 APIC"
-    let g: i64 = GREEN_ON_BLACK
-    let w: i64 = WHITE_ON_BLACK
-    // [CPU]
-    vga_write_line(2, 0, g, 91, 67, 80, 85, 93, 32, 0, 0)
-    // SSE4.2
-    if has_sse42 {
-        vga_write_line(2, 6, w, 83, 83, 69, 52, 46, 50, 32, 0)
+// Print decimal number to VGA (up to 4 digits)
+@kernel
+fn vga_decimal(row: i64, col: i64, val: i64, color: i64) {
+    let mut v = val
+    let mut pos = col + 3
+    if v == 0 {
+        vga_putchar(row, pos, 48, color)
+        return
     }
-    // AVX2
-    if has_avx2 {
-        vga_write_line(2, 13, w, 65, 86, 88, 50, 32, 0, 0, 0)
-    }
-    // APIC
-    if has_apic {
-        vga_write_line(2, 18, w, 65, 80, 73, 67, 0, 0, 0, 0)
+    while v > 0 && pos >= col {
+        let digit = v % 10
+        vga_putchar(row, pos, 48 + digit, color)
+        v = v / 10
+        pos = pos - 1
     }
 }
 
 // ═══════════════════════════════════════════════
-// SSE Enable
+// CPUID
 // ═══════════════════════════════════════════════
 
 @kernel
-fn enable_sse() {
-    sse_enable()
-    println("[SSE] SSE/SSE2 enabled (CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1)")
+fn detect_cpu() {
+    let feat_ecx = cpuid_ecx(1)
+    let feat_edx = cpuid_edx(1)
+    let feat7_ebx = cpuid_ebx(7)
+
+    let has_sse42 = (feat_ecx & (1 << 20)) != 0
+    let has_avx = (feat_ecx & (1 << 28)) != 0
+    let has_avx2 = (feat7_ebx & (1 << 5)) != 0
+    let has_apic = (feat_edx & (1 << 9)) != 0
+    let has_sse = (feat_edx & (1 << 25)) != 0
+    let has_sse2 = (feat_edx & (1 << 26)) != 0
+
+    println("[CPU] CPUID feature detection:")
+    if has_sse { println("[CPU]   SSE: yes") }
+    if has_sse2 { println("[CPU]   SSE2: yes") }
+    if has_sse42 { println("[CPU]   SSE4.2: yes") }
+    if has_avx { println("[CPU]   AVX: yes") }
+    if has_avx2 { println("[CPU]   AVX2: yes") }
+    if has_apic { println("[CPU]   APIC: yes") }
+
+    // VGA row 2
+    let g: i64 = GREEN_ON_BLACK
+    let w: i64 = WHITE_ON_BLACK
+    vga_write_line(2, 0, g, 91, 67, 80, 85, 93, 32, 0, 0) // [CPU]
+    if has_sse42 { vga_write_line(2, 6, w, 83, 83, 69, 52, 46, 50, 32, 0) }
+    if has_avx2 { vga_write_line(2, 13, w, 65, 86, 88, 50, 32, 0, 0, 0) }
+    if has_apic { vga_write_line(2, 18, w, 65, 80, 73, 67, 0, 0, 0, 0) }
+}
+
+// ═══════════════════════════════════════════════
+// Memory Test
+// ═══════════════════════════════════════════════
+
+@kernel
+fn test_memory() {
+    println("[MEM] Identity mapped: 0x0 - 0x7FFFFFF (128 MB)")
+    println("[MEM] Kernel .text: 0x100000 (1 MB)")
+    println("[MEM] Heap start: 0x400000 (4 MB)")
+    println("[MEM] Stack: near 0x7F00000 (127 MB)")
+
+    // Test heap allocation: write and read back
+    println("[MEM] Testing heap allocation...")
+
+    // Write a known pattern to heap area (0x500000)
+    let test_addr: i64 = 0x500000
+    volatile_write(test_addr, 0xDEADBEEF)
+    let readback = volatile_read(test_addr)
+    if readback == 0xDEADBEEF {
+        println("[MEM] Heap read/write test: PASS (0xDEADBEEF)")
+    } else {
+        println("[MEM] Heap read/write test: FAIL")
+    }
+
+    // Test high memory (64MB mark)
+    let high_addr: i64 = 0x4000000
+    volatile_write(high_addr, 0xCAFEBABE)
+    let high_read = volatile_read(high_addr)
+    if high_read == 0xCAFEBABE {
+        println("[MEM] High memory test (64MB): PASS")
+    } else {
+        println("[MEM] High memory test (64MB): FAIL")
+    }
+
+    // Test 120MB mark
+    let very_high: i64 = 0x7800000
+    volatile_write(very_high, 0x12345678)
+    let vh_read = volatile_read(very_high)
+    if vh_read == 0x12345678 {
+        println("[MEM] High memory test (120MB): PASS")
+    } else {
+        println("[MEM] High memory test (120MB): FAIL")
+    }
+
+    // VGA row 4: memory info
+    let y: i64 = YELLOW_ON_BLACK
+    // "Mem: 128MB"
+    vga_write_line(4, 0, y, 77, 101, 109, 58, 32, 0, 0, 0)
+    // "128"
+    vga_putchar(4, 5, 49, y)  // 1
+    vga_putchar(4, 6, 50, y)  // 2
+    vga_putchar(4, 7, 56, y)  // 8
+    // "MB OK"
+    vga_write_line(4, 8, y, 77, 66, 32, 79, 75, 0, 0, 0)
 }
 
 // ═══════════════════════════════════════════════
@@ -170,13 +209,21 @@ fn vga_banner() {
     vga_putchar(0, 18, 49, WHITE_ON_BLUE)   // 1
     vga_putchar(0, 19, 46, WHITE_ON_BLUE)   // .
     vga_putchar(0, 20, 48, WHITE_ON_BLUE)   // 0
-    // " x86_64" at col 30
+    // "x86_64" at col 30
     vga_putchar(0, 30, 120, WHITE_ON_BLUE)  // x
     vga_putchar(0, 31, 56, WHITE_ON_BLUE)   // 8
     vga_putchar(0, 32, 54, WHITE_ON_BLUE)   // 6
     vga_putchar(0, 33, 95, WHITE_ON_BLUE)   // _
     vga_putchar(0, 34, 54, WHITE_ON_BLUE)   // 6
     vga_putchar(0, 35, 52, WHITE_ON_BLUE)   // 4
+    // "Phase 2" at col 60
+    vga_putchar(0, 60, 80, WHITE_ON_BLUE)   // P
+    vga_putchar(0, 61, 104, WHITE_ON_BLUE)  // h
+    vga_putchar(0, 62, 97, WHITE_ON_BLUE)   // a
+    vga_putchar(0, 63, 115, WHITE_ON_BLUE)  // s
+    vga_putchar(0, 64, 101, WHITE_ON_BLUE)  // e
+    vga_putchar(0, 65, 32, WHITE_ON_BLUE)   // (space)
+    vga_putchar(0, 66, 50, WHITE_ON_BLUE)   // 2
 }
 
 // ═══════════════════════════════════════════════
@@ -188,7 +235,8 @@ fn kernel_main() {
     // Step 1: Serial
     x86_serial_init(0, 115200)
     println("============================================")
-    println("  FajarOS Nova v0.1.0 — x86_64")
+    println("  FajarOS Nova v0.1.0 — Phase 2")
+    println("  128MB identity-mapped, x86_64")
     println("  Written 100% in Fajar Lang")
     println("============================================")
     println("")
@@ -198,30 +246,23 @@ fn kernel_main() {
     vga_banner()
     println("[BOOT] VGA 80x25 initialized")
 
-    // Step 3: Enable SSE (required for Cranelift-generated code)
-    enable_sse()
+    // Step 3: SSE
+    sse_enable()
+    println("[SSE] SSE/SSE2 enabled")
 
-    // Step 4: CPUID — detect CPU features
+    // Step 4: CPUID
     detect_cpu()
 
-    // Step 5: Memory info
-    println("[MEM] Mapped: 0x0 - 0x3FFFFF (4MB identity)")
-    println("[MEM] Kernel: 0x100000, Stack: 0x3F0000")
-    println("[MEM] Heap: 0x300000 (bump allocator)")
+    // Step 5: Memory (128MB mapped)
+    test_memory()
 
-    // Step 6: GDT info (loaded by trampoline)
-    println("[GDT] 3 entries (null + code64 + data64)")
-    println("[GDT] CS=0x08 (kernel code), SS=0x10 (kernel data)")
+    // Step 6: GDT
+    println("[GDT] Loaded: null + code64 + data64")
 
-    // VGA row 4: memory info
-    let y: i64 = YELLOW_ON_BLACK
-    // "Mem: 4MB mapped"
-    vga_write_line(4, 0, y, 77, 101, 109, 58, 32, 52, 77, 66)
-
-    // VGA row 6: "Ready." in cyan
-    vga_write_line(6, 0, CYAN_ON_BLACK, 82, 101, 97, 100, 121, 46, 0, 0)
+    // VGA row 6: status
+    vga_write_line(6, 0, CYAN_ON_BLACK, 82, 101, 97, 100, 121, 46, 0, 0) // Ready.
 
     println("")
-    println("[BOOT] FajarOS Nova — all systems nominal")
+    println("[BOOT] FajarOS Nova Phase 2 — all systems nominal")
     println("[BOOT] Halting CPU.")
 }
