@@ -223,6 +223,8 @@ const RED_ON_BLACK: i64 = 0x0C
     cprintln("  reboot   - Reboot system", WHITE_ON_BLACK)
     cprintln("  shutdown - ACPI power off", WHITE_ON_BLACK)
     cprintln("  acpi     - ACPI info + CPU count", WHITE_ON_BLACK)
+    cprintln("  tensor   - Matrix multiply demo", WHITE_ON_BLACK)
+    cprintln("  mnist    - MNIST inference demo", WHITE_ON_BLACK)
 }
 
 @kernel fn cmd_uname() {
@@ -333,6 +335,90 @@ const RED_ON_BLACK: i64 = 0x0C
     acpi_shutdown()
 }
 
+@kernel fn cmd_tensor() {
+    cprintln("Tensor Operations (CPU):", YELLOW_ON_BLACK)
+
+    // Simple 3x3 matrix multiply demo using volatile memory as tensor storage
+    // Matrix A (3x3) at 0x500000, Matrix B (3x3) at 0x500100, Result at 0x500200
+    // A = [[1,2,3],[4,5,6],[7,8,9]]
+    volatile_write(0x500000, 1); volatile_write(0x500008, 2); volatile_write(0x500010, 3)
+    volatile_write(0x500018, 4); volatile_write(0x500020, 5); volatile_write(0x500028, 6)
+    volatile_write(0x500030, 7); volatile_write(0x500038, 8); volatile_write(0x500040, 9)
+    // B = identity [[1,0,0],[0,1,0],[0,0,1]]
+    volatile_write(0x500100, 1); volatile_write(0x500108, 0); volatile_write(0x500110, 0)
+    volatile_write(0x500118, 0); volatile_write(0x500120, 1); volatile_write(0x500128, 0)
+    volatile_write(0x500130, 0); volatile_write(0x500138, 0); volatile_write(0x500140, 1)
+
+    // Naive matmul: C[i][j] = sum(A[i][k] * B[k][j])
+    let t0 = rdtsc()
+    let mut i: i64 = 0
+    while i < 3 {
+        let mut j: i64 = 0
+        while j < 3 {
+            let mut sum: i64 = 0
+            let mut k: i64 = 0
+            while k < 3 {
+                let a = volatile_read(0x500000 + (i * 3 + k) * 8)
+                let b = volatile_read(0x500100 + (k * 3 + j) * 8)
+                sum = sum + a * b
+                k = k + 1
+            }
+            volatile_write(0x500200 + (i * 3 + j) * 8, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let t1 = rdtsc()
+
+    // Print result (should be same as A since B is identity)
+    cprint("  A * I = [", WHITE_ON_BLACK)
+    let mut r: i64 = 0
+    while r < 3 {
+        let mut c: i64 = 0
+        while c < 3 {
+            cprint_decimal(volatile_read(0x500200 + (r * 3 + c) * 8), CYAN_ON_BLACK)
+            if c < 2 { cprint(",", WHITE_ON_BLACK) }
+            c = c + 1
+        }
+        if r < 2 { cprint("; ", WHITE_ON_BLACK) }
+        r = r + 1
+    }
+    cprintln("]", WHITE_ON_BLACK)
+
+    cprint("  Cycles: ", WHITE_ON_BLACK)
+    cprint_decimal(t1 - t0, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Simple ReLU demo
+    cprintln("  ReLU([-3, 0, 5]) = [0, 0, 5]", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_mnist() {
+    cprintln("MNIST Inference (CPU):", YELLOW_ON_BLACK)
+    cprintln("  Model: MLP 784->128->10", WHITE_ON_BLACK)
+    cprintln("  Weights: not loaded (demo mode)", WHITE_ON_BLACK)
+
+    // Simulate a forward pass timing
+    let t0 = rdtsc()
+    // Simulate 784*128 = 100352 multiply-adds
+    let mut ops: i64 = 0
+    let mut acc: i64 = 0
+    while ops < 100352 {
+        acc = acc + ops * 3 - ops * 2  // dummy compute
+        ops = ops + 1
+    }
+    let t1 = rdtsc()
+
+    cprint("  Forward pass: ", WHITE_ON_BLACK)
+    cprint_decimal((t1 - t0) / 1000, CYAN_ON_BLACK)
+    cprintln("K cycles", WHITE_ON_BLACK)
+
+    // Simulated prediction
+    cprintln("  Input: blank image (28x28)", WHITE_ON_BLACK)
+    cprintln("  Prediction: 0 (demo)", GREEN_ON_BLACK)
+    cprintln("  Note: load real weights for accuracy", YELLOW_ON_BLACK)
+}
+
 @kernel fn cmd_acpi() {
     cprintln("ACPI Info:", YELLOW_ON_BLACK)
     let rsdp = acpi_find_rsdp()
@@ -392,6 +478,10 @@ const RED_ON_BLACK: i64 = 0x0C
     if handled == 0 && len == 8 && buf_eq4(115, 104, 117, 116) == 1 { cmd_shutdown(); handled = 1 }
     // acpi (97,99,112,105)
     if handled == 0 && len == 4 && buf_eq4(97, 99, 112, 105) == 1 { cmd_acpi(); handled = 1 }
+    // tensor (116,101,110,115,111,114)
+    if handled == 0 && len == 6 && buf_eq4(116, 101, 110, 115) == 1 { cmd_tensor(); handled = 1 }
+    // mnist (109,110,105,115,116)
+    if handled == 0 && len == 5 && buf_eq4(109, 110, 105, 115) == 1 { cmd_mnist(); handled = 1 }
 
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)
