@@ -1,102 +1,220 @@
-// FajarOS Nova — Phase 5: Ring 3 User Space + SYSCALL
-// TSS + SYSCALL/SYSRET + User processes
+// FajarOS Nova — Phase 6: Keyboard + VGA Console + PCI
+// Interactive shell with keyboard input!
 
 const VGA_BASE: i64 = 0xB8000
 const VGA_COLS: i64 = 80
+const VGA_ROWS: i64 = 25
 const WHITE_ON_BLACK: i64 = 0x0F
 const WHITE_ON_BLUE: i64 = 0x1F
 const GREEN_ON_BLACK: i64 = 0x0A
 const CYAN_ON_BLACK: i64 = 0x0B
 const YELLOW_ON_BLACK: i64 = 0x0E
 
-@kernel fn vga_putchar(row: i64, col: i64, ch: i64, color: i64) {
+// ═══════════════════════════════════════════════
+// VGA Console with cursor tracking + scrolling
+// ═══════════════════════════════════════════════
+
+// Cursor position stored at fixed addresses
+// 0x6FA00 = cursor row, 0x6FA08 = cursor col
+
+@kernel fn console_init() {
+    // Clear screen
+    let mut i: i64 = 0
+    while i < VGA_COLS * VGA_ROWS {
+        volatile_write(VGA_BASE + i * 2, 0x20)
+        volatile_write(VGA_BASE + i * 2 + 1, WHITE_ON_BLACK)
+        i = i + 1
+    }
+    volatile_write(0x6FA00, 0)  // row = 0
+    volatile_write(0x6FA08, 0)  // col = 0
+}
+
+@kernel fn console_scroll() {
+    // Move rows 1..24 up by 1
+    let mut i: i64 = 0
+    while i < VGA_COLS * (VGA_ROWS - 1) {
+        let src = VGA_BASE + (i + VGA_COLS) * 2
+        let dst = VGA_BASE + i * 2
+        volatile_write(dst, volatile_read(src))
+        volatile_write(dst + 1, volatile_read(src + 1))
+        i = i + 1
+    }
+    // Clear last row
+    let mut j: i64 = 0
+    while j < VGA_COLS {
+        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2, 0x20)
+        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2 + 1, WHITE_ON_BLACK)
+        j = j + 1
+    }
+}
+
+@kernel fn console_putchar(ch: i64, color: i64) {
+    let row = volatile_read(0x6FA00)
+    let col = volatile_read(0x6FA08)
+
+    if ch == 10 {
+        // Newline
+        volatile_write(0x6FA08, 0)
+        if row >= VGA_ROWS - 1 {
+            console_scroll()
+        } else {
+            volatile_write(0x6FA00, row + 1)
+        }
+        return
+    }
+
+    if ch == 8 {
+        // Backspace
+        if col > 0 {
+            volatile_write(0x6FA08, col - 1)
+            let addr = VGA_BASE + (row * VGA_COLS + col - 1) * 2
+            volatile_write(addr, 0x20)
+            volatile_write(addr + 1, color)
+        }
+        return
+    }
+
+    // Regular character
     let addr = VGA_BASE + (row * VGA_COLS + col) * 2
     volatile_write(addr, ch)
     volatile_write(addr + 1, color)
+
+    if col >= VGA_COLS - 1 {
+        volatile_write(0x6FA08, 0)
+        if row >= VGA_ROWS - 1 {
+            console_scroll()
+        } else {
+            volatile_write(0x6FA00, row + 1)
+        }
+    } else {
+        volatile_write(0x6FA08, col + 1)
+    }
 }
 
-@kernel fn vga_write_str(row: i64, col: i64, s: str, color: i64) {
+@kernel fn console_write_str(s: str, color: i64) {
     let len = str_len(s)
     let mut i: i64 = 0
-    while i < len && (col + i) < VGA_COLS {
-        vga_putchar(row, col + i, str_byte_at(s, i), color)
+    while i < len {
+        console_putchar(str_byte_at(s, i), color)
         i = i + 1
     }
 }
 
-@kernel fn vga_clear(color: i64) {
-    let mut i: i64 = 0
-    while i < VGA_COLS * 25 {
-        volatile_write(VGA_BASE + i * 2, 0x20)
-        volatile_write(VGA_BASE + i * 2 + 1, color)
-        i = i + 1
-    }
+@kernel fn console_newline() {
+    console_putchar(10, WHITE_ON_BLACK)
 }
 
-@kernel fn vga_fill_row(row: i64, color: i64) {
-    let mut i: i64 = 0
-    while i < VGA_COLS { vga_putchar(row, i, 0x20, color); i = i + 1 }
-}
-
-@kernel fn vga_decimal(row: i64, col: i64, val: i64, color: i64) {
-    if val == 0 { vga_putchar(row, col, 48, color); return }
+@kernel fn console_decimal(val: i64, color: i64) {
+    if val == 0 { console_putchar(48, color); return }
     let mut buf: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     let mut v = val
     let mut len: i64 = 0
     while v > 0 { buf[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
     let mut i: i64 = 0
-    while i < len { vga_putchar(row, col + i, buf[len - 1 - i], color); i = i + 1 }
+    while i < len { console_putchar(buf[len - 1 - i], color); i = i + 1 }
+}
+
+@kernel fn console_hex16(val: i64, color: i64) {
+    let mut i: i64 = 3
+    while i >= 0 {
+        let nibble = (val >> (i * 4)) & 0xF
+        if nibble < 10 {
+            console_putchar(48 + nibble, color)
+        } else {
+            console_putchar(55 + nibble, color)
+        }
+        i = i - 1
+    }
 }
 
 // ═══════════════════════════════════════════════
-// User Process A — runs in Ring 3, uses SYSCALL
+// Scancode → ASCII (Set 1, make codes only)
 // ═══════════════════════════════════════════════
 
-@kernel fn user_process_a() {
-    // This will run at Ring 3 (CPL=3)
-    // Serial output via direct port I/O (still works if IOPL allows)
-    let mut count: i64 = 0
-    while count < 30 {
-        port_outb(0x3F8, 65)  // 'A'
-        let mut i: i64 = 0
-        while i < 3000000 { i = i + 1 }
-        count = count + 1
-    }
-    // Spin when done
-    let mut spin: i64 = 0
-    while spin == 0 { spin = 0 }
+@kernel fn scancode_to_ascii(sc: i64) -> i64 {
+    if sc == 0x1C { return 10 }   // Enter
+    if sc == 0x0E { return 8 }    // Backspace
+    if sc == 0x39 { return 32 }   // Space
+    // Number row
+    if sc == 0x02 { return 49 }   // 1
+    if sc == 0x03 { return 50 }   // 2
+    if sc == 0x04 { return 51 }   // 3
+    if sc == 0x05 { return 52 }   // 4
+    if sc == 0x06 { return 53 }   // 5
+    if sc == 0x07 { return 54 }   // 6
+    if sc == 0x08 { return 55 }   // 7
+    if sc == 0x09 { return 56 }   // 8
+    if sc == 0x0A { return 57 }   // 9
+    if sc == 0x0B { return 48 }   // 0
+    // Letters
+    if sc == 0x10 { return 113 }  // q
+    if sc == 0x11 { return 119 }  // w
+    if sc == 0x12 { return 101 }  // e
+    if sc == 0x13 { return 114 }  // r
+    if sc == 0x14 { return 116 }  // t
+    if sc == 0x15 { return 121 }  // y
+    if sc == 0x16 { return 117 }  // u
+    if sc == 0x17 { return 105 }  // i
+    if sc == 0x18 { return 111 }  // o
+    if sc == 0x19 { return 112 }  // p
+    if sc == 0x1E { return 97 }   // a
+    if sc == 0x1F { return 115 }  // s
+    if sc == 0x20 { return 100 }  // d
+    if sc == 0x21 { return 102 }  // f
+    if sc == 0x22 { return 103 }  // g
+    if sc == 0x23 { return 104 }  // h
+    if sc == 0x24 { return 106 }  // j
+    if sc == 0x25 { return 107 }  // k
+    if sc == 0x26 { return 108 }  // l
+    if sc == 0x2C { return 122 }  // z
+    if sc == 0x2D { return 120 }  // x
+    if sc == 0x2E { return 99 }   // c
+    if sc == 0x2F { return 118 }  // v
+    if sc == 0x30 { return 98 }   // b
+    if sc == 0x31 { return 110 }  // n
+    if sc == 0x32 { return 109 }  // m
+    // Symbols
+    if sc == 0x0C { return 45 }   // -
+    if sc == 0x0D { return 61 }   // =
+    if sc == 0x33 { return 44 }   // ,
+    if sc == 0x34 { return 46 }   // .
+    if sc == 0x35 { return 47 }   // /
+    0  // unknown
 }
 
 // ═══════════════════════════════════════════════
-// User Process B
+// PCI Scan
 // ═══════════════════════════════════════════════
 
-@kernel fn user_process_b() {
-    let mut count: i64 = 0
-    while count < 30 {
-        port_outb(0x3F8, 66)  // 'B'
-        let mut i: i64 = 0
-        while i < 3000000 { i = i + 1 }
-        count = count + 1
+@kernel fn pci_scan() {
+    console_write_str("[PCI] Scanning bus 0...", GREEN_ON_BLACK)
+    console_newline()
+    let mut dev: i64 = 0
+    let mut found: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let vendor = id & 0xFFFF
+            let device = (id >> 16) & 0xFFFF
+            console_write_str("  ", WHITE_ON_BLACK)
+            console_hex16(vendor, CYAN_ON_BLACK)
+            console_putchar(58, WHITE_ON_BLACK) // ':'
+            console_hex16(device, CYAN_ON_BLACK)
+            // Read class code
+            let class_reg = pci_read32(0, dev, 0, 8)
+            let class = (class_reg >> 24) & 0xFF
+            let subclass = (class_reg >> 16) & 0xFF
+            console_write_str(" class=", WHITE_ON_BLACK)
+            console_hex16(class * 256 + subclass, YELLOW_ON_BLACK)
+            console_newline()
+            found = found + 1
+        }
+        dev = dev + 1
     }
-    let mut spin: i64 = 0
-    while spin == 0 { spin = 0 }
-}
-
-// ═══════════════════════════════════════════════
-// User Process C
-// ═══════════════════════════════════════════════
-
-@kernel fn user_process_c() {
-    let mut count: i64 = 0
-    while count < 30 {
-        port_outb(0x3F8, 67)  // 'C'
-        let mut i: i64 = 0
-        while i < 3000000 { i = i + 1 }
-        count = count + 1
-    }
-    let mut spin: i64 = 0
-    while spin == 0 { spin = 0 }
+    console_write_str("[PCI] ", GREEN_ON_BLACK)
+    console_decimal(found, GREEN_ON_BLACK)
+    console_write_str(" devices found", GREEN_ON_BLACK)
+    console_newline()
 }
 
 // ═══════════════════════════════════════════════
@@ -105,97 +223,77 @@ const YELLOW_ON_BLACK: i64 = 0x0E
 
 @kernel fn kernel_main() {
     x86_serial_init(0, 115200)
-    println("============================================")
-    println("  FajarOS Nova v0.1.0 — Phase 5")
-    println("  Ring 3 + TSS + SYSCALL/SYSRET")
-    println("============================================")
-    println("")
+    println("FajarOS Nova v0.1.0 — Phase 6")
 
-    // VGA
-    vga_clear(WHITE_ON_BLACK)
-    vga_fill_row(0, WHITE_ON_BLUE)
-    vga_write_str(0, 2, "FajarOS Nova v0.1.0", WHITE_ON_BLUE)
-    vga_write_str(0, 30, "x86_64", WHITE_ON_BLUE)
-    vga_write_str(0, 55, "Phase 5", WHITE_ON_BLUE)
+    // VGA console
+    console_init()
+    console_write_str("FajarOS Nova v0.1.0 — Phase 6: Keyboard + PCI", WHITE_ON_BLUE)
+    console_newline()
+    console_newline()
 
-    // SSE
+    // SSE + CPU
     sse_enable()
-    println("[SSE] Enabled")
+    console_write_str("[SSE] Enabled", GREEN_ON_BLACK)
+    console_newline()
 
-    // CPUID
-    let edx1 = cpuid_edx(1)
-    let ebx7 = cpuid_ebx(7)
-    vga_write_str(2, 0, "[CPU]", GREEN_ON_BLACK)
-    if (ebx7 & (1 << 5)) != 0 { vga_write_str(2, 6, "AVX2", WHITE_ON_BLACK) }
-    if (edx1 & (1 << 9)) != 0 { vga_write_str(2, 11, "APIC", WHITE_ON_BLACK) }
-    println("[CPU] Detected")
+    // IDT + PIC + PIT + TSS + SYSCALL
+    idt_init()
+    pic_remap()
+    pit_init(100)
+    tss_init()
+    syscall_init()
+    console_write_str("[IDT] 256 vectors, [PIC] remapped, [PIT] 100Hz", GREEN_ON_BLACK)
+    console_newline()
+    console_write_str("[TSS] Loaded, [SYSCALL] Ready", GREEN_ON_BLACK)
+    console_newline()
+    console_newline()
 
-    // Memory
-    vga_write_str(3, 0, "[MEM] 128MB", YELLOW_ON_BLACK)
-    println("[MEM] 128MB")
+    // PCI scan
+    pci_scan()
+    console_newline()
 
-    // Init process table
+    // Init process table + keyboard buffer
     let mut i: i64 = 0
     while i < 4096 { volatile_write(0x600000 + i, 0); i = i + 8 }
     volatile_write(0x6FE08, 0)
     set_current_pid(0)
-    volatile_write(0x600000 + 8, 2)  // kernel = running
+    volatile_write(0x600000 + 8, 2)
+    // Zero keyboard buffer indices
+    volatile_write(0x6FBF0, 0)
+    volatile_write(0x6FBF8, 0)
 
-    // IDT + PIC + PIT
-    idt_init()
-    println("[IDT] 256 vectors")
-    pic_remap()
-    println("[PIC] Remapped")
-    pit_init(100)
-    println("[PIT] 100 Hz")
-
-    // TSS — required for Ring 3 → Ring 0 transitions
-    tss_init()
-    println("[TSS] Initialized (RSP0 = kernel stack)")
-    vga_write_str(4, 0, "[TSS] Loaded", GREEN_ON_BLACK)
-
-    // SYSCALL/SYSRET — configure MSRs
-    syscall_init()
-    println("[SYSCALL] MSRs configured (STAR, LSTAR, FMASK)")
-    vga_write_str(5, 0, "[SYSCALL] Ready", GREEN_ON_BLACK)
-
-    // Create user processes (Ring 3)
-    println("[SCHED] Creating user processes...")
-    let pid_a = proc_create_user(fn_addr("user_process_a"))
-    let pid_b = proc_create_user(fn_addr("user_process_b"))
-    let pid_c = proc_create_user(fn_addr("user_process_c"))
-    println("[SCHED] 3 user processes created (Ring 3)")
-
-    vga_write_str(7, 0, "PID 1: User A (Ring 3)", WHITE_ON_BLACK)
-    vga_write_str(8, 0, "PID 2: User B (Ring 3)", WHITE_ON_BLACK)
-    vga_write_str(9, 0, "PID 3: User C (Ring 3)", WHITE_ON_BLACK)
-
-    // Enable interrupts — scheduler starts!
-    println("[SCHED] Enabling preemptive scheduling...")
+    // Enable interrupts for keyboard + timer
     irq_enable()
 
-    // Kernel main loop
-    let mut loops: i64 = 0
-    while loops < 80 {
-        let mut j: i64 = 0
-        while j < 5000000 { j = j + 1 }
-        let ticks = read_timer_ticks()
-        vga_write_str(11, 0, "Ticks:", CYAN_ON_BLACK)
-        vga_decimal(11, 7, ticks, CYAN_ON_BLACK)
-        loops = loops + 1
+    // Interactive keyboard loop
+    console_write_str("Keyboard ready. Type something:", YELLOW_ON_BLACK)
+    console_newline()
+    console_write_str("nova> ", GREEN_ON_BLACK)
+
+    // Also print to serial
+    println("[BOOT] Keyboard + PCI + Console ready")
+    println("[BOOT] Waiting for keyboard input...")
+
+    let mut running: i64 = 1
+    while running == 1 {
+        let has = kb_has_data()
+        if has == 1 {
+            let sc = kb_read_scancode()
+            // Only process make codes (bit 7 = 0 means key press)
+            if sc >= 0 && sc < 128 {
+                let ascii = scancode_to_ascii(sc)
+                if ascii > 0 {
+                    if ascii == 10 {
+                        // Enter — newline + new prompt
+                        console_newline()
+                        console_write_str("nova> ", GREEN_ON_BLACK)
+                        port_outb(0x3F8, 10)  // serial newline
+                    } else {
+                        console_putchar(ascii, WHITE_ON_BLACK)
+                        port_outb(0x3F8, ascii)  // echo to serial
+                    }
+                }
+            }
+        }
     }
-
-    irq_disable()
-    let final_ticks = read_timer_ticks()
-
-    vga_write_str(13, 0, "Phase 5 complete!", GREEN_ON_BLACK)
-    vga_write_str(14, 0, "Total ticks:", YELLOW_ON_BLACK)
-    vga_decimal(14, 13, final_ticks, YELLOW_ON_BLACK)
-
-    vga_fill_row(24, WHITE_ON_BLUE)
-    vga_write_str(24, 2, "FajarOS Nova", WHITE_ON_BLUE)
-    vga_write_str(24, 20, "Ring 3 + SYSCALL verified", WHITE_ON_BLUE)
-
-    println("")
-    println("[BOOT] FajarOS Nova Phase 5 complete!")
 }
