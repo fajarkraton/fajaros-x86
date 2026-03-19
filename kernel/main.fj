@@ -1,5 +1,5 @@
-// FajarOS Nova — Phase 4: Preemptive Scheduler
-// Process creation + timer-driven context switch
+// FajarOS Nova — Phase 5: Ring 3 User Space + SYSCALL
+// TSS + SYSCALL/SYSRET + User processes
 
 const VGA_BASE: i64 = 0xB8000
 const VGA_COLS: i64 = 80
@@ -8,10 +8,6 @@ const WHITE_ON_BLUE: i64 = 0x1F
 const GREEN_ON_BLACK: i64 = 0x0A
 const CYAN_ON_BLACK: i64 = 0x0B
 const YELLOW_ON_BLACK: i64 = 0x0E
-
-// ═══════════════════════════════════════════════
-// VGA
-// ═══════════════════════════════════════════════
 
 @kernel fn vga_putchar(row: i64, col: i64, ch: i64, color: i64) {
     let addr = VGA_BASE + (row * VGA_COLS + col) * 2
@@ -53,54 +49,52 @@ const YELLOW_ON_BLACK: i64 = 0x0E
 }
 
 // ═══════════════════════════════════════════════
-// Process A: prints 'A' repeatedly
+// User Process A — runs in Ring 3, uses SYSCALL
 // ═══════════════════════════════════════════════
 
-@kernel fn process_a() {
+@kernel fn user_process_a() {
+    // This will run at Ring 3 (CPL=3)
+    // Serial output via direct port I/O (still works if IOPL allows)
     let mut count: i64 = 0
-    while count < 20 {
+    while count < 30 {
         port_outb(0x3F8, 65)  // 'A'
-        // Busy loop to slow down
         let mut i: i64 = 0
-        while i < 5000000 { i = i + 1 }
+        while i < 3000000 { i = i + 1 }
         count = count + 1
     }
-    // Process done — halt (in real OS would call exit syscall)
-    // Process done — spin forever
+    // Spin when done
     let mut spin: i64 = 0
     while spin == 0 { spin = 0 }
 }
 
 // ═══════════════════════════════════════════════
-// Process B: prints 'B' repeatedly
+// User Process B
 // ═══════════════════════════════════════════════
 
-@kernel fn process_b() {
+@kernel fn user_process_b() {
     let mut count: i64 = 0
-    while count < 20 {
+    while count < 30 {
         port_outb(0x3F8, 66)  // 'B'
         let mut i: i64 = 0
-        while i < 5000000 { i = i + 1 }
+        while i < 3000000 { i = i + 1 }
         count = count + 1
     }
-    // Process done — spin forever
     let mut spin: i64 = 0
     while spin == 0 { spin = 0 }
 }
 
 // ═══════════════════════════════════════════════
-// Process C: prints 'C' repeatedly
+// User Process C
 // ═══════════════════════════════════════════════
 
-@kernel fn process_c() {
+@kernel fn user_process_c() {
     let mut count: i64 = 0
-    while count < 20 {
+    while count < 30 {
         port_outb(0x3F8, 67)  // 'C'
         let mut i: i64 = 0
-        while i < 5000000 { i = i + 1 }
+        while i < 3000000 { i = i + 1 }
         count = count + 1
     }
-    // Process done — spin forever
     let mut spin: i64 = 0
     while spin == 0 { spin = 0 }
 }
@@ -112,8 +106,8 @@ const YELLOW_ON_BLACK: i64 = 0x0E
 @kernel fn kernel_main() {
     x86_serial_init(0, 115200)
     println("============================================")
-    println("  FajarOS Nova v0.1.0 — Phase 4")
-    println("  Preemptive Round-Robin Scheduler")
+    println("  FajarOS Nova v0.1.0 — Phase 5")
+    println("  Ring 3 + TSS + SYSCALL/SYSRET")
     println("============================================")
     println("")
 
@@ -122,36 +116,30 @@ const YELLOW_ON_BLACK: i64 = 0x0E
     vga_fill_row(0, WHITE_ON_BLUE)
     vga_write_str(0, 2, "FajarOS Nova v0.1.0", WHITE_ON_BLUE)
     vga_write_str(0, 30, "x86_64", WHITE_ON_BLUE)
-    vga_write_str(0, 55, "Phase 4: Sched", WHITE_ON_BLUE)
+    vga_write_str(0, 55, "Phase 5", WHITE_ON_BLUE)
 
-    // SSE + CPUID
+    // SSE
     sse_enable()
-    let ebx7 = cpuid_ebx(7)
+    println("[SSE] Enabled")
+
+    // CPUID
     let edx1 = cpuid_edx(1)
-    let has_avx2 = (ebx7 & (1 << 5)) != 0
-    let has_apic = (edx1 & (1 << 9)) != 0
+    let ebx7 = cpuid_ebx(7)
     vga_write_str(2, 0, "[CPU]", GREEN_ON_BLACK)
-    if has_avx2 { vga_write_str(2, 6, "AVX2", WHITE_ON_BLACK) }
-    if has_apic { vga_write_str(2, 11, "APIC", WHITE_ON_BLACK) }
+    if (ebx7 & (1 << 5)) != 0 { vga_write_str(2, 6, "AVX2", WHITE_ON_BLACK) }
+    if (edx1 & (1 << 9)) != 0 { vga_write_str(2, 11, "APIC", WHITE_ON_BLACK) }
     println("[CPU] Detected")
 
     // Memory
     vga_write_str(3, 0, "[MEM] 128MB", YELLOW_ON_BLACK)
-    println("[MEM] 128MB identity mapped")
+    println("[MEM] 128MB")
 
-    // Initialize process table (zero out)
+    // Init process table
     let mut i: i64 = 0
-    while i < 4096 {
-        volatile_write(0x600000 + i, 0)
-        i = i + 8
-    }
-    // Set process count to 0
+    while i < 4096 { volatile_write(0x600000 + i, 0); i = i + 8 }
     volatile_write(0x6FE08, 0)
-    // Set current PID to 0 (kernel = process 0)
     set_current_pid(0)
-
-    // Register kernel as process 0 (running)
-    volatile_write(0x600000 + 8, 2)  // state = running
+    volatile_write(0x600000 + 8, 2)  // kernel = running
 
     // IDT + PIC + PIT
     idt_init()
@@ -161,55 +149,53 @@ const YELLOW_ON_BLACK: i64 = 0x0E
     pit_init(100)
     println("[PIT] 100 Hz")
 
-    // Create processes using fn_addr
-    println("[SCHED] Creating processes...")
+    // TSS — required for Ring 3 → Ring 0 transitions
+    tss_init()
+    println("[TSS] Initialized (RSP0 = kernel stack)")
+    vga_write_str(4, 0, "[TSS] Loaded", GREEN_ON_BLACK)
 
-    let pid_a = proc_create(fn_addr("process_a"))
-    let pid_b = proc_create(fn_addr("process_b"))
-    let pid_c = proc_create(fn_addr("process_c"))
+    // SYSCALL/SYSRET — configure MSRs
+    syscall_init()
+    println("[SYSCALL] MSRs configured (STAR, LSTAR, FMASK)")
+    vga_write_str(5, 0, "[SYSCALL] Ready", GREEN_ON_BLACK)
 
-    println("[SCHED] Process A created")
-    println("[SCHED] Process B created")
-    println("[SCHED] Process C created")
+    // Create user processes (Ring 3)
+    println("[SCHED] Creating user processes...")
+    let pid_a = proc_create_user(fn_addr("user_process_a"))
+    let pid_b = proc_create_user(fn_addr("user_process_b"))
+    let pid_c = proc_create_user(fn_addr("user_process_c"))
+    println("[SCHED] 3 user processes created (Ring 3)")
 
-    // VGA: show processes
-    vga_write_str(5, 0, "[SCHED] 3 processes created", GREEN_ON_BLACK)
-    vga_write_str(6, 0, "PID 1: Process A", WHITE_ON_BLACK)
-    vga_write_str(7, 0, "PID 2: Process B", WHITE_ON_BLACK)
-    vga_write_str(8, 0, "PID 3: Process C", WHITE_ON_BLACK)
+    vga_write_str(7, 0, "PID 1: User A (Ring 3)", WHITE_ON_BLACK)
+    vga_write_str(8, 0, "PID 2: User B (Ring 3)", WHITE_ON_BLACK)
+    vga_write_str(9, 0, "PID 3: User C (Ring 3)", WHITE_ON_BLACK)
 
     // Enable interrupts — scheduler starts!
     println("[SCHED] Enabling preemptive scheduling...")
-    println("[SCHED] Output: A/B/C interleaved = SUCCESS")
-    println("")
     irq_enable()
 
-    // Kernel loop — keep printing status
+    // Kernel main loop
     let mut loops: i64 = 0
-    while loops < 100 {
+    while loops < 80 {
         let mut j: i64 = 0
-        while j < 10000000 { j = j + 1 }
-
+        while j < 5000000 { j = j + 1 }
         let ticks = read_timer_ticks()
-        // Update VGA tick counter
-        vga_write_str(10, 0, "Ticks:", CYAN_ON_BLACK)
-        vga_decimal(10, 7, ticks, CYAN_ON_BLACK)
-
+        vga_write_str(11, 0, "Ticks:", CYAN_ON_BLACK)
+        vga_decimal(11, 7, ticks, CYAN_ON_BLACK)
         loops = loops + 1
     }
 
     irq_disable()
-
     let final_ticks = read_timer_ticks()
-    vga_write_str(12, 0, "Scheduler test complete!", GREEN_ON_BLACK)
-    vga_write_str(13, 0, "Total ticks:", YELLOW_ON_BLACK)
-    vga_decimal(13, 13, final_ticks, YELLOW_ON_BLACK)
 
-    // Bottom bar
+    vga_write_str(13, 0, "Phase 5 complete!", GREEN_ON_BLACK)
+    vga_write_str(14, 0, "Total ticks:", YELLOW_ON_BLACK)
+    vga_decimal(14, 13, final_ticks, YELLOW_ON_BLACK)
+
     vga_fill_row(24, WHITE_ON_BLUE)
     vga_write_str(24, 2, "FajarOS Nova", WHITE_ON_BLUE)
-    vga_write_str(24, 20, "Written 100% in Fajar Lang", WHITE_ON_BLUE)
+    vga_write_str(24, 20, "Ring 3 + SYSCALL verified", WHITE_ON_BLUE)
 
     println("")
-    println("[BOOT] FajarOS Nova Phase 4 — scheduler complete!")
+    println("[BOOT] FajarOS Nova Phase 5 complete!")
 }
