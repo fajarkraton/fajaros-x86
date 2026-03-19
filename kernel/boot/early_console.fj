@@ -1,0 +1,78 @@
+// FajarOS Nova — Early Console (Serial + VGA)
+// Provides output before full kernel initialization
+
+// ============================================================
+// 16550 UART Serial Port (COM1: 0x3F8)
+// ============================================================
+// Register offsets from base:
+//   +0: THR (Transmit Holding Register) / RBR (Receive Buffer)
+//   +1: IER (Interrupt Enable Register)
+//   +2: FCR (FIFO Control Register)
+//   +3: LCR (Line Control Register)
+//   +5: LSR (Line Status Register)
+// ============================================================
+
+const COM1: i64 = 0x3F8
+const COM2: i64 = 0x2F8
+
+// Initialize serial port
+// port: 0 = COM1, 1 = COM2
+// baud: baud rate (115200 typical)
+@kernel
+fn serial_init(port: i64, baud: i64) {
+    let base = if port == 0 { COM1 } else { COM2 }
+    let divisor = 115200 / baud
+
+    port_outb(base + 1, 0)           // Disable interrupts
+    port_outb(base + 3, 0x80)        // Enable DLAB (set baud rate divisor)
+    port_outb(base + 0, divisor)     // Set divisor lo byte
+    port_outb(base + 1, 0)           // Set divisor hi byte
+    port_outb(base + 3, 0x03)        // 8 bits, no parity, 1 stop bit (8N1)
+    port_outb(base + 2, 0xC7)        // Enable FIFO, clear, 14-byte threshold
+    port_outb(base + 4, 0x0B)        // IRQs enabled, RTS/DSR set
+}
+
+// Write a single byte to serial port
+@kernel
+fn serial_write_byte(base: i64, byte: i64) {
+    // Wait until transmit buffer is empty (LSR bit 5)
+    while (port_inb(base + 5) & 0x20) == 0 {
+        // busy wait
+    }
+    port_outb(base, byte)
+}
+
+// ============================================================
+// VGA Text Mode (80x25, buffer at 0xB8000)
+// ============================================================
+// Each cell: 2 bytes [ASCII char][attribute byte]
+// Attribute: [blink:1][BG:3][FG:4]
+// Colors: 0=black, 1=blue, 2=green, 3=cyan, 4=red,
+//         5=magenta, 6=brown, 7=light_grey, 8-15=bright variants
+// ============================================================
+
+const VGA_BUFFER: i64 = 0xB8000
+const VGA_WIDTH: i64 = 80
+const VGA_HEIGHT: i64 = 25
+const VGA_COLOR_WHITE_ON_BLACK: i64 = 0x0F
+const VGA_COLOR_WHITE_ON_BLUE: i64 = 0x1F
+
+// Write a character at position (row, col) with color
+@kernel
+fn vga_putchar_at(row: i64, col: i64, ch: i64, color: i64) {
+    let offset = (row * VGA_WIDTH + col) * 2
+    volatile_write(VGA_BUFFER + offset, ch)
+    volatile_write(VGA_BUFFER + offset + 1, color)
+}
+
+// Clear the VGA screen
+@kernel
+fn vga_clear() {
+    let mut i = 0
+    while i < VGA_WIDTH * VGA_HEIGHT {
+        let offset = i * 2
+        volatile_write(VGA_BUFFER + offset, 0x20)  // space
+        volatile_write(VGA_BUFFER + offset + 1, VGA_COLOR_WHITE_ON_BLACK)
+        i = i + 1
+    }
+}

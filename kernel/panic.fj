@@ -1,0 +1,41 @@
+// FajarOS Nova — Kernel Panic Handler
+//
+// When something goes fatally wrong, dump all useful info and halt.
+// Output goes to both serial (COM1) and VGA (if available).
+
+@kernel
+fn kernel_panic(msg: str) {
+    // Disable interrupts immediately
+    asm!("cli")
+
+    println("")
+    println("!!! KERNEL PANIC !!!")
+    println("====================================")
+    println(msg)
+    println("====================================")
+
+    // TODO: Print register dump
+    // let rip = read_rip()
+    // let rsp = read_rsp()
+    // let rflags = read_rflags()
+    // println("RIP:    " + hex(rip))
+    // println("RSP:    " + hex(rsp))
+    // println("RFLAGS: " + hex(rflags))
+
+    // TODO: Print stack trace (walk RBP chain)
+    // let mut rbp = read_rbp()
+    // while rbp != 0 {
+    //     let ret_addr = volatile_read(rbp + 8)
+    //     println("  at " + hex(ret_addr))
+    //     rbp = volatile_read(rbp)
+    // }
+
+    println("")
+    println("System halted. Please reboot.")
+
+    // Halt forever — no recovery from kernel panic
+    loop {
+        asm!("cli")
+        asm!("hlt")
+    }
+}

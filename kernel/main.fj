@@ -1,0 +1,72 @@
+// FajarOS Nova — Kernel Entry Point
+// Target: x86_64-unknown-none (bare-metal)
+// Boot: Multiboot2 protocol (GRUB2 compatible)
+
+// ============================================================
+// Phase 1: Foundation — Sprint 1
+// This is the first code that runs after GRUB hands off to us.
+// GRUB loads us in 64-bit long mode with:
+//   - RAX = 0x36D76289 (Multiboot2 magic)
+//   - RBX = pointer to Multiboot2 info struct
+//   - Paging: identity-mapped (first 4GB)
+//   - Interrupts: disabled
+//   - A20: enabled
+//   - GDT: flat segments (but we'll set up our own)
+// ============================================================
+
+@kernel
+fn kernel_main() {
+    // Step 1: Initialize serial console (COM1: 0x3F8)
+    serial_init(0, 115200)
+
+    // Step 2: Print boot banner
+    println("============================================")
+    println("  FajarOS Nova v0.1.0")
+    println("  Target: x86_64 (Intel Core i9-14900HX)")
+    println("  Written 100% in Fajar Lang")
+    println("============================================")
+    println("")
+
+    // Step 3: Early hardware detection
+    println("[BOOT] Serial console initialized (COM1: 115200)")
+
+    // TODO Phase 1 Sprint 3: GDT + TSS
+    // gdt_init()
+    // println("[BOOT] GDT loaded")
+
+    // TODO Phase 1 Sprint 3: CPUID
+    // let cpu = cpuid_detect()
+    // println("[BOOT] CPU: " + cpu.name)
+
+    // TODO Phase 2: Paging
+    // paging_init()
+    // println("[BOOT] Paging: 4-level (PML4), NX enabled")
+
+    // TODO Phase 3: IDT + LAPIC
+    // idt_init()
+    // lapic_init()
+    // println("[BOOT] IDT loaded, LAPIC timer: 100 Hz")
+
+    // TODO Phase 4: Scheduler
+    // scheduler_init()
+    // println("[BOOT] Scheduler ready")
+
+    // TODO Phase 7: Shell
+    // shell_start()
+
+    println("")
+    println("[BOOT] FajarOS Nova — kernel_main() reached")
+    println("[BOOT] All systems nominal. Halting.")
+
+    // Halt CPU (no work to do yet)
+    halt()
+}
+
+// Halt the CPU (infinite HLT loop)
+@kernel
+fn halt() {
+    println("[HALT] CPU halted. Goodbye.")
+    loop {
+        asm!("hlt")
+    }
+}

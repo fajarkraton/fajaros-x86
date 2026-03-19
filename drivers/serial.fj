@@ -1,0 +1,79 @@
+// FajarOS Nova — 16550 UART Serial Driver
+// Standard PC serial port (COM1: 0x3F8, COM2: 0x2F8)
+//
+// Register Map (offset from base):
+//   +0  THR/RBR  Transmit Holding / Receive Buffer
+//   +1  IER      Interrupt Enable Register
+//   +2  IIR/FCR  Interrupt ID / FIFO Control
+//   +3  LCR      Line Control Register
+//   +4  MCR      Modem Control Register
+//   +5  LSR      Line Status Register
+//   +6  MSR      Modem Status Register
+//   +7  SCR      Scratch Register
+
+const SERIAL_COM1_BASE: i64 = 0x3F8
+const SERIAL_COM2_BASE: i64 = 0x2F8
+
+// LSR bit masks
+const LSR_DATA_READY: i64 = 0x01
+const LSR_TX_EMPTY: i64 = 0x20
+
+// Initialize serial port with given baud rate
+@kernel
+fn serial_port_init(base: i64, baud: i64) {
+    let divisor = 115200 / baud
+
+    port_outb(base + 1, 0x00)    // Disable all interrupts
+    port_outb(base + 3, 0x80)    // Enable DLAB (Divisor Latch Access Bit)
+    port_outb(base + 0, divisor) // Set divisor low byte
+    port_outb(base + 1, 0x00)    // Set divisor high byte
+    port_outb(base + 3, 0x03)    // 8 bits, no parity, 1 stop bit (8N1)
+    port_outb(base + 2, 0xC7)    // Enable FIFO, clear TX/RX, 14-byte threshold
+    port_outb(base + 4, 0x0B)    // IRQs enabled, RTS/DSR set
+    port_outb(base + 4, 0x1E)    // Set loopback mode for test
+
+    // Self-test: send 0xAE and check if we receive it back
+    port_outb(base + 0, 0xAE)
+    let test = port_inb(base + 0)
+
+    if test != 0xAE {
+        // Serial port is faulty — continue anyway (VGA fallback)
+        return
+    }
+
+    // Disable loopback, set normal operation (OUT1 + OUT2 + RTS)
+    port_outb(base + 4, 0x0F)
+}
+
+// Send a single byte (blocking)
+@kernel
+fn serial_send(base: i64, byte: i64) {
+    // Wait for TX buffer empty
+    while (port_inb(base + 5) & LSR_TX_EMPTY) == 0 {
+        asm!("pause")  // hint to CPU: spin-wait
+    }
+    port_outb(base, byte)
+}
+
+// Receive a single byte (blocking)
+@kernel
+fn serial_recv(base: i64) -> i64 {
+    // Wait for data ready
+    while (port_inb(base + 5) & LSR_DATA_READY) == 0 {
+        asm!("pause")
+    }
+    port_inb(base)
+}
+
+// Check if data is available to read
+@kernel
+fn serial_data_available(base: i64) -> bool {
+    (port_inb(base + 5) & LSR_DATA_READY) != 0
+}
+
+// Send a string
+@kernel
+fn serial_send_str(base: i64, s: str) {
+    // TODO: iterate string bytes and call serial_send for each
+    // This needs string-to-bytes support from the compiler
+}

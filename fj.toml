@@ -1,0 +1,21 @@
+[project]
+name = "fajaros-nova"
+version = "0.1.0"
+description = "FajarOS Nova — x86_64 operating system in Fajar Lang"
+authors = ["Fajar <fajar@primecore.id>"]
+license = "MIT"
+
+[build]
+target = "x86_64-unknown-none"
+entry = "kernel/main.fj"
+output = "build/fajaros.elf"
+optimization = "release"
+
+[build.linker]
+script = "linker.ld"
+entry = "_start"
+
+[build.bare-metal]
+no-std = true
+no-libc = true
+static-link = true

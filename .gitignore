@@ -1,0 +1,27 @@
+# Build output
+*.elf
+*.bin
+*.iso
+*.o
+*.img
+build/
+target/
+
+# QEMU
+*.qcow2
+*.raw
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Debug
+*.log
+core

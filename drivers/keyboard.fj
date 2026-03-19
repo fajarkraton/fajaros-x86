@@ -1,0 +1,68 @@
+// FajarOS Nova — PS/2 Keyboard Driver
+// PS/2 controller ports: 0x60 (data), 0x64 (status/command)
+// IRQ 1 → IOAPIC vector 33
+
+const KB_DATA_PORT: i64 = 0x60
+const KB_STATUS_PORT: i64 = 0x64
+
+// Scancode Set 1 → ASCII mapping (lowercase, make codes only)
+// Index = scancode, value = ASCII character (0 = unmapped)
+
+// Read a scancode from the keyboard (blocking)
+@kernel
+fn keyboard_read_scancode() -> i64 {
+    // Wait for data available (status port bit 0)
+    while (port_inb(KB_STATUS_PORT) & 0x01) == 0 {
+        asm!("pause")
+    }
+    port_inb(KB_DATA_PORT)
+}
+
+// Convert scancode to ASCII (basic mapping)
+// Returns 0 for non-printable keys
+@kernel
+fn scancode_to_ascii(scancode: i64, shift: bool) -> i64 {
+    // TODO Sprint 16: Full scancode table
+    // Common scancodes (Set 1, make codes):
+    //   0x02-0x0B: '1'-'9','0'
+    //   0x10-0x19: 'q','w','e','r','t','y','u','i','o','p'
+    //   0x1E-0x26: 'a','s','d','f','g','h','j','k','l'
+    //   0x2C-0x32: 'z','x','c','v','b','n','m'
+    //   0x39: space
+    //   0x1C: enter
+    //   0x0E: backspace
+
+    if scancode == 0x1C { return 10 }   // Enter → newline
+    if scancode == 0x0E { return 8 }    // Backspace
+    if scancode == 0x39 { return 32 }   // Space
+
+    // Letters (simplified — just lowercase for now)
+    if scancode == 0x1E { return 97 }   // 'a'
+    if scancode == 0x30 { return 98 }   // 'b'
+    if scancode == 0x2E { return 99 }   // 'c'
+    if scancode == 0x20 { return 100 }  // 'd'
+    if scancode == 0x12 { return 101 }  // 'e'
+    if scancode == 0x21 { return 102 }  // 'f'
+    if scancode == 0x22 { return 103 }  // 'g'
+    if scancode == 0x23 { return 104 }  // 'h'
+    if scancode == 0x17 { return 105 }  // 'i'
+    if scancode == 0x24 { return 106 }  // 'j'
+    if scancode == 0x25 { return 107 }  // 'k'
+    if scancode == 0x26 { return 108 }  // 'l'
+    if scancode == 0x32 { return 109 }  // 'm'
+    if scancode == 0x31 { return 110 }  // 'n'
+    if scancode == 0x18 { return 111 }  // 'o'
+    if scancode == 0x19 { return 112 }  // 'p'
+    if scancode == 0x10 { return 113 }  // 'q'
+    if scancode == 0x13 { return 114 }  // 'r'
+    if scancode == 0x1F { return 115 }  // 's'
+    if scancode == 0x14 { return 116 }  // 't'
+    if scancode == 0x16 { return 117 }  // 'u'
+    if scancode == 0x2F { return 118 }  // 'v'
+    if scancode == 0x11 { return 119 }  // 'w'
+    if scancode == 0x2D { return 120 }  // 'x'
+    if scancode == 0x15 { return 121 }  // 'y'
+    if scancode == 0x2C { return 122 }  // 'z'
+
+    0  // unmapped
+}
