@@ -314,16 +314,16 @@ fajaros-x86/
 
 | # | Task | Detail | Status |
 |---|------|--------|--------|
-| 1.1 | **Create fajaros-x86 repo** | `gh repo create fajarkraton/fajaros-x86 --public`, README, CLAUDE.md, .gitignore | [ ] |
-| 1.2 | **Create fj.toml** | Project manifest with `target = "x86_64-unknown-none"`, kernel entry point | [ ] |
-| 1.3 | **Create Makefile** | Build targets: `make build`, `make run` (QEMU), `make debug` (QEMU+GDB), `make iso` | [ ] |
-| 1.4 | **Add x86_64 port I/O intrinsics** | `port_inb(port) -> u8`, `port_outb(port, val)` as compiler builtins for `in`/`out` instructions | [ ] |
-| 1.5 | **Update linker.rs for x86_64 bare-metal** | Correct memory layout: .text at 0x100000, .rodata, .data, .bss, .stack. Multiboot2 header section first. | [ ] |
-| 1.6 | **Update runtime_bare.rs UART for x86_64** | Detect x86_64 target → use 0x3F8 (port I/O) instead of 0x09000000 (MMIO). Use `out` instruction for serial. | [ ] |
-| 1.7 | **Create x86_64 _start wrapper** | Compiler generates: disable interrupts (cli), set stack, zero BSS, call kernel_main, halt (hlt loop) | [ ] |
-| 1.8 | **Create kernel/main.fj** | Minimal: `@kernel fn kernel_main() { println("Hello from FajarOS Nova!") }` | [ ] |
-| 1.9 | **Test: compile to x86_64 bare-metal ELF** | `fj build --target x86_64-none kernel/main.fj` → valid ELF64 x86_64 binary | [ ] |
-| 1.10 | **Test: boot in QEMU** | `qemu-system-x86_64 -kernel fajaros.elf -serial stdio -nographic` → "Hello" on serial | [ ] |
+| 1.1 | **Create fajaros-x86 repo** | `gh repo create fajarkraton/fajaros-x86 --public`, README, CLAUDE.md, .gitignore | [x] |
+| 1.2 | **Create fj.toml** | Project manifest with `target = "x86_64-unknown-none"`, kernel entry point | [x] |
+| 1.3 | **Create Makefile** | Build targets: `make build`, `make run` (QEMU), `make debug` (QEMU+GDB), `make iso` | [x] |
+| 1.4 | **Add x86_64 port I/O intrinsics** | `port_inb(port) -> u8`, `port_outb(port, val)` as compiler builtins for `in`/`out` instructions | [x] |
+| 1.5 | **Update linker.rs for x86_64 bare-metal** | Correct memory layout: .text at 0x100000, .rodata, .data, .bss, .stack. Multiboot2 header section first. | [x] |
+| 1.6 | **Update runtime_bare.rs UART for x86_64** | Detect x86_64 target → use 0x3F8 (port I/O) instead of 0x09000000 (MMIO). Use `out` instruction for serial. | [x] |
+| 1.7 | **Create x86_64 _start wrapper** | Compiler generates: disable interrupts (cli), set stack, zero BSS, call kernel_main, halt (hlt loop) | [x] |
+| 1.8 | **Create kernel/main.fj** | Minimal: `@kernel fn kernel_main() { println("Hello from FajarOS Nova!") }` | [x] |
+| 1.9 | **Test: compile to x86_64 bare-metal ELF** | `fj build --target x86_64-none kernel/main.fj` → valid ELF64 x86_64 binary | [x] |
+| 1.10 | **Test: boot in QEMU** | `qemu-system-x86_64 -kernel fajaros.elf -serial stdio -nographic` → "Hello" on serial | [x] |
 
 ### Sprint 2: Multiboot2 Boot Protocol
 
