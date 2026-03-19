@@ -189,15 +189,20 @@ const RED_ON_BLACK: i64 = 0x0C
 @kernel fn cmdbuf_match(s: str) -> i64 {
     let slen = str_len(s)
     let clen = cmdbuf_len()
-    if slen != clen { return 0 }
+    let mut result: i64 = 1
+    if slen != clen {
+        result = 0
+    }
     let mut i: i64 = 0
-    while i < slen {
+    while i < slen && result == 1 {
         let a = volatile_read_u8(0x6F800 + i)
         let b = str_byte_at(s, i)
-        if a != b { return 0 }
+        if a != b {
+            result = 0
+        }
         i = i + 1
     }
-    1
+    result
 }
 
 // ═══════════════════════════════════════════════
@@ -330,39 +335,46 @@ const RED_ON_BLACK: i64 = 0x0C
 // Command Dispatcher
 // ═══════════════════════════════════════════════
 
+@kernel fn buf_eq4(a: i64, b: i64, c: i64, d: i64) -> i64 {
+    let r0 = volatile_read_u8(0x6F800)
+    let r1 = volatile_read_u8(0x6F801)
+    let r2 = volatile_read_u8(0x6F802)
+    let r3 = volatile_read_u8(0x6F803)
+    if r0 == a && r1 == b && r2 == c && r3 == d { 1 } else { 0 }
+}
+
 @kernel fn dispatch_command() {
     let len = cmdbuf_len()
-    if len == 0 { return }
+    let mut handled: i64 = 0
 
-    if cmdbuf_match("help") == 1 { cmd_help(); return }
-    if cmdbuf_match("clear") == 1 { cmd_clear(); return }
-    if cmdbuf_match("uname") == 1 { cmd_uname(); return }
-    if cmdbuf_match("uptime") == 1 { cmd_uptime(); return }
-    if cmdbuf_match("cpuinfo") == 1 { cmd_cpuinfo(); return }
-    if cmdbuf_match("meminfo") == 1 { cmd_meminfo(); return }
-    if cmdbuf_match("lspci") == 1 { cmd_lspci(); return }
-    if cmdbuf_match("ps") == 1 { cmd_ps(); return }
-    if cmdbuf_match("reboot") == 1 { cmd_reboot(); return }
+    // help (104,101,108,112)
+    if len == 4 && buf_eq4(104, 101, 108, 112) == 1 { cmd_help(); handled = 1 }
+    // clear (99,108,101,97,114)
+    if handled == 0 && len == 5 && buf_eq4(99, 108, 101, 97) == 1 && volatile_read_u8(0x6F804) == 114 { cmd_clear(); handled = 1 }
+    // uname (117,110,97,109,101)
+    if handled == 0 && len == 5 && buf_eq4(117, 110, 97, 109) == 1 && volatile_read_u8(0x6F804) == 101 { cmd_uname(); handled = 1 }
+    // uptime (117,112,116,105,109,101)
+    if handled == 0 && len == 6 && buf_eq4(117, 112, 116, 105) == 1 { cmd_uptime(); handled = 1 }
+    // cpuinfo
+    if handled == 0 && len == 7 && buf_eq4(99, 112, 117, 105) == 1 { cmd_cpuinfo(); handled = 1 }
+    // meminfo
+    if handled == 0 && len == 7 && buf_eq4(109, 101, 109, 105) == 1 { cmd_meminfo(); handled = 1 }
+    // lspci (108,115,112,99,105)
+    if handled == 0 && len == 5 && buf_eq4(108, 115, 112, 99) == 1 { cmd_lspci(); handled = 1 }
+    // ps (112,115)
+    if handled == 0 && len == 2 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 115 { cmd_ps(); handled = 1 }
+    // reboot
+    if handled == 0 && len == 6 && buf_eq4(114, 101, 98, 111) == 1 { cmd_reboot(); handled = 1 }
 
-    // Check if starts with "echo "
-    if len > 4 {
-        let e = volatile_read_u8(0x6F800)
-        let c = volatile_read_u8(0x6F801)
-        let h = volatile_read_u8(0x6F802)
-        let o = volatile_read_u8(0x6F803)
-        if e == 101 && c == 99 && h == 104 && o == 111 {
-            cmd_echo()
-            return
+    if handled == 0 && len > 0 {
+        cprint("Unknown: ", RED_ON_BLACK)
+        let mut i: i64 = 0
+        while i < len {
+            console_putchar(volatile_read_u8(0x6F800 + i), RED_ON_BLACK)
+            i = i + 1
         }
+        console_putchar(10, WHITE_ON_BLACK)
     }
-
-    cprint("Unknown command: ", RED_ON_BLACK)
-    let mut i: i64 = 0
-    while i < len {
-        console_putchar(volatile_read_u8(0x6F800 + i), RED_ON_BLACK)
-        i = i + 1
-    }
-    console_putchar(10, WHITE_ON_BLACK)
 }
 
 // ═══════════════════════════════════════════════
