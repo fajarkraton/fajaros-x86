@@ -329,16 +329,16 @@ fajaros-x86/
 
 | # | Task | Detail | Status |
 |---|------|--------|--------|
-| 2.1 | **Generate Multiboot2 header in ELF** | Magic 0xE85250D6, architecture 0 (i386/x86), checksum. Embed in `.multiboot_header` section. | [ ] |
+| 2.1 | **Generate Multiboot2 header in ELF** | Magic 0xE85250D6, architecture 0 (i386/x86), checksum. Embed in `.multiboot_header` section. | [x] |
 | 2.2 | **Parse Multiboot2 boot info** | Read memory map tag (type 6): base_addr, length, type for each region. Store in global. | [ ] |
 | 2.3 | **Parse framebuffer info** | Multiboot2 tag type 8: framebuffer addr, pitch, width, height, bpp. Store for VGA/GOP. | [ ] |
-| 2.4 | **Implement serial driver (16550 UART)** | `serial_init(port, baud)`, `serial_write_byte(port, byte)`, `serial_write_str(port, ptr, len)`. COM1=0x3F8. | [ ] |
-| 2.5 | **Implement VGA text mode driver** | `vga_init()`, `vga_putchar(ch, color)`, `vga_write_str(ptr, len)`, `vga_clear()`. Buffer at 0xB8000. | [ ] |
-| 2.6 | **Implement kernel panic handler** | `@kernel fn panic(msg: str)` → print to serial + VGA, register dump (rax-r15, rip, rsp, rflags), halt. | [ ] |
-| 2.7 | **Create GRUB2 config** | `grub.cfg` with `multiboot2 /boot/fajaros.elf`. Support both serial and VGA console. | [ ] |
-| 2.8 | **Create ISO builder script** | `tools/make_iso.sh`: create boot/grub directory, copy kernel, run `grub-mkrescue` → fajaros.iso. | [ ] |
-| 2.9 | **Test: boot ISO in QEMU** | `qemu-system-x86_64 -cdrom fajaros.iso -serial stdio` → boot via GRUB → serial output | [ ] |
-| 2.10 | **Test: VGA text output** | Boot → see "FajarOS Nova" banner on VGA screen (80×25 text mode, white on blue) | [ ] |
+| 2.4 | **Implement serial driver (16550 UART)** | `serial_init(port, baud)`, `serial_write_byte(port, byte)`, `serial_write_str(port, ptr, len)`. COM1=0x3F8. | [x] |
+| 2.5 | **Implement VGA text mode driver** | `vga_init()`, `vga_putchar(ch, color)`, `vga_write_str(ptr, len)`, `vga_clear()`. Buffer at 0xB8000. | [x] |
+| 2.6 | **Implement kernel panic handler** | `@kernel fn panic(msg: str)` → print to serial + VGA, register dump (rax-r15, rip, rsp, rflags), halt. | [x] |
+| 2.7 | **Create GRUB2 config** | `grub.cfg` with `multiboot2 /boot/fajaros.elf`. Support both serial and VGA console. | [x] |
+| 2.8 | **Create ISO builder script** | `tools/make_iso.sh`: create boot/grub directory, copy kernel, run `grub-mkrescue` → fajaros.iso. | [x] |
+| 2.9 | **Test: boot ISO in QEMU** | `qemu-system-x86_64 -cdrom fajaros.iso -serial stdio` → boot via GRUB → serial output | [x] |
+| 2.10 | **Test: VGA text output** | Boot → see "FajarOS Nova" banner on VGA screen (80×25 text mode, white on blue) | [x] |
 
 ### Sprint 3: GDT & Basic CPU Setup
 

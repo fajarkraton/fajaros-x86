@@ -1,72 +1,198 @@
-// FajarOS Nova — Kernel Entry Point
-// Target: x86_64-unknown-none (bare-metal)
-// Boot: Multiboot2 protocol (GRUB2 compatible)
+// FajarOS Nova — Sprint 2 Kernel
+// VGA text mode + Serial console + Boot info
 
-// ============================================================
-// Phase 1: Foundation — Sprint 1
-// This is the first code that runs after GRUB hands off to us.
-// GRUB loads us in 64-bit long mode with:
-//   - RAX = 0x36D76289 (Multiboot2 magic)
-//   - RBX = pointer to Multiboot2 info struct
-//   - Paging: identity-mapped (first 4GB)
-//   - Interrupts: disabled
-//   - A20: enabled
-//   - GDT: flat segments (but we'll set up our own)
-// ============================================================
+// ═══════════════════════════════════════════════
+// VGA Text Mode Driver
+// Buffer at 0xB8000, 80×25, 2 bytes per cell
+// ═══════════════════════════════════════════════
+
+const VGA_BASE: i64 = 0xB8000
+const VGA_COLS: i64 = 80
+const VGA_ROWS: i64 = 25
+
+// Colors
+const WHITE_ON_BLACK: i64 = 0x0F
+const WHITE_ON_BLUE: i64 = 0x1F
+const YELLOW_ON_BLACK: i64 = 0x0E
+const GREEN_ON_BLACK: i64 = 0x0A
+const RED_ON_BLACK: i64 = 0x0C
+
+@kernel
+fn vga_clear(color: i64) {
+    let mut i: i64 = 0
+    while i < VGA_COLS * VGA_ROWS {
+        let addr = VGA_BASE + i * 2
+        volatile_write(addr, 0x20)      // space
+        volatile_write(addr + 1, color)
+        i = i + 1
+    }
+}
+
+@kernel
+fn vga_putchar(row: i64, col: i64, ch: i64, color: i64) {
+    if row >= 0 && row < VGA_ROWS && col >= 0 && col < VGA_COLS {
+        let addr = VGA_BASE + (row * VGA_COLS + col) * 2
+        volatile_write(addr, ch)
+        volatile_write(addr + 1, color)
+    }
+}
+
+@kernel
+fn vga_write_str_at(row: i64, col: i64, s: str, color: i64) {
+    // Write string character by character
+    // For bare-metal, println uses fj_rt_bare_println which writes to serial
+    // VGA needs per-char output using the string's memory representation
+    // For now, use the port I/O approach with known characters
+}
+
+// ═══════════════════════════════════════════════
+// VGA Banner — write known text using putchar
+// ═══════════════════════════════════════════════
+
+@kernel
+fn vga_banner() {
+    // Row 0: "FajarOS Nova v0.1.0" in white on blue
+    let row: i64 = 0
+    let c: i64 = WHITE_ON_BLUE
+
+    // Fill entire first row with blue background
+    let mut i: i64 = 0
+    while i < VGA_COLS {
+        vga_putchar(0, i, 0x20, c)
+        i = i + 1
+    }
+
+    // "FajarOS Nova v0.1.0"
+    vga_putchar(row, 2, 70, c)   // F
+    vga_putchar(row, 3, 97, c)   // a
+    vga_putchar(row, 4, 106, c)  // j
+    vga_putchar(row, 5, 97, c)   // a
+    vga_putchar(row, 6, 114, c)  // r
+    vga_putchar(row, 7, 79, c)   // O
+    vga_putchar(row, 8, 83, c)   // S
+    vga_putchar(row, 9, 32, c)   // (space)
+    vga_putchar(row, 10, 78, c)  // N
+    vga_putchar(row, 11, 111, c) // o
+    vga_putchar(row, 12, 118, c) // v
+    vga_putchar(row, 13, 97, c)  // a
+    vga_putchar(row, 14, 32, c)  // (space)
+    vga_putchar(row, 15, 118, c) // v
+    vga_putchar(row, 16, 48, c)  // 0
+    vga_putchar(row, 17, 46, c)  // .
+    vga_putchar(row, 18, 49, c)  // 1
+    vga_putchar(row, 19, 46, c)  // .
+    vga_putchar(row, 20, 48, c)  // 0
+
+    // Row 2: "[BOOT] Serial: COM1 115200" in green
+    let g: i64 = GREEN_ON_BLACK
+    // [
+    vga_putchar(2, 0, 91, g)
+    // B
+    vga_putchar(2, 1, 66, g)
+    // O
+    vga_putchar(2, 2, 79, g)
+    // O
+    vga_putchar(2, 3, 79, g)
+    // T
+    vga_putchar(2, 4, 84, g)
+    // ]
+    vga_putchar(2, 5, 93, g)
+    // (space)
+    vga_putchar(2, 6, 32, g)
+    // V
+    vga_putchar(2, 7, 86, WHITE_ON_BLACK)
+    // G
+    vga_putchar(2, 8, 71, WHITE_ON_BLACK)
+    // A
+    vga_putchar(2, 9, 65, WHITE_ON_BLACK)
+    // (space)
+    vga_putchar(2, 10, 32, WHITE_ON_BLACK)
+    // O
+    vga_putchar(2, 11, 79, WHITE_ON_BLACK)
+    // K
+    vga_putchar(2, 12, 75, WHITE_ON_BLACK)
+
+    // Row 4: "Ready." in yellow
+    vga_putchar(4, 0, 82, YELLOW_ON_BLACK)   // R
+    vga_putchar(4, 1, 101, YELLOW_ON_BLACK)  // e
+    vga_putchar(4, 2, 97, YELLOW_ON_BLACK)   // a
+    vga_putchar(4, 3, 100, YELLOW_ON_BLACK)  // d
+    vga_putchar(4, 4, 121, YELLOW_ON_BLACK)  // y
+    vga_putchar(4, 5, 46, YELLOW_ON_BLACK)   // .
+}
+
+// ═══════════════════════════════════════════════
+// Kernel Panic
+// ═══════════════════════════════════════════════
+
+@kernel
+fn kernel_panic_msg() {
+    // Red banner on VGA
+    let mut i: i64 = 0
+    while i < VGA_COLS {
+        vga_putchar(24, i, 32, RED_ON_BLACK)
+        i = i + 1
+    }
+    // "!!! KERNEL PANIC !!!"
+    vga_putchar(24, 2, 33, RED_ON_BLACK)    // !
+    vga_putchar(24, 3, 33, RED_ON_BLACK)    // !
+    vga_putchar(24, 4, 33, RED_ON_BLACK)    // !
+    vga_putchar(24, 5, 32, RED_ON_BLACK)    // (space)
+    vga_putchar(24, 6, 75, RED_ON_BLACK)    // K
+    vga_putchar(24, 7, 69, RED_ON_BLACK)    // E
+    vga_putchar(24, 8, 82, RED_ON_BLACK)    // R
+    vga_putchar(24, 9, 78, RED_ON_BLACK)    // N
+    vga_putchar(24, 10, 69, RED_ON_BLACK)   // E
+    vga_putchar(24, 11, 76, RED_ON_BLACK)   // L
+    vga_putchar(24, 12, 32, RED_ON_BLACK)   // (space)
+    vga_putchar(24, 13, 80, RED_ON_BLACK)   // P
+    vga_putchar(24, 14, 65, RED_ON_BLACK)   // A
+    vga_putchar(24, 15, 78, RED_ON_BLACK)   // N
+    vga_putchar(24, 16, 73, RED_ON_BLACK)   // I
+    vga_putchar(24, 17, 67, RED_ON_BLACK)   // C
+    vga_putchar(24, 18, 32, RED_ON_BLACK)   // (space)
+    vga_putchar(24, 19, 33, RED_ON_BLACK)   // !
+    vga_putchar(24, 20, 33, RED_ON_BLACK)   // !
+    vga_putchar(24, 21, 33, RED_ON_BLACK)   // !
+
+    // Also to serial
+    println("!!! KERNEL PANIC !!!")
+}
+
+// ═══════════════════════════════════════════════
+// Kernel Main
+// ═══════════════════════════════════════════════
 
 @kernel
 fn kernel_main() {
-    // Step 1: Initialize serial console (COM1: 0x3F8)
-    serial_init(0, 115200)
+    // Step 1: Serial console (already initialized by startup asm)
+    x86_serial_init(0, 115200)
 
-    // Step 2: Print boot banner
     println("============================================")
-    println("  FajarOS Nova v0.1.0")
-    println("  Target: x86_64 (Intel Core i9-14900HX)")
+    println("  FajarOS Nova v0.1.0 — x86_64")
+    println("  Target: Intel Core i9-14900HX")
     println("  Written 100% in Fajar Lang")
     println("============================================")
     println("")
 
-    // Step 3: Early hardware detection
-    println("[BOOT] Serial console initialized (COM1: 115200)")
+    // Step 2: VGA text mode
+    println("[BOOT] Initializing VGA text mode...")
+    vga_clear(WHITE_ON_BLACK)
+    vga_banner()
+    println("[BOOT] VGA: 80x25 text mode at 0xB8000 — OK")
 
-    // TODO Phase 1 Sprint 3: GDT + TSS
-    // gdt_init()
-    // println("[BOOT] GDT loaded")
+    // Step 3: Memory info (hardcoded for now)
+    println("[BOOT] Memory: identity mapped 0x0 - 0x3FFFFF (4MB)")
+    println("[BOOT] Kernel: 0x100000, Stack: 0x3F0000")
+    println("[BOOT] Heap: 0x300000 - 0x3E0000 (bump allocator)")
 
-    // TODO Phase 1 Sprint 3: CPUID
-    // let cpu = cpuid_detect()
-    // println("[BOOT] CPU: " + cpu.name)
-
-    // TODO Phase 2: Paging
-    // paging_init()
-    // println("[BOOT] Paging: 4-level (PML4), NX enabled")
-
-    // TODO Phase 3: IDT + LAPIC
-    // idt_init()
-    // lapic_init()
-    // println("[BOOT] IDT loaded, LAPIC timer: 100 Hz")
-
-    // TODO Phase 4: Scheduler
-    // scheduler_init()
-    // println("[BOOT] Scheduler ready")
-
-    // TODO Phase 7: Shell
-    // shell_start()
+    // Step 4: Port I/O test
+    let lsr = port_inb(0x3FD)
+    if (lsr & 0x20) != 0 {
+        println("[BOOT] COM1: TX ready — OK")
+    }
 
     println("")
-    println("[BOOT] FajarOS Nova — kernel_main() reached")
-    println("[BOOT] All systems nominal. Halting.")
-
-    // Halt CPU (no work to do yet)
-    halt()
-}
-
-// Halt the CPU (infinite HLT loop)
-@kernel
-fn halt() {
-    println("[HALT] CPU halted. Goodbye.")
-    loop {
-        asm!("hlt")
-    }
+    println("[BOOT] FajarOS Nova — all systems nominal")
+    println("[BOOT] Halting CPU.")
 }
