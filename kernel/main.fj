@@ -221,6 +221,8 @@ const RED_ON_BLACK: i64 = 0x0C
     cprintln("  ps       - Process list", WHITE_ON_BLACK)
     cprintln("  echo     - Echo text", WHITE_ON_BLACK)
     cprintln("  reboot   - Reboot system", WHITE_ON_BLACK)
+    cprintln("  shutdown - ACPI power off", WHITE_ON_BLACK)
+    cprintln("  acpi     - ACPI info + CPU count", WHITE_ON_BLACK)
 }
 
 @kernel fn cmd_uname() {
@@ -323,12 +325,33 @@ const RED_ON_BLACK: i64 = 0x0C
 
 @kernel fn cmd_reboot() {
     cprintln("Rebooting...", RED_ON_BLACK)
-    // Triple fault: load null IDT and trigger interrupt
-    volatile_write(0x6FA10, 0)  // zero limit
-    volatile_write(0x6FA18, 0)  // zero base
-    // We'd use lidt [0x6FA10] + int 0 but can't inline asm easily
-    // Instead use keyboard controller reset
-    port_outb(0x64, 0xFE)
+    port_outb(0x64, 0xFE)  // keyboard controller reset
+}
+
+@kernel fn cmd_shutdown() {
+    cprintln("Shutting down via ACPI...", YELLOW_ON_BLACK)
+    acpi_shutdown()
+}
+
+@kernel fn cmd_acpi() {
+    cprintln("ACPI Info:", YELLOW_ON_BLACK)
+    let rsdp = acpi_find_rsdp()
+    if rsdp != 0 {
+        cprint("  RSDP found at: 0x", WHITE_ON_BLACK)
+        cprint_hex(rsdp, 8, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        let cpus = acpi_get_cpu_count(rsdp)
+        cprint("  CPU cores: ", WHITE_ON_BLACK)
+        cprint_decimal(cpus, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else {
+        cprintln("  RSDP not found", RED_ON_BLACK)
+    }
+    cprint("  TSC: ", WHITE_ON_BLACK)
+    let tsc = rdtsc()
+    cprint_hex(tsc >> 32, 8, CYAN_ON_BLACK)
+    cprint_hex(tsc & 0xFFFFFFFF, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
 }
 
 // ═══════════════════════════════════════════════
@@ -365,6 +388,10 @@ const RED_ON_BLACK: i64 = 0x0C
     if handled == 0 && len == 2 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 115 { cmd_ps(); handled = 1 }
     // reboot
     if handled == 0 && len == 6 && buf_eq4(114, 101, 98, 111) == 1 { cmd_reboot(); handled = 1 }
+    // shutdown (115,104,117,116...)
+    if handled == 0 && len == 8 && buf_eq4(115, 104, 117, 116) == 1 { cmd_shutdown(); handled = 1 }
+    // acpi (97,99,112,105)
+    if handled == 0 && len == 4 && buf_eq4(97, 99, 112, 105) == 1 { cmd_acpi(); handled = 1 }
 
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)
