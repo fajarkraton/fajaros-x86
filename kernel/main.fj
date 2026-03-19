@@ -1,43 +1,38 @@
-// FajarOS Nova — Enhanced Kernel (Phase 3 + String Enhancement)
-// str_byte_at + str_len for clean VGA output
+// FajarOS Nova — Phase 4: Preemptive Scheduler
+// Process creation + timer-driven context switch
 
 const VGA_BASE: i64 = 0xB8000
 const VGA_COLS: i64 = 80
-const VGA_ROWS: i64 = 25
 const WHITE_ON_BLACK: i64 = 0x0F
 const WHITE_ON_BLUE: i64 = 0x1F
-const YELLOW_ON_BLACK: i64 = 0x0E
 const GREEN_ON_BLACK: i64 = 0x0A
 const CYAN_ON_BLACK: i64 = 0x0B
-const RED_ON_WHITE: i64 = 0xF4
+const YELLOW_ON_BLACK: i64 = 0x0E
 
 // ═══════════════════════════════════════════════
-// VGA Driver (now with string support!)
+// VGA
 // ═══════════════════════════════════════════════
-
-@kernel fn vga_clear(color: i64) {
-    let mut i: i64 = 0
-    while i < VGA_COLS * VGA_ROWS {
-        volatile_write(VGA_BASE + i * 2, 0x20)
-        volatile_write(VGA_BASE + i * 2 + 1, color)
-        i = i + 1
-    }
-}
 
 @kernel fn vga_putchar(row: i64, col: i64, ch: i64, color: i64) {
-    if row >= 0 && row < VGA_ROWS && col >= 0 && col < VGA_COLS {
-        let addr = VGA_BASE + (row * VGA_COLS + col) * 2
-        volatile_write(addr, ch)
-        volatile_write(addr + 1, color)
-    }
+    let addr = VGA_BASE + (row * VGA_COLS + col) * 2
+    volatile_write(addr, ch)
+    volatile_write(addr + 1, color)
 }
 
-// NEW: Write entire string to VGA using str_byte_at!
 @kernel fn vga_write_str(row: i64, col: i64, s: str, color: i64) {
     let len = str_len(s)
     let mut i: i64 = 0
     while i < len && (col + i) < VGA_COLS {
         vga_putchar(row, col + i, str_byte_at(s, i), color)
+        i = i + 1
+    }
+}
+
+@kernel fn vga_clear(color: i64) {
+    let mut i: i64 = 0
+    while i < VGA_COLS * 25 {
+        volatile_write(VGA_BASE + i * 2, 0x20)
+        volatile_write(VGA_BASE + i * 2 + 1, color)
         i = i + 1
     }
 }
@@ -48,20 +43,66 @@ const RED_ON_WHITE: i64 = 0xF4
 }
 
 @kernel fn vga_decimal(row: i64, col: i64, val: i64, color: i64) {
-    if val == 0 {
-        vga_putchar(row, col, 48, color)
-        return
-    }
+    if val == 0 { vga_putchar(row, col, 48, color); return }
+    let mut buf: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     let mut v = val
-    let mut digits: i64 = 0
-    let mut tmp = val
-    while tmp > 0 { digits = digits + 1; tmp = tmp / 10 }
-    let mut pos = col + digits - 1
-    while v > 0 && pos >= col {
-        vga_putchar(row, pos, 48 + (v % 10), color)
-        v = v / 10
-        pos = pos - 1
+    let mut len: i64 = 0
+    while v > 0 { buf[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
+    let mut i: i64 = 0
+    while i < len { vga_putchar(row, col + i, buf[len - 1 - i], color); i = i + 1 }
+}
+
+// ═══════════════════════════════════════════════
+// Process A: prints 'A' repeatedly
+// ═══════════════════════════════════════════════
+
+@kernel fn process_a() {
+    let mut count: i64 = 0
+    while count < 20 {
+        port_outb(0x3F8, 65)  // 'A'
+        // Busy loop to slow down
+        let mut i: i64 = 0
+        while i < 5000000 { i = i + 1 }
+        count = count + 1
     }
+    // Process done — halt (in real OS would call exit syscall)
+    // Process done — spin forever
+    let mut spin: i64 = 0
+    while spin == 0 { spin = 0 }
+}
+
+// ═══════════════════════════════════════════════
+// Process B: prints 'B' repeatedly
+// ═══════════════════════════════════════════════
+
+@kernel fn process_b() {
+    let mut count: i64 = 0
+    while count < 20 {
+        port_outb(0x3F8, 66)  // 'B'
+        let mut i: i64 = 0
+        while i < 5000000 { i = i + 1 }
+        count = count + 1
+    }
+    // Process done — spin forever
+    let mut spin: i64 = 0
+    while spin == 0 { spin = 0 }
+}
+
+// ═══════════════════════════════════════════════
+// Process C: prints 'C' repeatedly
+// ═══════════════════════════════════════════════
+
+@kernel fn process_c() {
+    let mut count: i64 = 0
+    while count < 20 {
+        port_outb(0x3F8, 67)  // 'C'
+        let mut i: i64 = 0
+        while i < 5000000 { i = i + 1 }
+        count = count + 1
+    }
+    // Process done — spin forever
+    let mut spin: i64 = 0
+    while spin == 0 { spin = 0 }
 }
 
 // ═══════════════════════════════════════════════
@@ -71,83 +112,104 @@ const RED_ON_WHITE: i64 = 0xF4
 @kernel fn kernel_main() {
     x86_serial_init(0, 115200)
     println("============================================")
-    println("  FajarOS Nova v0.1.0 — Phase 3 Enhanced")
-    println("  str_byte_at + IDT + PIC + PIT + 128MB")
+    println("  FajarOS Nova v0.1.0 — Phase 4")
+    println("  Preemptive Round-Robin Scheduler")
     println("============================================")
     println("")
 
-    // VGA: clear + banner (using str_byte_at!)
+    // VGA
     vga_clear(WHITE_ON_BLACK)
     vga_fill_row(0, WHITE_ON_BLUE)
     vga_write_str(0, 2, "FajarOS Nova v0.1.0", WHITE_ON_BLUE)
     vga_write_str(0, 30, "x86_64", WHITE_ON_BLUE)
-    vga_write_str(0, 55, "Enhanced", WHITE_ON_BLUE)
-    println("[BOOT] VGA 80x25 — str_byte_at working!")
+    vga_write_str(0, 55, "Phase 4: Sched", WHITE_ON_BLUE)
 
-    // SSE
+    // SSE + CPUID
     sse_enable()
-    println("[SSE] Enabled")
-
-    // CPUID
-    let ecx1 = cpuid_ecx(1)
-    let edx1 = cpuid_edx(1)
     let ebx7 = cpuid_ebx(7)
-    let has_sse42 = (ecx1 & (1 << 20)) != 0
+    let edx1 = cpuid_edx(1)
     let has_avx2 = (ebx7 & (1 << 5)) != 0
     let has_apic = (edx1 & (1 << 9)) != 0
-    println("[CPU] Feature detection complete")
-
-    // VGA row 2: CPU info (using vga_write_str!)
     vga_write_str(2, 0, "[CPU]", GREEN_ON_BLACK)
-    if has_sse42 { vga_write_str(2, 6, "SSE4.2", WHITE_ON_BLACK) }
-    if has_avx2 { vga_write_str(2, 13, "AVX2", WHITE_ON_BLACK) }
-    if has_apic { vga_write_str(2, 18, "APIC", WHITE_ON_BLACK) }
+    if has_avx2 { vga_write_str(2, 6, "AVX2", WHITE_ON_BLACK) }
+    if has_apic { vga_write_str(2, 11, "APIC", WHITE_ON_BLACK) }
+    println("[CPU] Detected")
 
     // Memory
+    vga_write_str(3, 0, "[MEM] 128MB", YELLOW_ON_BLACK)
     println("[MEM] 128MB identity mapped")
-    vga_write_str(4, 0, "Mem:", YELLOW_ON_BLACK)
-    vga_write_str(4, 5, "128MB", YELLOW_ON_BLACK)
 
-    // IDT
-    idt_init()
-    println("[IDT] 256 vectors initialized")
-
-    // PIC
-    pic_remap()
-    println("[PIC] Remapped IRQ0-7 to vec 32-39")
-
-    // PIT 100Hz
-    pit_init(100)
-    println("[PIT] 100 Hz timer")
-
-    // Enable interrupts
-    irq_enable()
-    println("[IRQ] Enabled")
-
-    // Wait for timer ticks
+    // Initialize process table (zero out)
     let mut i: i64 = 0
-    while i < 50000000 { i = i + 1 }
+    while i < 4096 {
+        volatile_write(0x600000 + i, 0)
+        i = i + 8
+    }
+    // Set process count to 0
+    volatile_write(0x6FE08, 0)
+    // Set current PID to 0 (kernel = process 0)
+    set_current_pid(0)
 
-    let ticks = read_timer_ticks()
+    // Register kernel as process 0 (running)
+    volatile_write(0x600000 + 8, 2)  // state = running
+
+    // IDT + PIC + PIT
+    idt_init()
+    println("[IDT] 256 vectors")
+    pic_remap()
+    println("[PIC] Remapped")
+    pit_init(100)
+    println("[PIT] 100 Hz")
+
+    // Create processes using fn_addr
+    println("[SCHED] Creating processes...")
+
+    let pid_a = proc_create(fn_addr("process_a"))
+    let pid_b = proc_create(fn_addr("process_b"))
+    let pid_c = proc_create(fn_addr("process_c"))
+
+    println("[SCHED] Process A created")
+    println("[SCHED] Process B created")
+    println("[SCHED] Process C created")
+
+    // VGA: show processes
+    vga_write_str(5, 0, "[SCHED] 3 processes created", GREEN_ON_BLACK)
+    vga_write_str(6, 0, "PID 1: Process A", WHITE_ON_BLACK)
+    vga_write_str(7, 0, "PID 2: Process B", WHITE_ON_BLACK)
+    vga_write_str(8, 0, "PID 3: Process C", WHITE_ON_BLACK)
+
+    // Enable interrupts — scheduler starts!
+    println("[SCHED] Enabling preemptive scheduling...")
+    println("[SCHED] Output: A/B/C interleaved = SUCCESS")
+    println("")
+    irq_enable()
+
+    // Kernel loop — keep printing status
+    let mut loops: i64 = 0
+    while loops < 100 {
+        let mut j: i64 = 0
+        while j < 10000000 { j = j + 1 }
+
+        let ticks = read_timer_ticks()
+        // Update VGA tick counter
+        vga_write_str(10, 0, "Ticks:", CYAN_ON_BLACK)
+        vga_decimal(10, 7, ticks, CYAN_ON_BLACK)
+
+        loops = loops + 1
+    }
+
     irq_disable()
-    println("[TMR] Timer ticks received!")
 
-    // VGA rows 6-10: status (all using vga_write_str!)
-    vga_write_str(6, 0, "[IDT] 256 vectors", GREEN_ON_BLACK)
-    vga_write_str(7, 0, "[PIC] IRQ0-7 remapped", GREEN_ON_BLACK)
-    vga_write_str(8, 0, "[PIT] 100 Hz timer", GREEN_ON_BLACK)
-    vga_write_str(10, 0, "Ticks:", CYAN_ON_BLACK)
-    vga_decimal(10, 7, ticks, CYAN_ON_BLACK)
+    let final_ticks = read_timer_ticks()
+    vga_write_str(12, 0, "Scheduler test complete!", GREEN_ON_BLACK)
+    vga_write_str(13, 0, "Total ticks:", YELLOW_ON_BLACK)
+    vga_decimal(13, 13, final_ticks, YELLOW_ON_BLACK)
 
-    // VGA row 12: status
-    vga_write_str(12, 0, "All systems nominal.", WHITE_ON_BLACK)
-
-    // VGA row 24: bottom bar
+    // Bottom bar
     vga_fill_row(24, WHITE_ON_BLUE)
     vga_write_str(24, 2, "FajarOS Nova", WHITE_ON_BLUE)
     vga_write_str(24, 20, "Written 100% in Fajar Lang", WHITE_ON_BLUE)
 
     println("")
-    println("[BOOT] FajarOS Nova — all systems nominal!")
-    println("[BOOT] Halting CPU.")
+    println("[BOOT] FajarOS Nova Phase 4 — scheduler complete!")
 }
