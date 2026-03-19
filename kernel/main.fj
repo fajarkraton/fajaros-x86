@@ -225,6 +225,20 @@ const RED_ON_BLACK: i64 = 0x0C
     cprintln("  acpi     - ACPI info + CPU count", WHITE_ON_BLACK)
     cprintln("  tensor   - Matrix multiply demo", WHITE_ON_BLACK)
     cprintln("  mnist    - MNIST inference demo", WHITE_ON_BLACK)
+    cprintln("  version  - Detailed version info", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_version() {
+    cprintln("FajarOS Nova v0.1.0 \"Nova\"", WHITE_ON_BLUE)
+    cprintln("  Kernel:   x86_64 bare-metal", WHITE_ON_BLACK)
+    cprintln("  Language: 100% Fajar Lang", WHITE_ON_BLACK)
+    cprintln("  Compiler: Fajar Lang + Cranelift", WHITE_ON_BLACK)
+    cprintln("  Boot:     Multiboot2 (GRUB2)", WHITE_ON_BLACK)
+    cprintln("  Paging:   128MB identity (2MB pages)", WHITE_ON_BLACK)
+    cprintln("  Timer:    PIT 100Hz preemptive", WHITE_ON_BLACK)
+    cprintln("  Shell:    15 commands", WHITE_ON_BLACK)
+    cprintln("  Author:   Fajar (TaxPrime/PrimeCore.id)", WHITE_ON_BLACK)
+    cprintln("  Built with Claude Opus 4.6", CYAN_ON_BLACK)
 }
 
 @kernel fn cmd_uname() {
@@ -482,6 +496,8 @@ const RED_ON_BLACK: i64 = 0x0C
     if handled == 0 && len == 6 && buf_eq4(116, 101, 110, 115) == 1 { cmd_tensor(); handled = 1 }
     // mnist (109,110,105,115,116)
     if handled == 0 && len == 5 && buf_eq4(109, 110, 105, 115) == 1 { cmd_mnist(); handled = 1 }
+    // version (118,101,114,115,105,111,110)
+    if handled == 0 && len == 7 && buf_eq4(118, 101, 114, 115) == 1 { cmd_version(); handled = 1 }
 
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)
