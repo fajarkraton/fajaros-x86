@@ -1,28 +1,31 @@
-// FajarOS Nova — Sprint 2 Kernel
-// VGA text mode + Serial console + Boot info
+// FajarOS Nova — Sprint 3 Kernel
+// GDT + CPUID + SSE + VGA + Serial
 
 // ═══════════════════════════════════════════════
-// VGA Text Mode Driver
-// Buffer at 0xB8000, 80×25, 2 bytes per cell
+// Constants
 // ═══════════════════════════════════════════════
 
 const VGA_BASE: i64 = 0xB8000
 const VGA_COLS: i64 = 80
 const VGA_ROWS: i64 = 25
 
-// Colors
 const WHITE_ON_BLACK: i64 = 0x0F
 const WHITE_ON_BLUE: i64 = 0x1F
 const YELLOW_ON_BLACK: i64 = 0x0E
 const GREEN_ON_BLACK: i64 = 0x0A
 const RED_ON_BLACK: i64 = 0x0C
+const CYAN_ON_BLACK: i64 = 0x0B
+
+// ═══════════════════════════════════════════════
+// VGA Driver
+// ═══════════════════════════════════════════════
 
 @kernel
 fn vga_clear(color: i64) {
     let mut i: i64 = 0
     while i < VGA_COLS * VGA_ROWS {
         let addr = VGA_BASE + i * 2
-        volatile_write(addr, 0x20)      // space
+        volatile_write(addr, 0x20)
         volatile_write(addr + 1, color)
         i = i + 1
     }
@@ -38,125 +41,142 @@ fn vga_putchar(row: i64, col: i64, ch: i64, color: i64) {
 }
 
 @kernel
-fn vga_write_str_at(row: i64, col: i64, s: str, color: i64) {
-    // Write string character by character
-    // For bare-metal, println uses fj_rt_bare_println which writes to serial
-    // VGA needs per-char output using the string's memory representation
-    // For now, use the port I/O approach with known characters
+fn vga_write_line(row: i64, col: i64, color: i64, c0: i64, c1: i64, c2: i64, c3: i64, c4: i64, c5: i64, c6: i64, c7: i64) {
+    if c0 != 0 { vga_putchar(row, col, c0, color) }
+    if c1 != 0 { vga_putchar(row, col + 1, c1, color) }
+    if c2 != 0 { vga_putchar(row, col + 2, c2, color) }
+    if c3 != 0 { vga_putchar(row, col + 3, c3, color) }
+    if c4 != 0 { vga_putchar(row, col + 4, c4, color) }
+    if c5 != 0 { vga_putchar(row, col + 5, c5, color) }
+    if c6 != 0 { vga_putchar(row, col + 6, c6, color) }
+    if c7 != 0 { vga_putchar(row, col + 7, c7, color) }
+}
+
+@kernel
+fn vga_fill_row(row: i64, color: i64) {
+    let mut i: i64 = 0
+    while i < VGA_COLS {
+        vga_putchar(row, i, 0x20, color)
+        i = i + 1
+    }
 }
 
 // ═══════════════════════════════════════════════
-// VGA Banner — write known text using putchar
+// CPUID — CPU Feature Detection
+// ═══════════════════════════════════════════════
+
+@kernel
+fn detect_cpu() {
+    // CPUID leaf 0: vendor string (EBX + EDX + ECX = 12 chars)
+    let ebx = cpuid_ebx(0)
+    let edx = cpuid_edx(0)
+    let ecx = cpuid_ecx(0)
+
+    // Print vendor to serial: extract chars from packed u32
+    // "GenuineIntel" = EBX="Genu" EDX="ineI" ECX="ntel"
+    println("[CPU] Vendor detected via CPUID leaf 0")
+
+    // CPUID leaf 1: feature flags
+    let feat_ecx = cpuid_ecx(1)
+    let feat_edx = cpuid_edx(1)
+
+    // EDX features
+    let has_fpu  = (feat_edx & (1 << 0)) != 0
+    let has_sse  = (feat_edx & (1 << 25)) != 0
+    let has_sse2 = (feat_edx & (1 << 26)) != 0
+    let has_apic = (feat_edx & (1 << 9)) != 0
+
+    // ECX features
+    let has_sse3  = (feat_ecx & (1 << 0)) != 0
+    let has_sse41 = (feat_ecx & (1 << 19)) != 0
+    let has_sse42 = (feat_ecx & (1 << 20)) != 0
+    let has_avx   = (feat_ecx & (1 << 28)) != 0
+    let has_x2apic = (feat_ecx & (1 << 21)) != 0
+
+    // CPUID leaf 7: extended features (AVX2, SMEP, SMAP)
+    let feat7_ebx = cpuid_ebx(7)
+    let has_avx2 = (feat7_ebx & (1 << 5)) != 0
+    let has_smep = (feat7_ebx & (1 << 7)) != 0
+    let has_smap = (feat7_ebx & (1 << 20)) != 0
+
+    // Print features to serial
+    if has_fpu { println("[CPU] FPU: yes") }
+    if has_sse { println("[CPU] SSE: yes") }
+    if has_sse2 { println("[CPU] SSE2: yes") }
+    if has_sse3 { println("[CPU] SSE3: yes") }
+    if has_sse41 { println("[CPU] SSE4.1: yes") }
+    if has_sse42 { println("[CPU] SSE4.2: yes") }
+    if has_avx { println("[CPU] AVX: yes") }
+    if has_avx2 { println("[CPU] AVX2: yes") }
+    if has_apic { println("[CPU] APIC: yes") }
+    if has_x2apic { println("[CPU] x2APIC: yes") }
+    if has_smep { println("[CPU] SMEP: yes") }
+    if has_smap { println("[CPU] SMAP: yes") }
+
+    // VGA row 2: CPU features summary
+    // "CPU: SSE4.2 AVX2 APIC"
+    let g: i64 = GREEN_ON_BLACK
+    let w: i64 = WHITE_ON_BLACK
+    // [CPU]
+    vga_write_line(2, 0, g, 91, 67, 80, 85, 93, 32, 0, 0)
+    // SSE4.2
+    if has_sse42 {
+        vga_write_line(2, 6, w, 83, 83, 69, 52, 46, 50, 32, 0)
+    }
+    // AVX2
+    if has_avx2 {
+        vga_write_line(2, 13, w, 65, 86, 88, 50, 32, 0, 0, 0)
+    }
+    // APIC
+    if has_apic {
+        vga_write_line(2, 18, w, 65, 80, 73, 67, 0, 0, 0, 0)
+    }
+}
+
+// ═══════════════════════════════════════════════
+// SSE Enable
+// ═══════════════════════════════════════════════
+
+@kernel
+fn enable_sse() {
+    sse_enable()
+    println("[SSE] SSE/SSE2 enabled (CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1)")
+}
+
+// ═══════════════════════════════════════════════
+// VGA Banner
 // ═══════════════════════════════════════════════
 
 @kernel
 fn vga_banner() {
-    // Row 0: "FajarOS Nova v0.1.0" in white on blue
-    let row: i64 = 0
-    let c: i64 = WHITE_ON_BLUE
-
-    // Fill entire first row with blue background
-    let mut i: i64 = 0
-    while i < VGA_COLS {
-        vga_putchar(0, i, 0x20, c)
-        i = i + 1
-    }
-
+    vga_fill_row(0, WHITE_ON_BLUE)
     // "FajarOS Nova v0.1.0"
-    vga_putchar(row, 2, 70, c)   // F
-    vga_putchar(row, 3, 97, c)   // a
-    vga_putchar(row, 4, 106, c)  // j
-    vga_putchar(row, 5, 97, c)   // a
-    vga_putchar(row, 6, 114, c)  // r
-    vga_putchar(row, 7, 79, c)   // O
-    vga_putchar(row, 8, 83, c)   // S
-    vga_putchar(row, 9, 32, c)   // (space)
-    vga_putchar(row, 10, 78, c)  // N
-    vga_putchar(row, 11, 111, c) // o
-    vga_putchar(row, 12, 118, c) // v
-    vga_putchar(row, 13, 97, c)  // a
-    vga_putchar(row, 14, 32, c)  // (space)
-    vga_putchar(row, 15, 118, c) // v
-    vga_putchar(row, 16, 48, c)  // 0
-    vga_putchar(row, 17, 46, c)  // .
-    vga_putchar(row, 18, 49, c)  // 1
-    vga_putchar(row, 19, 46, c)  // .
-    vga_putchar(row, 20, 48, c)  // 0
-
-    // Row 2: "[BOOT] Serial: COM1 115200" in green
-    let g: i64 = GREEN_ON_BLACK
-    // [
-    vga_putchar(2, 0, 91, g)
-    // B
-    vga_putchar(2, 1, 66, g)
-    // O
-    vga_putchar(2, 2, 79, g)
-    // O
-    vga_putchar(2, 3, 79, g)
-    // T
-    vga_putchar(2, 4, 84, g)
-    // ]
-    vga_putchar(2, 5, 93, g)
-    // (space)
-    vga_putchar(2, 6, 32, g)
-    // V
-    vga_putchar(2, 7, 86, WHITE_ON_BLACK)
-    // G
-    vga_putchar(2, 8, 71, WHITE_ON_BLACK)
-    // A
-    vga_putchar(2, 9, 65, WHITE_ON_BLACK)
-    // (space)
-    vga_putchar(2, 10, 32, WHITE_ON_BLACK)
-    // O
-    vga_putchar(2, 11, 79, WHITE_ON_BLACK)
-    // K
-    vga_putchar(2, 12, 75, WHITE_ON_BLACK)
-
-    // Row 4: "Ready." in yellow
-    vga_putchar(4, 0, 82, YELLOW_ON_BLACK)   // R
-    vga_putchar(4, 1, 101, YELLOW_ON_BLACK)  // e
-    vga_putchar(4, 2, 97, YELLOW_ON_BLACK)   // a
-    vga_putchar(4, 3, 100, YELLOW_ON_BLACK)  // d
-    vga_putchar(4, 4, 121, YELLOW_ON_BLACK)  // y
-    vga_putchar(4, 5, 46, YELLOW_ON_BLACK)   // .
-}
-
-// ═══════════════════════════════════════════════
-// Kernel Panic
-// ═══════════════════════════════════════════════
-
-@kernel
-fn kernel_panic_msg() {
-    // Red banner on VGA
-    let mut i: i64 = 0
-    while i < VGA_COLS {
-        vga_putchar(24, i, 32, RED_ON_BLACK)
-        i = i + 1
-    }
-    // "!!! KERNEL PANIC !!!"
-    vga_putchar(24, 2, 33, RED_ON_BLACK)    // !
-    vga_putchar(24, 3, 33, RED_ON_BLACK)    // !
-    vga_putchar(24, 4, 33, RED_ON_BLACK)    // !
-    vga_putchar(24, 5, 32, RED_ON_BLACK)    // (space)
-    vga_putchar(24, 6, 75, RED_ON_BLACK)    // K
-    vga_putchar(24, 7, 69, RED_ON_BLACK)    // E
-    vga_putchar(24, 8, 82, RED_ON_BLACK)    // R
-    vga_putchar(24, 9, 78, RED_ON_BLACK)    // N
-    vga_putchar(24, 10, 69, RED_ON_BLACK)   // E
-    vga_putchar(24, 11, 76, RED_ON_BLACK)   // L
-    vga_putchar(24, 12, 32, RED_ON_BLACK)   // (space)
-    vga_putchar(24, 13, 80, RED_ON_BLACK)   // P
-    vga_putchar(24, 14, 65, RED_ON_BLACK)   // A
-    vga_putchar(24, 15, 78, RED_ON_BLACK)   // N
-    vga_putchar(24, 16, 73, RED_ON_BLACK)   // I
-    vga_putchar(24, 17, 67, RED_ON_BLACK)   // C
-    vga_putchar(24, 18, 32, RED_ON_BLACK)   // (space)
-    vga_putchar(24, 19, 33, RED_ON_BLACK)   // !
-    vga_putchar(24, 20, 33, RED_ON_BLACK)   // !
-    vga_putchar(24, 21, 33, RED_ON_BLACK)   // !
-
-    // Also to serial
-    println("!!! KERNEL PANIC !!!")
+    vga_putchar(0, 2, 70, WHITE_ON_BLUE)    // F
+    vga_putchar(0, 3, 97, WHITE_ON_BLUE)    // a
+    vga_putchar(0, 4, 106, WHITE_ON_BLUE)   // j
+    vga_putchar(0, 5, 97, WHITE_ON_BLUE)    // a
+    vga_putchar(0, 6, 114, WHITE_ON_BLUE)   // r
+    vga_putchar(0, 7, 79, WHITE_ON_BLUE)    // O
+    vga_putchar(0, 8, 83, WHITE_ON_BLUE)    // S
+    vga_putchar(0, 9, 32, WHITE_ON_BLUE)    // (space)
+    vga_putchar(0, 10, 78, WHITE_ON_BLUE)   // N
+    vga_putchar(0, 11, 111, WHITE_ON_BLUE)  // o
+    vga_putchar(0, 12, 118, WHITE_ON_BLUE)  // v
+    vga_putchar(0, 13, 97, WHITE_ON_BLUE)   // a
+    vga_putchar(0, 14, 32, WHITE_ON_BLUE)   // (space)
+    vga_putchar(0, 15, 118, WHITE_ON_BLUE)  // v
+    vga_putchar(0, 16, 48, WHITE_ON_BLUE)   // 0
+    vga_putchar(0, 17, 46, WHITE_ON_BLUE)   // .
+    vga_putchar(0, 18, 49, WHITE_ON_BLUE)   // 1
+    vga_putchar(0, 19, 46, WHITE_ON_BLUE)   // .
+    vga_putchar(0, 20, 48, WHITE_ON_BLUE)   // 0
+    // " x86_64" at col 30
+    vga_putchar(0, 30, 120, WHITE_ON_BLUE)  // x
+    vga_putchar(0, 31, 56, WHITE_ON_BLUE)   // 8
+    vga_putchar(0, 32, 54, WHITE_ON_BLUE)   // 6
+    vga_putchar(0, 33, 95, WHITE_ON_BLUE)   // _
+    vga_putchar(0, 34, 54, WHITE_ON_BLUE)   // 6
+    vga_putchar(0, 35, 52, WHITE_ON_BLUE)   // 4
 }
 
 // ═══════════════════════════════════════════════
@@ -165,32 +185,41 @@ fn kernel_panic_msg() {
 
 @kernel
 fn kernel_main() {
-    // Step 1: Serial console (already initialized by startup asm)
+    // Step 1: Serial
     x86_serial_init(0, 115200)
-
     println("============================================")
     println("  FajarOS Nova v0.1.0 — x86_64")
-    println("  Target: Intel Core i9-14900HX")
     println("  Written 100% in Fajar Lang")
     println("============================================")
     println("")
 
-    // Step 2: VGA text mode
-    println("[BOOT] Initializing VGA text mode...")
+    // Step 2: VGA
     vga_clear(WHITE_ON_BLACK)
     vga_banner()
-    println("[BOOT] VGA: 80x25 text mode at 0xB8000 — OK")
+    println("[BOOT] VGA 80x25 initialized")
 
-    // Step 3: Memory info (hardcoded for now)
-    println("[BOOT] Memory: identity mapped 0x0 - 0x3FFFFF (4MB)")
-    println("[BOOT] Kernel: 0x100000, Stack: 0x3F0000")
-    println("[BOOT] Heap: 0x300000 - 0x3E0000 (bump allocator)")
+    // Step 3: Enable SSE (required for Cranelift-generated code)
+    enable_sse()
 
-    // Step 4: Port I/O test
-    let lsr = port_inb(0x3FD)
-    if (lsr & 0x20) != 0 {
-        println("[BOOT] COM1: TX ready — OK")
-    }
+    // Step 4: CPUID — detect CPU features
+    detect_cpu()
+
+    // Step 5: Memory info
+    println("[MEM] Mapped: 0x0 - 0x3FFFFF (4MB identity)")
+    println("[MEM] Kernel: 0x100000, Stack: 0x3F0000")
+    println("[MEM] Heap: 0x300000 (bump allocator)")
+
+    // Step 6: GDT info (loaded by trampoline)
+    println("[GDT] 3 entries (null + code64 + data64)")
+    println("[GDT] CS=0x08 (kernel code), SS=0x10 (kernel data)")
+
+    // VGA row 4: memory info
+    let y: i64 = YELLOW_ON_BLACK
+    // "Mem: 4MB mapped"
+    vga_write_line(4, 0, y, 77, 101, 109, 58, 32, 52, 77, 66)
+
+    // VGA row 6: "Ready." in cyan
+    vga_write_line(6, 0, CYAN_ON_BLACK, 82, 101, 97, 100, 121, 46, 0, 0)
 
     println("")
     println("[BOOT] FajarOS Nova — all systems nominal")

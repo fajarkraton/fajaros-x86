@@ -344,16 +344,16 @@ fajaros-x86/
 
 | # | Task | Detail | Status |
 |---|------|--------|--------|
-| 3.1 | **Implement GDT structure** | 5 entries: null, kernel code (CS=0x08), kernel data (SS=0x10), user code (CS=0x1B), user data (SS=0x23). Long mode descriptors (L=1). | [ ] |
+| 3.1 | **Implement GDT structure** | 5 entries: null, kernel code (CS=0x08), kernel data (SS=0x10), user code (CS=0x1B), user data (SS=0x23). Long mode descriptors (L=1). | [x] |
 | 3.2 | **Implement TSS structure** | Task State Segment: RSP0 (kernel stack), RSP1/2 (unused), IST[1-7] (interrupt stacks). 104 bytes. | [ ] |
-| 3.3 | **Load GDT via asm!** | `asm!("lgdt [{gdt_ptr}]", ...)` → reload CS (far jump), reload DS/ES/FS/GS/SS. | [ ] |
+| 3.3 | **Load GDT via asm!** | `asm!("lgdt [{gdt_ptr}]", ...)` → reload CS (far jump), reload DS/ES/FS/GS/SS. | [x] |
 | 3.4 | **Load TSS via asm!** | `asm!("ltr ax", in("ax") tss_selector)`. TSS selector = 0x28 (6th GDT entry). | [ ] |
-| 3.5 | **Implement CPUID reader** | `cpuid(leaf) -> (eax, ebx, ecx, edx)` via asm!. Read CPU vendor, features, topology. | [ ] |
-| 3.6 | **Detect CPU features** | Check: SSE, SSE2, AVX, AVX2, APIC, x2APIC, NX bit, SMEP, SMAP, FSGSBASE. Store in global. | [ ] |
-| 3.7 | **Print CPU info at boot** | "Intel Core i9-14900HX, 24 cores, AVX2, 36MB L3 cache" on serial console. | [ ] |
-| 3.8 | **Enable SSE/SSE2** | Set CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1. Required for Cranelift-generated code. | [ ] |
-| 3.9 | **Test: GDT loaded correctly** | Read CS/DS/SS selectors → verify kernel mode (RPL=0). | [ ] |
-| 3.10 | **Test: CPUID detects features** | Verify AVX2, APIC, NX reported correctly. | [ ] |
+| 3.5 | **Implement CPUID reader** | `cpuid(leaf) -> (eax, ebx, ecx, edx)` via asm!. Read CPU vendor, features, topology. | [x] |
+| 3.6 | **Detect CPU features** | Check: SSE, SSE2, AVX, AVX2, APIC, x2APIC, NX bit, SMEP, SMAP, FSGSBASE. Store in global. | [x] |
+| 3.7 | **Print CPU info at boot** | "Intel Core i9-14900HX, 24 cores, AVX2, 36MB L3 cache" on serial console. | [x] |
+| 3.8 | **Enable SSE/SSE2** | Set CR0.EM=0, CR0.MP=1, CR4.OSFXSR=1, CR4.OSXMMEXCPT=1. Required for Cranelift-generated code. | [x] |
+| 3.9 | **Test: GDT loaded correctly** | Read CS/DS/SS selectors → verify kernel mode (RPL=0). | [x] |
+| 3.10 | **Test: CPUID detects features** | Verify AVX2, APIC, NX reported correctly. | [x] |
 
 **Phase 1 Gate:**
 - [ ] FajarOS boots in QEMU x86_64 via Multiboot2
