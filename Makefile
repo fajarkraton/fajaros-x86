@@ -73,7 +73,7 @@ all: build
 # Concatenate all source files into one combined file
 $(COMBINED): $(SOURCES)
 	@mkdir -p $(BUILD_DIR)
-	@echo "// FajarOS Nova v0.5.0 — Auto-generated from modular sources" > $(COMBINED)
+	@echo "// FajarOS Nova v1.0.0 — Auto-generated from modular sources" > $(COMBINED)
 	@echo "// DO NOT EDIT — edit individual .fj files instead" >> $(COMBINED)
 	@echo "" >> $(COMBINED)
 	@for f in $(SOURCES); do \
@@ -156,7 +156,7 @@ clean:
 
 # Show help
 help:
-	@echo "FajarOS Nova v0.5.0 — Build Targets"
+	@echo "FajarOS Nova v1.0.0 — Build Targets"
 	@echo ""
 	@echo "  make build     Concatenate + compile kernel ELF"
 	@echo "  make run       Run in QEMU (serial, no KVM)"

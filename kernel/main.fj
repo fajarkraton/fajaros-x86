@@ -133,7 +133,7 @@
 
     // Boot banner
     cprintln("============================================", WHITE_ON_BLUE)
-    cprintln("  FajarOS Nova v0.5.0 — x86_64 Shell", WHITE_ON_BLUE)
+    cprintln("  FajarOS Nova v1.0.0 — x86_64 Shell", WHITE_ON_BLUE)
     cprintln("  Written 100% in Fajar Lang", WHITE_ON_BLUE)
     cprintln("============================================", WHITE_ON_BLUE)
     cprintln("", WHITE_ON_BLACK)

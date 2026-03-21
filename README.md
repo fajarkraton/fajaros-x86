@@ -240,6 +240,6 @@ MIT License — Copyright (c) 2026 Fajar (TaxPrime / PrimeCore.id)
 
 ---
 
-*FajarOS "Nova" v0.5.0 "Genesis" — A new star rises on x86_64*
-*9,000+ LOC | 145 commands | 35 modular files | 100% Fajar Lang*
+*FajarOS "Nova" v1.0.0 "Genesis" — A new star rises on x86_64*
+*11,615 LOC | 160+ commands | 35 modular files | 100% Fajar Lang*
 *Built with Fajar Lang + Claude Opus 4.6*
