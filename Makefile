@@ -63,7 +63,7 @@ QEMU_MEM := -m 512M
 QEMU_CPU := -cpu qemu64,+avx2,+sse4.2
 QEMU_KVM := -enable-kvm -cpu host
 QEMU_SMP := -smp 4
-QEMU_NVME := -drive file=disk.img,if=none,id=nvme0 -device nvme,serial=fajaros,drive=nvme0
+QEMU_NVME := -drive file=disk.img,if=none,id=nvme0 -device nvme,serial=fajaros,drive=nvme0 -boot d
 QEMU_NET := -netdev user,id=net0 -device virtio-net-pci,netdev=net0
 
 .PHONY: all build run run-kvm run-vga run-smp run-nvme run-net debug iso run-iso test clean help loc
