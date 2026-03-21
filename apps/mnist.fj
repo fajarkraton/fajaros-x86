@@ -1,0 +1,6 @@
+// FajarOS Nova v0.5.0 — MNIST Module
+// Part of the modular kernel build (concatenated by Makefile)
+// Note: MNIST commands (cmd_mnist, cmd_mnist_draw, mnist_init_weights, etc.)
+// are currently in shell/commands.fj as they are tightly coupled with the
+// shell command dispatcher. This file is reserved for future standalone
+// MNIST inference engine extraction.

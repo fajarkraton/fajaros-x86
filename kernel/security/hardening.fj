@@ -1,0 +1,57 @@
+// FajarOS Nova v0.5.0 — Security Features
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Security Features (Phase 8 Sprint 24)
+// ═══════════════════════════════════════════════
+
+@kernel fn cmd_fpu() {
+    // FPU/SSE state save/restore demo
+    cprintln("FPU/SSE State:", YELLOW_ON_BLACK)
+    // Save current FPU state to PID 0's area (0x650000)
+    let fpu_area: i64 = 0x650000
+    fxsave(fpu_area)
+    cprintln("  fxsave: 512 bytes saved to 0x650000", GREEN_ON_BLACK)
+    // Show first 16 bytes of FPU state
+    cprint("  State: ", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < 16 {
+        cprint_hex(volatile_read_u8(fpu_area + i), 2, CYAN_ON_BLACK)
+        console_putchar(32, WHITE_ON_BLACK)
+        i = i + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+    // Restore
+    fxrstor(fpu_area)
+    cprintln("  fxrstor: restored OK", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_ring3() {
+    // Ring 3 demo — show Ring 3 infrastructure status
+    cprintln("Ring 3 User Mode:", YELLOW_ON_BLACK)
+    cprintln("  GDT User CS: 0x23 (0x20 | RPL=3)", WHITE_ON_BLACK)
+    cprintln("  GDT User SS: 0x1B (0x18 | RPL=3)", WHITE_ON_BLACK)
+    cprint("  TSS RSP0:    0x", WHITE_ON_BLACK)
+    cprint_hex(0x7F00000, 8, CYAN_ON_BLACK)
+    cprintln(" (kernel stack)", WHITE_ON_BLACK)
+    cprintln("  SYSCALL:     IA32_STAR + IA32_LSTAR configured", GREEN_ON_BLACK)
+    cprintln("  Syscalls:    EXIT(0), WRITE(1), READ(2), GETPID(9), YIELD(10)", WHITE_ON_BLACK)
+    cprintln("  iretq_to_user: builtin available", GREEN_ON_BLACK)
+    cprintln("  map_page(USER): PAGE_USER flag (bit 2) supported", GREEN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("  To run Ring 3 code:", YELLOW_ON_BLACK)
+    cprintln("  1. Map user pages with PAGE_USER flag", WHITE_ON_BLACK)
+    cprintln("  2. Copy user code to user pages", WHITE_ON_BLACK)
+    cprintln("  3. Call iretq_to_user(rip, rsp, 0x202)", WHITE_ON_BLACK)
+    cprintln("  4. User code uses SYSCALL to return to kernel", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_random() {
+    // rdrand — hardware random number
+    let r = rdrand()
+    cprint("Random: ", WHITE_ON_BLACK)
+    cprint_hex(r, 16, CYAN_ON_BLACK)
+    cprint(" (", WHITE_ON_BLACK)
+    cprint_decimal(r % 1000000, CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+}

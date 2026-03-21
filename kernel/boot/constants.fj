@@ -1,0 +1,71 @@
+// FajarOS Nova v0.5.0 — Boot Constants + Security Mappings
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Global Constants
+// ═══════════════════════════════════════════════
+
+const VGA_BASE: i64 = 0xB8000
+const VGA_COLS: i64 = 80
+const VGA_ROWS: i64 = 25
+const WHITE_ON_BLACK: i64 = 0x0F
+const WHITE_ON_BLUE: i64 = 0x1F
+const GREEN_ON_BLACK: i64 = 0x0A
+const CYAN_ON_BLACK: i64 = 0x0B
+const YELLOW_ON_BLACK: i64 = 0x0E
+const RED_ON_BLACK: i64 = 0x0C
+
+// ═══════════════════════════════════════════════
+// Higher-Half + KPTI + SMAP (Phase 5/8)
+// ═══════════════════════════════════════════════
+
+@kernel fn cmd_highhalf() {
+    cprintln("Higher-Half Mapping:", YELLOW_ON_BLACK)
+    // Map kernel at 0xFFFFFFFF80100000 → phys 0x100000
+    // This is a 4-level page table walk into the upper half
+    // Higher-half needs PML4[256+] entries for 0xFFFFFFFF80000000+
+    cprintln("  Concept: kernel at 0xFFFFFFFF80100000", WHITE_ON_BLACK)
+    cprintln("  PML4[511] -> PDPT -> PD -> PT -> 0x100000", WHITE_ON_BLACK)
+    cprintln("  Currently: identity-mapped at 0x100000", CYAN_ON_BLACK)
+    cprintln("  map_page() supports arbitrary virtual addresses", GREEN_ON_BLACK)
+    cprintln("  Higher-half requires updating all kernel pointers", YELLOW_ON_BLACK)
+}
+
+@kernel fn cmd_kpti() {
+    cprintln("KPTI Status:", YELLOW_ON_BLACK)
+    cprintln("  Concept: separate kernel/user page tables", WHITE_ON_BLACK)
+    cprintln("  User PML4: only user pages mapped", WHITE_ON_BLACK)
+    cprintln("  Kernel PML4: all pages mapped", WHITE_ON_BLACK)
+    cprintln("  SYSCALL entry: load kernel CR3", WHITE_ON_BLACK)
+    cprintln("  SYSRET exit: load user CR3", WHITE_ON_BLACK)
+    cprintln("  Current: shared page tables (KPTI off)", YELLOW_ON_BLACK)
+    cprintln("  Infrastructure: map_page + frame_alloc ready", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_security() {
+    cprintln("Security Status:", YELLOW_ON_BLACK)
+    // NX
+    let efer = read_msr(0xC0000080)
+    cprint("  NX (EFER.NXE):  ", WHITE_ON_BLACK)
+    if (efer & (1 << 11)) != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+    else { cprintln("disabled", RED_ON_BLACK) }
+    // SMEP
+    let cr4 = read_cr4()
+    cprint("  SMEP (CR4.20):  ", WHITE_ON_BLACK)
+    if (cr4 & (1 << 20)) != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+    else { cprintln("disabled (CPU may not support)", YELLOW_ON_BLACK) }
+    // SMAP
+    cprint("  SMAP (CR4.21):  ", WHITE_ON_BLACK)
+    if (cr4 & (1 << 21)) != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+    else { cprintln("disabled", YELLOW_ON_BLACK) }
+    // W^X
+    cprintln("  W^X:            ENFORCED (.text=RX, .data=RW+NX)", GREEN_ON_BLACK)
+    // Double-free detection
+    cprintln("  Double-free:    DETECTED (magic 0xABCD1234)", GREEN_ON_BLACK)
+    // Stack
+    cprintln("  Stack:          0x7F0000 (64KB, no guard page)", YELLOW_ON_BLACK)
+    // ASLR
+    cprintln("  KASLR:          disabled (fixed at 0x100000)", YELLOW_ON_BLACK)
+    // KPTI
+    cprintln("  KPTI:           disabled (shared page tables)", YELLOW_ON_BLACK)
+}

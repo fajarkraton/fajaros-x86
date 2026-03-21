@@ -1,0 +1,164 @@
+// FajarOS Nova v0.5.0 — Freelist Heap Allocator
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Freelist Heap Allocator (Phase 2 Sprint 6)
+// Heap region: 0x400000 - 0x580000 (1.5MB)
+// Free list: linked list of (size, next_ptr) blocks
+// Header: 16 bytes (size: i64, next: i64)
+// Magic: 0xABCD1234 at offset -8 for double-free detect
+// ═══════════════════════════════════════════════
+
+const HEAP_START: i64 = 0x400000
+const HEAP_END: i64 = 0x580000
+const HEAP_HDR: i64 = 16
+const HEAP_MAGIC: i64 = 0xABCD1234
+
+@kernel fn heap_init() {
+    // Initialize free list: one big free block
+    volatile_write(HEAP_START, HEAP_END - HEAP_START - HEAP_HDR)  // size of free block
+    volatile_write(HEAP_START + 8, 0)  // next = null
+    // Stats at 0x581010
+    volatile_write(0x581010, 0)              // total allocated bytes
+    volatile_write(0x581018, HEAP_END - HEAP_START) // total heap size
+    volatile_write(0x581020, 0)              // allocation count
+}
+
+@kernel fn kmalloc(size: i64) -> i64 {
+    // First-fit allocation from free list
+    let aligned_size = ((size + 7) / 8) * 8  // 8-byte align
+    let mut prev: i64 = 0
+    let mut curr = HEAP_START
+    while curr != 0 {
+        let blk_size = volatile_read(curr)
+        if blk_size >= aligned_size {
+            // Found a block! Split if large enough
+            if blk_size >= aligned_size + HEAP_HDR + 16 {
+                // Split: create new free block after allocation
+                let new_free = curr + HEAP_HDR + aligned_size
+                volatile_write(new_free, blk_size - aligned_size - HEAP_HDR)
+                volatile_write(new_free + 8, volatile_read(curr + 8))
+                // Update current to allocated size
+                volatile_write(curr, aligned_size)
+                // Link previous to new free
+                if prev != 0 { volatile_write(prev + 8, new_free) }
+                else {
+                    // curr was head — update head to new_free
+                    // Store free list head at 0x581008
+                    volatile_write(0x581008, new_free)
+                }
+            } else {
+                // Use entire block
+                if prev != 0 { volatile_write(prev + 8, volatile_read(curr + 8)) }
+                else { volatile_write(0x581008, volatile_read(curr + 8)) }
+            }
+            // Write magic for double-free detection
+            volatile_write(curr + 8, HEAP_MAGIC)
+            // Update stats
+            volatile_write(0x581010, volatile_read(0x581010) + aligned_size)
+            volatile_write(0x581020, volatile_read(0x581020) + 1)
+            return curr + HEAP_HDR  // return pointer past header
+        }
+        prev = curr
+        curr = volatile_read(curr + 8)
+    }
+    -1  // OOM
+}
+
+@kernel fn kfree(ptr: i64) {
+    if ptr <= HEAP_START || ptr >= HEAP_END { return }
+    let hdr = ptr - HEAP_HDR
+    let magic = volatile_read(hdr + 8)
+    if magic != HEAP_MAGIC {
+        cprintln("PANIC: double-free or corruption detected!", RED_ON_BLACK)
+        return
+    }
+    let size = volatile_read(hdr)
+    // Clear magic
+    volatile_write(hdr + 8, 0)
+    // Add to front of free list
+    let old_head = volatile_read(0x581008)
+    volatile_write(hdr + 8, old_head)
+    volatile_write(0x581008, hdr)
+    // Update stats
+    volatile_write(0x581010, volatile_read(0x581010) - size)
+    volatile_write(0x581020, volatile_read(0x581020) - 1)
+}
+
+@kernel fn cmd_heap() {
+    let used = volatile_read(0x581010)
+    let total = volatile_read(0x581018)
+    let count = volatile_read(0x581020)
+    cprintln("Heap Allocator (freelist):", YELLOW_ON_BLACK)
+    cprint("  Total:   ", WHITE_ON_BLACK)
+    cprint_decimal(total / 1024, CYAN_ON_BLACK)
+    cprintln(" KB", WHITE_ON_BLACK)
+    cprint("  Used:    ", WHITE_ON_BLACK)
+    cprint_decimal(used, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+    cprint("  Free:    ", WHITE_ON_BLACK)
+    cprint_decimal((total - used) / 1024, CYAN_ON_BLACK)
+    cprintln(" KB", WHITE_ON_BLACK)
+    cprint("  Allocs:  ", WHITE_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprintln(" active", WHITE_ON_BLACK)
+    cprint("  Usage:   ", WHITE_ON_BLACK)
+    if total > 0 { cprint_decimal(used * 100 / total, CYAN_ON_BLACK) }
+    else { console_putchar(48, CYAN_ON_BLACK) }
+    cprintln("%", WHITE_ON_BLACK)
+    // Walk free list
+    cprint("  Blocks:  ", WHITE_ON_BLACK)
+    let mut blk_count: i64 = 0
+    let mut curr = volatile_read(0x581008)
+    while curr != 0 && blk_count < 20 {
+        blk_count = blk_count + 1
+        curr = volatile_read(curr + 8)
+    }
+    cprint_decimal(blk_count, CYAN_ON_BLACK)
+    cprintln(" free blocks", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_kmalloc() {
+    // kmalloc <size> — allocate from heap
+    let len = cmdbuf_len()
+    if len <= 8 { cprintln("Usage: kmalloc <size>", YELLOW_ON_BLACK); return }
+    let mut size: i64 = 0
+    let mut i: i64 = 8
+    while i < len {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch >= 48 && ch <= 57 { size = size * 10 + (ch - 48) }
+        i = i + 1
+    }
+    if size <= 0 || size > 65536 { cprintln("kmalloc: size 1-65536", YELLOW_ON_BLACK); return }
+    let ptr = kmalloc(size)
+    if ptr == -1 {
+        cprintln("kmalloc: OOM", RED_ON_BLACK)
+    } else {
+        cprint("  Allocated ", GREEN_ON_BLACK)
+        cprint_decimal(size, CYAN_ON_BLACK)
+        cprint(" bytes at 0x", WHITE_ON_BLACK)
+        cprint_hex(ptr, 8, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_kfree() {
+    // kfree <addr> — free heap allocation
+    let len = cmdbuf_len()
+    if len <= 6 { cprintln("Usage: kfree <hex_addr>", YELLOW_ON_BLACK); return }
+    let mut addr: i64 = 0
+    let mut i: i64 = 6
+    if i + 1 < len && volatile_read_u8(0x6F800 + i) == 48 && volatile_read_u8(0x6F800 + i + 1) == 120 { i = i + 2 }
+    while i < len {
+        let ch = volatile_read_u8(0x6F800 + i)
+        addr = addr * 16
+        if ch >= 48 && ch <= 57 { addr = addr + (ch - 48) }
+        else if ch >= 97 && ch <= 102 { addr = addr + (ch - 87) }
+        else if ch >= 65 && ch <= 70 { addr = addr + (ch - 55) }
+        i = i + 1
+    }
+    kfree(addr)
+    cprint("  Freed at 0x", GREEN_ON_BLACK)
+    cprint_hex(addr, 8, GREEN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}

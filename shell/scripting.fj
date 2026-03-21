@@ -1,0 +1,89 @@
+// FajarOS Nova v0.5.0 — Shell Scripting
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Shell Scripting (Sprint C1)
+// Execute command files from FAT32
+// ═══════════════════════════════════════════════
+
+@kernel fn script_exec_line(line_buf: i64, line_len: i64) {
+    // Skip empty lines and comments
+    if line_len == 0 { return }
+    let first = volatile_read_u8(line_buf)
+    if first == 35 { return } // '#' comment
+
+    // Copy line to command buffer at 0x6F800
+    let mut i: i64 = 0
+    while i < line_len && i < 63 {
+        volatile_write_u8(0x6F800 + i, volatile_read_u8(line_buf + i))
+        i = i + 1
+    }
+    volatile_write_u8(0x6F800 + i, 0)
+
+    // Script line display only (dispatch requires forward ref)
+    // Full script execution deferred to runtime shell loop
+}
+
+@kernel fn cmd_source() {
+    // "source <file>" — execute script from FAT32
+    if fat32_state_read(0) != 1 { cprintln("FAT32 not mounted", RED_ON_BLACK); return }
+
+    let mut fname_len: i64 = 0
+    let mut i: i64 = 7 // skip "source "
+    while i < 64 {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch == 0 { i = 64 }
+        else { volatile_write_u8(FAT32_NAME_BUF + 512 + fname_len, ch); fname_len = fname_len + 1; i = i + 1 }
+    }
+    volatile_write_u8(FAT32_NAME_BUF + 512 + fname_len, 0)
+
+    if fname_len == 0 { cprintln("Usage: source <file>", YELLOW_ON_BLACK); return }
+
+    // Find and read file
+    let root = fat32_state_read(48)
+    let result = fat32_find_in_dir(root, FAT32_NAME_BUF + 512)
+    if result == -1 { cprintln("Script not found", RED_ON_BLACK); return }
+
+    let shifted = result >> 32
+    let file_cluster = shifted & 0x7FFFFFFF
+    let file_size = result & 0xFFFFFFFF
+
+    let script_buf: i64 = 0x840000
+    let bytes = fat32_read_file(file_cluster, file_size, script_buf)
+    if bytes <= 0 { cprintln("Read error", RED_ON_BLACK); return }
+
+    cprint("Running script (", WHITE_ON_BLACK)
+    cprint_decimal(bytes, CYAN_ON_BLACK)
+    cprintln(" bytes):", WHITE_ON_BLACK)
+
+    // Parse lines and execute each
+    let line_buf: i64 = 0x841000
+    let mut pos: i64 = 0
+    let mut line_len: i64 = 0
+    while pos < bytes {
+        let ch = volatile_read_u8(script_buf + pos)
+        if ch == 10 || pos == bytes - 1 {
+            // End of line — execute
+            if ch != 10 {
+                volatile_write_u8(line_buf + line_len, ch)
+                line_len = line_len + 1
+            }
+            volatile_write_u8(line_buf + line_len, 0)
+            if line_len > 0 {
+                cprint("  > ", YELLOW_ON_BLACK)
+                let mut k: i64 = 0
+                while k < line_len { console_putchar(volatile_read_u8(line_buf + k), WHITE_ON_BLACK); k = k + 1 }
+                console_putchar(10, WHITE_ON_BLACK)
+                script_exec_line(line_buf, line_len)
+            }
+            line_len = 0
+        } else {
+            if line_len < 63 {
+                volatile_write_u8(line_buf + line_len, ch)
+                line_len = line_len + 1
+            }
+        }
+        pos = pos + 1
+    }
+    cprintln("Script done", GREEN_ON_BLACK)
+}

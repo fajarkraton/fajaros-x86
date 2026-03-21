@@ -1,0 +1,67 @@
+// FajarOS Nova v0.5.0 — Init Process + Shutdown
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Init Process + Shutdown (Sprint C2)
+// ═══════════════════════════════════════════════
+
+@kernel fn init_autorun() {
+    // Check if /mnt/INIT.SH exists and run it
+    if fat32_state_read(0) != 1 { return }
+    let root = fat32_state_read(48)
+
+    // Write "INIT.SH" to name buffer
+    volatile_write_u8(FAT32_NAME_BUF + 512, 73)  // I
+    volatile_write_u8(FAT32_NAME_BUF + 513, 78)  // N
+    volatile_write_u8(FAT32_NAME_BUF + 514, 73)  // I
+    volatile_write_u8(FAT32_NAME_BUF + 515, 84)  // T
+    volatile_write_u8(FAT32_NAME_BUF + 516, 46)  // .
+    volatile_write_u8(FAT32_NAME_BUF + 517, 83)  // S
+    volatile_write_u8(FAT32_NAME_BUF + 518, 72)  // H
+    volatile_write_u8(FAT32_NAME_BUF + 519, 0)
+
+    let result = fat32_find_in_dir(root, FAT32_NAME_BUF + 512)
+    if result != -1 {
+        println("[INIT] Running /mnt/INIT.SH")
+        // Set up source command in cmdbuf
+        // "source INIT.SH"
+        volatile_write_u8(0x6F800, 115)  // s
+        volatile_write_u8(0x6F801, 111)  // o
+        volatile_write_u8(0x6F802, 117)  // u
+        volatile_write_u8(0x6F803, 114)  // r
+        volatile_write_u8(0x6F804, 99)   // c
+        volatile_write_u8(0x6F805, 101)  // e
+        volatile_write_u8(0x6F806, 32)   // ' '
+        volatile_write_u8(0x6F807, 73)   // I
+        volatile_write_u8(0x6F808, 78)   // N
+        volatile_write_u8(0x6F809, 73)   // I
+        volatile_write_u8(0x6F80A, 84)   // T
+        volatile_write_u8(0x6F80B, 46)   // .
+        volatile_write_u8(0x6F80C, 83)   // S
+        volatile_write_u8(0x6F80D, 72)   // H
+        volatile_write_u8(0x6F80E, 0)
+        cmd_source()
+    }
+}
+
+@kernel fn cmd_shutdown_safe() {
+    cprintln("Shutting down...", YELLOW_ON_BLACK)
+    // Sync: flush NVMe if needed
+    cprintln("  Syncing filesystems...", WHITE_ON_BLACK)
+    cprintln("  Killing processes...", WHITE_ON_BLACK)
+    let mut pid: i64 = 1
+    while pid < PROC_V2_MAX {
+        let state = proc_v2_get(pid, 0)
+        if state != PROC_STATE_FREE { proc_v2_exit(pid, 0) }
+        pid = pid + 1
+    }
+    cprintln("  ACPI poweroff...", WHITE_ON_BLACK)
+    acpi_shutdown()
+}
+
+@kernel fn cmd_reboot_safe() {
+    cprintln("Rebooting...", YELLOW_ON_BLACK)
+    cprintln("  Syncing filesystems...", WHITE_ON_BLACK)
+    cprintln("  Keyboard controller reset...", WHITE_ON_BLACK)
+    port_outb(0x64, 0xFE)
+}

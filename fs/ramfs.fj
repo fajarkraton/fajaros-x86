@@ -1,0 +1,115 @@
+// FajarOS Nova v0.5.0 — RAM Filesystem (ramfs)
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// RAM Filesystem (ramfs)
+// Memory layout:
+//   0x700000: file_count
+//   0x700008: next_data_offset (starts at 0x710000)
+//   0x700100 + i*128: File entry i (max 64 files)
+//     +0:  name[32] (bytes)
+//     +32: size (i64)
+//     +40: data_ptr (absolute address)
+//     +48: type (1=file, 2=dir)
+//   0x710000 - 0x7E0000: data area (832KB)
+// ═══════════════════════════════════════════════
+
+const FS_BASE: i64 = 0x700000
+const FS_DATA: i64 = 0x710000
+const FS_MAX_FILES: i64 = 64
+const FS_ENTRY_SIZE: i64 = 128
+
+@kernel fn ramfs_init() {
+    volatile_write(FS_BASE, 0)          // file_count = 0
+    volatile_write(FS_BASE + 8, FS_DATA) // next_data = 0x710000
+    // Create root directory
+    ramfs_create_entry("/", 2)
+    // Create some default files
+    ramfs_create_entry("/etc", 2)
+    ramfs_create_entry("/tmp", 2)
+    ramfs_write_file("motd", "Welcome to FajarOS Nova!", 24)
+    ramfs_write_file("hostname", "fajaros-nova", 12)
+}
+
+@kernel fn ramfs_entry_addr(index: i64) -> i64 {
+    FS_BASE + 0x100 + index * FS_ENTRY_SIZE
+}
+
+@kernel fn ramfs_create_entry(name: str, ftype: i64) -> i64 {
+    let count = volatile_read(FS_BASE)
+    if count >= FS_MAX_FILES { return -1 }
+    let addr = ramfs_entry_addr(count)
+    // Write name
+    let nlen = str_len(name)
+    let mut i: i64 = 0
+    while i < nlen && i < 31 {
+        volatile_write_u8(addr + i, str_byte_at(name, i))
+        i = i + 1
+    }
+    volatile_write_u8(addr + i, 0) // null terminate
+    // Set type
+    volatile_write(addr + 48, ftype)
+    volatile_write(addr + 32, 0) // size = 0
+    volatile_write(addr + 40, 0) // data_ptr = 0
+    volatile_write(FS_BASE, count + 1)
+    count
+}
+
+@kernel fn ramfs_find(name: str) -> i64 {
+    let count = volatile_read(FS_BASE)
+    let nlen = str_len(name)
+    let mut i: i64 = 0
+    while i < count {
+        let addr = ramfs_entry_addr(i)
+        let mut match_ok: i64 = 1
+        let mut j: i64 = 0
+        while j < nlen && match_ok == 1 {
+            if volatile_read_u8(addr + j) != str_byte_at(name, j) { match_ok = 0 }
+            j = j + 1
+        }
+        // Also check name is same length (null terminator)
+        if match_ok == 1 && volatile_read_u8(addr + nlen) == 0 { return i }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn ramfs_find_buf(prefix_len: i64) -> i64 {
+    // Find file by name in cmdbuf starting at prefix_len
+    let cmd_len = cmdbuf_len()
+    let name_len = cmd_len - prefix_len
+    if name_len <= 0 { return -1 }
+    let count = volatile_read(FS_BASE)
+    let mut i: i64 = 0
+    while i < count {
+        let addr = ramfs_entry_addr(i)
+        let mut match_ok: i64 = 1
+        let mut j: i64 = 0
+        while j < name_len && match_ok == 1 {
+            if volatile_read_u8(addr + j) != volatile_read_u8(0x6F800 + prefix_len + j) { match_ok = 0 }
+            j = j + 1
+        }
+        if match_ok == 1 && volatile_read_u8(addr + name_len) == 0 { return i }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn ramfs_write_file(name: str, data: str, dlen: i64) {
+    let mut idx = ramfs_find(name)
+    if idx == -1 { idx = ramfs_create_entry(name, 1) }
+    if idx == -1 { return }
+    let addr = ramfs_entry_addr(idx)
+    let data_offset = volatile_read(FS_BASE + 8)
+    // Write data
+    let mut i: i64 = 0
+    while i < dlen {
+        volatile_write_u8(data_offset + i, str_byte_at(data, i))
+        i = i + 1
+    }
+    volatile_write(addr + 32, dlen)       // size
+    volatile_write(addr + 40, data_offset) // data_ptr
+    volatile_write(addr + 48, 1)           // type = file
+    volatile_write(FS_BASE + 8, data_offset + dlen) // advance next_data
+}
+

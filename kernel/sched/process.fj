@@ -1,0 +1,127 @@
+// FajarOS Nova v0.5.0 — Process Management
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Process Management v2 (Sprint B6)
+// Fork, exec, waitpid, exit with proper cleanup
+// ═══════════════════════════════════════════════
+
+const PROC_TABLE_V2: i64 = 0x890000  // 16 procs × 256 bytes
+// Per proc: +0=state, +8=pid, +16=ppid, +24=entry, +32=user_rsp,
+//           +40=kernel_rsp, +48=page_table, +56=exit_code, +64=name[32]
+
+const PROC_STATE_FREE: i64 = 0
+const PROC_STATE_READY: i64 = 1
+const PROC_STATE_RUNNING: i64 = 2
+const PROC_STATE_BLOCKED: i64 = 3
+const PROC_STATE_ZOMBIE: i64 = 4
+const PROC_V2_MAX: i64 = 16
+const PROC_V2_SIZE: i64 = 256
+
+@kernel fn proc_v2_init() {
+    let mut i: i64 = 0
+    while i < PROC_V2_MAX * PROC_V2_SIZE {
+        volatile_write_u8(PROC_TABLE_V2 + i, 0)
+        i = i + 1
+    }
+    // PID 0 = kernel/idle
+    volatile_write_u64(PROC_TABLE_V2, PROC_STATE_RUNNING) // state
+    volatile_write_u64(PROC_TABLE_V2 + 8, 0)  // pid
+    volatile_write_u64(PROC_TABLE_V2 + 16, 0) // ppid
+    frame_mark_used(PROC_TABLE_V2 / FRAME_SIZE)
+}
+
+@kernel fn proc_v2_alloc() -> i64 {
+    let mut pid: i64 = 1
+    while pid < PROC_V2_MAX {
+        let state = volatile_read_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE)
+        if state == PROC_STATE_FREE { return pid }
+        pid = pid + 1
+    }
+    -1
+}
+
+@kernel fn proc_v2_set(pid: i64, field: i64, val: i64) {
+    volatile_write_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE + field, val)
+}
+
+@kernel fn proc_v2_get(pid: i64, field: i64) -> i64 {
+    volatile_read_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE + field)
+}
+
+@kernel fn proc_v2_fork(parent_pid: i64) -> i64 {
+    let child_pid = proc_v2_alloc()
+    if child_pid < 0 { return -1 }
+
+    // Copy parent state to child
+    proc_v2_set(child_pid, 0, PROC_STATE_READY)
+    proc_v2_set(child_pid, 8, child_pid) // pid
+    proc_v2_set(child_pid, 16, parent_pid) // ppid
+    proc_v2_set(child_pid, 24, proc_v2_get(parent_pid, 24)) // entry
+    proc_v2_set(child_pid, 56, 0) // exit_code
+
+    // Allocate kernel stack for child
+    let stack_frame = frame_alloc()
+    if stack_frame != -1 {
+        let stack_addr = stack_frame * FRAME_SIZE + FRAME_SIZE // top of stack
+        proc_v2_set(child_pid, 40, stack_addr)
+    }
+
+    child_pid
+}
+
+@kernel fn proc_v2_exit(pid: i64, code: i64) {
+    proc_v2_set(pid, 0, PROC_STATE_ZOMBIE)
+    proc_v2_set(pid, 56, code)
+    // TODO: signal parent, free resources
+}
+
+@kernel fn proc_v2_waitpid(parent_pid: i64, child_pid: i64) -> i64 {
+    // Check if child is zombie
+    let state = proc_v2_get(child_pid, 0)
+    if state == PROC_STATE_ZOMBIE {
+        let code = proc_v2_get(child_pid, 56)
+        proc_v2_set(child_pid, 0, PROC_STATE_FREE) // Reap
+        return code
+    }
+    -1 // Not ready yet
+}
+
+@kernel fn cmd_proc_v2() {
+    cprintln("Process Table v2:", YELLOW_ON_BLACK)
+    let mut pid: i64 = 0
+    while pid < PROC_V2_MAX {
+        let state = proc_v2_get(pid, 0)
+        if state != PROC_STATE_FREE {
+            cprint("  PID ", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint(" PPID=", WHITE_ON_BLACK)
+            cprint_decimal(proc_v2_get(pid, 16), CYAN_ON_BLACK)
+            cprint(" state=", WHITE_ON_BLACK)
+            if state == PROC_STATE_READY { cprint("READY", GREEN_ON_BLACK) }
+            else if state == PROC_STATE_RUNNING { cprint("RUNNING", CYAN_ON_BLACK) }
+            else if state == PROC_STATE_BLOCKED { cprint("BLOCKED", YELLOW_ON_BLACK) }
+            else if state == PROC_STATE_ZOMBIE { cprint("ZOMBIE", RED_ON_BLACK) }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        pid = pid + 1
+    }
+}
+
+@kernel fn cmd_fork_test() {
+    cprintln("Fork test:", YELLOW_ON_BLACK)
+    let child = proc_v2_fork(0)
+    if child >= 0 {
+        cprint("  Forked child PID ", WHITE_ON_BLACK)
+        cprint_decimal(child, GREEN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        // Simulate child exit
+        proc_v2_exit(child, 42)
+        let code = proc_v2_waitpid(0, child)
+        cprint("  Child exited with code ", WHITE_ON_BLACK)
+        cprint_decimal(code, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else {
+        cprintln("  Fork failed: no free PID", RED_ON_BLACK)
+    }
+}

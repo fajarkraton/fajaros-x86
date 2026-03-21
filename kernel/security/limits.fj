@@ -1,0 +1,218 @@
+// FajarOS Nova v0.5.0 — Resource Limits + System Info
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Resource Limits (Phase 8 Sprint 24.7)
+// ═══════════════════════════════════════════════
+
+const MAX_PROCESSES: i64 = 16
+const MAX_FILES: i64 = 64
+const MAX_HEAP_ALLOCS: i64 = 1024
+
+@kernel fn cmd_limits() {
+    cprintln("Resource Limits:", YELLOW_ON_BLACK)
+    cprint("  Max processes: ", WHITE_ON_BLACK)
+    cprint_decimal(MAX_PROCESSES, CYAN_ON_BLACK)
+    let mut active: i64 = 0
+    let mut p: i64 = 0
+    while p < 16 { if volatile_read(0x600000 + p * 256 + 8) != 0 { active = active + 1 }; p = p + 1 }
+    cprint(" (", WHITE_ON_BLACK)
+    cprint_decimal(active, WHITE_ON_BLACK)
+    cprintln(" active)", WHITE_ON_BLACK)
+    cprint("  Max files:     ", WHITE_ON_BLACK)
+    cprint_decimal(MAX_FILES, CYAN_ON_BLACK)
+    cprint(" (", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read(FS_BASE), WHITE_ON_BLACK)
+    cprintln(" used)", WHITE_ON_BLACK)
+    cprint("  Max heap alloc:", WHITE_ON_BLACK)
+    cprint_decimal(MAX_HEAP_ALLOCS, CYAN_ON_BLACK)
+    cprint(" (", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read(0x581020), WHITE_ON_BLACK)
+    cprintln(" active)", WHITE_ON_BLACK)
+    cprint("  Max IPC msgs:  ", WHITE_ON_BLACK)
+    cprint_decimal(IPC_QUEUE_SIZE, CYAN_ON_BLACK)
+    cprintln(" per process", WHITE_ON_BLACK)
+    cprint("  Max pipe buf:  ", WHITE_ON_BLACK)
+    cprint_decimal(PIPE_BUF_SIZE, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_mb2info() {
+    cprintln("Multiboot2 Info:", YELLOW_ON_BLACK)
+    let ptr = volatile_read(0x6FF10)
+    if ptr == 0 { cprintln("  Not available (no MB2 info)", RED_ON_BLACK); return }
+    cprint("  Address:  0x", WHITE_ON_BLACK)
+    cprint_hex(ptr, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Size:     ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read(0x6FF18), CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+    let mmap = volatile_read(0x6FF20)
+    if mmap != 0 {
+        cprint("  MemMap:   0x", WHITE_ON_BLACK)
+        cprint_hex(mmap, 8, CYAN_ON_BLACK)
+        cprint(" (", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read(0x6FF28), CYAN_ON_BLACK)
+        cprintln(" bytes)", WHITE_ON_BLACK)
+        // Parse memory map entries
+        // Tag layout: type(4) + size(4) + entry_size(4) + entry_ver(4) + entries...
+        // Each entry: base_addr(8) + length(8) + type(4) + reserved(4) = 24 bytes
+        let entry_size = volatile_read_u32(mmap + 8)
+        if entry_size > 0 {
+            let data_start = mmap + 16
+            let data_end = mmap + volatile_read(0x6FF28)
+            let mut e = data_start
+            let mut total_usable: i64 = 0
+            cprintln("  Regions:", WHITE_ON_BLACK)
+            while e + 20 <= data_end {
+                let base = volatile_read(e)
+                let length = volatile_read(e + 8)
+                let rtype = volatile_read_u32(e + 16)
+                cprint("    0x", WHITE_ON_BLACK)
+                cprint_hex(base, 10, CYAN_ON_BLACK)
+                cprint(" - 0x", WHITE_ON_BLACK)
+                cprint_hex(base + length, 10, CYAN_ON_BLACK)
+                cprint(" ", WHITE_ON_BLACK)
+                if rtype == 1 { cprint("Available", GREEN_ON_BLACK); total_usable = total_usable + length }
+                else if rtype == 2 { cprint("Reserved", RED_ON_BLACK) }
+                else if rtype == 3 { cprint("ACPI", YELLOW_ON_BLACK) }
+                else if rtype == 4 { cprint("NVS", YELLOW_ON_BLACK) }
+                else { cprint("Other", WHITE_ON_BLACK) }
+                console_putchar(10, WHITE_ON_BLACK)
+                e = e + entry_size
+            }
+            cprint("  Total usable: ", WHITE_ON_BLACK)
+            cprint_decimal(total_usable / 1048576, CYAN_ON_BLACK)
+            cprintln(" MB", WHITE_ON_BLACK)
+        }
+    } else {
+        cprintln("  MemMap:   not found", YELLOW_ON_BLACK)
+    }
+    let fb = volatile_read(0x6FF30)
+    if fb != 0 {
+        cprint("  Framebuf: 0x", WHITE_ON_BLACK)
+        cprint_hex(fb, 8, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else {
+        cprintln("  Framebuf: not present (VGA text mode)", WHITE_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_ansi() {
+    // ANSI escape code demo — VGA attribute mapping
+    cprintln("ANSI Color Mapping:", YELLOW_ON_BLACK)
+    // VGA colors map to ANSI codes:
+    // 30=black 31=red 32=green 33=yellow 34=blue 35=magenta 36=cyan 37=white
+    cprint("  \\e[31m RED    ", RED_ON_BLACK)
+    cprint("  \\e[32m GREEN  ", GREEN_ON_BLACK)
+    cprintln("  \\e[33m YELLOW", YELLOW_ON_BLACK)
+    cprint("  \\e[34m BLUE   ", WHITE_ON_BLUE)
+    cprint("  \\e[36m CYAN   ", CYAN_ON_BLACK)
+    cprintln("  \\e[37m WHITE", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    // Background colors
+    let mut bg: i64 = 0
+    while bg < 8 {
+        let attr = bg * 16 + 15  // white text on colored bg
+        console_putchar(32, attr)
+        console_putchar(52 + bg % 10, attr)  // digit
+        console_putchar(48 + bg, attr)
+        console_putchar(32, attr)
+        bg = bg + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("  \\e[2J = clear, \\e[H = home, \\e[0m = reset", WHITE_ON_BLACK)
+    cprintln("  (VGA text mode uses direct attr bytes)", YELLOW_ON_BLACK)
+}
+
+@kernel fn lapic_eoi() {
+    // Send End of Interrupt to LAPIC
+    volatile_write_u32(LAPIC_BASE + LAPIC_EOI, 0)
+}
+
+@kernel fn cmd_lapic() {
+    cprintln("LAPIC Info:", YELLOW_ON_BLACK)
+    cprint("  Base: 0x", WHITE_ON_BLACK)
+    cprint_hex(LAPIC_BASE, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    let edx = cpuid_edx(1)
+    if (edx & (1 << 9)) != 0 {
+        cprintln("  APIC: present (CPUID)", GREEN_ON_BLACK)
+        // Read LAPIC registers (now mapped via map_page)
+        let lapic_id = volatile_read_u32(LAPIC_BASE + LAPIC_ID)
+        let lapic_ver = volatile_read_u32(LAPIC_BASE + LAPIC_VER)
+        let lapic_svr = volatile_read_u32(LAPIC_BASE + LAPIC_SVR)
+        cprint("  ID:   0x", WHITE_ON_BLACK)
+        cprint_hex(lapic_id >> 24, 2, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  Ver:  0x", WHITE_ON_BLACK)
+        cprint_hex(lapic_ver & 0xFF, 2, CYAN_ON_BLACK)
+        cprint(" (max LVT: ", WHITE_ON_BLACK)
+        cprint_decimal((lapic_ver >> 16) & 0xFF, CYAN_ON_BLACK)
+        cprintln(")", WHITE_ON_BLACK)
+        cprint("  SVR:  0x", WHITE_ON_BLACK)
+        cprint_hex(lapic_svr, 8, CYAN_ON_BLACK)
+        if (lapic_svr & 0x100) != 0 { cprintln(" ENABLED", GREEN_ON_BLACK) }
+        else { cprintln(" disabled", RED_ON_BLACK) }
+    } else {
+        cprintln("  APIC: not detected", RED_ON_BLACK)
+    }
+    // IOAPIC
+    cprintln("IOAPIC Info:", YELLOW_ON_BLACK)
+    cprint("  Base: 0x", WHITE_ON_BLACK)
+    cprint_hex(IOAPIC_BASE, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    // Read IOAPIC ID (register 0)
+    volatile_write_u32(IOAPIC_BASE, 0)  // select register 0
+    let ioapic_id = volatile_read_u32(IOAPIC_BASE + 0x10)
+    cprint("  ID:   0x", WHITE_ON_BLACK)
+    cprint_hex((ioapic_id >> 24) & 0xF, 1, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    // Read IOAPIC version (register 1)
+    volatile_write_u32(IOAPIC_BASE, 1)
+    let ioapic_ver = volatile_read_u32(IOAPIC_BASE + 0x10)
+    cprint("  Ver:  0x", WHITE_ON_BLACK)
+    cprint_hex(ioapic_ver & 0xFF, 2, CYAN_ON_BLACK)
+    cprint(" (max redir: ", WHITE_ON_BLACK)
+    cprint_decimal((ioapic_ver >> 16) & 0xFF, CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_irq() {
+    cprintln("IRQ Configuration:", YELLOW_ON_BLACK)
+    cprintln("  Controller: PIC 8259A (legacy)", WHITE_ON_BLACK)
+    cprintln("  Master PIC: vectors 0x20-0x27", WHITE_ON_BLACK)
+    cprintln("  Slave PIC:  vectors 0x28-0x2F", WHITE_ON_BLACK)
+    cprintln("  IRQ0 (PIT):  vector 0x20 - timer", GREEN_ON_BLACK)
+    cprintln("  IRQ1 (KBD):  vector 0x21 - keyboard", GREEN_ON_BLACK)
+    cprintln("  Timer:  PIT channel 0, 100 Hz", WHITE_ON_BLACK)
+    cprint("  Ticks:  ", WHITE_ON_BLACK)
+    cprint_decimal(read_timer_ticks(), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  TSC:    ", WHITE_ON_BLACK)
+    cprint_hex(rdtsc() >> 32, 8, CYAN_ON_BLACK)
+    cprint_hex(rdtsc() & 0xFFFFFFFF, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_timer() {
+    // timer — show timer details + test sleep
+    cprintln("Timer Test:", YELLOW_ON_BLACK)
+    cprint("  PIT freq: 100 Hz (", WHITE_ON_BLACK)
+    cprint_decimal(read_timer_ticks(), CYAN_ON_BLACK)
+    cprintln(" ticks)", WHITE_ON_BLACK)
+
+    cprint("  Testing sleep_ms(500)... ", WHITE_ON_BLACK)
+    let t0 = read_timer_ticks()
+    sleep_ms(500)
+    let t1 = read_timer_ticks()
+    cprint_decimal(t1 - t0, CYAN_ON_BLACK)
+    cprintln(" ticks (expect ~50)", WHITE_ON_BLACK)
+
+    cprint("  Testing delay_us(1000)... ", WHITE_ON_BLACK)
+    let c0 = rdtsc()
+    delay_us(1000)
+    let c1 = rdtsc()
+    cprint_decimal((c1 - c0) / 1000, CYAN_ON_BLACK)
+    cprintln("K cycles", WHITE_ON_BLACK)
+}

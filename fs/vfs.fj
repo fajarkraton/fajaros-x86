@@ -1,0 +1,325 @@
+// FajarOS Nova v0.5.0 — Virtual Filesystem Switch (VFS)
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// VFS — Virtual Filesystem Switch (Phase 13)
+// Mount table, unified path resolution, /dev, /proc
+// State at 0x806000 (mount table + fd table)
+// ═══════════════════════════════════════════════
+
+// Mount table: 8 entries × 64 bytes at 0x806000
+// Per entry: +0=fs_type (0=none,1=ramfs,2=fat32,3=devfs,4=procfs)
+//            +8=device_id, +16=mountpoint_hash, +24=flags
+const VFS_MOUNT_TABLE: i64 = 0x806000
+const VFS_MAX_MOUNTS: i64 = 8
+const VFS_MOUNT_SIZE: i64 = 64
+const VFS_FS_NONE: i64 = 0
+const VFS_FS_RAMFS: i64 = 1
+const VFS_FS_FAT32: i64 = 2
+const VFS_FS_DEVFS: i64 = 3
+const VFS_FS_PROCFS: i64 = 4
+
+// Mountpoint string table at 0x806200 (8 entries × 32 bytes)
+const VFS_MOUNT_NAMES: i64 = 0x806200
+
+// Simple hash for path matching
+@kernel fn vfs_path_hash(path_addr: i64) -> i64 {
+    let mut hash: i64 = 5381
+    let mut i: i64 = 0
+    while i < 32 {
+        let ch = volatile_read_u8(path_addr + i)
+        if ch == 0 { i = 32 }
+        else {
+            hash = hash * 33 + ch
+            i = i + 1
+        }
+    }
+    hash
+}
+
+@kernel fn vfs_mount_set(slot: i64, fs_type: i64, dev_id: i64, name_addr: i64) {
+    let base = VFS_MOUNT_TABLE + slot * VFS_MOUNT_SIZE
+    volatile_write_u64(base, fs_type)
+    volatile_write_u64(base + 8, dev_id)
+    // Copy mountpoint name
+    let name_base = VFS_MOUNT_NAMES + slot * 32
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(name_addr + i)
+        volatile_write_u8(name_base + i, ch)
+        if ch == 0 { i = 31 }
+        else { i = i + 1 }
+    }
+    volatile_write_u8(name_base + 31, 0)
+    volatile_write_u64(base + 16, vfs_path_hash(name_base))
+}
+
+@kernel fn vfs_find_mount(path_addr: i64) -> i64 {
+    // Find longest matching mountpoint for path
+    let mut best_slot: i64 = -1
+    let mut best_len: i64 = 0
+    let mut slot: i64 = 0
+    while slot < VFS_MAX_MOUNTS {
+        let fs_type = volatile_read_u64(VFS_MOUNT_TABLE + slot * VFS_MOUNT_SIZE)
+        if fs_type != VFS_FS_NONE {
+            let name_base = VFS_MOUNT_NAMES + slot * 32
+            // Check if path starts with mountpoint
+            let mut match_len: i64 = 0
+            let mut matches: i64 = 1
+            let mut k: i64 = 0
+            while k < 31 && matches == 1 {
+                let mc = volatile_read_u8(name_base + k)
+                if mc == 0 { k = 31 } // end of mountpoint
+                else {
+                    let pc = volatile_read_u8(path_addr + k)
+                    if mc != pc { matches = 0 }
+                    else { match_len = match_len + 1 }
+                    k = k + 1
+                }
+            }
+            if matches == 1 && match_len > best_len {
+                best_len = match_len
+                best_slot = slot
+            }
+        }
+        slot = slot + 1
+    }
+    best_slot
+}
+
+@kernel fn vfs_init() {
+    // Clear mount table
+    let mut i: i64 = 0
+    while i < VFS_MAX_MOUNTS * VFS_MOUNT_SIZE {
+        volatile_write_u8(VFS_MOUNT_TABLE + i, 0)
+        i = i + 1
+    }
+    // Mount ramfs at /
+    let slash: i64 = 0x806400 // temp buffer for "/"
+    volatile_write_u8(slash, 47) // '/'
+    volatile_write_u8(slash + 1, 0)
+    vfs_mount_set(0, VFS_FS_RAMFS, 0, slash)
+
+    // Mount devfs at /dev
+    volatile_write_u8(slash, 47)
+    volatile_write_u8(slash + 1, 100) // 'd'
+    volatile_write_u8(slash + 2, 101) // 'e'
+    volatile_write_u8(slash + 3, 118) // 'v'
+    volatile_write_u8(slash + 4, 0)
+    vfs_mount_set(1, VFS_FS_DEVFS, 0, slash)
+
+    // Mount procfs at /proc
+    volatile_write_u8(slash, 47)
+    volatile_write_u8(slash + 1, 112) // 'p'
+    volatile_write_u8(slash + 2, 114) // 'r'
+    volatile_write_u8(slash + 3, 111) // 'o'
+    volatile_write_u8(slash + 4, 99)  // 'c'
+    volatile_write_u8(slash + 5, 0)
+    vfs_mount_set(2, VFS_FS_PROCFS, 0, slash)
+
+    // If FAT32 mounted, add /mnt
+    if fat32_state_read(0) == 1 {
+        volatile_write_u8(slash, 47)
+        volatile_write_u8(slash + 1, 109) // 'm'
+        volatile_write_u8(slash + 2, 110) // 'n'
+        volatile_write_u8(slash + 3, 116) // 't'
+        volatile_write_u8(slash + 4, 0)
+        vfs_mount_set(3, VFS_FS_FAT32, 0, slash)
+    }
+
+    frame_mark_used(VFS_MOUNT_TABLE / FRAME_SIZE)
+}
+
+// ── /dev Device Files ──
+
+@kernel fn dev_read(name_addr: i64, buf: i64, size: i64) -> i64 {
+    // Check device name (after "/dev/")
+    let c0 = volatile_read_u8(name_addr)
+    let c1 = volatile_read_u8(name_addr + 1)
+    let c2 = volatile_read_u8(name_addr + 2)
+    let c3 = volatile_read_u8(name_addr + 3)
+
+    // /dev/null — returns 0 bytes (EOF)
+    if c0 == 110 && c1 == 117 && c2 == 108 && c3 == 108 {
+        return 0
+    }
+
+    // /dev/zero — fills buffer with zeros
+    if c0 == 122 && c1 == 101 && c2 == 114 && c3 == 111 {
+        let mut i: i64 = 0
+        while i < size { volatile_write_u8(buf + i, 0); i = i + 1 }
+        return size
+    }
+
+    // /dev/random — fills buffer with pseudo-random bytes
+    if c0 == 114 && c1 == 97 && c2 == 110 && c3 == 100 {
+        let mut i: i64 = 0
+        while i < size {
+            let r = rdrand()
+            volatile_write_u8(buf + i, r & 0xFF)
+            i = i + 1
+        }
+        return size
+    }
+
+    -1 // Unknown device
+}
+
+// ── /proc Virtual Files ──
+
+@kernel fn proc_read(name_addr: i64, buf: i64) -> i64 {
+    let c0 = volatile_read_u8(name_addr)
+
+    // /proc/version — "FajarOS Nova v0.5.0"
+    if c0 == 118 { // 'v' for version
+        let ver_str: i64 = 0x806500
+        volatile_write_u8(ver_str, 70)  // F
+        volatile_write_u8(ver_str + 1, 97) // a
+        volatile_write_u8(ver_str + 2, 106) // j
+        volatile_write_u8(ver_str + 3, 97)  // a
+        volatile_write_u8(ver_str + 4, 114) // r
+        volatile_write_u8(ver_str + 5, 79)  // O
+        volatile_write_u8(ver_str + 6, 83)  // S
+        volatile_write_u8(ver_str + 7, 32)  // ' '
+        volatile_write_u8(ver_str + 8, 78) // N
+        volatile_write_u8(ver_str + 9, 111)  // o
+        volatile_write_u8(ver_str + 10, 118) // v
+        volatile_write_u8(ver_str + 11, 97)  // a
+        volatile_write_u8(ver_str + 12, 10)  // \n
+        volatile_write_u8(ver_str + 13, 0)
+        let mut i: i64 = 0
+        while i < 13 { volatile_write_u8(buf + i, volatile_read_u8(ver_str + i)); i = i + 1 }
+        return 13
+    }
+
+    // /proc/uptime — ticks / 100 (seconds)
+    if c0 == 117 { // 'u' for uptime
+        let ticks = read_timer_ticks()
+        let secs = ticks / 100
+        // Write decimal number to buffer (simple)
+        let mut val = secs
+        let mut digits: i64 = 0
+        let mut temp = val
+        if temp == 0 { digits = 1 }
+        while temp > 0 { digits = digits + 1; temp = temp / 10 }
+        let mut pos = digits - 1
+        if val == 0 { volatile_write_u8(buf, 48) } // '0'
+        while val > 0 {
+            volatile_write_u8(buf + pos, 48 + val % 10)
+            val = val / 10
+            pos = pos - 1
+        }
+        volatile_write_u8(buf + digits, 10) // \n
+        return digits + 1
+    }
+
+    -1
+}
+
+// ── Shell Commands ──
+
+@kernel fn cmd_vfs_mounts() {
+    cprintln("VFS Mount Table:", YELLOW_ON_BLACK)
+    let mut slot: i64 = 0
+    while slot < VFS_MAX_MOUNTS {
+        let fs_type = volatile_read_u64(VFS_MOUNT_TABLE + slot * VFS_MOUNT_SIZE)
+        if fs_type != VFS_FS_NONE {
+            cprint("  ", WHITE_ON_BLACK)
+            let name_base = VFS_MOUNT_NAMES + slot * 32
+            let mut k: i64 = 0
+            while k < 31 {
+                let ch = volatile_read_u8(name_base + k)
+                if ch == 0 { k = 31 }
+                else { console_putchar(ch, CYAN_ON_BLACK); k = k + 1 }
+            }
+            cprint(" -> ", WHITE_ON_BLACK)
+            if fs_type == VFS_FS_RAMFS { cprintln("ramfs", GREEN_ON_BLACK) }
+            else if fs_type == VFS_FS_FAT32 { cprintln("fat32", GREEN_ON_BLACK) }
+            else if fs_type == VFS_FS_DEVFS { cprintln("devfs", GREEN_ON_BLACK) }
+            else if fs_type == VFS_FS_PROCFS { cprintln("procfs", GREEN_ON_BLACK) }
+            else { cprintln("unknown", RED_ON_BLACK) }
+        }
+        slot = slot + 1
+    }
+}
+
+@kernel fn cmd_dev_read() {
+    // "devread <device> <size>" — e.g., "devread random 16"
+    cprintln("/dev devices:", YELLOW_ON_BLACK)
+    // Read 16 bytes from /dev/random
+    let buf: i64 = 0x830000
+    let n = dev_read(0x806500, buf, 0) // Use temp buffer; first test /dev/null
+    // null test
+    volatile_write_u8(0x806500, 110) // 'n'
+    volatile_write_u8(0x806501, 117) // 'u'
+    volatile_write_u8(0x806502, 108) // 'l'
+    volatile_write_u8(0x806503, 108) // 'l'
+    volatile_write_u8(0x806504, 0)
+    let null_r = dev_read(0x806500, buf, 16)
+    cprint("  /dev/null read: ", WHITE_ON_BLACK)
+    cprint_decimal(null_r, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+    // zero test
+    volatile_write_u8(0x806500, 122) // 'z'
+    volatile_write_u8(0x806501, 101) // 'e'
+    volatile_write_u8(0x806502, 114) // 'r'
+    volatile_write_u8(0x806503, 111) // 'o'
+    volatile_write_u8(0x806504, 0)
+    let zero_r = dev_read(0x806500, buf, 8)
+    cprint("  /dev/zero read: ", WHITE_ON_BLACK)
+    cprint_decimal(zero_r, CYAN_ON_BLACK)
+    cprint(" bytes, first=", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u8(buf), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    // random test
+    volatile_write_u8(0x806500, 114) // 'r'
+    volatile_write_u8(0x806501, 97)  // 'a'
+    volatile_write_u8(0x806502, 110) // 'n'
+    volatile_write_u8(0x806503, 100) // 'd'
+    volatile_write_u8(0x806504, 0)
+    let rand_r = dev_read(0x806500, buf, 8)
+    cprint("  /dev/random read: ", WHITE_ON_BLACK)
+    cprint_decimal(rand_r, CYAN_ON_BLACK)
+    cprint(" bytes: ", WHITE_ON_BLACK)
+    let mut ri: i64 = 0
+    while ri < 8 {
+        cprint_hex(volatile_read_u8(buf + ri), 2, CYAN_ON_BLACK)
+        cprint(" ", WHITE_ON_BLACK)
+        ri = ri + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_proc_version() {
+    let buf: i64 = 0x830000
+    volatile_write_u8(0x806500, 118) // 'v'
+    volatile_write_u8(0x806501, 0)
+    let n = proc_read(0x806500, buf)
+    if n > 0 {
+        let mut i: i64 = 0
+        while i < n {
+            let ch = volatile_read_u8(buf + i)
+            if ch == 10 { console_putchar(10, WHITE_ON_BLACK) }
+            else if ch > 31 { console_putchar(ch, GREEN_ON_BLACK) }
+            i = i + 1
+        }
+    }
+}
+
+@kernel fn cmd_proc_uptime_vfs() {
+    let buf: i64 = 0x830000
+    volatile_write_u8(0x806500, 117) // 'u'
+    volatile_write_u8(0x806501, 0)
+    let n = proc_read(0x806500, buf)
+    if n > 0 {
+        cprint("Uptime: ", WHITE_ON_BLACK)
+        let mut i: i64 = 0
+        while i < n {
+            let ch = volatile_read_u8(buf + i)
+            if ch >= 48 && ch <= 57 { console_putchar(ch, CYAN_ON_BLACK) }
+            i = i + 1
+        }
+        cprintln(" seconds", WHITE_ON_BLACK)
+    }
+}
+

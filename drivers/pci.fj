@@ -1,0 +1,181 @@
+// FajarOS Nova v0.5.0 — PCI Bus Scanner
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// NVMe Detection (Phase 10 Sprint 28)
+// ═══════════════════════════════════════════════
+
+@kernel fn nvme_find_controller() -> i64 {
+    // Scan PCI for NVMe controller (class 01h, subclass 08h)
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let cl = pci_read32(0, dev, 0, 8)
+            let class = (cl >> 24) & 0xFF
+            let subclass = (cl >> 16) & 0xFF
+            if class == 1 && subclass == 8 { return dev }
+        }
+        dev = dev + 1
+    }
+    -1
+}
+
+@kernel fn cmd_nvme() {
+    cprintln("NVMe Controller:", YELLOW_ON_BLACK)
+    let dev = nvme_find_controller()
+    if dev == -1 { cprintln("  No NVMe controller found", RED_ON_BLACK); return }
+    cprint("  PCI Device: ", WHITE_ON_BLACK)
+    cprint_decimal(dev, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    let id = pci_read32(0, dev, 0, 0)
+    cprint("  Vendor:Device: ", WHITE_ON_BLACK)
+    cprint_hex(id & 0xFFFF, 4, CYAN_ON_BLACK)
+    console_putchar(58, WHITE_ON_BLACK)
+    cprint_hex((id >> 16) & 0xFFFF, 4, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    // Read BAR0
+    let bar0 = pci_read32(0, dev, 0, 0x10)
+    cprint("  BAR0: 0x", WHITE_ON_BLACK)
+    cprint_hex(bar0, 8, CYAN_ON_BLACK)
+    if (bar0 & 1) == 0 { cprintln(" (MMIO)", WHITE_ON_BLACK) }
+    else { cprintln(" (I/O)", WHITE_ON_BLACK) }
+    // Map BAR0 if MMIO
+    if (bar0 & 1) == 0 && bar0 > 0 {
+        let bar_addr = bar0 & 0xFFFFF000
+        map_page(bar_addr, bar_addr, PAGE_PRESENT | PAGE_WRITABLE)
+        // Read NVMe CAP register (offset 0)
+        let cap_lo = volatile_read_u32(bar_addr)
+        let cap_hi = volatile_read_u32(bar_addr + 4)
+        cprint("  CAP:  0x", WHITE_ON_BLACK)
+        cprint_hex(cap_hi, 8, CYAN_ON_BLACK)
+        cprint_hex(cap_lo, 8, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        let mqes = (cap_lo & 0xFFFF) + 1
+        cprint("  MQES: ", WHITE_ON_BLACK)
+        cprint_decimal(mqes, CYAN_ON_BLACK)
+        cprintln(" entries", WHITE_ON_BLACK)
+        // Read NVMe VS register (offset 0x08)
+        let vs = volatile_read_u32(bar_addr + 8)
+        cprint("  Version: ", WHITE_ON_BLACK)
+        cprint_decimal((vs >> 16) & 0xFFFF, CYAN_ON_BLACK)
+        cprint(".", WHITE_ON_BLACK)
+        cprint_decimal(vs & 0xFFFF, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+}
+
+@kernel fn pci_class_name(class: i64, subclass: i64) {
+    if class == 0x00 { cprint("Legacy", WHITE_ON_BLACK) }
+    else if class == 0x01 {
+        cprint("Storage", WHITE_ON_BLACK)
+        if subclass == 0x01 { cprint("/IDE", CYAN_ON_BLACK) }
+        else if subclass == 0x06 { cprint("/SATA", CYAN_ON_BLACK) }
+        else if subclass == 0x08 { cprint("/NVMe", GREEN_ON_BLACK) }
+    }
+    else if class == 0x02 {
+        cprint("Network", WHITE_ON_BLACK)
+        if subclass == 0x00 { cprint("/Ethernet", CYAN_ON_BLACK) }
+        else if subclass == 0x80 { cprint("/Other", CYAN_ON_BLACK) }
+    }
+    else if class == 0x03 {
+        cprint("Display", WHITE_ON_BLACK)
+        if subclass == 0x00 { cprint("/VGA", CYAN_ON_BLACK) }
+        else if subclass == 0x02 { cprint("/3D", CYAN_ON_BLACK) }
+    }
+    else if class == 0x04 { cprint("Multimedia", WHITE_ON_BLACK) }
+    else if class == 0x05 { cprint("Memory", WHITE_ON_BLACK) }
+    else if class == 0x06 {
+        cprint("Bridge", WHITE_ON_BLACK)
+        if subclass == 0x00 { cprint("/Host", CYAN_ON_BLACK) }
+        else if subclass == 0x01 { cprint("/ISA", CYAN_ON_BLACK) }
+        else if subclass == 0x04 { cprint("/PCI", CYAN_ON_BLACK) }
+    }
+    else if class == 0x07 { cprint("Serial", WHITE_ON_BLACK) }
+    else if class == 0x08 { cprint("System", WHITE_ON_BLACK) }
+    else if class == 0x0C {
+        cprint("Serial Bus", WHITE_ON_BLACK)
+        if subclass == 0x03 { cprint("/USB", CYAN_ON_BLACK) }
+    }
+    else { cprint("Unknown", WHITE_ON_BLACK) }
+}
+
+@kernel fn cmd_lspci() {
+    cprintln("PCI Devices:", YELLOW_ON_BLACK)
+    let mut dev: i64 = 0
+    let mut found: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_hex(id & 0xFFFF, 4, CYAN_ON_BLACK)
+            console_putchar(58, WHITE_ON_BLACK)
+            cprint_hex((id >> 16) & 0xFFFF, 4, CYAN_ON_BLACK)
+            let cl = pci_read32(0, dev, 0, 8)
+            let class = (cl >> 24) & 0xFF
+            let subclass = (cl >> 16) & 0xFF
+            cprint(" ", WHITE_ON_BLACK)
+            pci_class_name(class, subclass)
+            console_putchar(10, WHITE_ON_BLACK)
+            found = found + 1
+        }
+        dev = dev + 1
+    }
+    cprint("Total: ", GREEN_ON_BLACK)
+    cprint_decimal(found, GREEN_ON_BLACK)
+    cprintln(" devices", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_lspci_v() {
+    // lspci -v — verbose with BAR info
+    cprintln("PCI Devices (verbose):", YELLOW_ON_BLACK)
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let cl = pci_read32(0, dev, 0, 8)
+            let class = (cl >> 24) & 0xFF
+            let subclass = (cl >> 16) & 0xFF
+            cprint("  Dev ", WHITE_ON_BLACK)
+            cprint_decimal(dev, CYAN_ON_BLACK)
+            cprint(": ", WHITE_ON_BLACK)
+            cprint_hex(id & 0xFFFF, 4, CYAN_ON_BLACK)
+            console_putchar(58, WHITE_ON_BLACK)
+            cprint_hex((id >> 16) & 0xFFFF, 4, CYAN_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            pci_class_name(class, subclass)
+            console_putchar(10, WHITE_ON_BLACK)
+            // Read BARs (offset 0x10-0x24, 6 BARs)
+            let mut bar: i64 = 0
+            while bar < 6 {
+                let bar_val = pci_read32(0, dev, 0, 0x10 + bar * 4)
+                if bar_val != 0 {
+                    cprint("    BAR", WHITE_ON_BLACK)
+                    cprint_decimal(bar, WHITE_ON_BLACK)
+                    cprint(": 0x", WHITE_ON_BLACK)
+                    cprint_hex(bar_val, 8, CYAN_ON_BLACK)
+                    if (bar_val & 1) == 1 {
+                        cprint(" (I/O port ", YELLOW_ON_BLACK)
+                        cprint_hex(bar_val & 0xFFFFFFFC, 4, YELLOW_ON_BLACK)
+                        cprintln(")", WHITE_ON_BLACK)
+                    } else {
+                        let bar_type = (bar_val >> 1) & 3
+                        if bar_type == 0 { cprint(" (MMIO 32-bit)", YELLOW_ON_BLACK) }
+                        else if bar_type == 2 { cprint(" (MMIO 64-bit)", YELLOW_ON_BLACK) }
+                        console_putchar(10, WHITE_ON_BLACK)
+                    }
+                }
+                bar = bar + 1
+            }
+            // Read interrupt line
+            let int_reg = pci_read32(0, dev, 0, 0x3C)
+            let irq = int_reg & 0xFF
+            if irq != 0 && irq != 0xFF {
+                cprint("    IRQ: ", WHITE_ON_BLACK)
+                cprint_decimal(irq, CYAN_ON_BLACK)
+                console_putchar(10, WHITE_ON_BLACK)
+            }
+        }
+        dev = dev + 1
+    }
+}

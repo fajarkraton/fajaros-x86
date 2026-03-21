@@ -1,68 +1,202 @@
-// FajarOS Nova — PS/2 Keyboard Driver
-// PS/2 controller ports: 0x60 (data), 0x64 (status/command)
-// IRQ 1 → IOAPIC vector 33
+// FajarOS Nova v0.5.0 — PS/2 Keyboard Driver
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// PS/2 Keyboard Driver (Sprint B7)
+// Uses port_inb(0x60) for scancode, IRQ1
+// ═══════════════════════════════════════════════
 
 const KB_DATA_PORT: i64 = 0x60
 const KB_STATUS_PORT: i64 = 0x64
+const KB_BUFFER: i64 = 0x892000  // 256-byte ring buffer
+// +0: head, +8: tail, +16: buffer[256]
 
-// Scancode Set 1 → ASCII mapping (lowercase, make codes only)
-// Index = scancode, value = ASCII character (0 = unmapped)
-
-// Read a scancode from the keyboard (blocking)
-@kernel
-fn keyboard_read_scancode() -> i64 {
-    // Wait for data available (status port bit 0)
-    while (port_inb(KB_STATUS_PORT) & 0x01) == 0 {
-        asm!("pause")
-    }
-    port_inb(KB_DATA_PORT)
+@kernel fn kb_init() {
+    volatile_write_u64(KB_BUFFER, 0)      // head = 0
+    volatile_write_u64(KB_BUFFER + 8, 0)  // tail = 0
+    frame_mark_used(KB_BUFFER / FRAME_SIZE)
 }
 
-// Convert scancode to ASCII (basic mapping)
-// Returns 0 for non-printable keys
-@kernel
-fn scancode_to_ascii(scancode: i64, shift: bool) -> i64 {
-    // TODO Sprint 16: Full scancode table
-    // Common scancodes (Set 1, make codes):
-    //   0x02-0x0B: '1'-'9','0'
-    //   0x10-0x19: 'q','w','e','r','t','y','u','i','o','p'
-    //   0x1E-0x26: 'a','s','d','f','g','h','j','k','l'
-    //   0x2C-0x32: 'z','x','c','v','b','n','m'
-    //   0x39: space
-    //   0x1C: enter
-    //   0x0E: backspace
+@kernel fn kb_push_char(ch: i64) {
+    let tail = volatile_read_u64(KB_BUFFER + 8)
+    let new_tail = (tail + 1) % 256
+    let head = volatile_read_u64(KB_BUFFER)
+    if new_tail != head { // Not full
+        volatile_write_u8(KB_BUFFER + 16 + tail, ch)
+        volatile_write_u64(KB_BUFFER + 8, new_tail)
+    }
+}
 
-    if scancode == 0x1C { return 10 }   // Enter → newline
-    if scancode == 0x0E { return 8 }    // Backspace
-    if scancode == 0x39 { return 32 }   // Space
+@kernel fn kb_pop_char() -> i64 {
+    let head = volatile_read_u64(KB_BUFFER)
+    let tail = volatile_read_u64(KB_BUFFER + 8)
+    if head == tail { return -1 } // Empty
+    let ch = volatile_read_u8(KB_BUFFER + 16 + head)
+    volatile_write_u64(KB_BUFFER, (head + 1) % 256)
+    ch
+}
 
-    // Letters (simplified — just lowercase for now)
-    if scancode == 0x1E { return 97 }   // 'a'
-    if scancode == 0x30 { return 98 }   // 'b'
-    if scancode == 0x2E { return 99 }   // 'c'
-    if scancode == 0x20 { return 100 }  // 'd'
-    if scancode == 0x12 { return 101 }  // 'e'
-    if scancode == 0x21 { return 102 }  // 'f'
-    if scancode == 0x22 { return 103 }  // 'g'
-    if scancode == 0x23 { return 104 }  // 'h'
-    if scancode == 0x17 { return 105 }  // 'i'
-    if scancode == 0x24 { return 106 }  // 'j'
-    if scancode == 0x25 { return 107 }  // 'k'
-    if scancode == 0x26 { return 108 }  // 'l'
-    if scancode == 0x32 { return 109 }  // 'm'
-    if scancode == 0x31 { return 110 }  // 'n'
-    if scancode == 0x18 { return 111 }  // 'o'
-    if scancode == 0x19 { return 112 }  // 'p'
-    if scancode == 0x10 { return 113 }  // 'q'
-    if scancode == 0x13 { return 114 }  // 'r'
-    if scancode == 0x1F { return 115 }  // 's'
-    if scancode == 0x14 { return 116 }  // 't'
-    if scancode == 0x16 { return 117 }  // 'u'
-    if scancode == 0x2F { return 118 }  // 'v'
-    if scancode == 0x11 { return 119 }  // 'w'
-    if scancode == 0x2D { return 120 }  // 'x'
-    if scancode == 0x15 { return 121 }  // 'y'
-    if scancode == 0x2C { return 122 }  // 'z'
+@kernel fn kb_has_char() -> i64 {
+    let head = volatile_read_u64(KB_BUFFER)
+    let tail = volatile_read_u64(KB_BUFFER + 8)
+    if head != tail { 1 } else { 0 }
+}
 
-    0  // unmapped
+// Scancode set 1 → ASCII (basic mapping)
+@kernel fn scancode_to_ascii(sc: i64) -> i64 {
+    // Row 1: 1234567890-=
+    if sc == 0x02 { return 49 } // '1'
+    if sc == 0x03 { return 50 } // '2'
+    if sc == 0x04 { return 51 } // '3'
+    if sc == 0x05 { return 52 } // '4'
+    if sc == 0x06 { return 53 } // '5'
+    if sc == 0x07 { return 54 } // '6'
+    if sc == 0x08 { return 55 } // '7'
+    if sc == 0x09 { return 56 } // '8'
+    if sc == 0x0A { return 57 } // '9'
+    if sc == 0x0B { return 48 } // '0'
+    if sc == 0x0C { return 45 } // '-'
+    if sc == 0x0D { return 61 } // '='
+    // Row 2: qwertyuiop
+    if sc == 0x10 { return 113 }
+    if sc == 0x11 { return 119 }
+    if sc == 0x12 { return 101 }
+    if sc == 0x13 { return 114 }
+    if sc == 0x14 { return 116 }
+    if sc == 0x15 { return 121 }
+    if sc == 0x16 { return 117 }
+    if sc == 0x17 { return 105 }
+    if sc == 0x18 { return 111 }
+    if sc == 0x19 { return 112 }
+    // Row 3: asdfghjkl
+    if sc == 0x1E { return 97 }
+    if sc == 0x1F { return 115 }
+    if sc == 0x20 { return 100 }
+    if sc == 0x21 { return 102 }
+    if sc == 0x22 { return 103 }
+    if sc == 0x23 { return 104 }
+    if sc == 0x24 { return 106 }
+    if sc == 0x25 { return 107 }
+    if sc == 0x26 { return 108 }
+    // Row 4: zxcvbnm
+    if sc == 0x2C { return 122 }
+    if sc == 0x2D { return 120 }
+    if sc == 0x2E { return 99 }
+    if sc == 0x2F { return 118 }
+    if sc == 0x30 { return 98 }
+    if sc == 0x31 { return 110 }
+    if sc == 0x32 { return 109 }
+    // Special
+    if sc == 0x1C { return 10 }  // Enter
+    if sc == 0x39 { return 32 }  // Space
+    if sc == 0x0E { return 8 }   // Backspace
+    if sc == 0x01 { return 27 }  // Escape
+    if sc == 0x34 { return 46 }  // '.'
+    if sc == 0x33 { return 44 }  // ','
+    if sc == 0x35 { return 47 }  // '/'
+    0 // Unknown
+}
+
+@kernel fn kb_handle_irq() {
+    // Read scancode from PS/2 data port
+    let sc = port_inb(KB_DATA_PORT)
+    // Only process make codes (bit 7 = 0)
+    if sc < 0x80 {
+        let ascii = scancode_to_ascii(sc)
+        if ascii > 0 {
+            kb_push_char(ascii)
+        }
+    }
+}
+
+@kernel fn cmd_kb_test() {
+    cprintln("Keyboard Buffer:", YELLOW_ON_BLACK)
+    let head = volatile_read_u64(KB_BUFFER)
+    let tail = volatile_read_u64(KB_BUFFER + 8)
+    cprint("  Head: ", WHITE_ON_BLACK)
+    cprint_decimal(head, CYAN_ON_BLACK)
+    cprint("  Tail: ", WHITE_ON_BLACK)
+    cprint_decimal(tail, CYAN_ON_BLACK)
+    let buffered = if tail >= head { tail - head } else { 256 - head + tail }
+    cprint("  Buffered: ", WHITE_ON_BLACK)
+    cprint_decimal(buffered, CYAN_ON_BLACK)
+    cprintln(" chars", WHITE_ON_BLACK)
+
+    // Drain and print
+    let mut count: i64 = 0
+    while kb_has_char() == 1 && count < 64 {
+        let ch = kb_pop_char()
+        if ch > 31 && ch < 127 { console_putchar(ch, GREEN_ON_BLACK) }
+        count = count + 1
+    }
+    if count > 0 { console_putchar(10, WHITE_ON_BLACK) }
+}
+
+// ═══════════════════════════════════════════════
+// Scancode → ASCII (with shift support)
+// Shift state at 0x6FBE0: 0=normal, 1=shifted
+// Caps lock at 0x6FBE8: 0=off, 1=on
+// ═══════════════════════════════════════════════
+
+@kernel fn sc2ascii(sc: i64) -> i64 {
+    let shift = volatile_read(0x6FBE0)
+    let caps = volatile_read(0x6FBE8)
+    if sc == 0x1C { return 10 }   // Enter
+    if sc == 0x0E { return 8 }    // Backspace
+    if sc == 0x0F { return 9 }    // Tab
+    if sc == 0x39 { return 32 }   // Space
+    if sc == 0x01 { return 27 }   // Escape
+    // Number row (with shift → symbols)
+    if sc == 0x02 { if shift == 1 { return 33 } return 49 }  // 1 / !
+    if sc == 0x03 { if shift == 1 { return 64 } return 50 }  // 2 / @
+    if sc == 0x04 { if shift == 1 { return 35 } return 51 }  // 3 / #
+    if sc == 0x05 { if shift == 1 { return 36 } return 52 }  // 4 / $
+    if sc == 0x06 { if shift == 1 { return 37 } return 53 }  // 5 / %
+    if sc == 0x07 { if shift == 1 { return 94 } return 54 }  // 6 / ^
+    if sc == 0x08 { if shift == 1 { return 38 } return 55 }  // 7 / &
+    if sc == 0x09 { if shift == 1 { return 42 } return 56 }  // 8 / *
+    if sc == 0x0A { if shift == 1 { return 40 } return 57 }  // 9 / (
+    if sc == 0x0B { if shift == 1 { return 41 } return 48 }  // 0 / )
+    // Punctuation
+    if sc == 0x0C { if shift == 1 { return 95 } return 45 }  // - / _
+    if sc == 0x0D { if shift == 1 { return 43 } return 61 }  // = / +
+    if sc == 0x1A { if shift == 1 { return 123 } return 91 } // [ / {
+    if sc == 0x1B { if shift == 1 { return 125 } return 93 } // ] / }
+    if sc == 0x27 { if shift == 1 { return 58 } return 59 }  // ; / :
+    if sc == 0x28 { if shift == 1 { return 34 } return 39 }  // ' / "
+    if sc == 0x29 { if shift == 1 { return 126 } return 96 } // ` / ~
+    if sc == 0x2B { if shift == 1 { return 124 } return 92 } // \ / |
+    if sc == 0x33 { if shift == 1 { return 60 } return 44 }  // , / <
+    if sc == 0x34 { if shift == 1 { return 62 } return 46 }  // . / >
+    if sc == 0x35 { if shift == 1 { return 63 } return 47 }  // / / ?
+    // Letters — affected by shift XOR caps
+    let upper = (shift == 1 && caps == 0) || (shift == 0 && caps == 1)
+    let base_offset = if upper { 0 } else { 32 }
+    if sc == 0x10 { return 81 + base_offset }  // Q/q
+    if sc == 0x11 { return 87 + base_offset }  // W/w
+    if sc == 0x12 { return 69 + base_offset }  // E/e
+    if sc == 0x13 { return 82 + base_offset }  // R/r
+    if sc == 0x14 { return 84 + base_offset }  // T/t
+    if sc == 0x15 { return 89 + base_offset }  // Y/y
+    if sc == 0x16 { return 85 + base_offset }  // U/u
+    if sc == 0x17 { return 73 + base_offset }  // I/i
+    if sc == 0x18 { return 79 + base_offset }  // O/o
+    if sc == 0x19 { return 80 + base_offset }  // P/p
+    if sc == 0x1E { return 65 + base_offset }  // A/a
+    if sc == 0x1F { return 83 + base_offset }  // S/s
+    if sc == 0x20 { return 68 + base_offset }  // D/d
+    if sc == 0x21 { return 70 + base_offset }  // F/f
+    if sc == 0x22 { return 71 + base_offset }  // G/g
+    if sc == 0x23 { return 72 + base_offset }  // H/h
+    if sc == 0x24 { return 74 + base_offset }  // J/j
+    if sc == 0x25 { return 75 + base_offset }  // K/k
+    if sc == 0x26 { return 76 + base_offset }  // L/l
+    if sc == 0x2C { return 90 + base_offset }  // Z/z
+    if sc == 0x2D { return 88 + base_offset }  // X/x
+    if sc == 0x2E { return 67 + base_offset }  // C/c
+    if sc == 0x2F { return 86 + base_offset }  // V/v
+    if sc == 0x30 { return 66 + base_offset }  // B/b
+    if sc == 0x31 { return 78 + base_offset }  // N/n
+    if sc == 0x32 { return 77 + base_offset }  // M/m
+    0
 }

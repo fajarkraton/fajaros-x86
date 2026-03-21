@@ -1,0 +1,296 @@
+// FajarOS Nova v0.5.0 — SMP Infrastructure + AP Trampoline
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// SMP Infrastructure (Phase 8 Sprint 23)
+// ═══════════════════════════════════════════════
+
+const AP_COUNTER: i64 = 0x8100  // AP boot counter
+const PER_CPU_BASE: i64 = 0x652000  // 16 CPUs × 64 bytes
+
+@kernel fn smp_init_per_cpu() {
+    // Zero per-CPU data
+    let mut i: i64 = 0
+    while i < 16 * 64 { volatile_write_u8(PER_CPU_BASE + i, 0); i = i + 1 }
+    // BSP = CPU 0
+    volatile_write(PER_CPU_BASE, 0)  // LAPIC ID
+    volatile_write(PER_CPU_BASE + 8, 1)  // online = true
+    volatile_write(AP_COUNTER, 0)
+}
+
+@kernel fn smp_send_init_sipi(apic_id: i64) {
+    // Send INIT IPI
+    volatile_write_u32(LAPIC_BASE + LAPIC_ICR_HI, apic_id << 24)
+    volatile_write_u32(LAPIC_BASE + LAPIC_ICR_LO, 0x00004500)  // INIT
+    sleep_ms(10)
+    // Send SIPI #1 (vector = 0x08 → trampoline at 0x8000)
+    volatile_write_u32(LAPIC_BASE + LAPIC_ICR_HI, apic_id << 24)
+    volatile_write_u32(LAPIC_BASE + LAPIC_ICR_LO, 0x00004608)  // SIPI vec=8
+    delay_us(200)
+    // Send SIPI #2
+    volatile_write_u32(LAPIC_BASE + LAPIC_ICR_HI, apic_id << 24)
+    volatile_write_u32(LAPIC_BASE + LAPIC_ICR_LO, 0x00004608)
+}
+
+@kernel fn cmd_smp() {
+    cprintln("SMP Status:", YELLOW_ON_BLACK)
+    let rsdp = acpi_find_rsdp()
+    let cpus = if rsdp != 0 { acpi_get_cpu_count(rsdp) } else { 1 }
+    cprint("  CPUs detected (MADT):  ", WHITE_ON_BLACK)
+    cprint_decimal(cpus, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  BSP LAPIC ID:          ", WHITE_ON_BLACK)
+    let bsp_id = volatile_read_u32(LAPIC_BASE + LAPIC_ID) >> 24
+    cprint_decimal(bsp_id, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  APs booted:            ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read(AP_COUNTER), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("  Scheduler:             round-robin (BSP only)", WHITE_ON_BLACK)
+    cprintln("  Spinlock:              available", GREEN_ON_BLACK)
+    cprintln("  Per-CPU data:          at 0x652000 (16×64B)", WHITE_ON_BLACK)
+    cprintln("  AP trampoline:         0x8000 (installed)", GREEN_ON_BLACK)
+    cprintln("  INIT-SIPI-SIPI:        smp_send_init_sipi() ready", GREEN_ON_BLACK)
+    // Show per-CPU online status
+    let mut cpu: i64 = 0
+    while cpu < 16 {
+        let online = volatile_read(PER_CPU_BASE + cpu * 64 + 8)
+        if online != 0 {
+            cprint("  CPU ", WHITE_ON_BLACK)
+            cprint_decimal(cpu, CYAN_ON_BLACK)
+            cprintln(": ONLINE", GREEN_ON_BLACK)
+        }
+        cpu = cpu + 1
+    }
+}
+
+// ── AP Trampoline (16-bit real mode → 64-bit long mode) ──
+// Installed at physical address 0x8000 (page 8)
+// The SIPI vector 0x08 means APs start at 0x8000 in real mode.
+// Trampoline: set up GDT, enable PAE+PGE, load CR3, enable long mode, jump to AP entry
+
+@kernel fn smp_install_trampoline() {
+    // AP trampoline machine code at 0x8000
+    // This is a minimal 16-bit → 64-bit transition:
+    //   cli; load GDT; enable PE; load CR3 from 0x70000; enable PAE+PGE;
+    //   set EFER.LME; enable PG; far jump to 64-bit AP entry
+
+    let base: i64 = 0x8000
+
+    // Phase 1: 16-bit real mode setup
+    // cli
+    volatile_write_u8(base + 0, 0xFA)
+    // xor ax, ax ; mov ds, ax (zero segments)
+    volatile_write_u8(base + 1, 0x31)
+    volatile_write_u8(base + 2, 0xC0)
+    volatile_write_u8(base + 3, 0x8E)
+    volatile_write_u8(base + 4, 0xD8)
+    // lgdt [0x8080] — GDT pointer at offset 0x80
+    volatile_write_u8(base + 5, 0x0F)
+    volatile_write_u8(base + 6, 0x01)
+    volatile_write_u8(base + 7, 0x16)
+    volatile_write_u8(base + 8, 0x80)
+    volatile_write_u8(base + 9, 0x80)
+
+    // Phase 2: Enter protected mode
+    // mov eax, cr0; or al, 1; mov cr0, eax
+    volatile_write_u8(base + 10, 0x0F)
+    volatile_write_u8(base + 11, 0x20)
+    volatile_write_u8(base + 12, 0xC0)
+    volatile_write_u8(base + 13, 0x0C)
+    volatile_write_u8(base + 14, 0x01)
+    volatile_write_u8(base + 15, 0x0F)
+    volatile_write_u8(base + 16, 0x22)
+    volatile_write_u8(base + 17, 0xC0)
+
+    // jmp 0x08:0x8020 (far jump to 32-bit code at offset 0x20)
+    volatile_write_u8(base + 18, 0x66)
+    volatile_write_u8(base + 19, 0xEA)
+    volatile_write_u32(base + 20, 0x8020) // offset
+    volatile_write_u16(base + 24, 0x08)   // code segment
+
+    // NOP padding to offset 0x20
+    volatile_write_u8(base + 26, 0x90)
+    volatile_write_u8(base + 27, 0x90)
+    volatile_write_u8(base + 28, 0x90)
+    volatile_write_u8(base + 29, 0x90)
+    volatile_write_u8(base + 30, 0x90)
+    volatile_write_u8(base + 31, 0x90)
+
+    // Phase 3: 32-bit protected mode — enable PAE, load CR3, enable long mode
+    // At offset 0x20 (32-bit code):
+    let p32: i64 = base + 0x20
+    // mov ax, 0x10; mov ds, ax; mov es, ax; mov ss, ax
+    volatile_write_u8(p32, 0x66)
+    volatile_write_u8(p32 + 1, 0xB8)
+    volatile_write_u16(p32 + 2, 0x10)
+    volatile_write_u8(p32 + 4, 0x8E)
+    volatile_write_u8(p32 + 5, 0xD8)
+    volatile_write_u8(p32 + 6, 0x8E)
+    volatile_write_u8(p32 + 7, 0xC0)
+    volatile_write_u8(p32 + 8, 0x8E)
+    volatile_write_u8(p32 + 9, 0xD0)
+
+    // mov eax, cr4; or eax, 0x20; mov cr4, eax (enable PAE)
+    volatile_write_u8(p32 + 10, 0x0F)
+    volatile_write_u8(p32 + 11, 0x20)
+    volatile_write_u8(p32 + 12, 0xE0)
+    volatile_write_u8(p32 + 13, 0x0D)
+    volatile_write_u32(p32 + 14, 0x20)
+    volatile_write_u8(p32 + 18, 0x0F)
+    volatile_write_u8(p32 + 19, 0x22)
+    volatile_write_u8(p32 + 20, 0xE0)
+
+    // mov eax, 0x70000; mov cr3, eax (page table at 0x70000)
+    volatile_write_u8(p32 + 21, 0xB8)
+    volatile_write_u32(p32 + 22, 0x70000)
+    volatile_write_u8(p32 + 26, 0x0F)
+    volatile_write_u8(p32 + 27, 0x22)
+    volatile_write_u8(p32 + 28, 0xD8)
+
+    // rdmsr 0xC0000080 (EFER); or eax, 0x100 (LME); wrmsr
+    volatile_write_u8(p32 + 29, 0xB9)
+    volatile_write_u32(p32 + 30, 0xC0000080)
+    volatile_write_u8(p32 + 34, 0x0F)
+    volatile_write_u8(p32 + 35, 0x32) // rdmsr
+    volatile_write_u8(p32 + 36, 0x0D)
+    volatile_write_u32(p32 + 37, 0x100) // or eax, LME
+    volatile_write_u8(p32 + 41, 0x0F)
+    volatile_write_u8(p32 + 42, 0x30) // wrmsr
+
+    // mov eax, cr0; or eax, 0x80000000; mov cr0, eax (enable paging)
+    volatile_write_u8(p32 + 43, 0x0F)
+    volatile_write_u8(p32 + 44, 0x20)
+    volatile_write_u8(p32 + 45, 0xC0)
+    volatile_write_u8(p32 + 46, 0x0D)
+    volatile_write_u32(p32 + 47, 0x80000000)
+    volatile_write_u8(p32 + 51, 0x0F)
+    volatile_write_u8(p32 + 52, 0x22)
+    volatile_write_u8(p32 + 53, 0xC0)
+
+    // jmp 0x18:0x8060 (far jump to 64-bit code)
+    volatile_write_u8(p32 + 54, 0xEA)
+    volatile_write_u32(p32 + 55, 0x8060)
+    volatile_write_u16(p32 + 59, 0x18) // 64-bit code segment
+
+    // Phase 4: 64-bit long mode at offset 0x60
+    let p64: i64 = base + 0x60
+    // mov rsp, [0x8100+cpu_id*8] — set per-AP stack
+    // For simplicity: set rsp = 0x900000 + ap_counter * 0x10000
+    // mov eax, [0x8100] (AP counter)
+    volatile_write_u8(p64, 0x8B)
+    volatile_write_u8(p64 + 1, 0x04)
+    volatile_write_u8(p64 + 2, 0x25)
+    volatile_write_u32(p64 + 3, 0x8100) // AP_COUNTER address
+    // inc dword [0x8100] (atomically increment AP counter)
+    volatile_write_u8(p64 + 7, 0xF0) // LOCK prefix
+    volatile_write_u8(p64 + 8, 0xFF)
+    volatile_write_u8(p64 + 9, 0x04)
+    volatile_write_u8(p64 + 10, 0x25)
+    volatile_write_u32(p64 + 11, 0x8100)
+    // shl eax, 16 (multiply by 0x10000 = 64KB stack per AP)
+    volatile_write_u8(p64 + 15, 0xC1)
+    volatile_write_u8(p64 + 16, 0xE0)
+    volatile_write_u8(p64 + 17, 16)
+    // add rax, 0x910000 (stack base: 0x910000 + cpu*64KB)
+    volatile_write_u8(p64 + 18, 0x48)
+    volatile_write_u8(p64 + 19, 0x05)
+    volatile_write_u32(p64 + 20, 0x910000)
+    // mov rsp, rax
+    volatile_write_u8(p64 + 24, 0x48)
+    volatile_write_u8(p64 + 25, 0x89)
+    volatile_write_u8(p64 + 26, 0xC4)
+    // Enable LAPIC SVR (spurious interrupt vector)
+    // mov ecx, 0xFEE000F0; mov eax, [ecx]; or eax, 0x1FF; mov [ecx], eax
+    volatile_write_u8(p64 + 27, 0xB9)
+    volatile_write_u32(p64 + 28, 0xFEE000F0)
+    volatile_write_u8(p64 + 32, 0x8B)
+    volatile_write_u8(p64 + 33, 0x01)
+    volatile_write_u8(p64 + 34, 0x0D)
+    volatile_write_u32(p64 + 35, 0x1FF)
+    volatile_write_u8(p64 + 39, 0x89)
+    volatile_write_u8(p64 + 40, 0x01)
+    // hlt loop — AP waits for work
+    volatile_write_u8(p64 + 41, 0xF4) // hlt
+    volatile_write_u8(p64 + 42, 0xEB) // jmp -2
+    volatile_write_u8(p64 + 43, 0xFD)
+
+    // GDT at offset 0x80 (minimal: null, code32, data32, code64)
+    let gdt: i64 = base + 0x80
+    // Null descriptor
+    volatile_write_u64(gdt, 0)
+    // Code32 (0x08): base=0, limit=0xFFFFF, exec/read, 32-bit
+    volatile_write_u64(gdt + 8, 0x00CF9A000000FFFF)
+    // Data32 (0x10): base=0, limit=0xFFFFF, read/write
+    volatile_write_u64(gdt + 16, 0x00CF92000000FFFF)
+    // Code64 (0x18): long mode code segment
+    volatile_write_u64(gdt + 24, 0x00209A0000000000)
+
+    // GDT pointer at 0x8080 (limit:16 + base:32 for 16-bit lgdt)
+    // Actually the lgdt at 0x8080 is the pointer struct, GDT is at 0x8090
+    // Let me fix: move GDT to 0x8090, pointer at 0x8080
+    // GDT pointer: limit (2 bytes) + base (4 bytes)
+    let gdt_ptr: i64 = base + 0x80
+    volatile_write_u16(gdt_ptr, 31) // limit: 4 entries * 8 - 1
+    volatile_write_u32(gdt_ptr + 2, 0x8090) // base address of GDT
+
+    // Move GDT entries to 0x8090
+    let gdt2: i64 = base + 0x90
+    volatile_write_u64(gdt2, 0)
+    volatile_write_u64(gdt2 + 8, 0x00CF9A000000FFFF)
+    volatile_write_u64(gdt2 + 16, 0x00CF92000000FFFF)
+    volatile_write_u64(gdt2 + 24, 0x00209A0000000000)
+}
+
+@kernel fn smp_boot_aps() -> i64 {
+    // Install trampoline
+    smp_install_trampoline()
+
+    // Mark AP stacks as used
+    let mut f: i64 = 0x910000 / FRAME_SIZE
+    while f < 0x950000 / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
+
+    // Get CPU count from ACPI
+    let rsdp = acpi_find_rsdp()
+    let total_cpus = if rsdp != 0 { acpi_get_cpu_count(rsdp) } else { 1 }
+    if total_cpus <= 1 { return 0 }
+
+    // Reset AP counter
+    volatile_write(AP_COUNTER, 0)
+
+    // Send INIT-SIPI-SIPI to each AP (LAPIC IDs 1 to total_cpus-1)
+    let mut ap: i64 = 1
+    while ap < total_cpus && ap < 16 {
+        smp_send_init_sipi(ap)
+        ap = ap + 1
+    }
+
+    // Wait for APs to boot (poll AP_COUNTER)
+    let expected = total_cpus - 1
+    let mut wait: i64 = 100000
+    while volatile_read(AP_COUNTER) < expected && wait > 0 {
+        wait = wait - 1
+    }
+
+    let booted = volatile_read(AP_COUNTER)
+
+    // Update per-CPU online status
+    let mut cpu: i64 = 1
+    while cpu <= booted {
+        volatile_write(PER_CPU_BASE + cpu * 64 + 8, 1) // online = true
+        cpu = cpu + 1
+    }
+
+    booted
+}
+
+@kernel fn cmd_smp_boot() {
+    cprintln("Booting Application Processors...", YELLOW_ON_BLACK)
+    let booted = smp_boot_aps()
+    cprint("  APs booted: ", WHITE_ON_BLACK)
+    cprint_decimal(booted, if booted > 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Total CPUs online: ", WHITE_ON_BLACK)
+    cprint_decimal(booted + 1, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}

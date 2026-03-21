@@ -1,4 +1,6 @@
-// FajarOS Nova — 16550 UART Serial Driver
+// FajarOS Nova v0.5.0 — 16550 UART Serial Driver
+// Part of the modular kernel build (concatenated by Makefile)
+//
 // Standard PC serial port (COM1: 0x3F8, COM2: 0x2F8)
 //
 // Register Map (offset from base):

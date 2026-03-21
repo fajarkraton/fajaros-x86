@@ -1,0 +1,262 @@
+// FajarOS Nova v0.5.0 — User Programs, Login Shell, System Info
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// User Binary Support (Nova v0.4 Sprint N1)
+// Embed a minimal "hello" user program in kernel
+// for Ring 3 execution testing
+// ═══════════════════════════════════════════════
+
+const USER_CODE_BASE: i64 = 0x2000000   // 32MB — user code mapped here
+const USER_STACK_BASE: i64 = 0x2FF0000  // user stack (64KB below 48MB)
+const USER_HELLO_SIZE: i64 = 48         // minimal hello program bytes
+
+// Minimal x86_64 user program (runs in Ring 3):
+//   mov rax, 1       (SYS_WRITE)
+//   mov rdi, 1       (fd=stdout)
+//   mov rsi, msg     (buffer address)
+//   mov rdx, 14      (length)
+//   syscall
+//   mov rax, 60      (SYS_EXIT)
+//   xor rdi, rdi     (code=0)
+//   syscall
+//   msg: "Hello Ring 3!\n"
+@kernel fn user_install_hello() {
+    // Map user code page
+    let frame = frame_alloc()
+    if frame == -1 { return }
+    map_page(USER_CODE_BASE, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+
+    let base = USER_CODE_BASE
+    // mov rax, 1 (SYS_WRITE)
+    volatile_write_u8(base + 0, 0x48)
+    volatile_write_u8(base + 1, 0xC7)
+    volatile_write_u8(base + 2, 0xC0)
+    volatile_write_u32(base + 3, 1)
+    // mov rdi, 1 (fd=stdout)
+    volatile_write_u8(base + 7, 0x48)
+    volatile_write_u8(base + 8, 0xC7)
+    volatile_write_u8(base + 9, 0xC7)
+    volatile_write_u32(base + 10, 1)
+    // mov rsi, msg_addr (base + 34)
+    volatile_write_u8(base + 14, 0x48)
+    volatile_write_u8(base + 15, 0xC7)
+    volatile_write_u8(base + 16, 0xC6)
+    volatile_write_u32(base + 17, USER_CODE_BASE + 34)
+    // mov rdx, 14 (len)
+    volatile_write_u8(base + 21, 0x48)
+    volatile_write_u8(base + 22, 0xC7)
+    volatile_write_u8(base + 23, 0xC2)
+    volatile_write_u32(base + 24, 14)
+    // syscall
+    volatile_write_u8(base + 28, 0x0F)
+    volatile_write_u8(base + 29, 0x05)
+    // mov rax, 60 (SYS_EXIT)
+    volatile_write_u8(base + 30, 0xB8)
+    volatile_write_u32(base + 31, 60)
+    // xor edi, edi
+    volatile_write_u8(base + 35, 0x31)
+    volatile_write_u8(base + 36, 0xFF)
+    // syscall
+    volatile_write_u8(base + 37, 0x0F)
+    volatile_write_u8(base + 38, 0x05)
+    // msg: "Hello Ring 3!\n" at offset 34... wait, we overwrote at 35
+    // Fix layout: put message AFTER the exit syscall (offset 39)
+}
+
+// Corrected layout with message after code
+@kernel fn user_install_hello_v2() {
+    // USER_CODE_BASE (0x2000000) is within the 2MB identity-mapped region.
+    // Just set PAGE_USER on the huge page and write code directly.
+    map_page(USER_CODE_BASE, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+    map_page(USER_STACK_BASE, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+
+    let b = USER_CODE_BASE
+    let msg_addr = b + 40
+    let msg_len: i64 = 14
+
+    // mov eax, 1 (SYS_WRITE = 1)
+    volatile_write_u8(b, 0xB8)
+    volatile_write_u32(b + 1, 1)
+    // mov edi, 1 (stdout)
+    volatile_write_u8(b + 5, 0xBF)
+    volatile_write_u32(b + 6, 1)
+    // mov esi, msg_addr (32-bit — user space is in low 48MB)
+    volatile_write_u8(b + 10, 0xBE)
+    volatile_write_u32(b + 11, msg_addr)
+    // mov edx, msg_len
+    volatile_write_u8(b + 15, 0xBA)
+    volatile_write_u32(b + 16, msg_len)
+    // syscall
+    volatile_write_u8(b + 20, 0x0F)
+    volatile_write_u8(b + 21, 0x05)
+    // mov eax, 60 (SYS_EXIT = 60)
+    volatile_write_u8(b + 22, 0xB8)
+    volatile_write_u32(b + 23, 60)
+    // xor edi, edi (exit code 0)
+    volatile_write_u8(b + 27, 0x31)
+    volatile_write_u8(b + 28, 0xFF)
+    // syscall
+    volatile_write_u8(b + 29, 0x0F)
+    volatile_write_u8(b + 30, 0x05)
+    // hlt (safety — should never reach)
+    volatile_write_u8(b + 31, 0xF4)
+
+    // Message: "Hello Ring 3!\n" at offset 40
+    volatile_write_u8(msg_addr, 72)   // H
+    volatile_write_u8(msg_addr + 1, 101) // e
+    volatile_write_u8(msg_addr + 2, 108) // l
+    volatile_write_u8(msg_addr + 3, 108) // l
+    volatile_write_u8(msg_addr + 4, 111) // o
+    volatile_write_u8(msg_addr + 5, 32)  // ' '
+    volatile_write_u8(msg_addr + 6, 82)  // R
+    volatile_write_u8(msg_addr + 7, 105) // i
+    volatile_write_u8(msg_addr + 8, 110) // n
+    volatile_write_u8(msg_addr + 9, 103) // g
+    volatile_write_u8(msg_addr + 10, 32) // ' '
+    volatile_write_u8(msg_addr + 11, 51) // 3
+    volatile_write_u8(msg_addr + 12, 33) // !
+    volatile_write_u8(msg_addr + 13, 10) // \n
+}
+
+@kernel fn user_install_program(addr: i64, msg_start: i64, msg_bytes: i64) {
+    // Generic user program installer: SYS_WRITE(msg) + SYS_EXIT(0)
+    map_page(addr, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+
+    let b = addr
+    let msg_addr = b + 40
+
+    // mov eax, 1 (SYS_WRITE)
+    volatile_write_u8(b, 0xB8)
+    volatile_write_u32(b + 1, 1)
+    // mov edi, 1 (stdout)
+    volatile_write_u8(b + 5, 0xBF)
+    volatile_write_u32(b + 6, 1)
+    // mov esi, msg_addr
+    volatile_write_u8(b + 10, 0xBE)
+    volatile_write_u32(b + 11, msg_addr)
+    // mov edx, msg_len
+    volatile_write_u8(b + 15, 0xBA)
+    volatile_write_u32(b + 16, msg_bytes)
+    // syscall
+    volatile_write_u8(b + 20, 0x0F)
+    volatile_write_u8(b + 21, 0x05)
+    // mov eax, 60 (SYS_EXIT)
+    volatile_write_u8(b + 22, 0xB8)
+    volatile_write_u32(b + 23, 60)
+    // xor edi, edi
+    volatile_write_u8(b + 27, 0x31)
+    volatile_write_u8(b + 28, 0xFF)
+    // syscall
+    volatile_write_u8(b + 29, 0x0F)
+    volatile_write_u8(b + 30, 0x05)
+    // nop
+    volatile_write_u8(b + 31, 0x90)
+
+    // Copy message bytes
+    let mut i: i64 = 0
+    while i < msg_bytes {
+        volatile_write_u8(msg_addr + i, volatile_read_u8(msg_start + i))
+        i = i + 1
+    }
+}
+
+@kernel fn cmd_run_hello() {
+    cprintln("Installing user hello program...", YELLOW_ON_BLACK)
+    user_install_hello_v2()
+    cprintln("  Code:  32 bytes at 0x2000000", WHITE_ON_BLACK)
+    cprintln("  Stack: 4KB at 0x2FF0000", WHITE_ON_BLACK)
+    cprintln("  Entry: 0x2000000", WHITE_ON_BLACK)
+    cprintln("  Transitioning to Ring 3...", YELLOW_ON_BLACK)
+    println("[RING3] Entering user mode")
+
+    // Transition to Ring 3 via IRETQ
+    // User code will SYSCALL(SYS_WRITE) → serial output → SYSCALL(SYS_EXIT) → halt
+    iretq_to_user(USER_CODE_BASE, USER_STACK_BASE + 0xFF0, 0x202)
+
+    // We reach here only if user program returns (SYS_EXIT halts, so we won't)
+    println("[RING3] User program returned")
+    cprintln("  User program completed", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_run_fajaros() {
+    // Second user program: prints "FajarOS Nova!\n"
+    let msg_buf: i64 = 0x830500
+    volatile_write_u8(msg_buf, 70)      // F
+    volatile_write_u8(msg_buf + 1, 97)  // a
+    volatile_write_u8(msg_buf + 2, 106) // j
+    volatile_write_u8(msg_buf + 3, 97)  // a
+    volatile_write_u8(msg_buf + 4, 114) // r
+    volatile_write_u8(msg_buf + 5, 79)  // O
+    volatile_write_u8(msg_buf + 6, 83)  // S
+    volatile_write_u8(msg_buf + 7, 32)  // ' '
+    volatile_write_u8(msg_buf + 8, 78)  // N
+    volatile_write_u8(msg_buf + 9, 111) // o
+    volatile_write_u8(msg_buf + 10, 118) // v
+    volatile_write_u8(msg_buf + 11, 97)  // a
+    volatile_write_u8(msg_buf + 12, 33)  // !
+    volatile_write_u8(msg_buf + 13, 10)  // \n
+
+    // Install at different address (0x2001000)
+    cprintln("Installing user 'FajarOS' program...", YELLOW_ON_BLACK)
+    user_install_program(0x2001000, msg_buf, 14)
+    map_page(0x2F00000, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+    volatile_write_u64(0x6FC04, 0x7F0000)
+    println("[RING3] Running program 2: FajarOS Nova!")
+    iretq_to_user(0x2001000, 0x2F00FF0, 0x202)
+}
+
+// ── Login Shell (Sprint N4) ──
+
+@kernel fn cmd_login() {
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("FajarOS Nova v0.5.0", CYAN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    cprint("login: ", WHITE_ON_BLACK)
+    cprintln("root", GREEN_ON_BLACK)
+    cprint("password: ", WHITE_ON_BLACK)
+    cprintln("(none)", YELLOW_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("Welcome to FajarOS Nova!", GREEN_ON_BLACK)
+    cprintln("Type 'help' for commands.", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_whoami_v2() {
+    cprintln("root", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_hostname_v2() {
+    cprintln("nova", CYAN_ON_BLACK)
+}
+
+// ── System Info (Sprint N5) ──
+
+@kernel fn cmd_neofetch_v2() {
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("  ╔══════════════════════════╗", CYAN_ON_BLACK)
+    cprintln("  ║   FajarOS Nova v0.5.0    ║", CYAN_ON_BLACK)
+    cprintln("  ║   x86_64 bare-metal      ║", CYAN_ON_BLACK)
+    cprintln("  ╚══════════════════════════╝", CYAN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    cprint("  OS:      ", WHITE_ON_BLACK)
+    cprintln("FajarOS Nova v0.5.0 \"Resilience\"", GREEN_ON_BLACK)
+    cprint("  Arch:    ", WHITE_ON_BLACK)
+    cprintln("x86_64", CYAN_ON_BLACK)
+    cprint("  Lang:    ", WHITE_ON_BLACK)
+    cprintln("100% Fajar Lang", GREEN_ON_BLACK)
+    cprint("  Kernel:  ", WHITE_ON_BLACK)
+    cprintln("8500+ LOC, monolithic", WHITE_ON_BLACK)
+    cprint("  Shell:   ", WHITE_ON_BLACK)
+    cprintln("fjsh (140+ commands)", WHITE_ON_BLACK)
+    cprint("  Storage: ", WHITE_ON_BLACK)
+    cprintln("NVMe + FAT32 + ramfs", CYAN_ON_BLACK)
+    cprint("  Net:     ", WHITE_ON_BLACK)
+    cprintln("TCP/IP (ARP, IPv4, ICMP)", WHITE_ON_BLACK)
+    cprint("  VFS:     ", WHITE_ON_BLACK)
+    cprintln("/ /dev /proc /mnt", WHITE_ON_BLACK)
+    cprint("  Procs:   ", WHITE_ON_BLACK)
+    cprintln("16 PIDs, fork/exec/wait", WHITE_ON_BLACK)
+    cprint("  User:    ", WHITE_ON_BLACK)
+    cprintln("Ring 3 ready (IRETQ)", YELLOW_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+}

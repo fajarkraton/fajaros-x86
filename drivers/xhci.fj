@@ -1,0 +1,196 @@
+// FajarOS Nova v0.5.0 — USB XHCI Controller Driver
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// USB XHCI Detection (Sprint B8)
+// ═══════════════════════════════════════════════
+
+@kernel fn usb_find_xhci() -> i64 {
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let cl = pci_read32(0, dev, 0, 8)
+            let class = (cl >> 24) & 0xFF
+            let subclass = (cl >> 16) & 0xFF
+            let progif = (cl >> 8) & 0xFF
+            // USB: class 0x0C, subclass 0x03, progif 0x30=XHCI
+            if class == 0x0C && subclass == 0x03 && progif == 0x30 { return dev }
+        }
+        dev = dev + 1
+    }
+    -1
+}
+
+@kernel fn cmd_lsusb() {
+    cprintln("USB Controllers:", YELLOW_ON_BLACK)
+    let mut dev: i64 = 0
+    let mut found: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let cl = pci_read32(0, dev, 0, 8)
+            let class = (cl >> 24) & 0xFF
+            let subclass = (cl >> 16) & 0xFF
+            let progif = (cl >> 8) & 0xFF
+            if class == 0x0C && subclass == 0x03 {
+                cprint("  PCI ", WHITE_ON_BLACK)
+                cprint_decimal(dev, CYAN_ON_BLACK)
+                cprint(": USB ", WHITE_ON_BLACK)
+                if progif == 0x00 { cprint("UHCI", WHITE_ON_BLACK) }
+                else if progif == 0x10 { cprint("OHCI", WHITE_ON_BLACK) }
+                else if progif == 0x20 { cprint("EHCI", WHITE_ON_BLACK) }
+                else if progif == 0x30 { cprint("XHCI", GREEN_ON_BLACK) }
+                else { cprint("Unknown", RED_ON_BLACK) }
+                let vid = id & 0xFFFF
+                let did = (id >> 16) & 0xFFFF
+                cprint(" (", WHITE_ON_BLACK)
+                cprint_hex(vid, 4, CYAN_ON_BLACK)
+                cprint(":", WHITE_ON_BLACK)
+                cprint_hex(did, 4, CYAN_ON_BLACK)
+                cprintln(")", WHITE_ON_BLACK)
+
+                // Read BAR0 for MMIO base
+                let bar0 = pci_read32(0, dev, 0, 0x10)
+                if bar0 != 0 {
+                    cprint("    BAR0: 0x", WHITE_ON_BLACK)
+                    cprint_hex(bar0 & 0xFFFFF000, 8, CYAN_ON_BLACK)
+                    console_putchar(10, WHITE_ON_BLACK)
+                }
+                found = found + 1
+            }
+        }
+        dev = dev + 1
+    }
+    if found == 0 { cprintln("  No USB controllers found", YELLOW_ON_BLACK) }
+}
+
+// XHCI Controller Initialization
+const XHCI_STATE: i64 = 0x89A000
+// +0: bar_addr, +8: cap_length, +16: max_slots, +24: max_ports, +32: initialized
+
+@kernel fn xhci_init() -> i64 {
+    let dev = usb_find_xhci()
+    if dev == -1 { return -1 }
+
+    // Enable PCI bus master + memory space
+    let cmd = pci_read32(0, dev, 0, 0x04)
+    pci_write32(0, dev, 0, 0x04, cmd | 0x06)
+
+    // Get BAR0 (MMIO)
+    let bar0 = pci_read32(0, dev, 0, 0x10)
+    if bar0 & 1 != 0 { return -2 } // Not MMIO
+    let base = bar0 & 0xFFFFF000
+
+    // Map MMIO pages
+    map_page(base, base, PAGE_PRESENT | PAGE_WRITABLE)
+    map_page(base + 0x1000, base + 0x1000, PAGE_PRESENT | PAGE_WRITABLE)
+
+    volatile_write_u64(XHCI_STATE, base)
+
+    // Read CAPLENGTH (byte at offset 0)
+    let cap_length = volatile_read_u8(base) & 0xFF
+    volatile_write_u64(XHCI_STATE + 8, cap_length)
+
+    // Read HCSPARAMS1 (offset 0x04)
+    let hcsparams1 = volatile_read_u32(base + 4)
+    let max_slots = hcsparams1 & 0xFF
+    let max_ports = (hcsparams1 >> 24) & 0xFF
+    volatile_write_u64(XHCI_STATE + 16, max_slots)
+    volatile_write_u64(XHCI_STATE + 24, max_ports)
+
+    // Operational registers at base + cap_length
+    let op_base = base + cap_length
+
+    // Read USBSTS — check if halted
+    let usbsts = volatile_read_u32(op_base + 0x04)
+    let halted = usbsts & 1
+
+    // If running, halt first
+    if halted == 0 {
+        let usbcmd = volatile_read_u32(op_base)
+        volatile_write_u32(op_base, usbcmd & 0xFFFFFFFE) // Clear RS bit
+        // Wait for HCHalted
+        let mut wait: i64 = 100000
+        while volatile_read_u32(op_base + 0x04) & 1 == 0 && wait > 0 {
+            pause()
+            wait = wait - 1
+        }
+    }
+
+    // Reset controller
+    volatile_write_u32(op_base, 0x02) // HCRST
+    let mut wait: i64 = 100000
+    while volatile_read_u32(op_base) & 0x02 != 0 && wait > 0 {
+        pause()
+        wait = wait - 1
+    }
+
+    // Check port status
+    let port_base = op_base + 0x400
+    let mut connected: i64 = 0
+    let mut p: i64 = 0
+    while p < max_ports {
+        let portsc = volatile_read_u32(port_base + p * 0x10)
+        let ccs = portsc & 1 // Current Connect Status
+        if ccs != 0 { connected = connected + 1 }
+        p = p + 1
+    }
+
+    volatile_write_u64(XHCI_STATE + 32, 1) // initialized
+    frame_mark_used(XHCI_STATE / FRAME_SIZE)
+    connected
+}
+
+@kernel fn cmd_xhci_info() {
+    cprintln("XHCI Controller:", YELLOW_ON_BLACK)
+    let result = xhci_init()
+    if result < 0 {
+        cprintln("  No XHCI controller found", RED_ON_BLACK)
+        return
+    }
+    let base = volatile_read_u64(XHCI_STATE)
+    let cap_len = volatile_read_u64(XHCI_STATE + 8)
+    let max_slots = volatile_read_u64(XHCI_STATE + 16)
+    let max_ports = volatile_read_u64(XHCI_STATE + 24)
+
+    cprint("  BAR0: 0x", WHITE_ON_BLACK)
+    cprint_hex(base, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  CAPLENGTH: ", WHITE_ON_BLACK)
+    cprint_decimal(cap_len, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Max Slots: ", WHITE_ON_BLACK)
+    cprint_decimal(max_slots, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Max Ports: ", WHITE_ON_BLACK)
+    cprint_decimal(max_ports, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Connected: ", WHITE_ON_BLACK)
+    cprint_decimal(result, if result > 0 { GREEN_ON_BLACK } else { YELLOW_ON_BLACK })
+    cprintln(" device(s)", WHITE_ON_BLACK)
+
+    // Show per-port status
+    let op_base = base + cap_len
+    let port_base = op_base + 0x400
+    let mut p: i64 = 0
+    while p < max_ports {
+        let portsc = volatile_read_u32(port_base + p * 0x10)
+        let ccs = portsc & 1
+        let ped = (portsc >> 1) & 1
+        let speed = (portsc >> 10) & 0xF
+        if ccs != 0 {
+            cprint("  Port ", WHITE_ON_BLACK)
+            cprint_decimal(p + 1, CYAN_ON_BLACK)
+            cprint(": CONNECTED", GREEN_ON_BLACK)
+            cprint(" speed=", WHITE_ON_BLACK)
+            if speed == 1 { cprint("Full(12M)", WHITE_ON_BLACK) }
+            else if speed == 2 { cprint("Low(1.5M)", WHITE_ON_BLACK) }
+            else if speed == 3 { cprint("High(480M)", WHITE_ON_BLACK) }
+            else if speed == 4 { cprint("Super(5G)", CYAN_ON_BLACK) }
+            else { cprint_decimal(speed, WHITE_ON_BLACK) }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        p = p + 1
+    }
+}

@@ -1,98 +1,106 @@
-// FajarOS Nova — VGA Text Mode Driver
-// Standard VGA text buffer at 0xB8000
-// 80 columns × 25 rows = 2000 character cells
-// Each cell: [ASCII byte][attribute byte]
+// FajarOS Nova v0.5.0 — VGA Console Engine
+// Part of the modular kernel build (concatenated by Makefile)
 
-const VGA_BASE: i64 = 0xB8000
-const VGA_COLS: i64 = 80
-const VGA_ROWS: i64 = 25
+// ═══════════════════════════════════════════════
+// VGA Console Engine
+// ═══════════════════════════════════════════════
 
-// Color constants (4-bit)
-const COLOR_BLACK: i64 = 0
-const COLOR_BLUE: i64 = 1
-const COLOR_GREEN: i64 = 2
-const COLOR_CYAN: i64 = 3
-const COLOR_RED: i64 = 4
-const COLOR_MAGENTA: i64 = 5
-const COLOR_BROWN: i64 = 6
-const COLOR_LIGHT_GREY: i64 = 7
-const COLOR_DARK_GREY: i64 = 8
-const COLOR_LIGHT_BLUE: i64 = 9
-const COLOR_LIGHT_GREEN: i64 = 10
-const COLOR_LIGHT_CYAN: i64 = 11
-const COLOR_LIGHT_RED: i64 = 12
-const COLOR_PINK: i64 = 13
-const COLOR_YELLOW: i64 = 14
-const COLOR_WHITE: i64 = 15
-
-// Make attribute byte: foreground + background
-@kernel
-fn vga_color(fg: i64, bg: i64) -> i64 {
-    (bg << 4) | fg
-}
-
-// Clear entire screen with given color
-@kernel
-fn vga_clear_screen(color: i64) {
-    let mut i = 0
+@kernel fn console_init() {
+    let mut i: i64 = 0
     while i < VGA_COLS * VGA_ROWS {
-        let addr = VGA_BASE + i * 2
-        volatile_write(addr, 0x20)      // space character
-        volatile_write(addr + 1, color) // attribute
+        volatile_write(VGA_BASE + i * 2, 0x20)
+        volatile_write(VGA_BASE + i * 2 + 1, WHITE_ON_BLACK)
         i = i + 1
     }
+    volatile_write(0x6FA00, 0)
+    volatile_write(0x6FA08, 0)
 }
 
-// Write character at (row, col) with color
-@kernel
-fn vga_write_char(row: i64, col: i64, ch: i64, color: i64) {
-    if row >= 0 && row < VGA_ROWS && col >= 0 && col < VGA_COLS {
-        let addr = VGA_BASE + (row * VGA_COLS + col) * 2
-        volatile_write(addr, ch)
-        volatile_write(addr + 1, color)
-    }
-}
-
-// Scroll screen up by one line
-@kernel
-fn vga_scroll_up() {
-    // Move rows 1-24 to 0-23
-    let mut i = 0
+@kernel fn console_scroll() {
+    let mut i: i64 = 0
     while i < VGA_COLS * (VGA_ROWS - 1) {
-        let src = VGA_BASE + (i + VGA_COLS) * 2
-        let dst = VGA_BASE + i * 2
-        volatile_write(dst, volatile_read(src))
-        volatile_write(dst + 1, volatile_read(src + 1))
+        let s = VGA_BASE + (i + VGA_COLS) * 2
+        let d = VGA_BASE + i * 2
+        volatile_write(d, volatile_read(s))
+        volatile_write(d + 1, volatile_read(s + 1))
         i = i + 1
     }
-
-    // Clear last row
-    let last_row_start = VGA_COLS * (VGA_ROWS - 1)
-    let mut j = 0
+    let mut j: i64 = 0
     while j < VGA_COLS {
-        let addr = VGA_BASE + (last_row_start + j) * 2
-        volatile_write(addr, 0x20)
-        volatile_write(addr + 1, vga_color(COLOR_LIGHT_GREY, COLOR_BLACK))
+        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2, 0x20)
+        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2 + 1, WHITE_ON_BLACK)
         j = j + 1
     }
 }
 
-// Move hardware cursor to (row, col)
-// VGA cursor is controlled via I/O ports 0x3D4 (index) and 0x3D5 (data)
-@kernel
-fn vga_set_cursor(row: i64, col: i64) {
-    let pos = row * VGA_COLS + col
-    port_outb(0x3D4, 14)              // Cursor high byte register
-    port_outb(0x3D5, (pos >> 8) & 0xFF)
-    port_outb(0x3D4, 15)              // Cursor low byte register
-    port_outb(0x3D5, pos & 0xFF)
+@kernel fn console_putchar(ch: i64, color: i64) {
+    let row = volatile_read(0x6FA00)
+    let col = volatile_read(0x6FA08)
+    if ch == 10 {
+        volatile_write(0x6FA08, 0)
+        if row >= VGA_ROWS - 1 { console_scroll() }
+        else { volatile_write(0x6FA00, row + 1) }
+        return
+    }
+    if ch == 8 {
+        if col > 0 {
+            volatile_write(0x6FA08, col - 1)
+            let addr = VGA_BASE + (row * VGA_COLS + col - 1) * 2
+            volatile_write(addr, 0x20)
+            volatile_write(addr + 1, color)
+        }
+        return
+    }
+    let addr = VGA_BASE + (row * VGA_COLS + col) * 2
+    volatile_write(addr, ch)
+    volatile_write(addr + 1, color)
+    if col >= VGA_COLS - 1 {
+        volatile_write(0x6FA08, 0)
+        if row >= VGA_ROWS - 1 { console_scroll() }
+        else { volatile_write(0x6FA00, row + 1) }
+    } else {
+        volatile_write(0x6FA08, col + 1)
+    }
+    vga_update_cursor()
 }
 
-// Enable hardware cursor (underline style)
-@kernel
-fn vga_enable_cursor() {
-    port_outb(0x3D4, 0x0A)
-    port_outb(0x3D5, (port_inb(0x3D5) & 0xC0) | 14)  // Cursor start = 14
-    port_outb(0x3D4, 0x0B)
-    port_outb(0x3D5, (port_inb(0x3D5) & 0xE0) | 15)  // Cursor end = 15
+@kernel fn cprint(s: str, color: i64) {
+    let len = str_len(s)
+    let mut i: i64 = 0
+    while i < len { console_putchar(str_byte_at(s, i), color); i = i + 1 }
+}
+
+@kernel fn cprintln(s: str, color: i64) {
+    cprint(s, color)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cprint_decimal(val: i64, color: i64) {
+    if val == 0 { console_putchar(48, color); return }
+    let mut buf: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut v = val
+    let mut len: i64 = 0
+    while v > 0 { buf[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
+    let mut i: i64 = 0
+    while i < len { console_putchar(buf[len - 1 - i], color); i = i + 1 }
+}
+
+@kernel fn cprint_hex(val: i64, digits: i64, color: i64) {
+    let mut i = digits - 1
+    while i >= 0 {
+        let n = (val >> (i * 4)) & 0xF
+        if n < 10 { console_putchar(48 + n, color) }
+        else { console_putchar(55 + n, color) }
+        i = i - 1
+    }
+}
+
+@kernel fn vga_update_cursor() {
+    let row = volatile_read(0x6FA00)
+    let col = volatile_read(0x6FA08)
+    let pos = row * VGA_COLS + col
+    port_outb(0x3D4, 14)
+    port_outb(0x3D5, (pos >> 8) & 0xFF)
+    port_outb(0x3D4, 15)
+    port_outb(0x3D5, pos & 0xFF)
 }

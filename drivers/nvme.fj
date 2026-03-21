@@ -1,0 +1,645 @@
+// FajarOS Nova v0.5.0 — NVMe Block Device Driver
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// NVMe Block Device Driver (Phase 11 Sprint 31-33)
+// NVMe spec 1.4 — Admin queue + I/O queue + sector R/W
+// Memory layout:
+//   0x800000 — Admin SQ (4KB, 64 entries × 64 bytes)
+//   0x801000 — Admin CQ (4KB, 64 entries × 16 bytes)
+//   0x802000 — I/O SQ   (4KB, 64 entries × 64 bytes)
+//   0x803000 — I/O CQ   (4KB, 64 entries × 16 bytes)
+//   0x810000 — DMA data buffer (64KB for sector I/O)
+//   0xA00000 — Ramdisk  (1MB, fallback block device)
+// ═══════════════════════════════════════════════
+
+const NVME_ASQ: i64 = 0x800000
+const NVME_ACQ: i64 = 0x801000
+const NVME_ISQ: i64 = 0x802000
+const NVME_ICQ: i64 = 0x803000
+const NVME_DMA: i64 = 0x810000
+const NVME_QUEUE_ENTRIES: i64 = 64
+const NVME_SQE_SIZE: i64 = 64
+const NVME_CQE_SIZE: i64 = 16
+const RAMDISK_BASE: i64 = 0xA00000
+const RAMDISK_SIZE: i64 = 0x100000
+
+// NVMe register offsets (from BAR0)
+const NVME_REG_CAP: i64 = 0x00
+const NVME_REG_VS: i64 = 0x08
+const NVME_REG_INTMS: i64 = 0x0C
+const NVME_REG_INTMC: i64 = 0x10
+const NVME_REG_CC: i64 = 0x14
+const NVME_REG_CSTS: i64 = 0x1C
+const NVME_REG_AQA: i64 = 0x24
+const NVME_REG_ASQ: i64 = 0x28
+const NVME_REG_ACQ: i64 = 0x30
+
+// NVMe global state
+const NVME_STATE: i64 = 0x804000
+// +0: bar_addr (i64)
+// +8: sq_tail (i64) — admin SQ tail
+// +16: cq_head (i64) — admin CQ head
+// +24: phase (i64) — CQ phase bit (1 or 0)
+// +32: cmd_id (i64) — next command ID
+// +40: dstride (i64) — doorbell stride (from CAP)
+// +48: io_sq_tail (i64) — I/O SQ tail
+// +56: io_cq_head (i64) — I/O CQ head
+// +64: io_phase (i64) — I/O CQ phase
+// +72: nsid (i64) — namespace ID (usually 1)
+// +80: ns_size (i64) — namespace size in LBAs
+// +88: sector_size (i64) — bytes per sector (usually 512)
+// +96: initialized (i64) — 1 if driver ready
+
+@kernel fn nvme_state_read(offset: i64) -> i64 {
+    volatile_read_u64(NVME_STATE + offset)
+}
+
+@kernel fn nvme_state_write(offset: i64, val: i64) {
+    volatile_write_u64(NVME_STATE + offset, val)
+}
+
+@kernel fn nvme_reg_read32(offset: i64) -> i64 {
+    let bar = nvme_state_read(0)
+    volatile_read_u32(bar + offset)
+}
+
+@kernel fn nvme_reg_write32(offset: i64, val: i64) {
+    let bar = nvme_state_read(0)
+    volatile_write_u32(bar + offset, val)
+}
+
+// ── Sprint 31.1-31.2: Admin Queue Setup ──
+
+@kernel fn nvme_clear_queue(base: i64, size: i64) {
+    let mut i: i64 = 0
+    while i < size {
+        volatile_write_u64(base + i, 0)
+        i = i + 8
+    }
+}
+
+@kernel fn nvme_admin_sq_write(slot: i64, dword_idx: i64, val: i64) {
+    // Each SQE is 64 bytes = 16 dwords
+    volatile_write_u32(NVME_ASQ + slot * NVME_SQE_SIZE + dword_idx * 4, val)
+}
+
+@kernel fn nvme_admin_cq_read(slot: i64, dword_idx: i64) -> i64 {
+    volatile_read_u32(NVME_ACQ + slot * NVME_CQE_SIZE + dword_idx * 4)
+}
+
+// ── Sprint 31.3-31.5: Controller Enable ──
+
+@kernel fn nvme_init() -> i64 {
+    let dev = nvme_find_controller()
+    if dev == -1 { return -1 }
+
+    // Get BAR0 (MMIO base)
+    let bar0 = pci_read32(0, dev, 0, 0x10)
+    if (bar0 & 1) != 0 || bar0 == 0 { return -2 }
+    let bar_addr = bar0 & 0xFFFFF000
+
+    // Enable bus master + memory space in PCI command register
+    let cmd = pci_read32(0, dev, 0, 0x04)
+    pci_write32(0, dev, 0, 0x04, cmd | 0x06)
+
+    // Map BAR0 pages (may need multiple pages for large register sets)
+    map_page(bar_addr, bar_addr, PAGE_PRESENT | PAGE_WRITABLE)
+    map_page(bar_addr + 0x1000, bar_addr + 0x1000, PAGE_PRESENT | PAGE_WRITABLE)
+
+    // Store BAR address
+    nvme_state_write(0, bar_addr)
+
+    // Read CAP for doorbell stride and max queue entries
+    let cap_lo = volatile_read_u32(bar_addr + NVME_REG_CAP)
+    let cap_hi = volatile_read_u32(bar_addr + NVME_REG_CAP + 4)
+    let dstride = ((cap_hi >> 0) & 0xF)  // DSTRIDE field is bits 35:32 of CAP
+    nvme_state_write(40, dstride)
+
+    // Disable controller (CC.EN = 0)
+    nvme_reg_write32(NVME_REG_CC, 0)
+
+    // Wait for CSTS.RDY = 0 (controller not ready)
+    let mut timeout: i64 = 50000000
+    while (nvme_reg_read32(NVME_REG_CSTS) & 1) != 0 && timeout > 0 {
+        pause()
+        timeout = timeout - 1
+    }
+    if timeout == 0 { return -3 }
+
+    // Clear admin queues
+    nvme_clear_queue(NVME_ASQ, NVME_QUEUE_ENTRIES * NVME_SQE_SIZE)
+    nvme_clear_queue(NVME_ACQ, NVME_QUEUE_ENTRIES * NVME_CQE_SIZE)
+
+    // Mark NVMe queue memory as used in frame allocator
+    let mut f: i64 = 0x800000 / FRAME_SIZE
+    while f < 0x805000 / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
+    // DMA buffer
+    f = NVME_DMA / FRAME_SIZE
+    while f < (NVME_DMA + 0x10000) / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
+
+    // Map DMA buffer pages
+    let mut pg: i64 = NVME_DMA
+    while pg < NVME_DMA + 0x10000 {
+        map_page(pg, pg, PAGE_PRESENT | PAGE_WRITABLE)
+        pg = pg + FRAME_SIZE
+    }
+
+    // Set AQA: admin queue attributes (entries - 1 for both SQ and CQ)
+    let aqa = ((NVME_QUEUE_ENTRIES - 1) << 16) | (NVME_QUEUE_ENTRIES - 1)
+    nvme_reg_write32(NVME_REG_AQA, aqa)
+
+    // Set ASQ: admin submission queue base (physical address, 4KB aligned)
+    volatile_write_u32(bar_addr + NVME_REG_ASQ, NVME_ASQ & 0xFFFFFFFF)
+    volatile_write_u32(bar_addr + NVME_REG_ASQ + 4, 0)
+
+    // Set ACQ: admin completion queue base
+    volatile_write_u32(bar_addr + NVME_REG_ACQ, NVME_ACQ & 0xFFFFFFFF)
+    volatile_write_u32(bar_addr + NVME_REG_ACQ + 4, 0)
+
+    // Initialize state
+    nvme_state_write(8, 0)    // sq_tail = 0
+    nvme_state_write(16, 0)   // cq_head = 0
+    nvme_state_write(24, 1)   // phase = 1
+    nvme_state_write(32, 0)   // cmd_id = 0
+    nvme_state_write(48, 0)   // io_sq_tail = 0
+    nvme_state_write(56, 0)   // io_cq_head = 0
+    nvme_state_write(64, 1)   // io_phase = 1
+    nvme_state_write(72, 1)   // nsid = 1
+    nvme_state_write(88, 512) // sector_size default
+
+    // Enable controller: CC = MPS=0 | CSS=NVM(0) | EN=1
+    // CC bits: EN(0), CSS(4:6)=0, MPS(7:10)=0, AMS(11:13)=0, SHN(14:15)=0, IOSQES(16:19)=6, IOCQES(20:23)=4
+    let cc = 1 | (6 << 16) | (4 << 20)  // EN=1, IOSQES=64B(2^6), IOCQES=16B(2^4)
+    nvme_reg_write32(NVME_REG_CC, cc)
+
+    // Wait for CSTS.RDY = 1
+    timeout = 50000000
+    while (nvme_reg_read32(NVME_REG_CSTS) & 1) == 0 && timeout > 0 {
+        pause()
+        timeout = timeout - 1
+    }
+    if timeout == 0 { return -4 }
+
+    nvme_state_write(96, 1) // initialized = 1
+    0
+}
+
+// ── Sprint 31.6-31.8: Admin Command Submission ──
+
+@kernel fn nvme_admin_submit(opcode: i64, nsid: i64, cdw10: i64, cdw11: i64, prp1: i64, prp2: i64) -> i64 {
+    let sq_tail = nvme_state_read(8)
+    let cmd_id = nvme_state_read(32)
+    let slot = sq_tail
+
+    // Build submission queue entry (16 dwords = 64 bytes)
+    // CDW0: opcode(7:0) | FUSE(9:8)=0 | CID(31:16)
+    nvme_admin_sq_write(slot, 0, opcode | ((cmd_id & 0xFFFF) << 16))
+    nvme_admin_sq_write(slot, 1, nsid)   // NSID
+    nvme_admin_sq_write(slot, 2, 0)      // CDW2 reserved
+    nvme_admin_sq_write(slot, 3, 0)      // CDW3 reserved
+    nvme_admin_sq_write(slot, 4, 0)      // MPTR low
+    nvme_admin_sq_write(slot, 5, 0)      // MPTR high
+    nvme_admin_sq_write(slot, 6, prp1 & 0xFFFFFFFF)  // PRP1 low
+    nvme_admin_sq_write(slot, 7, (prp1 >> 32) & 0xFFFFFFFF) // PRP1 high
+    nvme_admin_sq_write(slot, 8, prp2 & 0xFFFFFFFF)  // PRP2 low
+    nvme_admin_sq_write(slot, 9, (prp2 >> 32) & 0xFFFFFFFF) // PRP2 high
+    nvme_admin_sq_write(slot, 10, cdw10) // CDW10
+    nvme_admin_sq_write(slot, 11, cdw11) // CDW11
+    nvme_admin_sq_write(slot, 12, 0)     // CDW12
+    nvme_admin_sq_write(slot, 13, 0)     // CDW13
+    nvme_admin_sq_write(slot, 14, 0)     // CDW14
+    nvme_admin_sq_write(slot, 15, 0)     // CDW15
+
+    // Advance SQ tail
+    let new_tail = (sq_tail + 1) % NVME_QUEUE_ENTRIES
+    nvme_state_write(8, new_tail)
+    nvme_state_write(32, cmd_id + 1)
+
+    // Ring doorbell: SQ0 tail doorbell at BAR0 + 0x1000
+    let bar = nvme_state_read(0)
+    memory_fence()
+    volatile_write_u32(bar + 0x1000, new_tail)
+
+    cmd_id
+}
+
+@kernel fn nvme_admin_wait_completion() -> i64 {
+    let cq_head = nvme_state_read(16)
+    let phase = nvme_state_read(24)
+
+    // Poll CQ for completion (phase tag = bit 16 of DW3)
+    let mut timeout: i64 = 50000000
+    let mut status: i64 = 0
+    while timeout > 0 {
+        let dw3 = nvme_admin_cq_read(cq_head, 3) // Status field + phase tag + CID
+        let cq_phase = (dw3 >> 16) & 1  // Phase tag is bit 16
+        if cq_phase == (phase & 1) {
+            // Completion arrived
+            status = (dw3 >> 17) & 0x7FFF // Status code (bits 31:17)
+            // Advance CQ head
+            let new_head = (cq_head + 1) % NVME_QUEUE_ENTRIES
+            nvme_state_write(16, new_head)
+            // Toggle phase if wrapped
+            if new_head == 0 {
+                nvme_state_write(24, 1 - phase)
+            }
+            // Ring CQ0 head doorbell at BAR0 + 0x1000 + 1*stride
+            let bar = nvme_state_read(0)
+            let dstride = nvme_state_read(40)
+            let cq_db_offset = 0x1000 + (2 * 0 + 1) * (4 << dstride)
+            volatile_write_u32(bar + cq_db_offset, new_head)
+            return status
+        }
+        pause()
+        timeout = timeout - 1
+    }
+    -1 // Timeout
+}
+
+// ── Sprint 31.6-31.7: Identify Controller + Namespace ──
+
+@kernel fn nvme_identify_controller() -> i64 {
+    // Identify Controller: opcode 0x06, CNS=1 (CDW10)
+    // Result written to PRP1 buffer (4KB)
+    nvme_clear_queue(NVME_DMA, 4096)
+    let cmd_id = nvme_admin_submit(0x06, 0, 1, 0, NVME_DMA, 0)
+    let status = nvme_admin_wait_completion()
+    if status != 0 { return -1 }
+    // Parse: bytes 24-63 = serial number, 64-103 = model number
+    0
+}
+
+@kernel fn nvme_identify_namespace() -> i64 {
+    // Identify Namespace: opcode 0x06, CNS=0 (CDW10), NSID=1
+    nvme_clear_queue(NVME_DMA, 4096)
+    let cmd_id = nvme_admin_submit(0x06, 1, 0, 0, NVME_DMA, 0)
+    let status = nvme_admin_wait_completion()
+    if status != 0 { return -1 }
+    // Parse NSZE: namespace size at offset 0 (8 bytes, little-endian)
+    let nsze = buffer_read_u64_le(NVME_DMA)
+    nvme_state_write(80, nsze)
+    // Parse LBAF0: offset 128 + 0*4 = 128, bits 23:16 = LBADS (log2 sector size)
+    let lbaf0 = buffer_read_u32_le(NVME_DMA + 128)
+    let lbads = (lbaf0 >> 16) & 0xFF
+    let sector_size = 1 << lbads
+    nvme_state_write(88, sector_size)
+    0
+}
+
+// ── Sprint 32: I/O Queue Setup ──
+
+@kernel fn nvme_create_io_queues() -> i64 {
+    // Clear I/O queues
+    nvme_clear_queue(NVME_ISQ, NVME_QUEUE_ENTRIES * NVME_SQE_SIZE)
+    nvme_clear_queue(NVME_ICQ, NVME_QUEUE_ENTRIES * NVME_CQE_SIZE)
+
+    // Create I/O Completion Queue: admin opcode 0x05
+    // CDW10: QSIZE(31:16) | QID(15:0) = (entries-1)<<16 | 1
+    // CDW11: PC(0)=1 (physically contiguous) | IEN(1)=0 | IV(31:16)=0
+    let cdw10_cq = ((NVME_QUEUE_ENTRIES - 1) << 16) | 1
+    let cdw11_cq = 1 // PC=1, no interrupt
+    println("[NVMe] Submit Create I/O CQ...")
+    nvme_admin_submit(0x05, 0, cdw10_cq, cdw11_cq, NVME_ICQ, 0)
+    println("[NVMe] Waiting CQ completion...")
+    let status = nvme_admin_wait_completion()
+    println("[NVMe] CQ status received")
+    if status != 0 {
+        println("[NVMe] Create I/O CQ failed")
+        return -1
+    }
+    println("[NVMe] I/O CQ created")
+
+    // Create I/O Submission Queue: admin opcode 0x01
+    // CDW10: QSIZE(31:16) | QID(15:0) = (entries-1)<<16 | 1
+    // CDW11: PC(0)=1 | QPRIO(2:1)=0 | CQID(31:16)=1
+    let cdw10_sq = ((NVME_QUEUE_ENTRIES - 1) << 16) | 1
+    let cdw11_sq = 1 | (1 << 16) // PC=1, CQID=1
+    println("[NVMe] Submit Create I/O SQ...")
+    nvme_admin_submit(0x01, 0, cdw10_sq, cdw11_sq, NVME_ISQ, 0)
+    println("[NVMe] Waiting SQ completion...")
+    let status2 = nvme_admin_wait_completion()
+    println("[NVMe] SQ status received")
+    if status2 != 0 {
+        println("[NVMe] Create I/O SQ failed")
+        return -2
+    }
+    0
+}
+
+// ── Sprint 33: NVM Read/Write Commands ──
+
+@kernel fn nvme_io_sq_write(slot: i64, dword_idx: i64, val: i64) {
+    volatile_write_u32(NVME_ISQ + slot * NVME_SQE_SIZE + dword_idx * 4, val)
+}
+
+@kernel fn nvme_io_cq_read(slot: i64, dword_idx: i64) -> i64 {
+    volatile_read_u32(NVME_ICQ + slot * NVME_CQE_SIZE + dword_idx * 4)
+}
+
+@kernel fn nvme_io_submit(opcode: i64, lba: i64, count: i64, prp1: i64) -> i64 {
+    let sq_tail = nvme_state_read(48)
+    let cmd_id = nvme_state_read(32)
+    let nsid = nvme_state_read(72)
+    let slot = sq_tail
+
+    // Build NVM command SQE
+    nvme_io_sq_write(slot, 0, opcode | ((cmd_id & 0xFFFF) << 16))
+    nvme_io_sq_write(slot, 1, nsid)
+    nvme_io_sq_write(slot, 2, 0)
+    nvme_io_sq_write(slot, 3, 0)
+    nvme_io_sq_write(slot, 4, 0)
+    nvme_io_sq_write(slot, 5, 0)
+    nvme_io_sq_write(slot, 6, prp1 & 0xFFFFFFFF)
+    nvme_io_sq_write(slot, 7, (prp1 >> 32) & 0xFFFFFFFF)
+    nvme_io_sq_write(slot, 8, 0) // PRP2 low (single-page I/O)
+    nvme_io_sq_write(slot, 9, 0) // PRP2 high
+    nvme_io_sq_write(slot, 10, lba & 0xFFFFFFFF) // Starting LBA low
+    nvme_io_sq_write(slot, 11, (lba >> 32) & 0xFFFFFFFF) // Starting LBA high
+    nvme_io_sq_write(slot, 12, (count - 1) & 0xFFFF) // Number of logical blocks (0-based)
+    nvme_io_sq_write(slot, 13, 0)
+    nvme_io_sq_write(slot, 14, 0)
+    nvme_io_sq_write(slot, 15, 0)
+
+    let new_tail = (sq_tail + 1) % NVME_QUEUE_ENTRIES
+    nvme_state_write(48, new_tail)
+    nvme_state_write(32, cmd_id + 1)
+
+    // Ring I/O SQ doorbell: QID=1, so offset = 0x1000 + 2*1*(4<<dstride)
+    let bar = nvme_state_read(0)
+    let dstride = nvme_state_read(40)
+    let sq_db = 0x1000 + 2 * 1 * (4 << dstride)
+    memory_fence()
+    volatile_write_u32(bar + sq_db, new_tail)
+    cmd_id
+}
+
+@kernel fn nvme_io_wait_completion() -> i64 {
+    let cq_head = nvme_state_read(56)
+    let phase = nvme_state_read(64)
+
+    let mut timeout: i64 = 50000000
+    while timeout > 0 {
+        let dw3 = nvme_io_cq_read(cq_head, 3)
+        let cq_phase = (dw3 >> 16) & 1  // Phase tag is bit 16
+        if cq_phase == (phase & 1) {
+            let status = (dw3 >> 17) & 0x7FFF
+            let new_head = (cq_head + 1) % NVME_QUEUE_ENTRIES
+            nvme_state_write(56, new_head)
+            if new_head == 0 {
+                nvme_state_write(64, 1 - phase)
+            }
+            // Ring I/O CQ doorbell
+            let bar = nvme_state_read(0)
+            let dstride = nvme_state_read(40)
+            let cq_db = 0x1000 + (2 * 1 + 1) * (4 << dstride)
+            volatile_write_u32(bar + cq_db, new_head)
+            return status
+        }
+        pause()
+        timeout = timeout - 1
+    }
+    -1
+}
+
+@kernel fn nvme_read_sectors(lba: i64, count: i64, buf: i64) -> i64 {
+    if nvme_state_read(96) != 1 { return -1 }
+    nvme_io_submit(0x02, lba, count, buf)
+    nvme_io_wait_completion()
+}
+
+@kernel fn nvme_write_sectors(lba: i64, count: i64, buf: i64) -> i64 {
+    if nvme_state_read(96) != 1 { return -1 }
+    nvme_io_submit(0x01, lba, count, buf)
+    nvme_io_wait_completion()
+}
+
+// ── Sprint 34: Block Device Abstraction ──
+
+// Block device table: 4 devices × 32 bytes at 0x804100
+// Per device: +0=type (0=none,1=nvme,2=ramdisk,3=virtio), +8=base_lba, +16=total_lba, +24=sector_size
+const BLK_TABLE: i64 = 0x804100
+const BLK_MAX_DEVS: i64 = 4
+
+@kernel fn blk_register(dev: i64, dev_type: i64, total_lba: i64, sector_size: i64) {
+    let base = BLK_TABLE + dev * 32
+    volatile_write_u64(base, dev_type)
+    volatile_write_u64(base + 8, 0)
+    volatile_write_u64(base + 16, total_lba)
+    volatile_write_u64(base + 24, sector_size)
+}
+
+@kernel fn blk_read(dev: i64, lba: i64, count: i64, buf: i64) -> i64 {
+    let dev_type = volatile_read_u64(BLK_TABLE + dev * 32)
+    if dev_type == 1 {
+        // NVMe
+        nvme_read_sectors(lba, count, buf)
+    } else if dev_type == 2 {
+        // Ramdisk: copy from RAMDISK_BASE + lba*512
+        let mut i: i64 = 0
+        let bytes = count * 512
+        while i < bytes {
+            volatile_write_u8(buf + i, volatile_read_u8(RAMDISK_BASE + lba * 512 + i))
+            i = i + 1
+        }
+        0
+    } else {
+        -1
+    }
+}
+
+@kernel fn blk_write(dev: i64, lba: i64, count: i64, buf: i64) -> i64 {
+    let dev_type = volatile_read_u64(BLK_TABLE + dev * 32)
+    if dev_type == 1 {
+        nvme_write_sectors(lba, count, buf)
+    } else if dev_type == 2 {
+        let mut i: i64 = 0
+        let bytes = count * 512
+        while i < bytes {
+            volatile_write_u8(RAMDISK_BASE + lba * 512 + i, volatile_read_u8(buf + i))
+            i = i + 1
+        }
+        0
+    } else {
+        -1
+    }
+}
+
+@kernel fn nvme_full_init() -> i64 {
+    println("[NVMe] Initializing controller...")
+    cprintln("[NVMe] Initializing controller...", CYAN_ON_BLACK)
+    let result = nvme_init()
+    if result != 0 {
+        println("[NVMe] Init failed")
+        cprint("[NVMe] Init failed: ", RED_ON_BLACK)
+        cprint_decimal(result, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        // Fallback: register ramdisk
+        blk_register(0, 2, RAMDISK_SIZE / 512, 512)
+        println("[NVMe] Using ramdisk fallback (1MB)")
+        cprintln("[NVMe] Using ramdisk fallback (1MB)", YELLOW_ON_BLACK)
+        return -1
+    }
+    println("[NVMe] Controller enabled")
+    cprintln("[NVMe] Controller enabled", GREEN_ON_BLACK)
+
+    // Identify Controller
+    println("[NVMe] Identify Controller...")
+    let idc = nvme_identify_controller()
+    if idc == 0 {
+        // Print model string (bytes 24-63 of identify data)
+        cprint("[NVMe] Model: ", WHITE_ON_BLACK)
+        let mut m: i64 = 24
+        while m < 64 {
+            let ch = volatile_read_u8(NVME_DMA + m)
+            if ch > 31 && ch < 127 { console_putchar(ch, CYAN_ON_BLACK) }
+            m = m + 1
+        }
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+
+    // Identify Namespace
+    println("[NVMe] Identify Namespace...")
+    let idn = nvme_identify_namespace()
+    if idn == 0 {
+        let ns_size = nvme_state_read(80)
+        let sector_sz = nvme_state_read(88)
+        cprint("[NVMe] Capacity: ", WHITE_ON_BLACK)
+        cprint_decimal(ns_size * sector_sz / 1048576, CYAN_ON_BLACK)
+        cprintln(" MB", WHITE_ON_BLACK)
+    }
+
+    // Create I/O queues
+    println("[NVMe] Creating I/O queues...")
+    let ioq = nvme_create_io_queues()
+    if ioq != 0 {
+        cprint("[NVMe] I/O queue creation failed: ", RED_ON_BLACK)
+        cprint_decimal(ioq, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        blk_register(0, 2, RAMDISK_SIZE / 512, 512)
+        return -2
+    }
+    println("[NVMe] I/O queues ready")
+    cprintln("[NVMe] I/O queues ready", GREEN_ON_BLACK)
+
+    // Register as block device 0
+    let ns_size = nvme_state_read(80)
+    let sector_sz = nvme_state_read(88)
+    blk_register(0, 1, ns_size, sector_sz)
+
+    // Also register ramdisk as device 1
+    blk_register(1, 2, RAMDISK_SIZE / 512, 512)
+    // Mark ramdisk memory as used
+    let mut f: i64 = RAMDISK_BASE / FRAME_SIZE
+    while f < (RAMDISK_BASE + RAMDISK_SIZE) / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
+
+    // Quick sector 0 read test
+    println("[NVMe] Testing sector read...")
+    nvme_clear_queue(NVME_DMA, 512)
+    let rs = nvme_read_sectors(0, 1, NVME_DMA)
+    if rs == 0 {
+        let b510 = volatile_read_u8(NVME_DMA + 510)
+        let b511 = volatile_read_u8(NVME_DMA + 511)
+        if b510 == 0x55 && b511 == 0xAA {
+            println("[NVMe] Sector 0 read OK — boot signature found (0x55AA)")
+        } else {
+            println("[NVMe] Sector 0 read OK — no boot signature")
+        }
+    } else {
+        println("[NVMe] Sector read FAILED")
+    }
+
+    // Auto-mount FAT32
+    let mnt = fat32_mount(0)
+    if mnt == 0 {
+        println("[FAT32] Mounted successfully")
+    } else {
+        println("[FAT32] Mount failed or no FAT32 partition")
+    }
+
+    0
+}
+
+// ── Shell Commands ──
+
+@kernel fn cmd_nvme_init() {
+    let r = nvme_full_init()
+    if r == 0 {
+        cprintln("NVMe fully initialized", GREEN_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_disk_read() {
+    // Read LBA 0 from device 0
+    cprintln("Reading LBA 0 from block device 0...", WHITE_ON_BLACK)
+    nvme_clear_queue(NVME_DMA, 512)
+    let status = blk_read(0, 0, 1, NVME_DMA)
+    cprint("  Status: ", WHITE_ON_BLACK)
+    let status_color = if status == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK }
+    cprint_decimal(status, status_color)
+    console_putchar(10, WHITE_ON_BLACK)
+    if status == 0 {
+        // Print first 32 bytes as hex
+        cprint("  Data: ", WHITE_ON_BLACK)
+        let mut i: i64 = 0
+        while i < 32 {
+            cprint_hex(volatile_read_u8(NVME_DMA + i), 2, CYAN_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            i = i + 1
+        }
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_disk_write() {
+    cprintln("Writing test pattern to LBA 1 on device 0...", WHITE_ON_BLACK)
+    // Write pattern: 0xFA, 0x4A, 0x52, 0x00 ("FAJ\0" marker)
+    volatile_write_u8(NVME_DMA, 0xFA)
+    volatile_write_u8(NVME_DMA + 1, 0x4A)
+    volatile_write_u8(NVME_DMA + 2, 0x52)
+    volatile_write_u8(NVME_DMA + 3, 0x00)
+    let mut i: i64 = 4
+    while i < 512 { volatile_write_u8(NVME_DMA + i, (i % 256)); i = i + 1 }
+    let status = blk_write(0, 1, 1, NVME_DMA)
+    cprint("  Write status: ", WHITE_ON_BLACK)
+    let status_color = if status == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK }
+    cprint_decimal(status, status_color)
+    console_putchar(10, WHITE_ON_BLACK)
+    if status == 0 {
+        // Read back and verify
+        nvme_clear_queue(NVME_DMA + 512, 512)
+        let rs = blk_read(0, 1, 1, NVME_DMA + 512)
+        if rs == 0 {
+            let b0 = volatile_read_u8(NVME_DMA + 512)
+            let b1 = volatile_read_u8(NVME_DMA + 513)
+            let b2 = volatile_read_u8(NVME_DMA + 514)
+            if b0 == 0xFA && b1 == 0x4A && b2 == 0x52 {
+                cprintln("  Verify: OK (FAJ marker found)", GREEN_ON_BLACK)
+            } else {
+                cprintln("  Verify: MISMATCH", RED_ON_BLACK)
+            }
+        }
+    }
+}
+
+@kernel fn cmd_blkdev() {
+    cprintln("Block Devices:", YELLOW_ON_BLACK)
+    let mut d: i64 = 0
+    while d < BLK_MAX_DEVS {
+        let dev_type = volatile_read_u64(BLK_TABLE + d * 32)
+        if dev_type != 0 {
+            cprint("  dev", WHITE_ON_BLACK)
+            cprint_decimal(d, CYAN_ON_BLACK)
+            cprint(": ", WHITE_ON_BLACK)
+            if dev_type == 1 { cprint("nvme", GREEN_ON_BLACK) }
+            else if dev_type == 2 { cprint("ramdisk", YELLOW_ON_BLACK) }
+            else if dev_type == 3 { cprint("virtio", CYAN_ON_BLACK) }
+            let total = volatile_read_u64(BLK_TABLE + d * 32 + 16)
+            let ss = volatile_read_u64(BLK_TABLE + d * 32 + 24)
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_decimal(total * ss / 1048576, CYAN_ON_BLACK)
+            cprintln(" MB", WHITE_ON_BLACK)
+        }
+        d = d + 1
+    }
+}

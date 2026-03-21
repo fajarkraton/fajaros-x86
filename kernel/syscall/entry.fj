@@ -1,0 +1,201 @@
+// FajarOS Nova v0.5.0 — SYSCALL/SYSRET Entry
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Security Hardening (Sprint C5)
+// SMEP, SMAP, NX enforcement
+// ═══════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════
+// SYSCALL/SYSRET Setup (Fix 2)
+// Syscall entry stub at 0x8200 (256 bytes)
+// Per-CPU kernel stack pointer at 0x652008
+// ═══════════════════════════════════════════════
+
+const SYSCALL_ENTRY_ADDR: i64 = 0x8200
+const KERNEL_RSP_SAVE: i64 = 0x652008  // per-CPU kernel RSP
+const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
+
+@kernel fn syscall_install_stub() {
+    // Install SYSCALL entry stub at 0x8200
+    // On SYSCALL: RCX = user RIP, R11 = user RFLAGS, RAX = syscall number
+    // We need to: save user RSP, switch to kernel stack, call handler, SYSRETQ
+    let b = SYSCALL_ENTRY_ADDR
+
+    // swapgs (switch GS base to kernel per-CPU area)
+    volatile_write_u8(b, 0x0F)
+    volatile_write_u8(b + 1, 0x01)
+    volatile_write_u8(b + 2, 0xF8)
+
+    // mov [USER_RSP_SAVE], rsp (save user RSP to fixed address)
+    volatile_write_u8(b + 3, 0x48)
+    volatile_write_u8(b + 4, 0x89)
+    volatile_write_u8(b + 5, 0x24)
+    volatile_write_u8(b + 6, 0x25)
+    volatile_write_u32(b + 7, USER_RSP_SAVE)
+
+    // mov rsp, [KERNEL_RSP_SAVE] (load kernel RSP)
+    volatile_write_u8(b + 11, 0x48)
+    volatile_write_u8(b + 12, 0x8B)
+    volatile_write_u8(b + 13, 0x24)
+    volatile_write_u8(b + 14, 0x25)
+    volatile_write_u32(b + 15, KERNEL_RSP_SAVE)
+
+    // push rcx (user RIP)
+    volatile_write_u8(b + 19, 0x51)
+    // push r11 (user RFLAGS)
+    volatile_write_u8(b + 20, 0x41)
+    volatile_write_u8(b + 21, 0x53)
+    // push rdi, rsi, rdx (syscall args)
+    volatile_write_u8(b + 22, 0x57)
+    volatile_write_u8(b + 23, 0x56)
+    volatile_write_u8(b + 24, 0x52)
+
+    // Now dispatch based on RAX (syscall number)
+    // We handle inline: SYS_WRITE(1) and SYS_EXIT(60)
+
+    // cmp rax, 1 (SYS_WRITE)
+    volatile_write_u8(b + 25, 0x48)
+    volatile_write_u8(b + 26, 0x83)
+    volatile_write_u8(b + 27, 0xF8)
+    volatile_write_u8(b + 28, 1)
+    // jne skip_write (jump forward if not SYS_WRITE)
+    volatile_write_u8(b + 29, 0x75)
+    volatile_write_u8(b + 30, 20)  // skip 20 bytes
+
+    // SYS_WRITE: rdi=fd, rsi=buf, rdx=len
+    // Write each byte to VGA console (0xB8000 + cursor*2)
+    // Simplified: write to serial port 0x3F8
+    // mov rcx, rdx (len → counter)
+    volatile_write_u8(b + 31, 0x48)
+    volatile_write_u8(b + 32, 0x89)
+    volatile_write_u8(b + 33, 0xD1)
+    // .write_loop: lodsb (load byte from [rsi] to al, increment rsi)
+    volatile_write_u8(b + 34, 0xAC)
+    // mov dx, 0x3F8 (serial port)
+    volatile_write_u8(b + 35, 0x66)
+    volatile_write_u8(b + 36, 0xBA)
+    volatile_write_u16(b + 37, 0x3F8)
+    // out dx, al (write byte to serial)
+    volatile_write_u8(b + 39, 0xEE)
+    // loop .write_loop (dec rcx, jnz)
+    volatile_write_u8(b + 40, 0xE2)
+    volatile_write_u8(b + 41, 0xF8)  // -8 (back to lodsb at offset 34)
+    // mov rax, rdx (return bytes written... but rdx was clobbered)
+    // Actually return original len from stack
+    volatile_write_u8(b + 42, 0x48)
+    volatile_write_u8(b + 43, 0x31)
+    volatile_write_u8(b + 44, 0xC0) // xor rax, rax (return 0 = success)
+    // jmp sysret_path
+    volatile_write_u8(b + 45, 0xEB)
+    volatile_write_u8(b + 46, 20)  // skip to sysret
+
+    // skip_write: (offset 51)
+    // cmp rax, 60 (SYS_EXIT)
+    volatile_write_u8(b + 51, 0x48)
+    volatile_write_u8(b + 52, 0x83)
+    volatile_write_u8(b + 53, 0xF8)
+    volatile_write_u8(b + 54, 60)
+    // jne unknown_syscall
+    volatile_write_u8(b + 55, 0x75)
+    volatile_write_u8(b + 56, 10) // skip 10 bytes
+
+    // SYS_EXIT: halt (user program terminated)
+    volatile_write_u8(b + 57, 0xF4) // hlt
+    volatile_write_u8(b + 58, 0xEB) // jmp -2
+    volatile_write_u8(b + 59, 0xFD)
+    // padding
+    volatile_write_u8(b + 60, 0x90)
+    volatile_write_u8(b + 61, 0x90)
+    volatile_write_u8(b + 62, 0x90)
+    volatile_write_u8(b + 63, 0x90)
+    volatile_write_u8(b + 64, 0x90)
+    volatile_write_u8(b + 65, 0x90)
+    volatile_write_u8(b + 66, 0x90)
+
+    // unknown_syscall: (offset 67)
+    // xor rax, rax; dec rax (return -1)
+    volatile_write_u8(b + 67, 0x48)
+    volatile_write_u8(b + 68, 0x31)
+    volatile_write_u8(b + 69, 0xC0)
+    volatile_write_u8(b + 70, 0x48)
+    volatile_write_u8(b + 71, 0xFF)
+    volatile_write_u8(b + 72, 0xC8) // dec rax
+
+    // sysret_path: (offset 73)
+    // pop rdx, rsi, rdi
+    volatile_write_u8(b + 73, 0x5A)
+    volatile_write_u8(b + 74, 0x5E)
+    volatile_write_u8(b + 75, 0x5F)
+    // pop r11 (user RFLAGS)
+    volatile_write_u8(b + 76, 0x41)
+    volatile_write_u8(b + 77, 0x5B)
+    // pop rcx (user RIP)
+    volatile_write_u8(b + 78, 0x59)
+
+    // mov rsp, [USER_RSP_SAVE] (restore user RSP)
+    volatile_write_u8(b + 79, 0x48)
+    volatile_write_u8(b + 80, 0x8B)
+    volatile_write_u8(b + 81, 0x24)
+    volatile_write_u8(b + 82, 0x25)
+    volatile_write_u32(b + 83, USER_RSP_SAVE)
+
+    // swapgs
+    volatile_write_u8(b + 87, 0x0F)
+    volatile_write_u8(b + 88, 0x01)
+    volatile_write_u8(b + 89, 0xF8)
+
+    // sysretq
+    volatile_write_u8(b + 90, 0x48)
+    volatile_write_u8(b + 91, 0x0F)
+    volatile_write_u8(b + 92, 0x07)
+}
+
+@kernel fn syscall_configure_msrs() {
+    // IA32_STAR (0xC0000081):
+    // Bits 63:48 = SYSRET CS base (user): 0x13 → CS=0x13+16=0x23(ring3), SS=0x13+8=0x1B(ring3)
+    // Bits 47:32 = SYSCALL CS (kernel): 0x08 → CS=0x08, SS=0x10
+    let star = (0x0013 << 48) | (0x0008 << 32)
+    wrmsr(0xC0000081, star)
+
+    // IA32_LSTAR (0xC0000082): SYSCALL entry point
+    wrmsr(0xC0000082, SYSCALL_ENTRY_ADDR)
+
+    // IA32_SFMASK (0xC0000083): RFLAGS bits to clear on SYSCALL (mask IF to disable interrupts)
+    wrmsr(0xC0000083, 0x200)  // Clear IF (bit 9)
+
+    // Enable SYSCALL/SYSRET in EFER (bit 0 = SCE)
+    let efer = rdmsr(0xC0000080)
+    wrmsr(0xC0000080, efer | 1)
+
+    // Set kernel RSP for syscall entry
+    volatile_write_u64(KERNEL_RSP_SAVE, 0x7F0000) // kernel stack top
+}
+
+@kernel fn syscall_setup() {
+    syscall_install_stub()
+    syscall_configure_msrs()
+}
+
+@kernel fn cmd_syscall_test() {
+    cprintln("SYSCALL/SYSRET Configuration:", YELLOW_ON_BLACK)
+    syscall_setup()
+    cprintln("  Stub installed at 0x8200 (93 bytes)", GREEN_ON_BLACK)
+    cprint("  IA32_STAR:  0x", WHITE_ON_BLACK)
+    let star = rdmsr(0xC0000081)
+    cprint_hex(star >> 32, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  IA32_LSTAR: 0x", WHITE_ON_BLACK)
+    cprint_hex(rdmsr(0xC0000082), 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  IA32_SFMASK: 0x", WHITE_ON_BLACK)
+    cprint_hex(rdmsr(0xC0000083), 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    let efer = rdmsr(0xC0000080)
+    cprint("  EFER.SCE: ", WHITE_ON_BLACK)
+    if efer & 1 != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+    else { cprintln("disabled", RED_ON_BLACK) }
+    cprintln("  SYS_WRITE(1): serial output", WHITE_ON_BLACK)
+    cprintln("  SYS_EXIT(60): halt", WHITE_ON_BLACK)
+    cprintln("  Ready for Ring 3 execution!", GREEN_ON_BLACK)
+}

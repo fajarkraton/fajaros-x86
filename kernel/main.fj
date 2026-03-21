@@ -1,518 +1,6 @@
-// FajarOS Nova — Phase 7: Shell + Commands
-// Interactive shell with 20+ built-in commands
-
-const VGA_BASE: i64 = 0xB8000
-const VGA_COLS: i64 = 80
-const VGA_ROWS: i64 = 25
-const WHITE_ON_BLACK: i64 = 0x0F
-const WHITE_ON_BLUE: i64 = 0x1F
-const GREEN_ON_BLACK: i64 = 0x0A
-const CYAN_ON_BLACK: i64 = 0x0B
-const YELLOW_ON_BLACK: i64 = 0x0E
-const RED_ON_BLACK: i64 = 0x0C
-
-// ═══════════════════════════════════════════════
-// VGA Console Engine
-// ═══════════════════════════════════════════════
-
-@kernel fn console_init() {
-    let mut i: i64 = 0
-    while i < VGA_COLS * VGA_ROWS {
-        volatile_write(VGA_BASE + i * 2, 0x20)
-        volatile_write(VGA_BASE + i * 2 + 1, WHITE_ON_BLACK)
-        i = i + 1
-    }
-    volatile_write(0x6FA00, 0)
-    volatile_write(0x6FA08, 0)
-}
-
-@kernel fn console_scroll() {
-    let mut i: i64 = 0
-    while i < VGA_COLS * (VGA_ROWS - 1) {
-        let s = VGA_BASE + (i + VGA_COLS) * 2
-        let d = VGA_BASE + i * 2
-        volatile_write(d, volatile_read(s))
-        volatile_write(d + 1, volatile_read(s + 1))
-        i = i + 1
-    }
-    let mut j: i64 = 0
-    while j < VGA_COLS {
-        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2, 0x20)
-        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2 + 1, WHITE_ON_BLACK)
-        j = j + 1
-    }
-}
-
-@kernel fn console_putchar(ch: i64, color: i64) {
-    let row = volatile_read(0x6FA00)
-    let col = volatile_read(0x6FA08)
-    if ch == 10 {
-        volatile_write(0x6FA08, 0)
-        if row >= VGA_ROWS - 1 { console_scroll() }
-        else { volatile_write(0x6FA00, row + 1) }
-        return
-    }
-    if ch == 8 {
-        if col > 0 {
-            volatile_write(0x6FA08, col - 1)
-            let addr = VGA_BASE + (row * VGA_COLS + col - 1) * 2
-            volatile_write(addr, 0x20)
-            volatile_write(addr + 1, color)
-        }
-        return
-    }
-    let addr = VGA_BASE + (row * VGA_COLS + col) * 2
-    volatile_write(addr, ch)
-    volatile_write(addr + 1, color)
-    if col >= VGA_COLS - 1 {
-        volatile_write(0x6FA08, 0)
-        if row >= VGA_ROWS - 1 { console_scroll() }
-        else { volatile_write(0x6FA00, row + 1) }
-    } else {
-        volatile_write(0x6FA08, col + 1)
-    }
-}
-
-@kernel fn cprint(s: str, color: i64) {
-    let len = str_len(s)
-    let mut i: i64 = 0
-    while i < len { console_putchar(str_byte_at(s, i), color); i = i + 1 }
-}
-
-@kernel fn cprintln(s: str, color: i64) {
-    cprint(s, color)
-    console_putchar(10, WHITE_ON_BLACK)
-}
-
-@kernel fn cprint_decimal(val: i64, color: i64) {
-    if val == 0 { console_putchar(48, color); return }
-    let mut buf: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    let mut v = val
-    let mut len: i64 = 0
-    while v > 0 { buf[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
-    let mut i: i64 = 0
-    while i < len { console_putchar(buf[len - 1 - i], color); i = i + 1 }
-}
-
-@kernel fn cprint_hex(val: i64, digits: i64, color: i64) {
-    let mut i = digits - 1
-    while i >= 0 {
-        let n = (val >> (i * 4)) & 0xF
-        if n < 10 { console_putchar(48 + n, color) }
-        else { console_putchar(55 + n, color) }
-        i = i - 1
-    }
-}
-
-// ═══════════════════════════════════════════════
-// Scancode → ASCII
-// ═══════════════════════════════════════════════
-
-@kernel fn sc2ascii(sc: i64) -> i64 {
-    if sc == 0x1C { return 10 }
-    if sc == 0x0E { return 8 }
-    if sc == 0x39 { return 32 }
-    if sc == 0x02 { return 49 }
-    if sc == 0x03 { return 50 }
-    if sc == 0x04 { return 51 }
-    if sc == 0x05 { return 52 }
-    if sc == 0x06 { return 53 }
-    if sc == 0x07 { return 54 }
-    if sc == 0x08 { return 55 }
-    if sc == 0x09 { return 56 }
-    if sc == 0x0A { return 57 }
-    if sc == 0x0B { return 48 }
-    if sc == 0x10 { return 113 }
-    if sc == 0x11 { return 119 }
-    if sc == 0x12 { return 101 }
-    if sc == 0x13 { return 114 }
-    if sc == 0x14 { return 116 }
-    if sc == 0x15 { return 121 }
-    if sc == 0x16 { return 117 }
-    if sc == 0x17 { return 105 }
-    if sc == 0x18 { return 111 }
-    if sc == 0x19 { return 112 }
-    if sc == 0x1E { return 97 }
-    if sc == 0x1F { return 115 }
-    if sc == 0x20 { return 100 }
-    if sc == 0x21 { return 102 }
-    if sc == 0x22 { return 103 }
-    if sc == 0x23 { return 104 }
-    if sc == 0x24 { return 106 }
-    if sc == 0x25 { return 107 }
-    if sc == 0x26 { return 108 }
-    if sc == 0x2C { return 122 }
-    if sc == 0x2D { return 120 }
-    if sc == 0x2E { return 99 }
-    if sc == 0x2F { return 118 }
-    if sc == 0x30 { return 98 }
-    if sc == 0x31 { return 110 }
-    if sc == 0x32 { return 109 }
-    if sc == 0x0C { return 45 }
-    if sc == 0x0D { return 61 }
-    if sc == 0x33 { return 44 }
-    if sc == 0x34 { return 46 }
-    if sc == 0x35 { return 47 }
-    0
-}
-
-// ═══════════════════════════════════════════════
-// Command Line Buffer (at 0x6F800, max 64 chars)
-// ═══════════════════════════════════════════════
-
-@kernel fn cmdbuf_clear() {
-    let mut i: i64 = 0
-    while i < 64 { volatile_write_u8(0x6F800 + i, 0); i = i + 1 }
-    volatile_write(0x6F880, 0)  // length = 0
-}
-
-@kernel fn cmdbuf_push(ch: i64) {
-    let len = volatile_read(0x6F880)
-    if len < 63 {
-        volatile_write_u8(0x6F800 + len, ch)
-        volatile_write(0x6F880, len + 1)
-    }
-}
-
-@kernel fn cmdbuf_pop() {
-    let len = volatile_read(0x6F880)
-    if len > 0 {
-        volatile_write(0x6F880, len - 1)
-        volatile_write_u8(0x6F800 + len - 1, 0)
-    }
-}
-
-@kernel fn cmdbuf_len() -> i64 {
-    volatile_read(0x6F880)
-}
-
-@kernel fn cmdbuf_match(s: str) -> i64 {
-    let slen = str_len(s)
-    let clen = cmdbuf_len()
-    let mut result: i64 = 1
-    if slen != clen {
-        result = 0
-    }
-    let mut i: i64 = 0
-    while i < slen && result == 1 {
-        let a = volatile_read_u8(0x6F800 + i)
-        let b = str_byte_at(s, i)
-        if a != b {
-            result = 0
-        }
-        i = i + 1
-    }
-    result
-}
-
-// ═══════════════════════════════════════════════
-// Shell Commands
-// ═══════════════════════════════════════════════
-
-@kernel fn cmd_help() {
-    cprintln("Available commands:", YELLOW_ON_BLACK)
-    cprintln("  help     - Show this help", WHITE_ON_BLACK)
-    cprintln("  clear    - Clear screen", WHITE_ON_BLACK)
-    cprintln("  uname    - System info", WHITE_ON_BLACK)
-    cprintln("  uptime   - Show ticks", WHITE_ON_BLACK)
-    cprintln("  cpuinfo  - CPU features", WHITE_ON_BLACK)
-    cprintln("  meminfo  - Memory info", WHITE_ON_BLACK)
-    cprintln("  lspci    - List PCI devices", WHITE_ON_BLACK)
-    cprintln("  ps       - Process list", WHITE_ON_BLACK)
-    cprintln("  echo     - Echo text", WHITE_ON_BLACK)
-    cprintln("  reboot   - Reboot system", WHITE_ON_BLACK)
-    cprintln("  shutdown - ACPI power off", WHITE_ON_BLACK)
-    cprintln("  acpi     - ACPI info + CPU count", WHITE_ON_BLACK)
-    cprintln("  tensor   - Matrix multiply demo", WHITE_ON_BLACK)
-    cprintln("  mnist    - MNIST inference demo", WHITE_ON_BLACK)
-    cprintln("  version  - Detailed version info", WHITE_ON_BLACK)
-}
-
-@kernel fn cmd_version() {
-    cprintln("FajarOS Nova v0.1.0 \"Nova\"", WHITE_ON_BLUE)
-    cprintln("  Kernel:   x86_64 bare-metal", WHITE_ON_BLACK)
-    cprintln("  Language: 100% Fajar Lang", WHITE_ON_BLACK)
-    cprintln("  Compiler: Fajar Lang + Cranelift", WHITE_ON_BLACK)
-    cprintln("  Boot:     Multiboot2 (GRUB2)", WHITE_ON_BLACK)
-    cprintln("  Paging:   128MB identity (2MB pages)", WHITE_ON_BLACK)
-    cprintln("  Timer:    PIT 100Hz preemptive", WHITE_ON_BLACK)
-    cprintln("  Shell:    15 commands", WHITE_ON_BLACK)
-    cprintln("  Author:   Fajar (TaxPrime/PrimeCore.id)", WHITE_ON_BLACK)
-    cprintln("  Built with Claude Opus 4.6", CYAN_ON_BLACK)
-}
-
-@kernel fn cmd_uname() {
-    cprintln("FajarOS Nova v0.1.0 x86_64 (Fajar Lang)", CYAN_ON_BLACK)
-}
-
-@kernel fn cmd_uptime() {
-    cprint("Uptime: ", WHITE_ON_BLACK)
-    let ticks = read_timer_ticks()
-    cprint_decimal(ticks, CYAN_ON_BLACK)
-    cprint(" ticks (", WHITE_ON_BLACK)
-    cprint_decimal(ticks / 100, CYAN_ON_BLACK)
-    cprintln(" seconds)", WHITE_ON_BLACK)
-}
-
-@kernel fn cmd_cpuinfo() {
-    let ecx1 = cpuid_ecx(1)
-    let edx1 = cpuid_edx(1)
-    let ebx7 = cpuid_ebx(7)
-    cprintln("CPU Features:", YELLOW_ON_BLACK)
-    if (edx1 & (1 << 0)) != 0 { cprintln("  FPU", WHITE_ON_BLACK) }
-    if (edx1 & (1 << 25)) != 0 { cprintln("  SSE", WHITE_ON_BLACK) }
-    if (edx1 & (1 << 26)) != 0 { cprintln("  SSE2", WHITE_ON_BLACK) }
-    if (ecx1 & (1 << 20)) != 0 { cprintln("  SSE4.2", WHITE_ON_BLACK) }
-    if (ecx1 & (1 << 28)) != 0 { cprintln("  AVX", WHITE_ON_BLACK) }
-    if (ebx7 & (1 << 5)) != 0 { cprintln("  AVX2", WHITE_ON_BLACK) }
-    if (edx1 & (1 << 9)) != 0 { cprintln("  APIC", WHITE_ON_BLACK) }
-}
-
-@kernel fn cmd_meminfo() {
-    cprintln("Memory:", YELLOW_ON_BLACK)
-    cprintln("  Total mapped: 128 MB (identity)", WHITE_ON_BLACK)
-    cprintln("  Kernel:  0x100000 (1 MB)", WHITE_ON_BLACK)
-    cprintln("  Heap:    0x400000 - 0x7000000 (108 MB)", WHITE_ON_BLACK)
-    cprintln("  Stack:   0x7F00000 (127 MB)", WHITE_ON_BLACK)
-    cprintln("  ProcTbl: 0x600000 (4 KB)", WHITE_ON_BLACK)
-}
-
-@kernel fn cmd_lspci() {
-    cprintln("PCI Devices:", YELLOW_ON_BLACK)
-    let mut dev: i64 = 0
-    let mut found: i64 = 0
-    while dev < 32 {
-        let id = pci_read32(0, dev, 0, 0)
-        if id != 0xFFFFFFFF && id != 0 {
-            cprint("  ", WHITE_ON_BLACK)
-            cprint_hex(id & 0xFFFF, 4, CYAN_ON_BLACK)
-            console_putchar(58, WHITE_ON_BLACK)
-            cprint_hex((id >> 16) & 0xFFFF, 4, CYAN_ON_BLACK)
-            let cl = pci_read32(0, dev, 0, 8)
-            cprint(" class=", WHITE_ON_BLACK)
-            cprint_hex((cl >> 24) & 0xFF, 2, YELLOW_ON_BLACK)
-            cprint_hex((cl >> 16) & 0xFF, 2, YELLOW_ON_BLACK)
-            console_putchar(10, WHITE_ON_BLACK)
-            found = found + 1
-        }
-        dev = dev + 1
-    }
-    cprint("Total: ", GREEN_ON_BLACK)
-    cprint_decimal(found, GREEN_ON_BLACK)
-    cprintln(" devices", GREEN_ON_BLACK)
-}
-
-@kernel fn cmd_ps() {
-    cprintln("Processes:", YELLOW_ON_BLACK)
-    cprintln("  PID  STATE    TICKS", WHITE_ON_BLACK)
-    let mut i: i64 = 0
-    while i < 16 {
-        let base = 0x600000 + i * 256
-        let state = volatile_read(base + 8)
-        if state != 0 {
-            cprint("  ", WHITE_ON_BLACK)
-            cprint_decimal(i, CYAN_ON_BLACK)
-            if state == 1 { cprint("    ready    ", WHITE_ON_BLACK) }
-            else if state == 2 { cprint("    running  ", GREEN_ON_BLACK) }
-            else { cprint("    blocked  ", YELLOW_ON_BLACK) }
-            cprint_decimal(volatile_read(base + 32), WHITE_ON_BLACK)
-            console_putchar(10, WHITE_ON_BLACK)
-        }
-        i = i + 1
-    }
-}
-
-@kernel fn cmd_clear() {
-    console_init()
-}
-
-@kernel fn cmd_echo() {
-    // Echo the command buffer (skip "echo " prefix = 5 chars)
-    let len = cmdbuf_len()
-    if len > 5 {
-        let mut i: i64 = 5
-        while i < len {
-            console_putchar(volatile_read_u8(0x6F800 + i), WHITE_ON_BLACK)
-            i = i + 1
-        }
-    }
-    console_putchar(10, WHITE_ON_BLACK)
-}
-
-@kernel fn cmd_reboot() {
-    cprintln("Rebooting...", RED_ON_BLACK)
-    port_outb(0x64, 0xFE)  // keyboard controller reset
-}
-
-@kernel fn cmd_shutdown() {
-    cprintln("Shutting down via ACPI...", YELLOW_ON_BLACK)
-    acpi_shutdown()
-}
-
-@kernel fn cmd_tensor() {
-    cprintln("Tensor Operations (CPU):", YELLOW_ON_BLACK)
-
-    // Simple 3x3 matrix multiply demo using volatile memory as tensor storage
-    // Matrix A (3x3) at 0x500000, Matrix B (3x3) at 0x500100, Result at 0x500200
-    // A = [[1,2,3],[4,5,6],[7,8,9]]
-    volatile_write(0x500000, 1); volatile_write(0x500008, 2); volatile_write(0x500010, 3)
-    volatile_write(0x500018, 4); volatile_write(0x500020, 5); volatile_write(0x500028, 6)
-    volatile_write(0x500030, 7); volatile_write(0x500038, 8); volatile_write(0x500040, 9)
-    // B = identity [[1,0,0],[0,1,0],[0,0,1]]
-    volatile_write(0x500100, 1); volatile_write(0x500108, 0); volatile_write(0x500110, 0)
-    volatile_write(0x500118, 0); volatile_write(0x500120, 1); volatile_write(0x500128, 0)
-    volatile_write(0x500130, 0); volatile_write(0x500138, 0); volatile_write(0x500140, 1)
-
-    // Naive matmul: C[i][j] = sum(A[i][k] * B[k][j])
-    let t0 = rdtsc()
-    let mut i: i64 = 0
-    while i < 3 {
-        let mut j: i64 = 0
-        while j < 3 {
-            let mut sum: i64 = 0
-            let mut k: i64 = 0
-            while k < 3 {
-                let a = volatile_read(0x500000 + (i * 3 + k) * 8)
-                let b = volatile_read(0x500100 + (k * 3 + j) * 8)
-                sum = sum + a * b
-                k = k + 1
-            }
-            volatile_write(0x500200 + (i * 3 + j) * 8, sum)
-            j = j + 1
-        }
-        i = i + 1
-    }
-    let t1 = rdtsc()
-
-    // Print result (should be same as A since B is identity)
-    cprint("  A * I = [", WHITE_ON_BLACK)
-    let mut r: i64 = 0
-    while r < 3 {
-        let mut c: i64 = 0
-        while c < 3 {
-            cprint_decimal(volatile_read(0x500200 + (r * 3 + c) * 8), CYAN_ON_BLACK)
-            if c < 2 { cprint(",", WHITE_ON_BLACK) }
-            c = c + 1
-        }
-        if r < 2 { cprint("; ", WHITE_ON_BLACK) }
-        r = r + 1
-    }
-    cprintln("]", WHITE_ON_BLACK)
-
-    cprint("  Cycles: ", WHITE_ON_BLACK)
-    cprint_decimal(t1 - t0, CYAN_ON_BLACK)
-    console_putchar(10, WHITE_ON_BLACK)
-
-    // Simple ReLU demo
-    cprintln("  ReLU([-3, 0, 5]) = [0, 0, 5]", GREEN_ON_BLACK)
-}
-
-@kernel fn cmd_mnist() {
-    cprintln("MNIST Inference (CPU):", YELLOW_ON_BLACK)
-    cprintln("  Model: MLP 784->128->10", WHITE_ON_BLACK)
-    cprintln("  Weights: not loaded (demo mode)", WHITE_ON_BLACK)
-
-    // Simulate a forward pass timing
-    let t0 = rdtsc()
-    // Simulate 784*128 = 100352 multiply-adds
-    let mut ops: i64 = 0
-    let mut acc: i64 = 0
-    while ops < 100352 {
-        acc = acc + ops * 3 - ops * 2  // dummy compute
-        ops = ops + 1
-    }
-    let t1 = rdtsc()
-
-    cprint("  Forward pass: ", WHITE_ON_BLACK)
-    cprint_decimal((t1 - t0) / 1000, CYAN_ON_BLACK)
-    cprintln("K cycles", WHITE_ON_BLACK)
-
-    // Simulated prediction
-    cprintln("  Input: blank image (28x28)", WHITE_ON_BLACK)
-    cprintln("  Prediction: 0 (demo)", GREEN_ON_BLACK)
-    cprintln("  Note: load real weights for accuracy", YELLOW_ON_BLACK)
-}
-
-@kernel fn cmd_acpi() {
-    cprintln("ACPI Info:", YELLOW_ON_BLACK)
-    let rsdp = acpi_find_rsdp()
-    if rsdp != 0 {
-        cprint("  RSDP found at: 0x", WHITE_ON_BLACK)
-        cprint_hex(rsdp, 8, CYAN_ON_BLACK)
-        console_putchar(10, WHITE_ON_BLACK)
-        let cpus = acpi_get_cpu_count(rsdp)
-        cprint("  CPU cores: ", WHITE_ON_BLACK)
-        cprint_decimal(cpus, CYAN_ON_BLACK)
-        console_putchar(10, WHITE_ON_BLACK)
-    } else {
-        cprintln("  RSDP not found", RED_ON_BLACK)
-    }
-    cprint("  TSC: ", WHITE_ON_BLACK)
-    let tsc = rdtsc()
-    cprint_hex(tsc >> 32, 8, CYAN_ON_BLACK)
-    cprint_hex(tsc & 0xFFFFFFFF, 8, CYAN_ON_BLACK)
-    console_putchar(10, WHITE_ON_BLACK)
-}
-
-// ═══════════════════════════════════════════════
-// Command Dispatcher
-// ═══════════════════════════════════════════════
-
-@kernel fn buf_eq4(a: i64, b: i64, c: i64, d: i64) -> i64 {
-    let r0 = volatile_read_u8(0x6F800)
-    let r1 = volatile_read_u8(0x6F801)
-    let r2 = volatile_read_u8(0x6F802)
-    let r3 = volatile_read_u8(0x6F803)
-    if r0 == a && r1 == b && r2 == c && r3 == d { 1 } else { 0 }
-}
-
-@kernel fn dispatch_command() {
-    let len = cmdbuf_len()
-    let mut handled: i64 = 0
-
-    // help (104,101,108,112)
-    if len == 4 && buf_eq4(104, 101, 108, 112) == 1 { cmd_help(); handled = 1 }
-    // clear (99,108,101,97,114)
-    if handled == 0 && len == 5 && buf_eq4(99, 108, 101, 97) == 1 && volatile_read_u8(0x6F804) == 114 { cmd_clear(); handled = 1 }
-    // uname (117,110,97,109,101)
-    if handled == 0 && len == 5 && buf_eq4(117, 110, 97, 109) == 1 && volatile_read_u8(0x6F804) == 101 { cmd_uname(); handled = 1 }
-    // uptime (117,112,116,105,109,101)
-    if handled == 0 && len == 6 && buf_eq4(117, 112, 116, 105) == 1 { cmd_uptime(); handled = 1 }
-    // cpuinfo
-    if handled == 0 && len == 7 && buf_eq4(99, 112, 117, 105) == 1 { cmd_cpuinfo(); handled = 1 }
-    // meminfo
-    if handled == 0 && len == 7 && buf_eq4(109, 101, 109, 105) == 1 { cmd_meminfo(); handled = 1 }
-    // lspci (108,115,112,99,105)
-    if handled == 0 && len == 5 && buf_eq4(108, 115, 112, 99) == 1 { cmd_lspci(); handled = 1 }
-    // ps (112,115)
-    if handled == 0 && len == 2 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 115 { cmd_ps(); handled = 1 }
-    // reboot
-    if handled == 0 && len == 6 && buf_eq4(114, 101, 98, 111) == 1 { cmd_reboot(); handled = 1 }
-    // shutdown (115,104,117,116...)
-    if handled == 0 && len == 8 && buf_eq4(115, 104, 117, 116) == 1 { cmd_shutdown(); handled = 1 }
-    // acpi (97,99,112,105)
-    if handled == 0 && len == 4 && buf_eq4(97, 99, 112, 105) == 1 { cmd_acpi(); handled = 1 }
-    // tensor (116,101,110,115,111,114)
-    if handled == 0 && len == 6 && buf_eq4(116, 101, 110, 115) == 1 { cmd_tensor(); handled = 1 }
-    // mnist (109,110,105,115,116)
-    if handled == 0 && len == 5 && buf_eq4(109, 110, 105, 115) == 1 { cmd_mnist(); handled = 1 }
-    // version (118,101,114,115,105,111,110)
-    if handled == 0 && len == 7 && buf_eq4(118, 101, 114, 115) == 1 { cmd_version(); handled = 1 }
-
-    if handled == 0 && len > 0 {
-        cprint("Unknown: ", RED_ON_BLACK)
-        let mut i: i64 = 0
-        while i < len {
-            console_putchar(volatile_read_u8(0x6F800 + i), RED_ON_BLACK)
-            i = i + 1
-        }
-        console_putchar(10, WHITE_ON_BLACK)
-    }
-}
-
-// ═══════════════════════════════════════════════
-// Kernel Main
-// ═══════════════════════════════════════════════
+// FajarOS Nova v0.5.0 "Transcendence" — Kernel Entry Point
+// Part of the modular kernel build (concatenated by Makefile)
+// This file MUST be last in the concatenation order.
 
 @kernel fn kernel_main() {
     x86_serial_init(0, 115200)
@@ -536,12 +24,166 @@ const RED_ON_BLACK: i64 = 0x0C
     volatile_write(0x6FBF0, 0)
     volatile_write(0x6FBF8, 0)
 
+    // Enable NX bit (EFER.NXE, MSR 0xC0000080 bit 11)
+    let efer = read_msr(0xC0000080)
+    write_msr(0xC0000080, efer | (1 << 11))
+
+    // Parse Multiboot2 info (pointer saved at 0x6FF00 by trampoline)
+    let mb2_ptr = volatile_read(0x6FF00)
+    if mb2_ptr > 0x1000 && mb2_ptr < 0x8000000 {
+        volatile_write(0x6FF10, mb2_ptr)
+        let mb2_size = volatile_read_u32(mb2_ptr)
+        if mb2_size > 8 && mb2_size < 0x100000 {
+            volatile_write(0x6FF18, mb2_size)
+            let mut offset: i64 = 8
+            while offset + 8 < mb2_size {
+                let tag_type = volatile_read_u32(mb2_ptr + offset)
+                let tag_size = volatile_read_u32(mb2_ptr + offset + 4)
+                if tag_type == 0 || tag_size < 8 { offset = mb2_size }
+                else {
+                    if tag_type == 6 {
+                        volatile_write(0x6FF20, mb2_ptr + offset)
+                        volatile_write(0x6FF28, tag_size)
+                    }
+                    if tag_type == 8 { volatile_write(0x6FF30, mb2_ptr + offset) }
+                    let aligned = (tag_size + 7) / 8 * 8
+                    offset = offset + aligned
+                }
+            }
+        }
+    }
+
+    // Note: SMEP (CR4 bit 20) NOT enabled — our identity-mapped 2MB pages
+    // use P|RW|PS flags without explicit Supervisor-only marking.
+    // On real CPUs with SMEP, the U/S bit in page tables must be 0 for
+    // kernel pages. Our 32-bit trampoline sets PD entries with just P|RW|PS
+    // (no User bit), so SMEP *should* work, but some QEMU -cpu host configs
+    // expose SMEP before we can verify page table correctness.
+    // TODO: Enable SMEP after verifying all kernel pages have U/S=0.
+
+    // Stack guard page: unmap bottom of stack to catch overflow
+    unmap_page(0x7F0000 - 4096)  // guard page below stack bottom
+
+    // Init memory + SMP + IPC + ramfs + history + ML
+    smp_init_per_cpu()
+    frames_init()
+    heap_init()
+    slab_init()
+    ipc_init()
+    ramfs_init()
+    mnist_init_weights()
+
+    // Map LAPIC + IOAPIC MMIO pages (beyond 128MB identity region)
+    map_page(0xFEE00000, 0xFEE00000, PAGE_PRESENT | PAGE_WRITABLE)  // LAPIC
+    map_page(0xFEC00000, 0xFEC00000, PAGE_PRESENT | PAGE_WRITABLE)  // IOAPIC
+
+    // Initialize LAPIC
+    let apic_present = cpuid_edx(1) & (1 << 9)
+    if apic_present != 0 {
+        // Set spurious interrupt vector to 0xFF, enable APIC (bit 8)
+        let svr = volatile_read_u32(0xFEE000F0)
+        volatile_write_u32(0xFEE000F0, svr | 0x1FF)  // vector 0xFF + enable
+    }
+    history_init()
+
+    // Initialize NVMe block device (or ramdisk fallback)
+    nvme_full_init()
+
+    // Initialize VFS (mounts /, /dev, /proc, /mnt if FAT32 available)
+    vfs_init()
+    println("[VFS] Initialized")
+
+    // Initialize network stack
+    net_init()
+    println("[NET] Initialized")
+
+    // Initialize syscall dispatch table
+    syscall_init()
+    println("[ELF] Syscall table ready")
+
+    // Initialize process table v2 + keyboard buffer
+    proc_v2_init()
+    kb_init()
+    fd_init(0) // FDs for kernel process
+    println("[PROC] Process table v2 ready")
+    println("[KB] Keyboard buffer ready")
+
+    // Configure SYSCALL/SYSRET for Ring 3
+    syscall_setup()
+    println("[SYSCALL] Entry stub + MSRs configured")
+
+    // Ring 3 test: SYS_WRITE("Hello Ring 3!\n") + SYS_EXIT(0)
+    println("[RING3] Installing user program...")
+    map_page(0x2000000, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+    map_page(0x2F00000, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+
+    let b: i64 = 0x2000000
+    let msg_off: i64 = 40
+    // mov eax, 1 (SYS_WRITE)
+    volatile_write_u8(b, 0xB8)
+    volatile_write_u32(b + 1, 1)
+    // mov edi, 1 (stdout)
+    volatile_write_u8(b + 5, 0xBF)
+    volatile_write_u32(b + 6, 1)
+    // lea rsi, [rip + msg] — use absolute: mov esi, msg_addr
+    volatile_write_u8(b + 10, 0xBE)
+    volatile_write_u32(b + 11, b + msg_off)
+    // mov edx, 14 (len)
+    volatile_write_u8(b + 15, 0xBA)
+    volatile_write_u32(b + 16, 14)
+    // syscall
+    volatile_write_u8(b + 20, 0x0F)
+    volatile_write_u8(b + 21, 0x05)
+    // mov eax, 60 (SYS_EXIT)
+    volatile_write_u8(b + 22, 0xB8)
+    volatile_write_u32(b + 23, 60)
+    // xor edi, edi
+    volatile_write_u8(b + 27, 0x31)
+    volatile_write_u8(b + 28, 0xFF)
+    // syscall
+    volatile_write_u8(b + 29, 0x0F)
+    volatile_write_u8(b + 30, 0x05)
+    // nop nop (safety)
+    volatile_write_u8(b + 31, 0x90)
+    volatile_write_u8(b + 32, 0x90)
+
+    // Message at offset 40: "Hello Ring 3!\n"
+    volatile_write_u8(b + msg_off, 72)      // H
+    volatile_write_u8(b + msg_off + 1, 101)  // e
+    volatile_write_u8(b + msg_off + 2, 108)  // l
+    volatile_write_u8(b + msg_off + 3, 108)  // l
+    volatile_write_u8(b + msg_off + 4, 111)  // o
+    volatile_write_u8(b + msg_off + 5, 32)   // ' '
+    volatile_write_u8(b + msg_off + 6, 82)   // R
+    volatile_write_u8(b + msg_off + 7, 105)  // i
+    volatile_write_u8(b + msg_off + 8, 110)  // n
+    volatile_write_u8(b + msg_off + 9, 103)  // g
+    volatile_write_u8(b + msg_off + 10, 32)  // ' '
+    volatile_write_u8(b + msg_off + 11, 51)  // 3
+    volatile_write_u8(b + msg_off + 12, 33)  // !
+    volatile_write_u8(b + msg_off + 13, 10)  // \n
+    // Force-set TSS.RSP0 right before transition
+    volatile_write_u64(0x6FC04, 0x7F0000)
+    println("[RING3] IRETQ to user mode...")
+    iretq_to_user(0x2000000, 0x2F00FF0, 0x202)
+    // Note: SYS_EXIT currently halts. Future: return to shell.
+
+    println("[SEC] Security commands ready")
+    println("[INIT] Script engine ready")
+
     // Enable interrupts
     irq_enable()
 
+    // Serial confirmation
+    println("[NOVA] FajarOS Nova v0.5.0 Transcendence booted")
+    println("[NOVA] 9000+ LOC | 145 commands | 100% Fajar Lang")
+    println("[NOVA] Frame allocator: 32768 frames (128MB)")
+    println("[NOVA] RamFS: 64 entries, 832KB data")
+    println("[NOVA] VGA console active at 0xB8000")
+
     // Boot banner
     cprintln("============================================", WHITE_ON_BLUE)
-    cprintln("  FajarOS Nova v0.1.0 — x86_64 Shell", WHITE_ON_BLUE)
+    cprintln("  FajarOS Nova v0.5.0 — x86_64 Shell", WHITE_ON_BLUE)
     cprintln("  Written 100% in Fajar Lang", WHITE_ON_BLUE)
     cprintln("============================================", WHITE_ON_BLUE)
     cprintln("", WHITE_ON_BLACK)
@@ -552,25 +194,61 @@ const RED_ON_BLACK: i64 = 0x0C
     cmdbuf_clear()
     cprint("nova> ", GREEN_ON_BLACK)
 
-    // Main shell loop
+    // Init shift/caps state
+    volatile_write(0x6FBE0, 0)  // shift = 0
+    volatile_write(0x6FBE8, 0)  // caps = 0
+
+    // Main shell loop — shift, caps lock, arrow history
     let mut running: i64 = 1
+    let mut ext_prefix: i64 = 0
     while running == 1 {
         if kb_has_data() == 1 {
             let sc = kb_read_scancode()
-            if sc >= 0 && sc < 128 {
+
+            // Extended scancode prefix (arrows, etc.)
+            if sc == 0xE0 {
+                ext_prefix = 1
+            }
+            // Shift make/break
+            else if sc == 0x2A || sc == 0x36 {
+                volatile_write(0x6FBE0, 1)  // shift pressed
+            }
+            else if sc == 0xAA || sc == 0xB6 {
+                volatile_write(0x6FBE0, 0)  // shift released
+            }
+            // Caps Lock toggle (make only)
+            else if sc == 0x3A {
+                let caps = volatile_read(0x6FBE8)
+                volatile_write(0x6FBE8, 1 - caps)
+            }
+            // Arrow keys (after E0 prefix)
+            else if ext_prefix == 1 {
+                ext_prefix = 0
+                if sc == 0x48 { history_navigate(-1) }       // Up
+                else if sc == 0x50 { history_navigate(1) }   // Down
+            }
+            // Break codes (key release, >= 0x80) — ignore
+            else if sc >= 0x80 {
+                // Ignore break codes
+            }
+            // Normal key press
+            else if sc > 0 && sc < 128 {
                 let ascii = sc2ascii(sc)
                 if ascii == 10 {
-                    // Enter — execute command
                     console_putchar(10, WHITE_ON_BLACK)
+                    history_push()
                     dispatch_command()
                     cmdbuf_clear()
                     cprint("nova> ", GREEN_ON_BLACK)
                 } else if ascii == 8 {
-                    // Backspace
                     if cmdbuf_len() > 0 {
                         cmdbuf_pop()
                         console_putchar(8, WHITE_ON_BLACK)
                     }
+                } else if ascii == 9 {
+                    // Tab → 4 spaces
+                    let mut t: i64 = 0
+                    while t < 4 { cmdbuf_push(32); console_putchar(32, WHITE_ON_BLACK); t = t + 1 }
                 } else if ascii > 0 {
                     cmdbuf_push(ascii)
                     console_putchar(ascii, WHITE_ON_BLACK)

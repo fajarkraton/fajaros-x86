@@ -1,0 +1,60 @@
+// FajarOS Nova v0.5.0 — GPU Detection Driver
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// GPU Detection (Phase 9 Sprint 27)
+// ═══════════════════════════════════════════════
+
+@kernel fn gpu_find_controller() -> i64 {
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let cl = pci_read32(0, dev, 0, 8)
+            let class = (cl >> 24) & 0xFF
+            if class == 3 { return dev }  // Display controller
+        }
+        dev = dev + 1
+    }
+    -1
+}
+
+@kernel fn cmd_gpu() {
+    cprintln("GPU Controller:", YELLOW_ON_BLACK)
+    let dev = gpu_find_controller()
+    if dev == -1 { cprintln("  No GPU found", RED_ON_BLACK); return }
+    let id = pci_read32(0, dev, 0, 0)
+    let vendor = id & 0xFFFF
+    let device = (id >> 16) & 0xFFFF
+    cprint("  PCI Device: ", WHITE_ON_BLACK)
+    cprint_decimal(dev, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Vendor: 0x", WHITE_ON_BLACK)
+    cprint_hex(vendor, 4, CYAN_ON_BLACK)
+    if vendor == 0x10DE { cprint(" (NVIDIA)", GREEN_ON_BLACK) }
+    else if vendor == 0x8086 { cprint(" (Intel)", CYAN_ON_BLACK) }
+    else if vendor == 0x1002 { cprint(" (AMD)", CYAN_ON_BLACK) }
+    else if vendor == 0x1AF4 { cprint(" (VirtIO)", CYAN_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Device: 0x", WHITE_ON_BLACK)
+    cprint_hex(device, 4, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    // Read BAR0
+    let bar0 = pci_read32(0, dev, 0, 0x10)
+    cprint("  BAR0: 0x", WHITE_ON_BLACK)
+    cprint_hex(bar0, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    let bar1 = pci_read32(0, dev, 0, 0x14)
+    if bar1 != 0 {
+        cprint("  BAR1: 0x", WHITE_ON_BLACK)
+        cprint_hex(bar1, 8, CYAN_ON_BLACK)
+        cprintln(" (framebuffer)", WHITE_ON_BLACK)
+    }
+    // Read class info
+    let cl = pci_read32(0, dev, 0, 8)
+    let subclass = (cl >> 16) & 0xFF
+    cprint("  Type: ", WHITE_ON_BLACK)
+    if subclass == 0 { cprintln("VGA compatible", WHITE_ON_BLACK) }
+    else if subclass == 2 { cprintln("3D controller", WHITE_ON_BLACK) }
+    else { cprintln("Display controller", WHITE_ON_BLACK) }
+}

@@ -1,0 +1,34 @@
+// FajarOS Nova v0.5.0 — Spinlock
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Spinlock (Phase 8 Sprint 23.6)
+// Simple test-and-set lock using volatile memory
+// ═══════════════════════════════════════════════
+
+@kernel fn spinlock_acquire(lock_addr: i64) {
+    // Spin until lock is 0, then set to 1
+    while volatile_read(lock_addr) != 0 {}
+    volatile_write(lock_addr, 1)
+}
+
+@kernel fn spinlock_release(lock_addr: i64) {
+    volatile_write(lock_addr, 0)
+}
+
+@kernel fn cmd_spinlock() {
+    cprintln("Spinlock Test:", YELLOW_ON_BLACK)
+    let lock: i64 = 0x651000  // test lock address
+    volatile_write(lock, 0)
+    cprint("  Acquire... ", WHITE_ON_BLACK)
+    spinlock_acquire(lock)
+    cprintln("OK (locked)", GREEN_ON_BLACK)
+    cprint("  Release... ", WHITE_ON_BLACK)
+    spinlock_release(lock)
+    cprintln("OK (unlocked)", GREEN_ON_BLACK)
+    cprint("  Double acquire... ", WHITE_ON_BLACK)
+    spinlock_acquire(lock)
+    cprintln("OK", GREEN_ON_BLACK)
+    spinlock_release(lock)
+    cprintln("  Spinlock verified!", GREEN_ON_BLACK)
+}

@@ -1,0 +1,44 @@
+// FajarOS Nova v0.5.0 — Virtio-Blk Driver
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Virtio-Blk Driver (Sprint B9)
+// PCI vendor 0x1AF4, device 0x1001
+// ═══════════════════════════════════════════════
+
+@kernel fn virtio_blk_find() -> i64 {
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let vendor = id & 0xFFFF
+            let device_id = (id >> 16) & 0xFFFF
+            if vendor == 0x1AF4 && device_id == 0x1001 { return dev }
+        }
+        dev = dev + 1
+    }
+    -1
+}
+
+@kernel fn cmd_virtio_blk() {
+    cprintln("Virtio Block Devices:", YELLOW_ON_BLACK)
+    let dev = virtio_blk_find()
+    if dev == -1 {
+        cprintln("  No virtio-blk found", YELLOW_ON_BLACK)
+        return
+    }
+    let id = pci_read32(0, dev, 0, 0)
+    cprint("  PCI ", WHITE_ON_BLACK)
+    cprint_decimal(dev, CYAN_ON_BLACK)
+    cprint(": virtio-blk (", WHITE_ON_BLACK)
+    cprint_hex(id & 0xFFFF, 4, CYAN_ON_BLACK)
+    cprint(":", WHITE_ON_BLACK)
+    cprint_hex((id >> 16) & 0xFFFF, 4, CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+
+    let bar0 = pci_read32(0, dev, 0, 0x10)
+    cprint("  BAR0: 0x", WHITE_ON_BLACK)
+    cprint_hex(bar0, 8, CYAN_ON_BLACK)
+    if bar0 & 1 != 0 { cprintln(" (I/O port)", WHITE_ON_BLACK) }
+    else { cprintln(" (MMIO)", WHITE_ON_BLACK) }
+}

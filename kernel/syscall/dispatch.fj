@@ -1,0 +1,243 @@
+// FajarOS Nova v0.5.0 — Syscall Dispatch Table
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ── Syscall Dispatch Table ──
+
+const SYSCALL_TABLE: i64 = 0x884000  // 32 entries × 8 bytes (fn pointers)
+const SYS_EXIT: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_READ: i64 = 2
+const SYS_GETPID: i64 = 3
+const SYS_YIELD: i64 = 4
+const SYS_SLEEP: i64 = 5
+const SYS_MMAP: i64 = 6
+const SYS_BRK: i64 = 7
+
+@kernel fn syscall_init() {
+    // Clear syscall table
+    let mut i: i64 = 0
+    while i < 32 * 8 { volatile_write_u8(SYSCALL_TABLE + i, 0); i = i + 1 }
+    frame_mark_used(SYSCALL_TABLE / FRAME_SIZE)
+}
+
+@kernel fn syscall_handle(num: i64, arg0: i64, arg1: i64, arg2: i64) -> i64 {
+    if num == SYS_EXIT { return arg0 }
+    if num == SYS_WRITE {
+        // arg0=fd, arg1=buf_addr, arg2=len
+        if arg0 == 1 { // stdout
+            let mut i: i64 = 0
+            while i < arg2 {
+                let ch = volatile_read_u8(arg1 + i)
+                console_putchar(ch, WHITE_ON_BLACK)
+                i = i + 1
+            }
+            return arg2
+        }
+        return -1
+    }
+    if num == SYS_READ {
+        // arg0=fd — stdin not implemented yet
+        return 0
+    }
+    if num == SYS_GETPID {
+        return 0 // TODO: return actual PID
+    }
+    if num == SYS_YIELD {
+        return 0
+    }
+    if num == SYS_SLEEP {
+        sleep_ms(arg0)
+        return 0
+    }
+    if num == SYS_MMAP {
+        // Simple: allocate arg0 bytes, return address
+        let pages = (arg0 + FRAME_SIZE - 1) / FRAME_SIZE
+        let base = ELF_LOAD_BASE + 0x800000 // heap starts at 40MB
+        let mut pg: i64 = 0
+        while pg < pages {
+            let frame = frame_alloc()
+            if frame != -1 {
+                map_page(base + pg * FRAME_SIZE, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+            }
+            pg = pg + 1
+        }
+        return base
+    }
+    -1 // Unknown syscall
+}
+
+// ── Shell Commands ──
+
+@kernel fn cmd_readelf() {
+    // "readelf <filename>" — parse ELF from FAT32
+    if fat32_state_read(0) != 1 { cprintln("FAT32 not mounted", RED_ON_BLACK); return }
+
+    // Get filename from cmdbuf offset 8 ("readelf ")
+    let mut fname_len: i64 = 0
+    let mut i: i64 = 8
+    while i < 64 {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch == 0 { i = 64 }
+        else { volatile_write_u8(FAT32_NAME_BUF + 256 + fname_len, ch); fname_len = fname_len + 1; i = i + 1 }
+    }
+    volatile_write_u8(FAT32_NAME_BUF + 256 + fname_len, 0)
+
+    if fname_len == 0 { cprintln("Usage: readelf <filename>", YELLOW_ON_BLACK); return }
+
+    // Find file
+    let root = fat32_state_read(48)
+    let result = fat32_find_in_dir(root, FAT32_NAME_BUF + 256)
+    if result == -1 { cprintln("File not found", RED_ON_BLACK); return }
+
+    let shifted = result >> 32
+    let file_cluster = shifted & 0x7FFFFFFF
+    let file_size = result & 0xFFFFFFFF
+
+    // Read file
+    let bytes = fat32_read_file(file_cluster, file_size, ELF_BUF)
+    if bytes <= 0 { cprintln("Read error", RED_ON_BLACK); return }
+
+    // Validate ELF
+    let valid = elf_validate(ELF_BUF)
+    if valid != 0 {
+        cprint("Not a valid ELF64: error ", RED_ON_BLACK)
+        cprint_decimal(valid, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        return
+    }
+
+    cprintln("ELF64 Header:", YELLOW_ON_BLACK)
+    let entry = elf_get_entry(ELF_BUF)
+    cprint("  Entry point: 0x", WHITE_ON_BLACK)
+    cprint_hex(entry, 16, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let phnum = elf_get_phnum(ELF_BUF)
+    cprint("  Program headers: ", WHITE_ON_BLACK)
+    cprint_decimal(phnum, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let phoff = elf_get_phoff(ELF_BUF)
+    let phentsize = elf_get_phentsize(ELF_BUF)
+    i = 0
+    while i < phnum {
+        let ph = ELF_BUF + phoff + i * phentsize
+        let ph_type = buffer_read_u32_le(ph + PH_OFF_TYPE)
+        let vaddr = buffer_read_u64_le(ph + PH_OFF_VADDR)
+        let filesz = buffer_read_u64_le(ph + PH_OFF_FILESZ)
+        let memsz = buffer_read_u64_le(ph + PH_OFF_MEMSZ)
+        let flags = buffer_read_u32_le(ph + PH_OFF_FLAGS)
+        cprint("  [", WHITE_ON_BLACK)
+        cprint_decimal(i, CYAN_ON_BLACK)
+        cprint("] type=", WHITE_ON_BLACK)
+        if ph_type == 1 { cprint("LOAD", GREEN_ON_BLACK) }
+        else { cprint_decimal(ph_type, WHITE_ON_BLACK) }
+        cprint(" vaddr=0x", WHITE_ON_BLACK)
+        cprint_hex(vaddr, 8, CYAN_ON_BLACK)
+        cprint(" filesz=", WHITE_ON_BLACK)
+        cprint_decimal(filesz, CYAN_ON_BLACK)
+        cprint(" memsz=", WHITE_ON_BLACK)
+        cprint_decimal(memsz, CYAN_ON_BLACK)
+        cprint(" flags=", WHITE_ON_BLACK)
+        if flags & 4 != 0 { cprint("R", GREEN_ON_BLACK) }
+        if flags & 2 != 0 { cprint("W", YELLOW_ON_BLACK) }
+        if flags & 1 != 0 { cprint("X", RED_ON_BLACK) }
+        console_putchar(10, WHITE_ON_BLACK)
+        i = i + 1
+    }
+
+    cprint("  File size: ", WHITE_ON_BLACK)
+    cprint_decimal(bytes, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_exec() {
+    // "exec <filename>" — load and execute ELF from FAT32
+    if fat32_state_read(0) != 1 { cprintln("FAT32 not mounted", RED_ON_BLACK); return }
+
+    let mut fname_len: i64 = 0
+    let mut i: i64 = 5
+    while i < 64 {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch == 0 { i = 64 }
+        else { volatile_write_u8(FAT32_NAME_BUF + 256 + fname_len, ch); fname_len = fname_len + 1; i = i + 1 }
+    }
+    volatile_write_u8(FAT32_NAME_BUF + 256 + fname_len, 0)
+
+    if fname_len == 0 { cprintln("Usage: exec <filename>", YELLOW_ON_BLACK); return }
+
+    let root = fat32_state_read(48)
+    let result = fat32_find_in_dir(root, FAT32_NAME_BUF + 256)
+    if result == -1 { cprintln("File not found", RED_ON_BLACK); return }
+
+    let shifted = result >> 32
+    let file_cluster = shifted & 0x7FFFFFFF
+    let file_size = result & 0xFFFFFFFF
+
+    cprint("Loading ", WHITE_ON_BLACK)
+    let mut k: i64 = 0
+    while k < fname_len {
+        console_putchar(volatile_read_u8(FAT32_NAME_BUF + 256 + k), CYAN_ON_BLACK)
+        k = k + 1
+    }
+    cprint(" (", WHITE_ON_BLACK)
+    cprint_decimal(file_size, CYAN_ON_BLACK)
+    cprintln(" bytes)...", WHITE_ON_BLACK)
+
+    let bytes = fat32_read_file(file_cluster, file_size, ELF_BUF)
+    if bytes <= 0 { cprintln("Read error", RED_ON_BLACK); return }
+
+    let valid = elf_validate(ELF_BUF)
+    if valid != 0 {
+        cprintln("Not a valid ELF64", RED_ON_BLACK)
+        return
+    }
+
+    // Load PT_LOAD segments into memory
+    let loaded = elf_load_segments(ELF_BUF, bytes)
+    cprint("  Loaded ", WHITE_ON_BLACK)
+    cprint_decimal(loaded, CYAN_ON_BLACK)
+    cprintln(" segments", WHITE_ON_BLACK)
+
+    let entry = elf_get_entry(ELF_BUF)
+    cprint("  Entry: 0x", WHITE_ON_BLACK)
+    cprint_hex(entry, 16, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Setup user stack (64KB at ELF_STACK_TOP - 0x10000)
+    let user_stack_base = ELF_STACK_TOP - 0x10000
+    let mut pg: i64 = user_stack_base
+    while pg < ELF_STACK_TOP {
+        let frame = frame_alloc()
+        if frame != -1 {
+            map_page(pg, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+        }
+        pg = pg + FRAME_SIZE
+    }
+
+    let user_rsp = ELF_STACK_TOP - 8 // Stack grows down, leave room
+    cprintln("  Transitioning to Ring 3...", YELLOW_ON_BLACK)
+
+    // Setup SYSCALL/SYSRET MSRs for return path
+    // IA32_STAR (0xC0000081): SYSRET CS/SS in bits 63:48, SYSCALL CS/SS in 47:32
+    // Kernel CS=0x08, Kernel SS=0x10, User CS=0x20|3=0x23, User SS=0x18|3=0x1B
+    // STAR: (user_cs_base << 48) | (kernel_cs << 32)
+    // SYSRET loads CS from STAR[63:48]+16, SS from STAR[63:48]+8
+    // So user_cs_base = 0x18 (SYSRET adds 16 → 0x28? No...)
+    // Actually: SYSRET 64-bit loads CS = STAR[63:48]+16, SS = STAR[63:48]+8
+    // We want CS=0x23 (0x20|RPL3). STAR[63:48] = 0x13 → CS = 0x13+16 = 0x23. SS = 0x13+8 = 0x1B.
+    let star_val = (0x13 << 48) | (0x08 << 32)
+    wrmsr(0xC0000081, star_val)
+
+    // IA32_LSTAR (0xC0000082): SYSCALL entry point
+    // For now, set to a simple handler that writes to VGA and halts
+    // We'll use a fixed kernel address for the syscall handler
+    // Actually, without a real SYSCALL handler in the kernel binary,
+    // we can't safely transition. Use IRETQ instead (which we have).
+
+    // IRETQ to Ring 3: push SS, RSP, RFLAGS, CS, RIP on stack
+    // iretq_to_user(rip, rsp, rflags) does this for us
+    iretq_to_user(entry, user_rsp, 0x202) // IF=1 (interrupts enabled)
+    // Note: we only reach here if user program returns via exception/syscall
+    cprintln("  User program returned", GREEN_ON_BLACK)
+}

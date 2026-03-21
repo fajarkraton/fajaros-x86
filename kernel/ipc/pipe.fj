@@ -1,0 +1,166 @@
+// FajarOS Nova v0.5.0 — Pipe + File Descriptors
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Pipe + File Descriptors (Sprint C3)
+// ═══════════════════════════════════════════════
+
+const FD_TABLE: i64 = 0x894000  // 16 procs × 16 FDs × 16 bytes
+// Per FD: +0=type (0=closed, 1=console, 2=file, 3=pipe_read, 4=pipe_write)
+//         +8=data (file offset, pipe buffer addr, etc.)
+const PIPE_POOL: i64 = 0x898000  // 8 pipes × 4KB each
+const PIPE_MAX: i64 = 8
+
+@kernel fn fd_init(pid: i64) {
+    let base = FD_TABLE + pid * 16 * 16
+    // FD 0 = stdin (console)
+    volatile_write_u64(base, 1) // type=console
+    // FD 1 = stdout (console)
+    volatile_write_u64(base + 16, 1) // type=console
+    // FD 2 = stderr (console)
+    volatile_write_u64(base + 32, 1) // type=console
+    // Rest = closed
+    let mut fd: i64 = 3
+    while fd < 16 {
+        volatile_write_u64(base + fd * 16, 0)
+        fd = fd + 1
+    }
+}
+
+@kernel fn pipe_create() -> i64 {
+    // Find free pipe slot
+    let mut slot: i64 = 0
+    while slot < PIPE_MAX {
+        let pipe_base = PIPE_POOL + slot * 4096
+        let in_use = volatile_read_u64(pipe_base)
+        if in_use == 0 {
+            volatile_write_u64(pipe_base, 1)    // in_use = 1
+            volatile_write_u64(pipe_base + 8, 0) // read_pos = 0
+            volatile_write_u64(pipe_base + 16, 0) // write_pos = 0
+            return slot
+        }
+        slot = slot + 1
+    }
+    -1
+}
+
+@kernel fn pipe_write(slot: i64, data: i64, len: i64) -> i64 {
+    let pipe_base = PIPE_POOL + slot * 4096
+    let write_pos = volatile_read_u64(pipe_base + 16)
+    let avail = 4096 - 32 - write_pos // Header = 32 bytes
+    let to_write = if len < avail { len } else { avail }
+    let mut i: i64 = 0
+    while i < to_write {
+        volatile_write_u8(pipe_base + 32 + write_pos + i, volatile_read_u8(data + i))
+        i = i + 1
+    }
+    volatile_write_u64(pipe_base + 16, write_pos + to_write)
+    to_write
+}
+
+@kernel fn pipe_read(slot: i64, buf: i64, len: i64) -> i64 {
+    let pipe_base = PIPE_POOL + slot * 4096
+    let read_pos = volatile_read_u64(pipe_base + 8)
+    let write_pos = volatile_read_u64(pipe_base + 16)
+    let available = write_pos - read_pos
+    if available <= 0 { return 0 }
+    let to_read = if len < available { len } else { available }
+    let mut i: i64 = 0
+    while i < to_read {
+        volatile_write_u8(buf + i, volatile_read_u8(pipe_base + 32 + read_pos + i))
+        i = i + 1
+    }
+    volatile_write_u64(pipe_base + 8, read_pos + to_read)
+    to_read
+}
+
+@kernel fn cmd_pipe_test() {
+    cprintln("Pipe test:", YELLOW_ON_BLACK)
+    let slot = pipe_create()
+    if slot < 0 { cprintln("  No free pipe", RED_ON_BLACK); return }
+    cprint("  Created pipe ", WHITE_ON_BLACK)
+    cprint_decimal(slot, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Write "Hello pipe!"
+    let msg: i64 = 0x830000
+    volatile_write_u8(msg, 72)   // H
+    volatile_write_u8(msg + 1, 101) // e
+    volatile_write_u8(msg + 2, 108) // l
+    volatile_write_u8(msg + 3, 108) // l
+    volatile_write_u8(msg + 4, 111) // o
+    volatile_write_u8(msg + 5, 33)  // !
+    let written = pipe_write(slot, msg, 6)
+    cprint("  Written: ", WHITE_ON_BLACK)
+    cprint_decimal(written, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+
+    // Read back
+    let rbuf: i64 = 0x831000
+    let rn = pipe_read(slot, rbuf, 64)
+    cprint("  Read: ", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < rn { console_putchar(volatile_read_u8(rbuf + i), GREEN_ON_BLACK); i = i + 1 }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+// ═══════════════════════════════════════════════
+// Pipe (Phase 5 Sprint 15.7)
+// Simple 4KB buffer between two processes
+// Pipe data at 0x650000 (4096 bytes buffer + metadata)
+// ═══════════════════════════════════════════════
+
+const PIPE_BASE: i64 = 0x650000
+const PIPE_BUF_SIZE: i64 = 4096
+
+@kernel fn pipe_init() {
+    volatile_write(PIPE_BASE, 0)           // read_pos
+    volatile_write(PIPE_BASE + 8, 0)       // write_pos
+    volatile_write(PIPE_BASE + 16, 0)      // count (bytes in buffer)
+    volatile_write(PIPE_BASE + 24, 0)      // closed flag
+}
+
+@kernel fn pipe_write_byte(b: i64) -> i64 {
+    let count = volatile_read(PIPE_BASE + 16)
+    if count >= PIPE_BUF_SIZE { return -1 }  // full
+    let wpos = volatile_read(PIPE_BASE + 8)
+    volatile_write_u8(PIPE_BASE + 32 + wpos, b)
+    volatile_write(PIPE_BASE + 8, (wpos + 1) % PIPE_BUF_SIZE)
+    volatile_write(PIPE_BASE + 16, count + 1)
+    0
+}
+
+@kernel fn pipe_read_byte() -> i64 {
+    let count = volatile_read(PIPE_BASE + 16)
+    if count == 0 { return -1 }  // empty
+    let rpos = volatile_read(PIPE_BASE)
+    let b = volatile_read_u8(PIPE_BASE + 32 + rpos)
+    volatile_write(PIPE_BASE, (rpos + 1) % PIPE_BUF_SIZE)
+    volatile_write(PIPE_BASE + 16, count - 1)
+    b
+}
+
+@kernel fn cmd_pipe() {
+    // pipe <text> — write text to pipe, then read it back (demo)
+    let len = cmdbuf_len()
+    if len <= 5 { cprintln("Usage: pipe <text>", YELLOW_ON_BLACK); return }
+    pipe_init()
+    // Write text to pipe
+    let text_len = len - 5
+    let mut i: i64 = 5
+    while i < len {
+        pipe_write_byte(volatile_read_u8(0x6F800 + i))
+        i = i + 1
+    }
+    cprint("Wrote ", WHITE_ON_BLACK)
+    cprint_decimal(text_len, CYAN_ON_BLACK)
+    cprintln(" bytes to pipe", WHITE_ON_BLACK)
+    // Read back from pipe
+    cprint("Read:  ", WHITE_ON_BLACK)
+    let mut b = pipe_read_byte()
+    while b != -1 {
+        console_putchar(b, GREEN_ON_BLACK)
+        b = pipe_read_byte()
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+}

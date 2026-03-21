@@ -1,0 +1,116 @@
+// FajarOS Nova v0.5.0 — ELF Loader
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// ELF Loader + Syscall ABI (Phase 16)
+// Loads and executes ELF64 binaries from FAT32
+// Syscall dispatch table for user-space programs
+// ═══════════════════════════════════════════════
+
+const ELF_LOAD_BASE: i64 = 0x2000000  // 32MB — user ELF load address
+const ELF_STACK_TOP: i64 = 0x3000000  // 48MB — user stack top
+const ELF_BUF: i64 = 0x880000  // ELF read buffer (64KB)
+const ELF_MAGIC: i64 = 0x464C457F // \x7FELF
+
+// ELF64 header offsets
+const ELF_OFF_MAGIC: i64 = 0
+const ELF_OFF_CLASS: i64 = 4   // 1=32-bit, 2=64-bit
+const ELF_OFF_DATA: i64 = 5    // 1=LE, 2=BE
+const ELF_OFF_TYPE: i64 = 16   // 2=ET_EXEC, 3=ET_DYN
+const ELF_OFF_MACHINE: i64 = 18 // 0x3E=x86_64
+const ELF_OFF_ENTRY: i64 = 24  // Entry point (8 bytes)
+const ELF_OFF_PHOFF: i64 = 32  // Program header offset (8 bytes)
+const ELF_OFF_PHENTSIZE: i64 = 54 // Program header entry size (2 bytes)
+const ELF_OFF_PHNUM: i64 = 56  // Number of program headers (2 bytes)
+
+// Program header offsets (64-bit)
+const PH_OFF_TYPE: i64 = 0     // 1=PT_LOAD
+const PH_OFF_FLAGS: i64 = 4    // PF_X=1, PF_W=2, PF_R=4
+const PH_OFF_OFFSET: i64 = 8   // File offset (8 bytes)
+const PH_OFF_VADDR: i64 = 16   // Virtual address (8 bytes)
+const PH_OFF_FILESZ: i64 = 32  // Size in file (8 bytes)
+const PH_OFF_MEMSZ: i64 = 40   // Size in memory (8 bytes)
+
+@kernel fn elf_validate(buf: i64) -> i64 {
+    // Check ELF magic: 0x7F 'E' 'L' 'F'
+    let m0 = volatile_read_u8(buf)
+    let m1 = volatile_read_u8(buf + 1)
+    let m2 = volatile_read_u8(buf + 2)
+    let m3 = volatile_read_u8(buf + 3)
+    if m0 != 0x7F || m1 != 0x45 || m2 != 0x4C || m3 != 0x46 { return -1 }
+    // Check 64-bit
+    if volatile_read_u8(buf + ELF_OFF_CLASS) != 2 { return -2 }
+    // Check little-endian
+    if volatile_read_u8(buf + ELF_OFF_DATA) != 1 { return -3 }
+    // Check x86_64
+    let machine = buffer_read_u16_le(buf + ELF_OFF_MACHINE)
+    if machine != 0x3E { return -4 }
+    0
+}
+
+@kernel fn elf_get_entry(buf: i64) -> i64 {
+    buffer_read_u64_le(buf + ELF_OFF_ENTRY)
+}
+
+@kernel fn elf_get_phoff(buf: i64) -> i64 {
+    buffer_read_u64_le(buf + ELF_OFF_PHOFF)
+}
+
+@kernel fn elf_get_phnum(buf: i64) -> i64 {
+    buffer_read_u16_le(buf + ELF_OFF_PHNUM)
+}
+
+@kernel fn elf_get_phentsize(buf: i64) -> i64 {
+    buffer_read_u16_le(buf + ELF_OFF_PHENTSIZE)
+}
+
+@kernel fn elf_load_segments(buf: i64, file_size: i64) -> i64 {
+    let phoff = elf_get_phoff(buf)
+    let phnum = elf_get_phnum(buf)
+    let phentsize = elf_get_phentsize(buf)
+    let mut loaded: i64 = 0
+
+    let mut i: i64 = 0
+    while i < phnum {
+        let ph = buf + phoff + i * phentsize
+        let ph_type = buffer_read_u32_le(ph + PH_OFF_TYPE)
+
+        if ph_type == 1 { // PT_LOAD
+            let offset = buffer_read_u64_le(ph + PH_OFF_OFFSET)
+            let vaddr = buffer_read_u64_le(ph + PH_OFF_VADDR)
+            let filesz = buffer_read_u64_le(ph + PH_OFF_FILESZ)
+            let memsz = buffer_read_u64_le(ph + PH_OFF_MEMSZ)
+
+            // Map pages for this segment
+            let mut pg: i64 = vaddr & 0xFFFFF000
+            let end_pg = (vaddr + memsz + 0xFFF) & 0xFFFFF000
+            while pg < end_pg {
+                // Allocate frame and map
+                let frame = frame_alloc()
+                if frame != -1 {
+                    map_page(pg, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+                }
+                pg = pg + FRAME_SIZE
+            }
+
+            // Copy file data to memory
+            let mut j: i64 = 0
+            while j < filesz {
+                if offset + j < file_size {
+                    volatile_write_u8(vaddr + j, volatile_read_u8(buf + offset + j))
+                }
+                j = j + 1
+            }
+
+            // Zero BSS (memsz - filesz)
+            while j < memsz {
+                volatile_write_u8(vaddr + j, 0)
+                j = j + 1
+            }
+
+            loaded = loaded + 1
+        }
+        i = i + 1
+    }
+    loaded
+}

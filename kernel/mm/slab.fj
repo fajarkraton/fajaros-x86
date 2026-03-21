@@ -1,0 +1,103 @@
+// FajarOS Nova v0.5.0 — Slab Allocator
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Slab Allocator (Phase 2 Sprint 6)
+// Pre-sized caches: 32, 64, 128, 256, 512, 1024
+// Each slab: bitmap + objects at fixed addresses
+// ═══════════════════════════════════════════════
+
+const SLAB_BASE: i64 = 0x590000
+const SLAB_SIZES: i64 = 6  // 32, 64, 128, 256, 512, 1024
+
+@kernel fn slab_init() {
+    // Initialize slab metadata at SLAB_BASE
+    // Each slab: offset +0: object_size, +8: capacity, +16: used, +24: bitmap_addr, +32: data_addr
+    let mut i: i64 = 0
+    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
+    let mut data_off: i64 = SLAB_BASE + 256  // data starts after metadata
+    while i < SLAB_SIZES {
+        let meta = SLAB_BASE + i * 40
+        let obj_size = sizes[i]
+        let capacity = 4096 / obj_size  // one page worth
+        volatile_write(meta, obj_size)
+        volatile_write(meta + 8, capacity)
+        volatile_write(meta + 16, 0)      // used = 0
+        volatile_write(meta + 24, data_off) // bitmap
+        volatile_write(meta + 32, data_off + capacity) // data
+        // Clear bitmap
+        let mut j: i64 = 0
+        while j < capacity { volatile_write_u8(data_off + j, 0); j = j + 1 }
+        data_off = data_off + capacity + capacity * obj_size
+        i = i + 1
+    }
+}
+
+@kernel fn slab_alloc(size: i64) -> i64 {
+    // Find smallest slab that fits
+    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
+    let mut i: i64 = 0
+    while i < SLAB_SIZES {
+        if sizes[i] >= size {
+            let meta = SLAB_BASE + i * 40
+            let capacity = volatile_read(meta + 8)
+            let used = volatile_read(meta + 16)
+            if used < capacity {
+                let bitmap = volatile_read(meta + 24)
+                let data = volatile_read(meta + 32)
+                // Find free slot
+                let mut j: i64 = 0
+                while j < capacity {
+                    if volatile_read_u8(bitmap + j) == 0 {
+                        volatile_write_u8(bitmap + j, 1)
+                        volatile_write(meta + 16, used + 1)
+                        return data + j * sizes[i]
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    -1  // No suitable slab
+}
+
+@kernel fn slab_free(ptr: i64, size: i64) {
+    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
+    let mut i: i64 = 0
+    while i < SLAB_SIZES {
+        if sizes[i] >= size {
+            let meta = SLAB_BASE + i * 40
+            let data = volatile_read(meta + 32)
+            let bitmap = volatile_read(meta + 24)
+            let slot = (ptr - data) / sizes[i]
+            if slot >= 0 && slot < volatile_read(meta + 8) {
+                volatile_write_u8(bitmap + slot, 0)
+                let used = volatile_read(meta + 16)
+                if used > 0 { volatile_write(meta + 16, used - 1) }
+            }
+            return
+        }
+        i = i + 1
+    }
+}
+
+@kernel fn cmd_slab() {
+    cprintln("Slab Allocator:", YELLOW_ON_BLACK)
+    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
+    let mut i: i64 = 0
+    while i < SLAB_SIZES {
+        let meta = SLAB_BASE + i * 40
+        let obj_size = volatile_read(meta)
+        let capacity = volatile_read(meta + 8)
+        let used = volatile_read(meta + 16)
+        cprint("  ", WHITE_ON_BLACK)
+        cprint_decimal(obj_size, CYAN_ON_BLACK)
+        cprint("B: ", WHITE_ON_BLACK)
+        cprint_decimal(used, WHITE_ON_BLACK)
+        cprint("/", WHITE_ON_BLACK)
+        cprint_decimal(capacity, WHITE_ON_BLACK)
+        cprintln(" used", WHITE_ON_BLACK)
+        i = i + 1
+    }
+}

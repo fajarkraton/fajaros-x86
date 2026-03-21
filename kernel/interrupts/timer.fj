@@ -1,0 +1,21 @@
+// FajarOS Nova v0.5.0 — Timer Utilities
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Timer Utilities (Phase 3)
+// ═══════════════════════════════════════════════
+
+@kernel fn sleep_ms(ms: i64) {
+    // Busy-wait using PIT ticks (100 Hz = 10ms per tick)
+    let ticks_to_wait = ms / 10
+    let target = read_timer_ticks() + ticks_to_wait
+    while read_timer_ticks() < target {}
+}
+
+@kernel fn delay_us(us: i64) {
+    // Microsecond delay using TSC
+    // Estimate TSC frequency: ~2 GHz (QEMU default) = 2000 cycles/us
+    let cycles = us * 2000
+    let start = rdtsc()
+    while rdtsc() - start < cycles {}
+}

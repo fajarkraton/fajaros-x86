@@ -1,0 +1,25 @@
+// FajarOS Nova v0.5.0 — LAPIC / IOAPIC
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// LAPIC / IOAPIC (Phase 3 Sprint 8)
+// LAPIC MMIO at 0xFEE00000 (identity-mapped in 128MB)
+// Note: only works if APIC is within 128MB mapping
+// QEMU default LAPIC is at 0xFEE00000 (outside 128MB!)
+// These functions prepare for when higher-address mapping is added
+// ═══════════════════════════════════════════════
+
+const LAPIC_BASE: i64 = 0xFEE00000
+const LAPIC_ID: i64 = 0x20
+const LAPIC_VER: i64 = 0x30
+const LAPIC_TPR: i64 = 0x80
+const LAPIC_EOI: i64 = 0xB0
+const LAPIC_SVR: i64 = 0xF0
+const LAPIC_ICR_LO: i64 = 0x300
+const LAPIC_ICR_HI: i64 = 0x310
+const LAPIC_TIMER_LVT: i64 = 0x320
+const LAPIC_TIMER_INIT: i64 = 0x380
+const LAPIC_TIMER_CUR: i64 = 0x390
+const LAPIC_TIMER_DIV: i64 = 0x3E0
+
+const IOAPIC_BASE: i64 = 0xFEC00000
