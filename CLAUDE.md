@@ -1,18 +1,18 @@
-# CLAUDE.md — FajarOS Nova v0.5.0 "Transcendence" (x86_64)
+# CLAUDE.md — FajarOS Nova v1.0.0 "Genesis" (x86_64)
 
 > Auto-loaded by Claude Code. Single source of truth for this repo.
 
 ## Project Identity
 
-- **Project:** FajarOS Nova v0.5.0 — x86_64 operating system written 100% in Fajar Lang
-- **Codename:** "Nova" / "Transcendence"
+- **Project:** FajarOS Nova v1.0.0 — x86_64 operating system written 100% in Fajar Lang
+- **Codename:** "Nova" / "Genesis"
 - **Target:** Intel Core i9-14900HX (Lenovo Legion Pro)
 - **Language:** 100% Fajar Lang (`.fj` files)
 - **Compiler:** [Fajar Lang](https://github.com/fajarkraton/fajar-lang) (`fj` binary)
 - **Author:** Fajar (TaxPrime / PrimeCore.id)
 - **Model:** Claude Opus 4.6 exclusively
-- **LOC:** 9,000+ lines across 35 modular `.fj` files
-- **Commands:** 145 shell commands
+- **LOC:** 11,615 lines across 35 modular `.fj` files
+- **Commands:** 160+ shell commands
 
 ## Build System
 
@@ -37,7 +37,7 @@ make clean          # Remove build artifacts
 
 ```
 Layer 5: Applications (@safe)    — Ring 3 — user programs, login, neofetch
-Layer 4: Shell (@kernel)         — 145 commands, scripting, history
+Layer 4: Shell (@kernel)         — 160+ commands, scripting, history
 Layer 3: Filesystem (@kernel)    — VFS, FAT32, RamFS, /dev, /proc
 Layer 2: Drivers (@kernel)       — Serial, VGA, KB, PCI, NVMe, Net, USB, GPU
 Layer 1: Microkernel (@kernel)   — MM, scheduler, IPC, syscall, SMP, ELF
@@ -86,7 +86,7 @@ Layer 0: Hardware                — Intel i9-14900HX, RTX 4090, NVMe
 | 28 | fs/ramfs.fj | 115 | RAM filesystem |
 | 29 | fs/fat32.fj | 752 | FAT32 filesystem |
 | 30 | fs/vfs.fj | 325 | VFS (/dev, /proc, mount table) |
-| 31 | shell/commands.fj | 3394 | 145 commands + dispatch |
+| 31 | shell/commands.fj | 3394 | 160+ commands + dispatch |
 | 32 | shell/scripting.fj | 89 | Script execution |
 | 33 | apps/user_programs.fj | 262 | Ring 3 programs + login |
 | 34 | apps/mnist.fj | 6 | MNIST (reserved) |

@@ -1,4 +1,4 @@
-# FajarOS Nova v0.5.0 "Transcendence" — x86_64 Operating System in Fajar Lang
+# FajarOS Nova v1.0.0 "Genesis" — x86_64 Operating System in Fajar Lang
 
 > The world's first OS written 100% in [Fajar Lang](https://github.com/fajarkraton/fajar-lang)
 > that natively unifies kernel safety, hardware drivers, and AI inference —
@@ -10,16 +10,18 @@
 
 | Metric | Value |
 |--------|-------|
-| **LOC** | 9,000+ lines of Fajar Lang |
-| **Commands** | 145 shell commands |
+| **LOC** | 11,615 lines of Fajar Lang |
+| **Commands** | 160+ shell commands |
 | **Files** | 35 modular `.fj` source files |
-| **Ring 3** | SYSCALL/SYSRET with user mode programs |
-| **Storage** | NVMe + FAT32 + VFS + RamFS |
-| **Network** | Ethernet + ARP + IPv4 + ICMP (ping) |
+| **Scheduler** | Preemptive multitasking (timer-driven context switch) |
+| **Ring 3** | 3 user programs run + return to kernel via SYSCALL |
+| **Memory** | Per-process page tables (CR3 switch), page fault handler |
+| **Storage** | NVMe + USB Mass Storage (XHCI→SCSI) + FAT32 + VFS |
+| **Network** | DHCP + ARP + IPv4 + ICMP (real ping!) + UDP + TCP + HTTP |
 | **SMP** | AP trampoline, INIT-SIPI-SIPI, per-CPU |
 | **AI** | MNIST classifier (784 -> 10, softmax) |
-| **Process** | 16 PIDs, fork/exit/waitpid, pipes, FD table |
-| **ELF** | ELF64 parser + PT_LOAD segment loader |
+| **Process** | Init (PID 1), 16 PIDs, fork/exit/waitpid, pipes, FD table |
+| **ELF** | ELF64 parser + PT_LOAD loader + exec from FAT32 |
 
 ## Target Hardware
 
@@ -100,12 +102,12 @@ make loc
 ### Expected Output
 
 ```
-[NOVA] FajarOS Nova v0.5.0 Transcendence booted
-[NOVA] 9000+ LOC | 145 commands | 100% Fajar Lang
+[NOVA] FajarOS Nova v1.0.0 Genesis booted
+[NOVA] 11600+ LOC | 160 commands | Preemptive | 100% Fajar Lang
 [NOVA] Frame allocator: 32768 frames (128MB)
 [NOVA] RamFS: 64 entries, 832KB data
 ============================================
-  FajarOS Nova v0.5.0 — x86_64 Shell
+  FajarOS Nova v1.0.0 — x86_64 Shell
   Written 100% in Fajar Lang
 ============================================
 
@@ -238,6 +240,6 @@ MIT License — Copyright (c) 2026 Fajar (TaxPrime / PrimeCore.id)
 
 ---
 
-*FajarOS "Nova" v0.5.0 "Transcendence" — A new star rises on x86_64*
+*FajarOS "Nova" v0.5.0 "Genesis" — A new star rises on x86_64*
 *9,000+ LOC | 145 commands | 35 modular files | 100% Fajar Lang*
 *Built with Fajar Lang + Claude Opus 4.6*
