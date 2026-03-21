@@ -22,6 +22,224 @@ const NET_TX_BUF: i64 = 0x874000  // 16KB TX buffer
 const NET_ARP_CACHE: i64 = 0x878000  // ARP cache: 16 entries × 16 bytes (ip:4 + mac:6 + pad:6)
 const NET_PKT_BUF: i64 = 0x87C000  // Temp packet build buffer (4KB)
 
+// Virtqueue memory layout (at 0x890000, page-aligned)
+// Queue 0 = RX, Queue 1 = TX
+// Each queue: 16 descriptors × 16 bytes = 256 bytes descriptors
+//   + avail ring: 6 + 16*2 = 38 bytes (padded to 4096 boundary)
+//   + used ring: 4 + 16*8 = 132 bytes
+// Total per queue: ~4KB (page-aligned)
+const VQ_NUM_ENTRIES: i64 = 16
+const VQ_RX_BASE: i64 = 0x890000     // RX queue (page 0)
+const VQ_TX_BASE: i64 = 0x894000     // TX queue (page 1)
+const VQ_RX_BUFS: i64 = 0x898000    // RX packet buffers: 16 × 2KB = 32KB
+const VIRTIO_NET_HDR_SIZE: i64 = 10  // virtio-net header prepended to each packet
+
+// Net state extended offsets:
+// +64: rx_avail_idx (current avail ring index for RX)
+// +72: tx_avail_idx
+// +80: rx_used_last (last processed used ring index)
+// +88: tx_used_last
+
+// Descriptor flags
+const VRING_DESC_F_NEXT: i64 = 1
+const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → driver)
+
+// Virtqueue descriptor: 16 bytes
+// +0: addr (u64) — physical address of buffer
+// +8: len  (u32) — buffer length
+// +12: flags (u16) — VRING_DESC_F_*
+// +14: next (u16) — next descriptor index (if F_NEXT)
+
+@kernel fn vq_desc_set(base: i64, idx: i64, addr: i64, len: i64, flags: i64, next: i64) {
+    let off = base + idx * 16
+    volatile_write_u64(off, addr)
+    volatile_write_u32(off + 8, len)
+    volatile_write_u16(off + 12, flags)
+    volatile_write_u16(off + 14, next)
+}
+
+// Avail ring layout (after descriptors):
+// +0: flags (u16) — 0 = no interrupt suppression
+// +2: idx (u16) — next slot to fill
+// +4: ring[N] (u16 each) — descriptor indices
+
+@kernel fn vq_avail_offset(base: i64) -> i64 {
+    // Avail ring starts after descriptor table: N * 16 bytes
+    base + VQ_NUM_ENTRIES * 16
+}
+
+@kernel fn vq_avail_add(base: i64, desc_idx: i64) {
+    let avail = vq_avail_offset(base)
+    let idx = volatile_read_u16(avail + 2) & 0xFFFF
+    let ring_idx = idx % VQ_NUM_ENTRIES
+    volatile_write_u16(avail + 4 + ring_idx * 2, desc_idx)
+    // Memory barrier (ensure descriptor is visible before updating idx)
+    // On x86 stores are ordered, but add a compiler fence
+    volatile_write_u16(avail + 2, (idx + 1) & 0xFFFF)
+}
+
+// Used ring layout (page-aligned after avail ring):
+// +0: flags (u16)
+// +2: idx (u16)
+// +4: ring[N] × 8 bytes: id(u32) + len(u32)
+
+@kernel fn vq_used_offset(base: i64) -> i64 {
+    // Used ring must be page-aligned (4096 boundary)
+    // desc_table = N*16, avail_ring = 6+2*N, pad to 4096
+    let avail_end = base + VQ_NUM_ENTRIES * 16 + 6 + VQ_NUM_ENTRIES * 2
+    let aligned = ((avail_end + 4095) / 4096) * 4096
+    aligned
+}
+
+@kernel fn vq_used_idx(base: i64) -> i64 {
+    volatile_read_u16(vq_used_offset(base) + 2) & 0xFFFF
+}
+
+@kernel fn vq_setup_queue(io_base: i64, queue_idx: i64, queue_base: i64) {
+    // Select queue
+    port_outw(io_base + 0x0E, queue_idx)
+    // Read queue size (should return max entries)
+    let qsz = port_inw(io_base + 0x0C) & 0xFFFF
+    if qsz == 0 { return }
+    // Write queue PFN (physical address >> 12 = page frame number)
+    port_outd(io_base + 0x08, queue_base / 4096)
+}
+
+@kernel fn vq_init_mem(base: i64) {
+    // Zero the entire queue region (4KB should be enough)
+    let mut i: i64 = 0
+    while i < 4096 { volatile_write_u8(base + i, 0); i = i + 1 }
+}
+
+@kernel fn net_setup_rx_queue() {
+    // Pre-fill RX queue with empty buffers (device writes received packets here)
+    let mut i: i64 = 0
+    while i < VQ_NUM_ENTRIES {
+        let buf_addr = VQ_RX_BUFS + i * 2048  // 2KB per RX buffer
+        // Descriptor: addr=buf, len=2048, flags=WRITE (device fills it), no next
+        vq_desc_set(VQ_RX_BASE, i, buf_addr, 2048, VRING_DESC_F_WRITE, 0)
+        // Add to avail ring
+        vq_avail_add(VQ_RX_BASE, i)
+        i = i + 1
+    }
+    // Store our tracking indices
+    net_state_write(64, VQ_NUM_ENTRIES)  // rx_avail_idx = N (we filled N entries)
+    net_state_write(80, 0)               // rx_used_last = 0
+}
+
+@kernel fn net_tx_packet(data: i64, len: i64) -> i64 {
+    // Send a packet via virtio-net TX queue
+    // data must include the 10-byte virtio-net header prepended
+    let io_base = net_state_read(56)
+    if io_base == 0 { return -1 }
+
+    let tx_idx = net_state_read(72) & 0xFFFF
+    let desc_idx = tx_idx % VQ_NUM_ENTRIES
+
+    // Set descriptor: point to TX buffer with data
+    vq_desc_set(VQ_TX_BASE, desc_idx, data, len, 0, 0)
+
+    // Add to avail ring
+    vq_avail_add(VQ_TX_BASE, desc_idx)
+
+    // Update our tracking
+    net_state_write(72, tx_idx + 1)
+
+    // Kick the device (notify TX queue = queue 1)
+    port_outw(io_base + 0x10, 1)
+
+    // Increment TX counter
+    net_state_write(48, net_state_read(48) + 1)
+
+    0
+}
+
+@kernel fn net_rx_poll() -> i64 {
+    // Check for received packets. Returns length of packet or -1 if none.
+    // Received packet data is at VQ_RX_BUFS + desc_idx * 2048
+    let used_idx = vq_used_idx(VQ_RX_BASE)
+    let last = net_state_read(80) & 0xFFFF
+    if used_idx == last { return -1 }  // no new packets
+
+    // Read the used ring entry
+    let used_base = vq_used_offset(VQ_RX_BASE)
+    let ring_idx = last % VQ_NUM_ENTRIES
+    let desc_id = volatile_read_u32(used_base + 4 + ring_idx * 8) & 0xFFFF
+    let pkt_len = volatile_read_u32(used_base + 4 + ring_idx * 8 + 4)
+
+    // Advance last-processed index
+    net_state_write(80, last + 1)
+
+    // Increment RX counter
+    net_state_write(40, net_state_read(40) + 1)
+
+    // Copy received data to NET_RX_BUF for parsing
+    let src = VQ_RX_BUFS + desc_id * 2048
+    let mut i: i64 = 0
+    while i < pkt_len && i < 16384 {
+        volatile_write_u8(NET_RX_BUF + i, volatile_read_u8(src + i))
+        i = i + 1
+    }
+
+    // Re-add this descriptor to available ring for future receives
+    vq_avail_add(VQ_RX_BASE, desc_id)
+    net_state_write(64, net_state_read(64) + 1)
+
+    // Notify RX queue
+    let io_base = net_state_read(56)
+    port_outw(io_base + 0x10, 0)
+
+    pkt_len
+}
+
+@kernel fn net_send_frame(frame_data: i64, frame_len: i64) -> i64 {
+    // Prepend 10-byte virtio-net header + send via TX queue
+    // Header: flags(1)=0, gso_type(1)=0, hdr_len(2)=0, gso_size(2)=0,
+    //         csum_start(2)=0, csum_offset(2)=0
+    let tx_buf = NET_TX_BUF + 4096  // Use upper part of TX buffer area
+    // Zero virtio-net header
+    let mut i: i64 = 0
+    while i < VIRTIO_NET_HDR_SIZE { volatile_write_u8(tx_buf + i, 0); i = i + 1 }
+    // Copy frame after header
+    i = 0
+    while i < frame_len { volatile_write_u8(tx_buf + VIRTIO_NET_HDR_SIZE + i, volatile_read_u8(frame_data + i)); i = i + 1 }
+
+    net_tx_packet(tx_buf, VIRTIO_NET_HDR_SIZE + frame_len)
+}
+
+@kernel fn net_check_icmp_reply() -> i64 {
+    // Poll for ICMP echo reply. Returns RTT in TSC cycles or -1.
+    let t0 = rdtsc()
+    let mut attempts: i64 = 0
+    while attempts < 50000000 {  // ~5 second timeout
+        let pkt_len = net_rx_poll()
+        if pkt_len > 0 {
+            // Skip virtio-net header (10 bytes)
+            let eth_off = VIRTIO_NET_HDR_SIZE
+            // Check ethertype at offset 12 (after 6+6 MAC addresses)
+            let et_hi = volatile_read_u8(NET_RX_BUF + eth_off + 12)
+            let et_lo = volatile_read_u8(NET_RX_BUF + eth_off + 13)
+            if et_hi == 0x08 && et_lo == 0x00 {
+                // IPv4 — check protocol at IP offset 9
+                let ip_off = eth_off + 14
+                let proto = volatile_read_u8(NET_RX_BUF + ip_off + 9)
+                if proto == 1 {
+                    // ICMP — check type at ICMP offset 0
+                    let icmp_off = ip_off + 20
+                    let icmp_type = volatile_read_u8(NET_RX_BUF + icmp_off)
+                    if icmp_type == 0 {
+                        // Type 0 = Echo Reply!
+                        return rdtsc() - t0
+                    }
+                }
+            }
+        }
+        pause()
+        attempts = attempts + 1
+    }
+    -1  // timeout
+}
+
 @kernel fn net_state_read(off: i64) -> i64 { volatile_read_u64(NET_STATE + off) }
 @kernel fn net_state_write(off: i64, val: i64) { volatile_write_u64(NET_STATE + off, val) }
 
@@ -95,6 +313,30 @@ const NET_PKT_BUF: i64 = 0x87C000  // Temp packet build buffer (4KB)
         volatile_write_u8(NET_STATE + 8 + i, mac_byte)
         i = i + 1
     }
+
+    // 7.5. Set up virtqueues BEFORE DRIVER_OK
+    // Initialize queue memory
+    vq_init_mem(VQ_RX_BASE)
+    vq_init_mem(VQ_TX_BASE)
+    // Zero RX buffers
+    i = 0
+    while i < 16 * 2048 { volatile_write_u8(VQ_RX_BUFS + i, 0); i = i + 1 }
+    // Mark queue memory as used in frame allocator
+    let mut f: i64 = VQ_RX_BASE / FRAME_SIZE
+    while f < (VQ_RX_BUFS + 16 * 2048) / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
+    // Map queue pages
+    let mut pg: i64 = VQ_RX_BASE
+    while pg < VQ_RX_BUFS + 16 * 2048 {
+        map_page(pg, pg, PAGE_PRESENT | PAGE_WRITABLE)
+        pg = pg + FRAME_SIZE
+    }
+    // Set up RX queue (index 0)
+    vq_setup_queue(io_base, 0, VQ_RX_BASE)
+    // Set up TX queue (index 1)
+    vq_setup_queue(io_base, 1, VQ_TX_BASE)
+    // Pre-fill RX queue with empty buffers
+    net_setup_rx_queue()
+    println("[NET] Virtqueues configured (RX=0, TX=1)")
 
     // 8. Set DRIVER_OK (4) — device is live
     port_outb(io_base + 0x12, 15) // ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK
@@ -353,13 +595,31 @@ const NET_PKT_BUF: i64 = 0x87C000  // Temp packet build buffer (4KB)
     ip_print(target)
     console_putchar(10, WHITE_ON_BLACK)
 
-    // Without real virtio-net TX, we simulate success
+    // Send packet via virtio-net or simulate
     if net_state_read(56) == 0 {
-        cprintln("  (simulated — no virtio-net driver for actual TX)", YELLOW_ON_BLACK)
+        cprintln("  (simulated — no virtio-net device found)", YELLOW_ON_BLACK)
         cprintln("  Reply: 64 bytes, ttl=64, time<1ms (simulated)", GREEN_ON_BLACK)
     } else {
-        // TODO: actual virtio-net TX via virtqueue
-        cprintln("  Packet queued for virtio-net TX", CYAN_ON_BLACK)
+        // Real TX via virtqueue
+        let tx_result = net_send_frame(NET_TX_BUF, frame_len)
+        if tx_result == 0 {
+            cprintln("  Packet sent via virtio-net TX", GREEN_ON_BLACK)
+            // Wait for ICMP echo reply
+            let rtt = net_check_icmp_reply()
+            if rtt >= 0 {
+                cprint("  Reply from ", WHITE_ON_BLACK)
+                ip_print(target)
+                cprint(": time=", WHITE_ON_BLACK)
+                // Convert TSC cycles to approximate microseconds
+                // Assume ~2GHz TSC → rtt/2000 = microseconds
+                cprint_decimal(rtt / 2000, CYAN_ON_BLACK)
+                cprintln("us", WHITE_ON_BLACK)
+            } else {
+                cprintln("  Request timed out", RED_ON_BLACK)
+            }
+        } else {
+            cprintln("  TX failed", RED_ON_BLACK)
+        }
     }
 }
 
@@ -391,3 +651,5 @@ const NET_PKT_BUF: i64 = 0x87C000  // Temp packet build buffer (4KB)
         cprintln("Network init failed", RED_ON_BLACK)
     }
 }
+
+// ═══════════════════════════════════════════════

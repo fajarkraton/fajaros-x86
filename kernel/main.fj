@@ -176,7 +176,7 @@
 
     // Serial confirmation
     println("[NOVA] FajarOS Nova v0.5.0 Transcendence booted")
-    println("[NOVA] 9000+ LOC | 145 commands | 100% Fajar Lang")
+    println("[NOVA] 9200+ LOC | 145 commands | 100% Fajar Lang")
     println("[NOVA] Frame allocator: 32768 frames (128MB)")
     println("[NOVA] RamFS: 64 entries, 832KB data")
     println("[NOVA] VGA console active at 0xB8000")
