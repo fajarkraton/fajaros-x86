@@ -1,7 +1,7 @@
 [project]
 name = "fajaros-nova"
-version = "0.5.0"
-description = "FajarOS Nova v0.5.0 Transcendence — x86_64 OS in Fajar Lang (9K+ LOC, 145 commands)"
+version = "0.6.0"
+description = "FajarOS Nova v0.6.0 Ascension — x86_64 OS in Fajar Lang (9.6K LOC, 148 commands)"
 authors = ["Fajar <fajar@primecore.id>"]
 license = "MIT"
 
