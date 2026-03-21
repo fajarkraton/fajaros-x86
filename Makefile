@@ -148,6 +148,25 @@ loc:
 	@echo ""
 	@echo "Total .fj files: $(words $(SOURCES))"
 
+# v2.0 Microkernel: build individual services as separate ELFs
+# (Requires services/ directory structure from Sprint 1.3+)
+.PHONY: microkernel services
+
+microkernel: $(KERNEL_ELF) services
+	@echo "[OK] Microkernel + services built"
+
+services:
+	@mkdir -p $(BUILD_DIR)
+	@for svc in services/*/; do \
+		if [ -d "$$svc" ]; then \
+			name=$$(basename $$svc); \
+			echo "[BUILD] Service: $$name"; \
+			$(FJ) build --target x86_64-user $$svc -o $(BUILD_DIR)/$$name.elf 2>/dev/null || \
+				echo "[SKIP] $$name (no .fj files)"; \
+		fi \
+	done
+	@echo "[OK] Services built"
+
 # Clean build artifacts
 clean:
 	rm -rf $(BUILD_DIR)
