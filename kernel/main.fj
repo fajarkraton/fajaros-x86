@@ -112,61 +112,10 @@
     syscall_setup()
     println("[SYSCALL] Entry stub + MSRs configured")
 
-    // Ring 3 test: SYS_WRITE("Hello Ring 3!\n") + SYS_EXIT(0)
-    println("[RING3] Installing user program...")
-    map_page(0x2000000, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
-    map_page(0x2F00000, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
-
-    let b: i64 = 0x2000000
-    let msg_off: i64 = 40
-    // mov eax, 1 (SYS_WRITE)
-    volatile_write_u8(b, 0xB8)
-    volatile_write_u32(b + 1, 1)
-    // mov edi, 1 (stdout)
-    volatile_write_u8(b + 5, 0xBF)
-    volatile_write_u32(b + 6, 1)
-    // lea rsi, [rip + msg] — use absolute: mov esi, msg_addr
-    volatile_write_u8(b + 10, 0xBE)
-    volatile_write_u32(b + 11, b + msg_off)
-    // mov edx, 14 (len)
-    volatile_write_u8(b + 15, 0xBA)
-    volatile_write_u32(b + 16, 14)
-    // syscall
-    volatile_write_u8(b + 20, 0x0F)
-    volatile_write_u8(b + 21, 0x05)
-    // mov eax, 60 (SYS_EXIT)
-    volatile_write_u8(b + 22, 0xB8)
-    volatile_write_u32(b + 23, 60)
-    // xor edi, edi
-    volatile_write_u8(b + 27, 0x31)
-    volatile_write_u8(b + 28, 0xFF)
-    // syscall
-    volatile_write_u8(b + 29, 0x0F)
-    volatile_write_u8(b + 30, 0x05)
-    // nop nop (safety)
-    volatile_write_u8(b + 31, 0x90)
-    volatile_write_u8(b + 32, 0x90)
-
-    // Message at offset 40: "Hello Ring 3!\n"
-    volatile_write_u8(b + msg_off, 72)      // H
-    volatile_write_u8(b + msg_off + 1, 101)  // e
-    volatile_write_u8(b + msg_off + 2, 108)  // l
-    volatile_write_u8(b + msg_off + 3, 108)  // l
-    volatile_write_u8(b + msg_off + 4, 111)  // o
-    volatile_write_u8(b + msg_off + 5, 32)   // ' '
-    volatile_write_u8(b + msg_off + 6, 82)   // R
-    volatile_write_u8(b + msg_off + 7, 105)  // i
-    volatile_write_u8(b + msg_off + 8, 110)  // n
-    volatile_write_u8(b + msg_off + 9, 103)  // g
-    volatile_write_u8(b + msg_off + 10, 32)  // ' '
-    volatile_write_u8(b + msg_off + 11, 51)  // 3
-    volatile_write_u8(b + msg_off + 12, 33)  // !
-    volatile_write_u8(b + msg_off + 13, 10)  // \n
-    // Force-set TSS.RSP0 right before transition
-    volatile_write_u64(0x6FC04, 0x7F0000)
-    println("[RING3] IRETQ to user mode...")
-    iretq_to_user(0x2000000, 0x2F00FF0, 0x202)
-    // Note: SYS_EXIT currently halts. Future: return to shell.
+    // Ring 3 user program is pre-installed but NOT auto-run
+    // Use 'runhello' command to test Ring 3 execution
+    // (Auto-running Ring 3 halts the kernel because SYS_EXIT does hlt)
+    println("[RING3] User program ready (type 'runhello' to test)")
 
     println("[SEC] Security commands ready")
     println("[INIT] Script engine ready")
