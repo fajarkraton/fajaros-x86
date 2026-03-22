@@ -1206,25 +1206,33 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 // ═══════════════════════════════════════════════
 
 @kernel fn cmd_kill() {
-    // kill <pid>
+    // kill <pid> [signal] — send signal via Sprint 5.4 signal system
     let len = cmdbuf_len()
-    if len <= 5 { cprintln("Usage: kill <pid>", YELLOW_ON_BLACK); return }
+    if len <= 5 { cprintln("Usage: kill <pid> [signal]", YELLOW_ON_BLACK); return }
     let mut pid: i64 = 0
     let mut i: i64 = 5
-    while i < len {
+    while i < len && volatile_read_u8(0x6F800 + i) != 32 {
         let ch = volatile_read_u8(0x6F800 + i)
         if ch >= 48 && ch <= 57 { pid = pid * 10 + (ch - 48) }
         i = i + 1
     }
-    if pid == 0 { cprintln("kill: cannot kill PID 0 (kernel)", RED_ON_BLACK); return }
-    if pid >= 16 { cprintln("kill: invalid PID", RED_ON_BLACK); return }
-    let base = 0x600000 + pid * 256
-    let state = volatile_read(base + 8)
-    if state == 0 { cprintln("kill: no such process", RED_ON_BLACK); return }
-    volatile_write(base + 8, 0)  // state = dead
-    cprint("Killed PID ", GREEN_ON_BLACK)
-    cprint_decimal(pid, GREEN_ON_BLACK)
-    console_putchar(10, WHITE_ON_BLACK)
+    // Parse optional signal number after space
+    let mut sig: i64 = SIG_TERM
+    if i < len && volatile_read_u8(0x6F800 + i) == 32 {
+        sig = 0; i = i + 1
+        while i < len {
+            let ch = volatile_read_u8(0x6F800 + i)
+            if ch >= 48 && ch <= 57 { sig = sig * 10 + (ch - 48) }
+            i = i + 1
+        }
+    }
+    if pid == 0 { cprintln("kill: cannot kill PID 0", RED_ON_BLACK); return }
+    let result = sig_send(pid, sig)
+    if result == 0 {
+        cprint("Signal ", GREEN_ON_BLACK); cprint_decimal(sig, CYAN_ON_BLACK)
+        cprint(" → PID ", GREEN_ON_BLACK); cprint_decimal(pid, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else { cprintln("kill: failed", RED_ON_BLACK) }
 }
 
 @kernel fn cmd_dmesg() {
@@ -2535,38 +2543,28 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 // ═══════════════════════════════════════════════
 
 @kernel fn cmd_spawn() {
-    // spawn <name> — create simulated process entry
+    // spawn <name> — create process via proc_v2 + ramfs (Sprint 5.4)
     let len = cmdbuf_len()
     if len <= 6 { cprintln("Usage: spawn <name>", YELLOW_ON_BLACK); return }
-    // Find free PID
-    let mut pid: i64 = -1
-    let mut i: i64 = 1
-    while i < 16 && pid == -1 {
-        if volatile_read(0x600000 + i * 256 + 8) == 0 { pid = i }
-        i = i + 1
+    let name_addr = 0x6F800 + 6
+    volatile_write_u8(0x6F800 + len, 0) // null-terminate
+    let pid = sc_spawn(name_addr, len - 6)
+    if pid >= 0 {
+        cprint("Spawned PID ", GREEN_ON_BLACK)
+        cprint_decimal(pid, CYAN_ON_BLACK)
+        cprint(" (", WHITE_ON_BLACK)
+        let mut k: i64 = 6
+        while k < len { console_putchar(volatile_read_u8(0x6F800 + k), WHITE_ON_BLACK); k = k + 1 }
+        cprintln(")", WHITE_ON_BLACK)
+    } else {
+        cprint("spawn: error ", RED_ON_BLACK)
+        cprint_decimal(pid, RED_ON_BLACK)
+        cprintln(" (-1=not found, -3=no PIDs, -4=ELF load fail)", WHITE_ON_BLACK)
     }
-    if pid == -1 { cprintln("spawn: no free PIDs", RED_ON_BLACK); return }
-    // Set process state
-    let base = 0x600000 + pid * 256
-    volatile_write(base + 8, 1)    // state = ready
-    volatile_write(base + 32, 0)   // ticks = 0
-    // Copy name (up to 16 chars)
-    let mut j: i64 = 0
-    while j < 16 && j + 6 < len {
-        volatile_write_u8(base + 64 + j, volatile_read_u8(0x6F800 + 6 + j))
-        j = j + 1
-    }
-    volatile_write_u8(base + 64 + j, 0)
-    cprint("Spawned PID ", GREEN_ON_BLACK)
-    cprint_decimal(pid, CYAN_ON_BLACK)
-    cprint(" (", WHITE_ON_BLACK)
-    let mut k: i64 = 6
-    while k < len { console_putchar(volatile_read_u8(0x6F800 + k), WHITE_ON_BLACK); k = k + 1 }
-    cprintln(")", WHITE_ON_BLACK)
 }
 
 @kernel fn cmd_wait() {
-    // wait <pid> — wait for process (simulated)
+    // wait <pid> — wait/reap child process (Sprint 5.4)
     let len = cmdbuf_len()
     if len <= 5 { cprintln("Usage: wait <pid>", YELLOW_ON_BLACK); return }
     let mut pid: i64 = 0
@@ -2576,23 +2574,14 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
         if ch >= 48 && ch <= 57 { pid = pid * 10 + (ch - 48) }
         i = i + 1
     }
-    let base = 0x600000 + pid * 256
-    let state = volatile_read(base + 8)
-    if state == 0 {
-        cprint("PID ", WHITE_ON_BLACK)
-        cprint_decimal(pid, CYAN_ON_BLACK)
-        cprintln(" already exited", WHITE_ON_BLACK)
+    let code = sc_wait(pid)
+    if code != -1 {
+        cprint("PID ", GREEN_ON_BLACK); cprint_decimal(pid, CYAN_ON_BLACK)
+        cprint(" exited (", WHITE_ON_BLACK); cprint_decimal(code, CYAN_ON_BLACK)
+        cprintln(")", WHITE_ON_BLACK)
     } else {
-        cprint("Waiting for PID ", WHITE_ON_BLACK)
-        cprint_decimal(pid, CYAN_ON_BLACK)
-        cprintln("...", WHITE_ON_BLACK)
-        // Simulate wait (busy-wait 1 second then mark dead)
-        let target = read_timer_ticks() + 100
-        while read_timer_ticks() < target {}
-        volatile_write(base + 8, 0)
-        cprint("PID ", GREEN_ON_BLACK)
-        cprint_decimal(pid, GREEN_ON_BLACK)
-        cprintln(" exited (0)", GREEN_ON_BLACK)
+        cprint("PID ", WHITE_ON_BLACK); cprint_decimal(pid, CYAN_ON_BLACK)
+        cprintln(" not zombie (still running or not child)", WHITE_ON_BLACK)
     }
 }
 
@@ -3290,6 +3279,9 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len > 10 && volatile_read_u8(0x6F800) == 109 && volatile_read_u8(0x6F801) == 107 && volatile_read_u8(0x6F802) == 100 && volatile_read_u8(0x6F803) == 105 && volatile_read_u8(0x6F804) == 114 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 && volatile_read_u8(0x6F807) == 112 && volatile_read_u8(0x6F808) == 99 { cmd_mkdir_ipc(); handled = 1 }
     // vfs-lifecycle — full create+write+read+delete test (Sprint 5.2)
     if handled == 0 && len == 13 && volatile_read_u8(0x6F800) == 118 && volatile_read_u8(0x6F801) == 102 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 108 { cmd_vfs_lifecycle(); handled = 1 }
+    // lifecycle — Sprint 5.4 process lifecycle test
+    // "lifecycle" = 108,105,102,101,99,121,99,108,101
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 108 && volatile_read_u8(0x6F801) == 105 && volatile_read_u8(0x6F802) == 102 && volatile_read_u8(0x6F803) == 101 { cmd_proc_lifecycle(); handled = 1 }
 
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)

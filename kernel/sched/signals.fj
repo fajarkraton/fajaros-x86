@@ -1,0 +1,156 @@
+// FajarOS Nova v2.0 — Sprint 5.4: Signals + Process Lifecycle
+// kernel/sched/signals.fj
+
+// ═══════════════════════════════════════════════════════════════
+// Signal Constants
+// ═══════════════════════════════════════════════════════════════
+
+const SIG_INT: i64 = 2       // Keyboard interrupt (Ctrl+C)
+const SIG_KILL: i64 = 9      // Immediate termination
+const SIG_SEGV: i64 = 11     // Segmentation fault
+const SIG_TERM: i64 = 15     // Graceful termination
+const SIG_CONT: i64 = 18     // Resume stopped process
+const SIG_STOP: i64 = 19     // Pause process
+
+// Per-process signal fields in PROC_TABLE_V2
+const PROC_SIG_PENDING: i64 = 112  // pending signal bitmask
+const PROC_SIG_BLOCKED: i64 = 120  // blocked signal mask
+const PROC_PGROUP: i64 = 128       // process group leader PID
+
+// ═══════════════════════════════════════════════════════════════
+// Signal Delivery — default handlers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn sig_send(pid: i64, sig: i64) -> i64 {
+    if pid < 0 || pid >= PROC_V2_MAX { return -1 }
+    let state = proc_v2_get(pid, 0)
+    if state == PROC_STATE_FREE { return -1 }
+
+    if sig == SIG_KILL {
+        proc_v2_exit(pid, -9)
+        return 0
+    }
+    if sig == SIG_STOP {
+        if state == PROC_STATE_READY || state == PROC_STATE_RUNNING {
+            proc_v2_set(pid, 0, PROC_STATE_BLOCKED)
+        }
+        return 0
+    }
+    if sig == SIG_CONT {
+        if state == PROC_STATE_BLOCKED { proc_v2_set(pid, 0, PROC_STATE_READY) }
+        return 0
+    }
+    if sig == SIG_TERM || sig == SIG_INT || sig == SIG_SEGV {
+        proc_v2_exit(pid, 0 - sig)
+        return 0
+    }
+    // Other: set pending bit
+    let pending = proc_v2_get(pid, PROC_SIG_PENDING)
+    proc_v2_set(pid, PROC_SIG_PENDING, pending | (1 << sig))
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Syscall Handlers (called from dispatch.fj)
+// ═══════════════════════════════════════════════════════════════
+
+// SYS_SPAWN: arg0=name_addr, arg1=name_len → child PID or error
+@kernel fn sc_spawn(name_addr: i64, name_len: i64) -> i64 {
+    let parent_pid = volatile_read_u64(0x6FE00)
+    let idx = ramfs_find_at(name_addr)
+    if idx < 0 { return -1 }
+    let entry = ramfs_entry_addr(idx)
+    let fsize = volatile_read(entry + 32)
+    let dptr = volatile_read(entry + 40)
+    if fsize <= 0 || dptr == 0 { return -2 }
+
+    let child = proc_v2_alloc()
+    if child < 0 { return -3 }
+    proc_v2_set(child, 0, PROC_STATE_READY)
+    proc_v2_set(child, 8, child)
+    proc_v2_set(child, 16, parent_pid)
+    proc_v2_set(child, 56, 0)
+    proc_v2_set(child, PROC_SIG_PENDING, 0)
+    proc_v2_set(child, PROC_PGROUP, parent_pid)
+
+    // Try ELF load if magic matches
+    if volatile_read_u8(dptr) == 0x7F && volatile_read_u8(dptr+1) == 69 {
+        let pages = svc_elf_load(child, dptr, fsize)
+        if pages < 0 { proc_v2_set(child, 0, PROC_STATE_FREE); return -4 }
+    } else {
+        proc_v2_set(child, 24, dptr)
+    }
+    cap_init_process(child, 0)
+    child
+}
+
+// SYS_KILL: arg0=target_pid, arg1=signal → 0 or -1
+@kernel fn sc_kill(target: i64, signal: i64) -> i64 {
+    if target == 0 || target < 0 || target >= PROC_V2_MAX { return -1 }
+    sig_send(target, signal)
+}
+
+// SYS_WAIT: arg0=child_pid (-1=any) → exit_code or -1
+@kernel fn sc_wait(child_pid: i64) -> i64 {
+    let parent = volatile_read_u64(0x6FE00)
+    if child_pid == -1 {
+        let mut p: i64 = 1
+        while p < PROC_V2_MAX {
+            if proc_v2_get(p, 16) == parent && proc_v2_get(p, 0) == PROC_STATE_ZOMBIE {
+                let code = proc_v2_get(p, 56)
+                proc_v2_set(p, 0, PROC_STATE_FREE)
+                return code
+            }
+            p = p + 1
+        }
+        return -1
+    }
+    if child_pid < 1 || child_pid >= PROC_V2_MAX { return -1 }
+    if proc_v2_get(child_pid, 16) != parent { return -1 }
+    proc_v2_waitpid(parent, child_pid)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sprint 5.4 Lifecycle Test
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_proc_lifecycle() {
+    println("[5.4] Starting lifecycle test")
+
+    // 1. Create process
+    println("[5.4] Forking...")
+    let child = proc_v2_fork(0)
+    if child < 0 { println("[5.4] Fork FAILED"); return }
+    proc_v2_set(child, PROC_SIG_PENDING, 0)
+    proc_v2_set(child, PROC_PGROUP, 0)
+    println("[5.4] Fork OK")
+
+    // 2-3. STOP/CONT
+    sig_send(child, SIG_STOP)
+    if proc_v2_get(child, 0) == PROC_STATE_BLOCKED { println("[5.4] STOP→BLOCKED OK") }
+    else { println("[5.4] STOP FAIL") }
+    sig_send(child, SIG_CONT)
+    if proc_v2_get(child, 0) == PROC_STATE_READY { println("[5.4] CONT→READY OK") }
+    else { println("[5.4] CONT FAIL") }
+
+    // 4-6. KILL/Wait/Reap
+    sig_send(child, SIG_KILL)
+    if proc_v2_get(child, 0) == PROC_STATE_ZOMBIE { println("[5.4] KILL→ZOMBIE OK") }
+    else { println("[5.4] KILL FAIL") }
+    let code = proc_v2_waitpid(0, child)
+    if code == -9 { println("[5.4] Wait: reaped (-9) OK") }
+    else { println("[5.4] Wait: unexpected") }
+    if proc_v2_get(child, 0) == PROC_STATE_FREE { println("[5.4] Reap: FREE OK") }
+    else { println("[5.4] Reap FAIL") }
+
+    // 7. SIG_TERM
+    let c2 = proc_v2_fork(0)
+    if c2 >= 0 {
+        sig_send(c2, SIG_TERM)
+        if proc_v2_get(c2, 56) == -15 { println("[5.4] TERM: exit=-15 OK") }
+        else { println("[5.4] TERM: unexpected code") }
+        proc_v2_set(c2, 0, PROC_STATE_FREE)
+    }
+
+    println("[5.4] Lifecycle test complete")
+}

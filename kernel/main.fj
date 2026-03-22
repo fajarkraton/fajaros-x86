@@ -170,6 +170,11 @@
 
     println("[TEST] 5.3 done")
 
+    // Sprint 5.4: Process lifecycle test
+    println("[TEST] 5.4: Process lifecycle...")
+    cmd_proc_lifecycle()
+    println("[TEST] 5.4 done")
+
     // Ring 3 user program is pre-installed but NOT auto-run
     // Use 'runhello' command to test Ring 3 execution
     // (Auto-running Ring 3 halts the kernel because SYS_EXIT does hlt)

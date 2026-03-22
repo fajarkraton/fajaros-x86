@@ -24,6 +24,11 @@ const SYS_NOTIFY: i64 = 14
 const SYS_MUNMAP: i64 = 21
 const SYS_SHARE: i64 = 22
 
+// Process lifecycle (Sprint 5.4)
+const SYS_SPAWN: i64 = 40
+const SYS_KILL_SIG: i64 = 41
+const SYS_WAITPID: i64 = 42
+
 // I/O syscalls (for drivers)
 const SYS_IRQ_WAIT: i64 = 30
 const SYS_PORT_IO: i64 = 31
@@ -113,6 +118,11 @@ const SYS_DMA_ALLOC: i64 = 32
         // arg0=size — allocate DMA-safe memory
         return shm_create(arg0)
     }
+
+    // Process lifecycle (Sprint 5.4)
+    if num == SYS_SPAWN { return sc_spawn(arg0, arg1) }
+    if num == SYS_KILL_SIG { return sc_kill(arg0, arg1) }
+    if num == SYS_WAITPID { return sc_wait(arg0) }
 
     -1 // Unknown syscall
 }
