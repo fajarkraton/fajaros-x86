@@ -1,0 +1,875 @@
+// FajarOS Nova v2.0 — VFS Service (Sprint 1.4)
+// @safe process — PID 3, listens on "vfs" IPC channel
+// Handles: MSG_VFS_OPEN, READ, WRITE, CLOSE, STAT, LIST, DEV_REG
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// VFS Protocol Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Message types (msg_type field in 64-byte IPC message)
+const MSG_VFS_OPEN: i64 = 0x0100
+const MSG_VFS_READ: i64 = 0x0101
+const MSG_VFS_WRITE: i64 = 0x0102
+const MSG_VFS_CLOSE: i64 = 0x0103
+const MSG_VFS_STAT: i64 = 0x0104
+const MSG_VFS_LIST: i64 = 0x0105
+const MSG_VFS_REPLY: i64 = 0x01FF
+const MSG_DEV_REG: i64 = 0x0400
+
+// VFS status codes (in reply payload)
+const VFS_OK: i64 = 0
+const VFS_ENOENT: i64 = -1      // File not found
+const VFS_EACCES: i64 = -2      // Permission denied
+const VFS_ENOSPC: i64 = -3      // No space left
+const VFS_EBADF: i64 = -4       // Bad file descriptor
+const VFS_EEXIST: i64 = -5      // File already exists
+const VFS_EINVAL: i64 = -6      // Invalid argument
+const VFS_EISDIR: i64 = -7      // Is a directory
+const VFS_EMFILE: i64 = -8      // Too many open files
+
+// VFS service PID
+const VFS_PID: i64 = 3
+
+// ═══════════════════════════════════════════════════════════════
+// VFS Mount Table
+// 8 entries × 64 bytes at VFS_SVC_BASE (0x8B0000)
+// ═══════════════════════════════════════════════════════════════
+
+const VFS_SVC_BASE: i64 = 0x8B0000
+const VFS_MNT_MAX: i64 = 8
+const VFS_MNT_SIZE: i64 = 64
+
+// Mount entry: +0=fs_type, +8=dev_pid (service PID for block I/O),
+//              +16=name[32], +48=flags, +56=reserved
+const VFS_MNT_FSTYPE: i64 = 0
+const VFS_MNT_DEVPID: i64 = 8
+const VFS_MNT_NAME: i64 = 16
+const VFS_MNT_FLAGS: i64 = 48
+
+// Filesystem types
+const FSTYPE_NONE: i64 = 0
+const FSTYPE_RAMFS: i64 = 1
+const FSTYPE_FAT32: i64 = 2
+const FSTYPE_DEVFS: i64 = 3
+const FSTYPE_PROCFS: i64 = 4
+
+// ═══════════════════════════════════════════════════════════════
+// File Descriptor Table
+// 16 processes × 16 FDs × 32 bytes = 8KB at VFS_FD_BASE
+// Per FD: +0=state, +8=fs_type, +16=inode, +24=offset
+// ═══════════════════════════════════════════════════════════════
+
+const VFS_FD_BASE: i64 = 0x8B2000
+const VFS_FD_MAX_PER_PROC: i64 = 16
+const VFS_FD_SIZE: i64 = 32
+const VFS_FD_PROC_STRIDE: i64 = 512  // 16 FDs × 32 bytes
+
+const FD_STATE_CLOSED: i64 = 0
+const FD_STATE_OPEN: i64 = 1
+const FD_STATE_CONSOLE: i64 = 2
+
+// ═══════════════════════════════════════════════════════════════
+// Device Table (registered via MSG_DEV_REG)
+// 16 devices × 64 bytes at VFS_DEV_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const VFS_DEV_BASE: i64 = 0x8B4000
+const VFS_DEV_MAX: i64 = 16
+const VFS_DEV_SIZE: i64 = 64
+// Per device: +0=active, +8=owner_pid, +16=name[32], +48=type, +56=reserved
+
+// ═══════════════════════════════════════════════════════════════
+// Mount Table Operations
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn vfs_svc_mount_addr(slot: i64) -> i64 {
+    VFS_SVC_BASE + slot * VFS_MNT_SIZE
+}
+
+@kernel fn vfs_svc_mount_set(slot: i64, fstype: i64, dev_pid: i64, name_addr: i64) {
+    let base = vfs_svc_mount_addr(slot)
+    volatile_write_u64(base + VFS_MNT_FSTYPE, fstype)
+    volatile_write_u64(base + VFS_MNT_DEVPID, dev_pid)
+    // Copy name (max 32 bytes)
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(name_addr + i)
+        volatile_write_u8(base + VFS_MNT_NAME + i, ch)
+        if ch == 0 { i = 31 } else { i = i + 1 }
+    }
+    volatile_write_u8(base + VFS_MNT_NAME + 31, 0)
+}
+
+@kernel fn vfs_svc_mount_match(slot: i64, path_addr: i64) -> i64 {
+    // Returns match length if path starts with mount name, 0 otherwise
+    let base = vfs_svc_mount_addr(slot)
+    if volatile_read_u64(base + VFS_MNT_FSTYPE) == FSTYPE_NONE { return 0 }
+    let mut i: i64 = 0
+    while i < 31 {
+        let mc = volatile_read_u8(base + VFS_MNT_NAME + i)
+        if mc == 0 { return i }  // End of mount name — full match
+        let pc = volatile_read_u8(path_addr + i)
+        if mc != pc { return 0 }
+        i = i + 1
+    }
+    i
+}
+
+@kernel fn vfs_svc_find_mount(path_addr: i64) -> i64 {
+    // Find longest matching mountpoint, return slot (-1 if none)
+    let mut best: i64 = -1
+    let mut best_len: i64 = 0
+    let mut slot: i64 = 0
+    while slot < VFS_MNT_MAX {
+        let mlen = vfs_svc_mount_match(slot, path_addr)
+        if mlen > best_len { best = slot; best_len = mlen }
+        slot = slot + 1
+    }
+    best
+}
+
+// ═══════════════════════════════════════════════════════════════
+// File Descriptor Operations
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn vfs_fd_addr(pid: i64, fd: i64) -> i64 {
+    // Bounds check: prevent overwriting VFS_DEV_BASE if pid >= 16 or fd >= 16
+    if pid < 0 || pid >= 16 || fd < 0 || fd >= VFS_FD_MAX_PER_PROC {
+        return VFS_FD_BASE  // Safe fallback: return base (FD 0 of PID 0 = console)
+    }
+    VFS_FD_BASE + pid * VFS_FD_PROC_STRIDE + fd * VFS_FD_SIZE
+}
+
+@kernel fn vfs_fd_alloc(pid: i64) -> i64 {
+    // Find free FD for process (skip 0,1,2 = stdin/out/err)
+    let mut fd: i64 = 3
+    while fd < VFS_FD_MAX_PER_PROC {
+        let addr = vfs_fd_addr(pid, fd)
+        if volatile_read_u64(addr) == FD_STATE_CLOSED { return fd }
+        fd = fd + 1
+    }
+    -1  // No free FDs
+}
+
+@kernel fn vfs_fd_open(pid: i64, fd: i64, fstype: i64, inode: i64) {
+    let addr = vfs_fd_addr(pid, fd)
+    volatile_write_u64(addr, FD_STATE_OPEN)
+    volatile_write_u64(addr + 8, fstype)
+    volatile_write_u64(addr + 16, inode)
+    volatile_write_u64(addr + 24, 0)  // offset = 0
+}
+
+@kernel fn vfs_fd_close(pid: i64, fd: i64) {
+    let addr = vfs_fd_addr(pid, fd)
+    volatile_write_u64(addr, FD_STATE_CLOSED)
+}
+
+@kernel fn vfs_fd_get_inode(pid: i64, fd: i64) -> i64 {
+    volatile_read_u64(vfs_fd_addr(pid, fd) + 16)
+}
+
+@kernel fn vfs_fd_get_offset(pid: i64, fd: i64) -> i64 {
+    volatile_read_u64(vfs_fd_addr(pid, fd) + 24)
+}
+
+@kernel fn vfs_fd_set_offset(pid: i64, fd: i64, offset: i64) {
+    volatile_write_u64(vfs_fd_addr(pid, fd) + 24, offset)
+}
+
+@kernel fn vfs_fd_is_open(pid: i64, fd: i64) -> i64 {
+    if fd < 0 || fd >= VFS_FD_MAX_PER_PROC { return 0 }
+    volatile_read_u64(vfs_fd_addr(pid, fd))
+}
+
+@kernel fn vfs_fd_init_process(pid: i64) {
+    // Initialize FDs: 0=stdin, 1=stdout, 2=stderr (console)
+    let mut fd: i64 = 0
+    while fd < VFS_FD_MAX_PER_PROC {
+        let addr = vfs_fd_addr(pid, fd)
+        if fd < 3 {
+            volatile_write_u64(addr, FD_STATE_CONSOLE)
+        } else {
+            volatile_write_u64(addr, FD_STATE_CLOSED)
+        }
+        fd = fd + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Device Registration
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn vfs_dev_register(owner_pid: i64, name_addr: i64, dev_type: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < VFS_DEV_MAX {
+        let addr = VFS_DEV_BASE + i * VFS_DEV_SIZE
+        if volatile_read_u64(addr) == 0 {
+            volatile_write_u64(addr, 1)  // active
+            volatile_write_u64(addr + 8, owner_pid)
+            // Copy name
+            let mut j: i64 = 0
+            while j < 31 {
+                let ch = volatile_read_u8(name_addr + j)
+                volatile_write_u8(addr + 16 + j, ch)
+                if ch == 0 { j = 31 } else { j = j + 1 }
+            }
+            volatile_write_u8(addr + 47, 0)
+            volatile_write_u64(addr + 48, dev_type)
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// /proc Filesystem — Dynamic Generation
+// ═══════════════════════════════════════════════════════════════
+
+const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
+
+@kernel fn vfs_proc_read(name_addr: i64, buf: i64) -> i64 {
+    // Generate /proc content dynamically
+    // name_addr points to the relative path after "/proc/"
+
+    // "version"
+    let is_version = volatile_read_u8(name_addr) == 118 &&  // v
+                     volatile_read_u8(name_addr + 1) == 101 && // e
+                     volatile_read_u8(name_addr + 2) == 114 && // r
+                     volatile_read_u8(name_addr + 3) == 115 && // s
+                     volatile_read_u8(name_addr + 4) == 105 && // i
+                     volatile_read_u8(name_addr + 5) == 111 && // o
+                     volatile_read_u8(name_addr + 6) == 110    // n
+    if is_version == 1 {
+        // "FajarOS Nova v2.0 Microkernel\n"
+        let ver: i64 = buf
+        volatile_write_u8(ver, 70)    // F
+        volatile_write_u8(ver+1, 97)  // a
+        volatile_write_u8(ver+2, 106) // j
+        volatile_write_u8(ver+3, 97)  // a
+        volatile_write_u8(ver+4, 114) // r
+        volatile_write_u8(ver+5, 79)  // O
+        volatile_write_u8(ver+6, 83)  // S
+        volatile_write_u8(ver+7, 32)  // ' '
+        volatile_write_u8(ver+8, 78)  // N
+        volatile_write_u8(ver+9, 111) // o
+        volatile_write_u8(ver+10, 118) // v
+        volatile_write_u8(ver+11, 97)  // a
+        volatile_write_u8(ver+12, 32)  // ' '
+        volatile_write_u8(ver+13, 118) // v
+        volatile_write_u8(ver+14, 50)  // 2
+        volatile_write_u8(ver+15, 46)  // .
+        volatile_write_u8(ver+16, 48)  // 0
+        volatile_write_u8(ver+17, 10)  // \n
+        return 18
+    }
+
+    // "uptime"
+    let is_uptime = volatile_read_u8(name_addr) == 117 &&     // u
+                    volatile_read_u8(name_addr + 1) == 112 &&  // p
+                    volatile_read_u8(name_addr + 2) == 116 &&  // t
+                    volatile_read_u8(name_addr + 3) == 105 &&  // i
+                    volatile_read_u8(name_addr + 4) == 109 &&  // m
+                    volatile_read_u8(name_addr + 5) == 101     // e
+    if is_uptime == 1 {
+        let ticks = read_timer_ticks()
+        let secs = ticks / 100
+        // Write seconds as decimal
+        let mut len: i64 = 0
+        let mut tmp: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        let mut v = secs
+        if v == 0 { volatile_write_u8(buf, 48); return 1 }
+        while v > 0 { tmp[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
+        let mut j: i64 = 0
+        while j < len { volatile_write_u8(buf + j, tmp[len - 1 - j]); j = j + 1 }
+        volatile_write_u8(buf + len, 10) // newline
+        return len + 1
+    }
+
+    // "cpuinfo"
+    let is_cpuinfo = volatile_read_u8(name_addr) == 99 &&     // c
+                     volatile_read_u8(name_addr + 1) == 112 && // p
+                     volatile_read_u8(name_addr + 2) == 117    // u
+    if is_cpuinfo == 1 {
+        // "x86_64\n"
+        volatile_write_u8(buf, 120)    // x
+        volatile_write_u8(buf+1, 56)   // 8
+        volatile_write_u8(buf+2, 54)   // 6
+        volatile_write_u8(buf+3, 95)   // _
+        volatile_write_u8(buf+4, 54)   // 6
+        volatile_write_u8(buf+5, 52)   // 4
+        volatile_write_u8(buf+6, 10)   // \n
+        return 7
+    }
+
+    // "meminfo"
+    let is_meminfo = volatile_read_u8(name_addr) == 109 &&    // m
+                     volatile_read_u8(name_addr + 1) == 101 && // e
+                     volatile_read_u8(name_addr + 2) == 109    // m
+    if is_meminfo == 1 {
+        let used = frame_stats_used()
+        let free = TOTAL_FRAMES - used
+        // Write "used:XXXX free:XXXX\n"
+        volatile_write_u8(buf, 117) // u
+        volatile_write_u8(buf+1, 115) // s
+        volatile_write_u8(buf+2, 101) // e
+        volatile_write_u8(buf+3, 100) // d
+        volatile_write_u8(buf+4, 58) // :
+        // Write used count
+        let mut pos: i64 = 5
+        let mut tmp2: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        let mut len2: i64 = 0
+        let mut v2 = used
+        if v2 == 0 { volatile_write_u8(buf + pos, 48); pos = pos + 1 }
+        while v2 > 0 { tmp2[len2] = 48 + (v2 % 10); v2 = v2 / 10; len2 = len2 + 1 }
+        let mut k: i64 = 0
+        while k < len2 { volatile_write_u8(buf + pos, tmp2[len2 - 1 - k]); pos = pos + 1; k = k + 1 }
+        volatile_write_u8(buf + pos, 10)
+        return pos + 1
+    }
+
+    0  // Unknown /proc entry
+}
+
+// ═══════════════════════════════════════════════════════════════
+// VFS Service Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn vfs_svc_init() {
+    // Clear mount table
+    let mut i: i64 = 0
+    while i < VFS_MNT_MAX * VFS_MNT_SIZE {
+        volatile_write_u8(VFS_SVC_BASE + i, 0)
+        i = i + 1
+    }
+
+    // Clear FD table
+    i = 0
+    while i < 16 * VFS_FD_PROC_STRIDE {
+        volatile_write_u8(VFS_FD_BASE + i, 0)
+        i = i + 1
+    }
+
+    // Clear device table
+    i = 0
+    while i < VFS_DEV_MAX * VFS_DEV_SIZE {
+        volatile_write_u8(VFS_DEV_BASE + i, 0)
+        i = i + 1
+    }
+
+    // Initialize FDs for all active processes
+    i = 0
+    while i < 16 {
+        vfs_fd_init_process(i)
+        i = i + 1
+    }
+
+    // Mount root filesystem (ramfs)
+    let name_buf: i64 = 0x8B5F00  // scratch
+    volatile_write_u8(name_buf, 47)  // /
+    volatile_write_u8(name_buf + 1, 0)
+    vfs_svc_mount_set(0, FSTYPE_RAMFS, 0, name_buf)
+
+    // Mount /dev (devfs)
+    volatile_write_u8(name_buf, 47)     // /
+    volatile_write_u8(name_buf + 1, 100) // d
+    volatile_write_u8(name_buf + 2, 101) // e
+    volatile_write_u8(name_buf + 3, 118) // v
+    volatile_write_u8(name_buf + 4, 0)
+    vfs_svc_mount_set(1, FSTYPE_DEVFS, 0, name_buf)
+
+    // Mount /proc (procfs)
+    volatile_write_u8(name_buf, 47)     // /
+    volatile_write_u8(name_buf + 1, 112) // p
+    volatile_write_u8(name_buf + 2, 114) // r
+    volatile_write_u8(name_buf + 3, 111) // o
+    volatile_write_u8(name_buf + 4, 99)  // c
+    volatile_write_u8(name_buf + 5, 0)
+    vfs_svc_mount_set(2, FSTYPE_PROCFS, 0, name_buf)
+
+    // Register built-in /dev devices
+    volatile_write_u8(name_buf, 110) // n
+    volatile_write_u8(name_buf+1, 117) // u
+    volatile_write_u8(name_buf+2, 108) // l
+    volatile_write_u8(name_buf+3, 108) // l
+    volatile_write_u8(name_buf+4, 0)
+    vfs_dev_register(0, name_buf, 0)  // /dev/null
+
+    volatile_write_u8(name_buf, 122)   // z
+    volatile_write_u8(name_buf+1, 101) // e
+    volatile_write_u8(name_buf+2, 114) // r
+    volatile_write_u8(name_buf+3, 111) // o
+    volatile_write_u8(name_buf+4, 0)
+    vfs_dev_register(0, name_buf, 0)  // /dev/zero
+}
+
+// ═══════════════════════════════════════════════════════════════
+// VFS IPC Message Handler
+// Dispatches incoming IPC messages by type
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn vfs_svc_handle_msg(sender: i64, msg_buf: i64, reply_buf: i64) -> i64 {
+    let msg_type = volatile_read_u32(msg_buf + 8)
+
+    if msg_type == MSG_VFS_OPEN {
+        // Payload: path[40] (null-terminated string)
+        let path_addr = msg_buf + 16
+
+        // Find mount point
+        let slot = vfs_svc_find_mount(path_addr)
+        if slot < 0 {
+            // No matching mount — ENOENT
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+            volatile_write_u64(reply_buf + 16, -1)           // fd = -1
+            volatile_write_u64(reply_buf + 32, VFS_ENOENT)   // status
+            return 0
+        }
+
+        let base = vfs_svc_mount_addr(slot)
+        let fstype = volatile_read_u64(base + VFS_MNT_FSTYPE)
+
+        // For procfs: check if the file exists
+        if fstype == FSTYPE_PROCFS {
+            // Path is like "/proc/version" — skip mount prefix
+            let mount_len = vfs_svc_mount_match(slot, path_addr)
+            let rel_path = path_addr + mount_len
+            // Skip leading /
+            let mut rp = rel_path
+            if volatile_read_u8(rp) == 47 { rp = rp + 1 }
+
+            // Check if it's a known proc entry
+            let len = vfs_proc_read(rp, PROC_BUF)
+            if len > 0 {
+                // Allocate FD
+                let fd = vfs_fd_alloc(sender)
+                if fd < 0 {
+                    ipc_msg_clear(reply_buf)
+                    ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+                    volatile_write_u64(reply_buf + 16, -1)
+                    volatile_write_u64(reply_buf + 32, VFS_EMFILE)
+                    return 0
+                }
+                vfs_fd_open(sender, fd, FSTYPE_PROCFS, rp)
+                ipc_msg_clear(reply_buf)
+                ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+                volatile_write_u64(reply_buf + 16, fd)      // fd
+                volatile_write_u64(reply_buf + 24, len)      // size
+                volatile_write_u64(reply_buf + 32, VFS_OK)   // status
+                return 0
+            }
+        }
+
+        // For ramfs: look up in ramfs
+        if fstype == FSTYPE_RAMFS {
+            let mount_len = vfs_svc_mount_match(slot, path_addr)
+            let rel_path = path_addr + mount_len
+            let mut rp = rel_path
+            if volatile_read_u8(rp) == 47 { rp = rp + 1 }
+
+            let idx = ramfs_find_at(rp)
+            if idx >= 0 {
+                let fd = vfs_fd_alloc(sender)
+                if fd < 0 {
+                    ipc_msg_clear(reply_buf)
+                    ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+                    volatile_write_u64(reply_buf + 16, -1)
+                    volatile_write_u64(reply_buf + 32, VFS_EMFILE)
+                    return 0
+                }
+                let entry = ramfs_entry_addr(idx)
+                let file_size = volatile_read(entry + 32)
+                vfs_fd_open(sender, fd, FSTYPE_RAMFS, idx)
+                ipc_msg_clear(reply_buf)
+                ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+                volatile_write_u64(reply_buf + 16, fd)
+                volatile_write_u64(reply_buf + 24, file_size)
+                volatile_write_u64(reply_buf + 32, VFS_OK)
+                return 0
+            }
+        }
+
+        // File not found
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, -1)
+        volatile_write_u64(reply_buf + 32, VFS_ENOENT)
+        return 0
+    }
+
+    if msg_type == MSG_VFS_READ {
+        // Payload: fd(8), offset(8), len(8)
+        let fd = volatile_read_u64(msg_buf + 16)
+        let req_offset = volatile_read_u64(msg_buf + 24)
+        let req_len = volatile_read_u64(msg_buf + 32)
+
+        if vfs_fd_is_open(sender, fd) == 0 {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+            volatile_write_u64(reply_buf + 16, 0)
+            volatile_write_u64(reply_buf + 24, VFS_EBADF)
+            return 0
+        }
+
+        let fstype = volatile_read_u64(vfs_fd_addr(sender, fd) + 8)
+        let inode = vfs_fd_get_inode(sender, fd)
+
+        // Read from procfs
+        if fstype == FSTYPE_PROCFS {
+            let len = vfs_proc_read(inode, PROC_BUF)
+            let actual = if req_len < len { req_len } else { len }
+            // Copy to first 40 bytes of reply payload (for small reads)
+            let mut i: i64 = 0
+            let copy_len = if actual > 32 { 32 } else { actual }  // Max inline in 64B msg
+            while i < copy_len {
+                volatile_write_u8(reply_buf + 16 + i, volatile_read_u8(PROC_BUF + i))
+                i = i + 1
+            }
+            ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+            volatile_write_u64(reply_buf + 48, copy_len)   // bytes actually inline (was 'actual' — FIXED)
+            volatile_write_u64(reply_buf + 56, VFS_OK)
+            return 0
+        }
+
+        // Read from ramfs
+        if fstype == FSTYPE_RAMFS {
+            let entry = ramfs_entry_addr(inode)
+            let file_size = volatile_read(entry + 32)
+            let data_ptr = volatile_read(entry + 40)
+            let offset = vfs_fd_get_offset(sender, fd)
+            let remaining = file_size - offset
+            if remaining <= 0 {
+                ipc_msg_clear(reply_buf)
+                ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+                volatile_write_u64(reply_buf + 48, 0)
+                volatile_write_u64(reply_buf + 56, VFS_OK)
+                return 0
+            }
+            let actual = if req_len < remaining { req_len } else { remaining }
+            let copy_len = if actual > 32 { 32 } else { actual }
+            let mut i: i64 = 0
+            while i < copy_len {
+                volatile_write_u8(reply_buf + 16 + i, volatile_read_u8(data_ptr + offset + i))
+                i = i + 1
+            }
+            vfs_fd_set_offset(sender, fd, offset + copy_len)  // advance by bytes actually returned (was actual — FIXED)
+            ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+            volatile_write_u64(reply_buf + 48, copy_len)   // bytes actually inline (was actual — FIXED)
+            volatile_write_u64(reply_buf + 56, VFS_OK)
+            return 0
+        }
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 56, VFS_EINVAL)
+        return 0
+    }
+
+    if msg_type == MSG_VFS_CLOSE {
+        let fd = volatile_read_u64(msg_buf + 16)
+        vfs_fd_close(sender, fd)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, VFS_OK)
+        return 0
+    }
+
+    if msg_type == MSG_VFS_STAT {
+        let fd = volatile_read_u64(msg_buf + 16)
+        if vfs_fd_is_open(sender, fd) == 0 {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+            volatile_write_u64(reply_buf + 16, VFS_EBADF)
+            return 0
+        }
+        let fstype = volatile_read_u64(vfs_fd_addr(sender, fd) + 8)
+        let inode = vfs_fd_get_inode(sender, fd)
+        let mut file_size: i64 = 0
+        let mut file_type: i64 = 1  // default: file
+
+        if fstype == FSTYPE_RAMFS {
+            let entry = ramfs_entry_addr(inode)
+            file_size = volatile_read(entry + 32)
+            file_type = volatile_read(entry + 48)
+        }
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, file_size)
+        volatile_write_u64(reply_buf + 24, file_type)
+        volatile_write_u64(reply_buf + 32, VFS_OK)
+        return 0
+    }
+
+    if msg_type == MSG_VFS_LIST {
+        // List files in directory — path in payload[0..40]
+        let path_addr = msg_buf + 16
+        let slot = vfs_svc_find_mount(path_addr)
+        let mut count: i64 = 0
+
+        if slot >= 0 {
+            let base = vfs_svc_mount_addr(slot)
+            let fstype = volatile_read_u64(base + VFS_MNT_FSTYPE)
+            if fstype == FSTYPE_RAMFS {
+                count = volatile_read(FS_BASE)  // ramfs file count
+            }
+            if fstype == FSTYPE_PROCFS {
+                count = 4  // version, uptime, cpuinfo, meminfo
+            }
+            if fstype == FSTYPE_DEVFS {
+                let mut d: i64 = 0
+                while d < VFS_DEV_MAX {
+                    if volatile_read_u64(VFS_DEV_BASE + d * VFS_DEV_SIZE) != 0 { count = count + 1 }
+                    d = d + 1
+                }
+            }
+        }
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, count)
+        volatile_write_u64(reply_buf + 24, VFS_OK)
+        return 0
+    }
+
+    if msg_type == MSG_DEV_REG {
+        // Device registration: payload = name[32] + type(8)
+        let name_addr = msg_buf + 16
+        let dev_type = volatile_read_u64(msg_buf + 48)
+        let id = vfs_dev_register(sender, name_addr, dev_type)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, id)
+        volatile_write_u64(reply_buf + 24, VFS_OK)
+        return 0
+    }
+
+    // Unknown message type
+    ipc_msg_clear(reply_buf)
+    ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+    volatile_write_u64(reply_buf + 16, VFS_EINVAL)
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RamFS lookup helper (by address, not string literal)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ramfs_find_at(name_addr: i64) -> i64 {
+    // Find file in ramfs by name at memory address
+    let count = volatile_read(FS_BASE)
+    let mut i: i64 = 0
+    while i < count {
+        let addr = ramfs_entry_addr(i)
+        let mut match_ok: i64 = 1
+        let mut j: i64 = 0
+        while j < 31 && match_ok == 1 {
+            let a = volatile_read_u8(addr + j)
+            let b = volatile_read_u8(name_addr + j)
+            if a != b { match_ok = 0 }
+            if a == 0 && b == 0 { return i }  // Both null = match
+            if a == 0 || b == 0 { match_ok = 0 }  // One null = mismatch
+            j = j + 1
+        }
+        if match_ok == 1 { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// VFS Service Test Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_vfs_test() {
+    cprintln("=== VFS Service Test ===", YELLOW_ON_BLACK)
+
+    // Test 1: Open /proc/version via IPC
+    cprintln("[1] Open /proc/version:", WHITE_ON_BLACK)
+    let msg: i64 = 0x8B6000
+    let reply: i64 = 0x8B6100
+    ipc_msg_clear(msg)
+    let my_pid = volatile_read_u64(0x6FE00)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_OPEN, 0)
+    // Write "/proc/version" into payload
+    volatile_write_u8(msg + 16, 47)   // /
+    volatile_write_u8(msg + 17, 112)  // p
+    volatile_write_u8(msg + 18, 114)  // r
+    volatile_write_u8(msg + 19, 111)  // o
+    volatile_write_u8(msg + 20, 99)   // c
+    volatile_write_u8(msg + 21, 47)   // /
+    volatile_write_u8(msg + 22, 118)  // v
+    volatile_write_u8(msg + 23, 101)  // e
+    volatile_write_u8(msg + 24, 114)  // r
+    volatile_write_u8(msg + 25, 115)  // s
+    volatile_write_u8(msg + 26, 105)  // i
+    volatile_write_u8(msg + 27, 111)  // o
+    volatile_write_u8(msg + 28, 110)  // n
+    volatile_write_u8(msg + 29, 0)
+
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let fd = volatile_read_u64(reply + 16)
+    let fsize = volatile_read_u64(reply + 24)
+    let status = volatile_read_u64(reply + 32)
+    cprint("  fd=", WHITE_ON_BLACK)
+    cprint_decimal(fd, CYAN_ON_BLACK)
+    cprint(" size=", WHITE_ON_BLACK)
+    cprint_decimal(fsize, CYAN_ON_BLACK)
+    cprint(" status=", WHITE_ON_BLACK)
+    cprint_decimal(status, if status == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test 2: Read from the opened FD
+    if fd >= 0 {
+        cprintln("[2] Read /proc/version:", WHITE_ON_BLACK)
+        ipc_msg_clear(msg)
+        ipc_msg_set_header(msg, my_pid, MSG_VFS_READ, 0)
+        volatile_write_u64(msg + 16, fd)     // fd
+        volatile_write_u64(msg + 24, 0)      // offset
+        volatile_write_u64(msg + 32, 32)     // len
+
+        ipc_msg_clear(reply)
+        vfs_svc_handle_msg(my_pid, msg, reply)
+        let bytes_read = volatile_read_u64(reply + 48)
+        cprint("  bytes_read=", WHITE_ON_BLACK)
+        cprint_decimal(bytes_read, CYAN_ON_BLACK)
+        cprint(" data=\"", WHITE_ON_BLACK)
+        let mut i: i64 = 0
+        while i < bytes_read && i < 32 {
+            let ch = volatile_read_u8(reply + 16 + i)
+            if ch >= 32 && ch < 127 { console_putchar(ch, GREEN_ON_BLACK) }
+            i = i + 1
+        }
+        cprintln("\"", WHITE_ON_BLACK)
+
+        // Test 3: Close
+        cprintln("[3] Close fd:", WHITE_ON_BLACK)
+        ipc_msg_clear(msg)
+        ipc_msg_set_header(msg, my_pid, MSG_VFS_CLOSE, 0)
+        volatile_write_u64(msg + 16, fd)
+        ipc_msg_clear(reply)
+        vfs_svc_handle_msg(my_pid, msg, reply)
+        let close_status = volatile_read_u64(reply + 16)
+        cprint("  status=", WHITE_ON_BLACK)
+        if close_status == 0 { cprintln("OK", GREEN_ON_BLACK) }
+        else { cprintln("FAIL", RED_ON_BLACK) }
+    }
+
+    // Test 4: List /proc
+    cprintln("[4] List /proc:", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_LIST, 0)
+    volatile_write_u8(msg + 16, 47)   // /
+    volatile_write_u8(msg + 17, 112)  // p
+    volatile_write_u8(msg + 18, 114)  // r
+    volatile_write_u8(msg + 19, 111)  // o
+    volatile_write_u8(msg + 20, 99)   // c
+    volatile_write_u8(msg + 21, 0)
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let count = volatile_read_u64(reply + 16)
+    cprint("  entries=", WHITE_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprintln(" (version, uptime, cpuinfo, meminfo)", WHITE_ON_BLACK)
+
+    // Test 5: Open ramfs file
+    cprintln("[5] Open ramfs /motd:", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_OPEN, 0)
+    volatile_write_u8(msg + 16, 47)   // /
+    volatile_write_u8(msg + 17, 109)  // m
+    volatile_write_u8(msg + 18, 111)  // o
+    volatile_write_u8(msg + 19, 116)  // t
+    volatile_write_u8(msg + 20, 100)  // d
+    volatile_write_u8(msg + 21, 0)
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let fd2 = volatile_read_u64(reply + 16)
+    let size2 = volatile_read_u64(reply + 24)
+    let stat2 = volatile_read_u64(reply + 32)
+    cprint("  fd=", WHITE_ON_BLACK)
+    cprint_decimal(fd2, CYAN_ON_BLACK)
+    cprint(" size=", WHITE_ON_BLACK)
+    cprint_decimal(size2, CYAN_ON_BLACK)
+    cprint(" status=", WHITE_ON_BLACK)
+    cprint_decimal(stat2, if stat2 == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+
+    if fd2 >= 0 {
+        ipc_msg_clear(msg)
+        ipc_msg_set_header(msg, my_pid, MSG_VFS_READ, 0)
+        volatile_write_u64(msg + 16, fd2)
+        volatile_write_u64(msg + 24, 0)
+        volatile_write_u64(msg + 32, 32)
+        ipc_msg_clear(reply)
+        vfs_svc_handle_msg(my_pid, msg, reply)
+        let br = volatile_read_u64(reply + 48)
+        cprint("  data=\"", WHITE_ON_BLACK)
+        let mut i: i64 = 0
+        while i < br && i < 32 {
+            let ch = volatile_read_u8(reply + 16 + i)
+            if ch >= 32 && ch < 127 { console_putchar(ch, GREEN_ON_BLACK) }
+            i = i + 1
+        }
+        cprintln("\"", WHITE_ON_BLACK)
+        // Close
+        ipc_msg_clear(msg)
+        ipc_msg_set_header(msg, my_pid, MSG_VFS_CLOSE, 0)
+        volatile_write_u64(msg + 16, fd2)
+        vfs_svc_handle_msg(my_pid, msg, reply)
+    }
+
+    cprintln("=== VFS tests complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_vfs_mounts() {
+    cprintln("VFS Mounts:", YELLOW_ON_BLACK)
+    let mut slot: i64 = 0
+    while slot < VFS_MNT_MAX {
+        let base = vfs_svc_mount_addr(slot)
+        let fstype = volatile_read_u64(base + VFS_MNT_FSTYPE)
+        if fstype != FSTYPE_NONE {
+            cprint("  [", WHITE_ON_BLACK)
+            cprint_decimal(slot, CYAN_ON_BLACK)
+            cprint("] \"", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < 31 {
+                let ch = volatile_read_u8(base + VFS_MNT_NAME + j)
+                if ch == 0 { j = 31 } else { console_putchar(ch, GREEN_ON_BLACK); j = j + 1 }
+            }
+            cprint("\" type=", WHITE_ON_BLACK)
+            if fstype == FSTYPE_RAMFS { cprint("ramfs", CYAN_ON_BLACK) }
+            else if fstype == FSTYPE_FAT32 { cprint("fat32", CYAN_ON_BLACK) }
+            else if fstype == FSTYPE_DEVFS { cprint("devfs", CYAN_ON_BLACK) }
+            else if fstype == FSTYPE_PROCFS { cprint("procfs", CYAN_ON_BLACK) }
+            else { cprint("unknown", RED_ON_BLACK) }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        slot = slot + 1
+    }
+}
+
+@kernel fn cmd_vfs_devs() {
+    cprintln("VFS Devices:", YELLOW_ON_BLACK)
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < VFS_DEV_MAX {
+        let addr = VFS_DEV_BASE + i * VFS_DEV_SIZE
+        if volatile_read_u64(addr) != 0 {
+            cprint("  /dev/", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < 31 {
+                let ch = volatile_read_u8(addr + 16 + j)
+                if ch == 0 { j = 31 } else { console_putchar(ch, GREEN_ON_BLACK); j = j + 1 }
+            }
+            cprint(" (pid=", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(addr + 8), CYAN_ON_BLACK)
+            cprintln(")", WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (no devices)", WHITE_ON_BLACK) }
+}

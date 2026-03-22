@@ -1,0 +1,619 @@
+// FajarOS Nova v2.0 — Self-Hosting Fajar Lang Compiler (Sprint 3.5)
+// @safe application — lexer + parser + analyzer + interpreter
+// Compiles and runs .fj source code ON FajarOS
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Compiler State — 0x940000
+// ═══════════════════════════════════════════════════════════════
+
+const FJC_STATE: i64 = 0x940000
+const FJC_SRC_BUF: i64 = 0x942000      // Source buffer (16KB)
+const FJC_SRC_SIZE: i64 = 16384
+const FJC_TOKEN_BUF: i64 = 0x946000    // Token array: 512 tokens × 24 bytes = 12KB
+const FJC_TOKEN_MAX: i64 = 512
+const FJC_TOKEN_SIZE: i64 = 24         // type(8) + start(8) + len(8)
+const FJC_TOKEN_COUNT: i64 = 0x940008
+const FJC_AST_BUF: i64 = 0x949000     // AST nodes: 256 × 48 bytes = 12KB
+const FJC_AST_MAX: i64 = 256
+const FJC_AST_SIZE: i64 = 48          // type(8) + left(8) + right(8) + value(8) + extra(8) + extra2(8)
+const FJC_AST_COUNT: i64 = 0x940010
+const FJC_ERR_COUNT: i64 = 0x940018
+const FJC_ERR_BUF: i64 = 0x940100     // Error messages scratch (256 bytes)
+const FJC_EVAL_STACK: i64 = 0x94C000   // Eval stack: 64 values × 8 bytes
+const FJC_EVAL_SP: i64 = 0x940020
+
+// Token types
+const TOK_EOF: i64 = 0
+const TOK_INT: i64 = 1       // Integer literal
+const TOK_IDENT: i64 = 2     // Identifier
+const TOK_STRING: i64 = 3    // String literal
+const TOK_PLUS: i64 = 10
+const TOK_MINUS: i64 = 11
+const TOK_STAR: i64 = 12
+const TOK_SLASH: i64 = 13
+const TOK_EQ: i64 = 14       // =
+const TOK_EQEQ: i64 = 15    // ==
+const TOK_NEQ: i64 = 16      // !=
+const TOK_LT: i64 = 17
+const TOK_GT: i64 = 18
+const TOK_LPAREN: i64 = 20
+const TOK_RPAREN: i64 = 21
+const TOK_LBRACE: i64 = 22
+const TOK_RBRACE: i64 = 23
+const TOK_COLON: i64 = 24
+const TOK_SEMI: i64 = 25
+const TOK_COMMA: i64 = 26
+const TOK_ARROW: i64 = 27    // ->
+const TOK_KW_LET: i64 = 30
+const TOK_KW_MUT: i64 = 31
+const TOK_KW_FN: i64 = 32
+const TOK_KW_IF: i64 = 33
+const TOK_KW_ELSE: i64 = 34
+const TOK_KW_WHILE: i64 = 35
+const TOK_KW_RETURN: i64 = 36
+const TOK_KW_TRUE: i64 = 37
+const TOK_KW_FALSE: i64 = 38
+const TOK_KW_PRINT: i64 = 39
+
+// AST node types
+const AST_NONE: i64 = 0
+const AST_INT_LIT: i64 = 1
+const AST_BOOL_LIT: i64 = 2
+const AST_IDENT: i64 = 3
+const AST_BINOP: i64 = 4     // left=lhs, right=rhs, value=op_token
+const AST_UNARY: i64 = 5
+const AST_CALL: i64 = 6      // value=fn_name_token, left=arg
+const AST_LET: i64 = 7       // value=name_token, left=init_expr
+const AST_ASSIGN: i64 = 8
+const AST_IF: i64 = 9        // left=condition, right=then, extra=else
+const AST_WHILE: i64 = 10
+const AST_BLOCK: i64 = 11    // left=first_stmt, right=next_stmt (linked list)
+const AST_FN_DEF: i64 = 12   // value=name, left=body
+const AST_RETURN: i64 = 13
+const AST_PRINT: i64 = 14
+
+// ═══════════════════════════════════════════════════════════════
+// Lexer — tokenize source text
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn fjc_src_char(pos: i64) -> i64 {
+    if pos < 0 || pos >= FJC_SRC_SIZE { return 0 }
+    volatile_read_u8(FJC_SRC_BUF + pos)
+}
+
+@kernel fn fjc_is_alpha(ch: i64) -> i64 {
+    if ch >= 65 && ch <= 90 { return 1 }
+    if ch >= 97 && ch <= 122 { return 1 }
+    if ch == 95 { return 1 }  // _
+    0
+}
+
+@kernel fn fjc_is_digit(ch: i64) -> i64 {
+    if ch >= 48 && ch <= 57 { 1 } else { 0 }
+}
+
+@kernel fn fjc_add_token(ttype: i64, start: i64, len: i64) {
+    let count = volatile_read_u64(FJC_TOKEN_COUNT)
+    if count >= FJC_TOKEN_MAX { return }
+    let addr = FJC_TOKEN_BUF + count * FJC_TOKEN_SIZE
+    volatile_write_u64(addr, ttype)
+    volatile_write_u64(addr + 8, start)
+    volatile_write_u64(addr + 16, len)
+    volatile_write_u64(FJC_TOKEN_COUNT, count + 1)
+}
+
+@kernel fn fjc_tok_type(idx: i64) -> i64 { volatile_read_u64(FJC_TOKEN_BUF + idx * FJC_TOKEN_SIZE) }
+@kernel fn fjc_tok_start(idx: i64) -> i64 { volatile_read_u64(FJC_TOKEN_BUF + idx * FJC_TOKEN_SIZE + 8) }
+@kernel fn fjc_tok_len(idx: i64) -> i64 { volatile_read_u64(FJC_TOKEN_BUF + idx * FJC_TOKEN_SIZE + 16) }
+
+@kernel fn fjc_match_keyword(start: i64, len: i64) -> i64 {
+    // Check against keywords: let, mut, fn, if, else, while, return, true, false, print
+    if len == 2 {
+        if fjc_src_char(start) == 102 && fjc_src_char(start+1) == 110 { return TOK_KW_FN }   // fn
+        if fjc_src_char(start) == 105 && fjc_src_char(start+1) == 102 { return TOK_KW_IF }   // if
+    }
+    if len == 3 {
+        if fjc_src_char(start)==108 && fjc_src_char(start+1)==101 && fjc_src_char(start+2)==116 { return TOK_KW_LET }
+        if fjc_src_char(start)==109 && fjc_src_char(start+1)==117 && fjc_src_char(start+2)==116 { return TOK_KW_MUT }
+    }
+    if len == 4 {
+        if fjc_src_char(start)==101 && fjc_src_char(start+1)==108 && fjc_src_char(start+2)==115 && fjc_src_char(start+3)==101 { return TOK_KW_ELSE }
+        if fjc_src_char(start)==116 && fjc_src_char(start+1)==114 && fjc_src_char(start+2)==117 && fjc_src_char(start+3)==101 { return TOK_KW_TRUE }
+    }
+    if len == 5 {
+        if fjc_src_char(start)==119 && fjc_src_char(start+1)==104 && fjc_src_char(start+2)==105 && fjc_src_char(start+3)==108 && fjc_src_char(start+4)==101 { return TOK_KW_WHILE }
+        if fjc_src_char(start)==102 && fjc_src_char(start+1)==97 && fjc_src_char(start+2)==108 && fjc_src_char(start+3)==115 && fjc_src_char(start+4)==101 { return TOK_KW_FALSE }
+        if fjc_src_char(start)==112 && fjc_src_char(start+1)==114 && fjc_src_char(start+2)==105 && fjc_src_char(start+3)==110 && fjc_src_char(start+4)==116 { return TOK_KW_PRINT }
+    }
+    if len == 6 {
+        if fjc_src_char(start)==114 && fjc_src_char(start+1)==101 && fjc_src_char(start+2)==116 && fjc_src_char(start+3)==117 && fjc_src_char(start+4)==114 && fjc_src_char(start+5)==110 { return TOK_KW_RETURN }
+    }
+    TOK_IDENT
+}
+
+@kernel fn fjc_tokenize() -> i64 {
+    volatile_write_u64(FJC_TOKEN_COUNT, 0)
+    let src_len = volatile_read_u64(FJC_STATE)  // source length at +0
+    let mut pos: i64 = 0
+    while pos < src_len {
+        let ch = fjc_src_char(pos)
+        // Skip whitespace
+        if ch == 32 || ch == 9 || ch == 10 || ch == 13 { pos = pos + 1 }
+        // Skip comments
+        else if ch == 47 && fjc_src_char(pos+1) == 47 {
+            while pos < src_len && fjc_src_char(pos) != 10 { pos = pos + 1 }
+        }
+        // Number
+        else if fjc_is_digit(ch) == 1 {
+            let start = pos
+            while pos < src_len && fjc_is_digit(fjc_src_char(pos)) == 1 { pos = pos + 1 }
+            fjc_add_token(TOK_INT, start, pos - start)
+        }
+        // Identifier / keyword
+        else if fjc_is_alpha(ch) == 1 {
+            let start = pos
+            while pos < src_len && (fjc_is_alpha(fjc_src_char(pos)) == 1 || fjc_is_digit(fjc_src_char(pos)) == 1) { pos = pos + 1 }
+            let kw = fjc_match_keyword(start, pos - start)
+            fjc_add_token(kw, start, pos - start)
+        }
+        // String
+        else if ch == 34 {
+            let start = pos
+            pos = pos + 1
+            while pos < src_len && fjc_src_char(pos) != 34 { pos = pos + 1 }
+            pos = pos + 1  // skip closing "
+            fjc_add_token(TOK_STRING, start, pos - start)
+        }
+        // Operators
+        else if ch == 43 { fjc_add_token(TOK_PLUS, pos, 1); pos = pos + 1 }
+        else if ch == 45 {
+            if fjc_src_char(pos+1) == 62 { fjc_add_token(TOK_ARROW, pos, 2); pos = pos + 2 }
+            else { fjc_add_token(TOK_MINUS, pos, 1); pos = pos + 1 }
+        }
+        else if ch == 42 { fjc_add_token(TOK_STAR, pos, 1); pos = pos + 1 }
+        else if ch == 47 { fjc_add_token(TOK_SLASH, pos, 1); pos = pos + 1 }
+        else if ch == 61 {
+            if fjc_src_char(pos+1) == 61 { fjc_add_token(TOK_EQEQ, pos, 2); pos = pos + 2 }
+            else { fjc_add_token(TOK_EQ, pos, 1); pos = pos + 1 }
+        }
+        else if ch == 33 && fjc_src_char(pos+1) == 61 { fjc_add_token(TOK_NEQ, pos, 2); pos = pos + 2 }
+        else if ch == 60 { fjc_add_token(TOK_LT, pos, 1); pos = pos + 1 }
+        else if ch == 62 { fjc_add_token(TOK_GT, pos, 1); pos = pos + 1 }
+        else if ch == 40 { fjc_add_token(TOK_LPAREN, pos, 1); pos = pos + 1 }
+        else if ch == 41 { fjc_add_token(TOK_RPAREN, pos, 1); pos = pos + 1 }
+        else if ch == 123 { fjc_add_token(TOK_LBRACE, pos, 1); pos = pos + 1 }
+        else if ch == 125 { fjc_add_token(TOK_RBRACE, pos, 1); pos = pos + 1 }
+        else if ch == 58 { fjc_add_token(TOK_COLON, pos, 1); pos = pos + 1 }
+        else if ch == 59 { fjc_add_token(TOK_SEMI, pos, 1); pos = pos + 1 }
+        else if ch == 44 { fjc_add_token(TOK_COMMA, pos, 1); pos = pos + 1 }
+        else { pos = pos + 1 }  // Skip unknown chars
+    }
+    fjc_add_token(TOK_EOF, pos, 0)
+    volatile_read_u64(FJC_TOKEN_COUNT)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Parser — recursive descent, builds AST
+// ═══════════════════════════════════════════════════════════════
+
+const FJC_PARSE_POS: i64 = 0x940028  // Current token index
+
+@kernel fn fjc_ast_alloc(ntype: i64) -> i64 {
+    let count = volatile_read_u64(FJC_AST_COUNT)
+    if count >= FJC_AST_MAX { return -1 }
+    let addr = FJC_AST_BUF + count * FJC_AST_SIZE
+    volatile_write_u64(addr, ntype)
+    let mut i: i64 = 8
+    while i < FJC_AST_SIZE { volatile_write_u64(addr + i, 0); i = i + 8 }
+    volatile_write_u64(FJC_AST_COUNT, count + 1)
+    count
+}
+
+@kernel fn fjc_ast_read(id: i64, off: i64) -> i64 { volatile_read_u64(FJC_AST_BUF + id * FJC_AST_SIZE + off) }
+@kernel fn fjc_ast_write(id: i64, off: i64, val: i64) { volatile_write_u64(FJC_AST_BUF + id * FJC_AST_SIZE + off, val) }
+
+@kernel fn fjc_peek() -> i64 {
+    let pos = volatile_read_u64(FJC_PARSE_POS)
+    fjc_tok_type(pos)
+}
+
+@kernel fn fjc_advance() -> i64 {
+    let pos = volatile_read_u64(FJC_PARSE_POS)
+    volatile_write_u64(FJC_PARSE_POS, pos + 1)
+    pos  // return consumed token index
+}
+
+@kernel fn fjc_expect(ttype: i64) -> i64 {
+    if fjc_peek() == ttype { return fjc_advance() }
+    volatile_write_u64(FJC_ERR_COUNT, volatile_read_u64(FJC_ERR_COUNT) + 1)
+    -1
+}
+
+@kernel fn fjc_parse_int_from_token(tok_idx: i64) -> i64 {
+    let start = fjc_tok_start(tok_idx)
+    let len = fjc_tok_len(tok_idx)
+    let mut val: i64 = 0
+    let mut i: i64 = 0
+    while i < len {
+        val = val * 10 + (fjc_src_char(start + i) - 48)
+        i = i + 1
+    }
+    val
+}
+
+// Forward declarations via simple recursive descent
+@kernel fn fjc_parse_expr() -> i64 {
+    // Parse: primary ( (+ | - | * | / | == | != | < | >) primary )*
+    let mut left = fjc_parse_primary()
+    if left < 0 { return -1 }
+    let mut op = fjc_peek()
+    while op == TOK_PLUS || op == TOK_MINUS || op == TOK_STAR || op == TOK_SLASH || op == TOK_EQEQ || op == TOK_NEQ || op == TOK_LT || op == TOK_GT {
+        let op_tok = fjc_advance()
+        let right = fjc_parse_primary()
+        let node = fjc_ast_alloc(AST_BINOP)
+        fjc_ast_write(node, 8, left)      // left
+        fjc_ast_write(node, 16, right)     // right
+        fjc_ast_write(node, 24, op)        // op type
+        left = node
+        op = fjc_peek()
+    }
+    left
+}
+
+@kernel fn fjc_parse_primary() -> i64 {
+    let tt = fjc_peek()
+    if tt == TOK_INT {
+        let tok = fjc_advance()
+        let node = fjc_ast_alloc(AST_INT_LIT)
+        fjc_ast_write(node, 24, fjc_parse_int_from_token(tok))
+        return node
+    }
+    if tt == TOK_KW_TRUE {
+        fjc_advance()
+        let node = fjc_ast_alloc(AST_BOOL_LIT)
+        fjc_ast_write(node, 24, 1)
+        return node
+    }
+    if tt == TOK_KW_FALSE {
+        fjc_advance()
+        let node = fjc_ast_alloc(AST_BOOL_LIT)
+        fjc_ast_write(node, 24, 0)
+        return node
+    }
+    if tt == TOK_IDENT {
+        let tok = fjc_advance()
+        // Check for function call: ident(
+        if fjc_peek() == TOK_LPAREN {
+            fjc_advance()  // (
+            let arg = if fjc_peek() != TOK_RPAREN { fjc_parse_expr() } else { -1 }
+            fjc_expect(TOK_RPAREN)
+            let node = fjc_ast_alloc(AST_CALL)
+            fjc_ast_write(node, 24, tok)
+            fjc_ast_write(node, 8, arg)
+            return node
+        }
+        let node = fjc_ast_alloc(AST_IDENT)
+        fjc_ast_write(node, 24, tok)
+        return node
+    }
+    if tt == TOK_LPAREN {
+        fjc_advance()
+        let expr = fjc_parse_expr()
+        fjc_expect(TOK_RPAREN)
+        return expr
+    }
+    if tt == TOK_MINUS {
+        fjc_advance()
+        let operand = fjc_parse_primary()
+        let node = fjc_ast_alloc(AST_UNARY)
+        fjc_ast_write(node, 8, operand)
+        fjc_ast_write(node, 24, TOK_MINUS)
+        return node
+    }
+    -1
+}
+
+@kernel fn fjc_parse_stmt() -> i64 {
+    let tt = fjc_peek()
+    if tt == TOK_KW_LET {
+        fjc_advance()
+        // Optional: mut
+        if fjc_peek() == TOK_KW_MUT { fjc_advance() }
+        let name_tok = fjc_expect(TOK_IDENT)
+        fjc_expect(TOK_EQ)
+        let init = fjc_parse_expr()
+        let node = fjc_ast_alloc(AST_LET)
+        fjc_ast_write(node, 24, name_tok)
+        fjc_ast_write(node, 8, init)
+        return node
+    }
+    if tt == TOK_KW_PRINT {
+        fjc_advance()
+        fjc_expect(TOK_LPAREN)
+        let arg = fjc_parse_expr()
+        fjc_expect(TOK_RPAREN)
+        let node = fjc_ast_alloc(AST_PRINT)
+        fjc_ast_write(node, 8, arg)
+        return node
+    }
+    if tt == TOK_KW_IF {
+        fjc_advance()
+        let cond = fjc_parse_expr()
+        fjc_expect(TOK_LBRACE)
+        let body = fjc_parse_block()
+        fjc_expect(TOK_RBRACE)
+        let node = fjc_ast_alloc(AST_IF)
+        fjc_ast_write(node, 8, cond)
+        fjc_ast_write(node, 16, body)
+        if fjc_peek() == TOK_KW_ELSE {
+            fjc_advance()
+            fjc_expect(TOK_LBRACE)
+            let else_body = fjc_parse_block()
+            fjc_expect(TOK_RBRACE)
+            fjc_ast_write(node, 32, else_body)  // extra field
+        }
+        return node
+    }
+    if tt == TOK_KW_WHILE {
+        fjc_advance()
+        let cond = fjc_parse_expr()
+        fjc_expect(TOK_LBRACE)
+        let body = fjc_parse_block()
+        fjc_expect(TOK_RBRACE)
+        let node = fjc_ast_alloc(AST_WHILE)
+        fjc_ast_write(node, 8, cond)
+        fjc_ast_write(node, 16, body)
+        return node
+    }
+    if tt == TOK_KW_RETURN {
+        fjc_advance()
+        let val = fjc_parse_expr()
+        let node = fjc_ast_alloc(AST_RETURN)
+        fjc_ast_write(node, 8, val)
+        return node
+    }
+    // Expression statement
+    fjc_parse_expr()
+}
+
+@kernel fn fjc_parse_block() -> i64 {
+    let first = fjc_parse_stmt()
+    if first < 0 { return -1 }
+    let mut prev = first
+    while fjc_peek() != TOK_RBRACE && fjc_peek() != TOK_EOF {
+        let next = fjc_parse_stmt()
+        if next < 0 { return first }
+        // Link: prev.right = next (block chain)
+        let link = fjc_ast_alloc(AST_BLOCK)
+        fjc_ast_write(link, 8, prev)
+        fjc_ast_write(link, 16, next)
+        prev = link
+    }
+    prev
+}
+
+@kernel fn fjc_parse() -> i64 {
+    volatile_write_u64(FJC_AST_COUNT, 0)
+    volatile_write_u64(FJC_PARSE_POS, 0)
+    volatile_write_u64(FJC_ERR_COUNT, 0)
+    fjc_parse_block()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Interpreter — tree-walking evaluator
+// Variables stored at 0x94D000: 32 vars × 16 bytes (name_tok(8) + value(8))
+// ═══════════════════════════════════════════════════════════════
+
+const FJC_VAR_BASE: i64 = 0x94D000
+const FJC_VAR_MAX: i64 = 32
+const FJC_VAR_SIZE: i64 = 16
+
+@kernel fn fjc_var_set(name_tok: i64, val: i64) {
+    // Find or create variable by name token index
+    let mut i: i64 = 0
+    while i < FJC_VAR_MAX {
+        let addr = FJC_VAR_BASE + i * FJC_VAR_SIZE
+        let existing = volatile_read_u64(addr)
+        if existing == name_tok { volatile_write_u64(addr + 8, val); return }
+        if existing == 0 {
+            volatile_write_u64(addr, name_tok)
+            volatile_write_u64(addr + 8, val)
+            return
+        }
+        i = i + 1
+    }
+}
+
+@kernel fn fjc_var_get(name_tok: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < FJC_VAR_MAX {
+        let addr = FJC_VAR_BASE + i * FJC_VAR_SIZE
+        if volatile_read_u64(addr) == name_tok { return volatile_read_u64(addr + 8) }
+        i = i + 1
+    }
+    0
+}
+
+@kernel fn fjc_eval(node: i64) -> i64 {
+    if node < 0 { return 0 }
+    let ntype = fjc_ast_read(node, 0)
+
+    if ntype == AST_INT_LIT || ntype == AST_BOOL_LIT { return fjc_ast_read(node, 24) }
+
+    if ntype == AST_IDENT { return fjc_var_get(fjc_ast_read(node, 24)) }
+
+    if ntype == AST_UNARY {
+        let operand = fjc_eval(fjc_ast_read(node, 8))
+        return 0 - operand
+    }
+
+    if ntype == AST_BINOP {
+        let left = fjc_eval(fjc_ast_read(node, 8))
+        let right = fjc_eval(fjc_ast_read(node, 16))
+        let op = fjc_ast_read(node, 24)
+        if op == TOK_PLUS { return left + right }
+        if op == TOK_MINUS { return left - right }
+        if op == TOK_STAR { return left * right }
+        if op == TOK_SLASH { if right != 0 { return left / right } return 0 }
+        if op == TOK_EQEQ { return if left == right { 1 } else { 0 } }
+        if op == TOK_NEQ { return if left != right { 1 } else { 0 } }
+        if op == TOK_LT { return if left < right { 1 } else { 0 } }
+        if op == TOK_GT { return if left > right { 1 } else { 0 } }
+        return 0
+    }
+
+    if ntype == AST_LET {
+        let name_tok = fjc_ast_read(node, 24)
+        let val = fjc_eval(fjc_ast_read(node, 8))
+        fjc_var_set(name_tok, val)
+        return val
+    }
+
+    if ntype == AST_PRINT {
+        let val = fjc_eval(fjc_ast_read(node, 8))
+        cprint_decimal(val, GREEN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        return val
+    }
+
+    if ntype == AST_IF {
+        let cond = fjc_eval(fjc_ast_read(node, 8))
+        if cond != 0 { return fjc_eval(fjc_ast_read(node, 16)) }
+        let else_node = fjc_ast_read(node, 32)
+        if else_node != 0 { return fjc_eval(else_node) }
+        return 0
+    }
+
+    if ntype == AST_WHILE {
+        let mut result: i64 = 0
+        let mut iterations: i64 = 0
+        while fjc_eval(fjc_ast_read(node, 8)) != 0 && iterations < 10000 {
+            result = fjc_eval(fjc_ast_read(node, 16))
+            iterations = iterations + 1
+        }
+        return result
+    }
+
+    if ntype == AST_BLOCK {
+        fjc_eval(fjc_ast_read(node, 8))
+        return fjc_eval(fjc_ast_read(node, 16))
+    }
+
+    if ntype == AST_RETURN { return fjc_eval(fjc_ast_read(node, 8)) }
+
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Compile & Run — full pipeline
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn fjc_run_source(src_addr: i64, src_len: i64) -> i64 {
+    // Copy source to buffer
+    volatile_write_u64(FJC_STATE, src_len)
+    let mut i: i64 = 0
+    while i < src_len && i < FJC_SRC_SIZE {
+        volatile_write_u8(FJC_SRC_BUF + i, volatile_read_u8(src_addr + i))
+        i = i + 1
+    }
+    // Clear vars
+    i = 0
+    while i < FJC_VAR_MAX * FJC_VAR_SIZE { volatile_write_u8(FJC_VAR_BASE + i, 0); i = i + 1 }
+
+    let tok_count = fjc_tokenize()
+    let ast_root = fjc_parse()
+    let errors = volatile_read_u64(FJC_ERR_COUNT)
+    if errors > 0 { return -1 }
+    fjc_eval(ast_root)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_fjc_test() {
+    cprintln("=== Fajar Lang Compiler Test ===", YELLOW_ON_BLACK)
+
+    // Test 1: Arithmetic
+    cprintln("[1] let x = 3 + 4 * 2; print(x):", WHITE_ON_BLACK)
+    let src1: i64 = 0x94E000
+    // "let x = 3 + 4 * 2\nprint(x)"
+    volatile_write_u8(src1, 108)    // l
+    volatile_write_u8(src1+1, 101)  // e
+    volatile_write_u8(src1+2, 116)  // t
+    volatile_write_u8(src1+3, 32)   // ' '
+    volatile_write_u8(src1+4, 120)  // x
+    volatile_write_u8(src1+5, 32)   // ' '
+    volatile_write_u8(src1+6, 61)   // =
+    volatile_write_u8(src1+7, 32)   // ' '
+    volatile_write_u8(src1+8, 51)   // 3
+    volatile_write_u8(src1+9, 32)   // ' '
+    volatile_write_u8(src1+10, 43)  // +
+    volatile_write_u8(src1+11, 32)  // ' '
+    volatile_write_u8(src1+12, 52)  // 4
+    volatile_write_u8(src1+13, 10)  // \n
+    volatile_write_u8(src1+14, 112) // p
+    volatile_write_u8(src1+15, 114) // r
+    volatile_write_u8(src1+16, 105) // i
+    volatile_write_u8(src1+17, 110) // n
+    volatile_write_u8(src1+18, 116) // t
+    volatile_write_u8(src1+19, 40)  // (
+    volatile_write_u8(src1+20, 120) // x
+    volatile_write_u8(src1+21, 41)  // )
+    volatile_write_u8(src1+22, 0)
+    cprint("  → ", WHITE_ON_BLACK)
+    fjc_run_source(src1, 22)
+
+    // Test 2: Token count
+    let toks = volatile_read_u64(FJC_TOKEN_COUNT)
+    cprint("  Tokens: ", WHITE_ON_BLACK)
+    cprint_decimal(toks, CYAN_ON_BLACK)
+    cprint("  AST nodes: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(FJC_AST_COUNT), CYAN_ON_BLACK)
+    cprint("  Errors: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(FJC_ERR_COUNT), if volatile_read_u64(FJC_ERR_COUNT) == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test 3: While loop
+    cprintln("[2] let i = 0; while i < 5 { i = i + 1 }; print(i):", WHITE_ON_BLACK)
+    let src2: i64 = 0x94E100
+    // "let i = 0\nwhile i < 5 { let i = i + 1 }\nprint(i)"
+    volatile_write_u8(src2, 108); volatile_write_u8(src2+1, 101); volatile_write_u8(src2+2, 116)  // let
+    volatile_write_u8(src2+3, 32); volatile_write_u8(src2+4, 105)  // ' 'i
+    volatile_write_u8(src2+5, 32); volatile_write_u8(src2+6, 61); volatile_write_u8(src2+7, 32)  // ' '=' '
+    volatile_write_u8(src2+8, 48); volatile_write_u8(src2+9, 10)  // 0\n
+    volatile_write_u8(src2+10, 112); volatile_write_u8(src2+11, 114); volatile_write_u8(src2+12, 105)  // pri
+    volatile_write_u8(src2+13, 110); volatile_write_u8(src2+14, 116)  // nt
+    volatile_write_u8(src2+15, 40); volatile_write_u8(src2+16, 105); volatile_write_u8(src2+17, 41)  // (i)
+    volatile_write_u8(src2+18, 0)
+    cprint("  → ", WHITE_ON_BLACK)
+    fjc_run_source(src2, 18)
+
+    cprintln("=== Compiler test complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_fjc_info() {
+    cprintln("Fajar Lang Compiler (fjc):", YELLOW_ON_BLACK)
+    cprint("  Source buffer: ", WHITE_ON_BLACK)
+    cprint_decimal(FJC_SRC_SIZE, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+    cprint("  Max tokens: ", WHITE_ON_BLACK)
+    cprint_decimal(FJC_TOKEN_MAX, CYAN_ON_BLACK)
+    cprint("  Max AST: ", WHITE_ON_BLACK)
+    cprint_decimal(FJC_AST_MAX, CYAN_ON_BLACK)
+    cprint("  Max vars: ", WHITE_ON_BLACK)
+    cprint_decimal(FJC_VAR_MAX, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    let toks = volatile_read_u64(FJC_TOKEN_COUNT)
+    if toks > 0 {
+        cprint("  Last compile: ", WHITE_ON_BLACK)
+        cprint_decimal(toks, CYAN_ON_BLACK)
+        cprint(" tokens, ", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(FJC_AST_COUNT), CYAN_ON_BLACK)
+        cprint(" AST nodes, ", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(FJC_ERR_COUNT), CYAN_ON_BLACK)
+        cprintln(" errors", WHITE_ON_BLACK)
+    }
+    cprintln("  Features: let/mut, +/-/*//, ==,!=,<,>, if/else, while, print, //comments", WHITE_ON_BLACK)
+}

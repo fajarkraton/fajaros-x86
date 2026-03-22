@@ -1,0 +1,515 @@
+// FajarOS Nova v2.0 — Input Service (Sprint 3.2)
+// @device process — PID 7, handles mouse + touchpad input
+// PS/2 mouse (IRQ 12), USB HID mouse stub, cursor rendering
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Input IPC Protocol
+// ═══════════════════════════════════════════════════════════════
+
+const MSG_INPUT_MOUSE_MOVE: i64 = 0x0800
+const MSG_INPUT_MOUSE_CLICK: i64 = 0x0801
+const MSG_INPUT_MOUSE_DRAG: i64 = 0x0802
+const MSG_INPUT_MOUSE_SCROLL: i64 = 0x0803
+const MSG_INPUT_KEY: i64 = 0x0804
+const MSG_INPUT_INFO: i64 = 0x0805
+const MSG_INPUT_SUBSCRIBE: i64 = 0x0806
+const MSG_INPUT_POLL: i64 = 0x0807
+const MSG_INPUT_REPLY: i64 = 0x08FF
+
+const INPUT_SVC_PID: i64 = 7
+
+// Mouse buttons
+const MOUSE_BTN_LEFT: i64 = 1
+const MOUSE_BTN_RIGHT: i64 = 2
+const MOUSE_BTN_MIDDLE: i64 = 4
+
+// ═══════════════════════════════════════════════════════════════
+// Mouse State — at 0x926000
+// ═══════════════════════════════════════════════════════════════
+
+const MOUSE_STATE: i64 = 0x926000
+const MOUSE_X: i64 = 0            // Current X position
+const MOUSE_Y: i64 = 8            // Current Y position
+const MOUSE_BUTTONS: i64 = 16     // Button bitmap (left=1, right=2, mid=4)
+const MOUSE_DX: i64 = 24          // Last delta X
+const MOUSE_DY: i64 = 32          // Last delta Y
+const MOUSE_VISIBLE: i64 = 40     // Cursor visible flag
+const MOUSE_CLICK_COUNT: i64 = 48 // Total clicks
+const MOUSE_MOVE_COUNT: i64 = 56  // Total moves
+const MOUSE_DRAG_ACTIVE: i64 = 64 // Drag state (0=none, 1=dragging)
+const MOUSE_DRAG_START_X: i64 = 72
+const MOUSE_DRAG_START_Y: i64 = 80
+const MOUSE_PACKET_BYTE: i64 = 88 // PS/2 packet assembly (0-2)
+const MOUSE_PACKET_BUF: i64 = 96  // 3-byte PS/2 packet buffer
+
+@kernel fn mouse_read(off: i64) -> i64 { volatile_read_u64(MOUSE_STATE + off) }
+@kernel fn mouse_write(off: i64, val: i64) { volatile_write_u64(MOUSE_STATE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Event Queue — 32 events × 32 bytes at 0x926100
+// Per event: type(8), x(8), y(8), buttons(8)
+// ═══════════════════════════════════════════════════════════════
+
+const EVT_QUEUE: i64 = 0x926100
+const EVT_MAX: i64 = 32
+const EVT_SIZE: i64 = 32
+const EVT_HEAD: i64 = 0x926F00
+const EVT_TAIL: i64 = 0x926F08
+const EVT_COUNT: i64 = 0x926F10
+
+// Event types
+const EVT_MOVE: i64 = 1
+const EVT_CLICK: i64 = 2
+const EVT_RELEASE: i64 = 3
+const EVT_DRAG: i64 = 4
+const EVT_SCROLL: i64 = 5
+
+@kernel fn evt_push(etype: i64, x: i64, y: i64, buttons: i64) {
+    let count = volatile_read_u64(EVT_COUNT)
+    if count >= EVT_MAX { return }  // Queue full, drop event
+    let tail = volatile_read_u64(EVT_TAIL)
+    let addr = EVT_QUEUE + tail * EVT_SIZE
+    volatile_write_u64(addr, etype)
+    volatile_write_u64(addr + 8, x)
+    volatile_write_u64(addr + 16, y)
+    volatile_write_u64(addr + 24, buttons)
+    volatile_write_u64(EVT_TAIL, (tail + 1) % EVT_MAX)
+    volatile_write_u64(EVT_COUNT, count + 1)
+}
+
+@kernel fn evt_pop(out_addr: i64) -> i64 {
+    let count = volatile_read_u64(EVT_COUNT)
+    if count == 0 { return 0 }
+    let head = volatile_read_u64(EVT_HEAD)
+    let addr = EVT_QUEUE + head * EVT_SIZE
+    volatile_write_u64(out_addr, volatile_read_u64(addr))
+    volatile_write_u64(out_addr + 8, volatile_read_u64(addr + 8))
+    volatile_write_u64(out_addr + 16, volatile_read_u64(addr + 16))
+    volatile_write_u64(out_addr + 24, volatile_read_u64(addr + 24))
+    volatile_write_u64(EVT_HEAD, (head + 1) % EVT_MAX)
+    volatile_write_u64(EVT_COUNT, count - 1)
+    1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PS/2 Mouse Driver
+// IRQ 12, data port 0x60, command port 0x64
+// 3-byte packet: [flags, dx, dy]
+// ═══════════════════════════════════════════════════════════════
+
+const PS2_DATA: i64 = 0x60
+const PS2_CMD: i64 = 0x64
+
+@kernel fn ps2_mouse_wait_write() {
+    let mut i: i64 = 0
+    while i < 10000 {
+        if (port_inb(PS2_CMD) & 2) == 0 { return }
+        i = i + 1
+    }
+}
+
+@kernel fn ps2_mouse_wait_read() {
+    let mut i: i64 = 0
+    while i < 10000 {
+        if (port_inb(PS2_CMD) & 1) != 0 { return }
+        i = i + 1
+    }
+}
+
+@kernel fn ps2_mouse_cmd(cmd: i64) {
+    ps2_mouse_wait_write()
+    port_outb(PS2_CMD, 0xD4)  // Send to mouse port
+    ps2_mouse_wait_write()
+    port_outb(PS2_DATA, cmd)
+    ps2_mouse_wait_read()
+    port_inb(PS2_DATA)  // Read ACK
+}
+
+@kernel fn ps2_mouse_init() {
+    // Enable auxiliary device (mouse port)
+    ps2_mouse_wait_write()
+    port_outb(PS2_CMD, 0xA8)   // Enable aux port
+
+    // Enable IRQ 12
+    ps2_mouse_wait_write()
+    port_outb(PS2_CMD, 0x20)   // Read controller config
+    ps2_mouse_wait_read()
+    let config = port_inb(PS2_DATA)
+    ps2_mouse_wait_write()
+    port_outb(PS2_CMD, 0x60)   // Write controller config
+    ps2_mouse_wait_write()
+    port_outb(PS2_DATA, config | 2)  // Enable IRQ 12 (bit 1)
+
+    // Reset mouse
+    ps2_mouse_cmd(0xFF)  // Reset
+    // Set defaults
+    ps2_mouse_cmd(0xF6)  // Set defaults
+    // Enable data reporting
+    ps2_mouse_cmd(0xF4)  // Enable
+}
+
+@kernel fn ps2_mouse_handle_byte(byte: i64) {
+    let pkt_byte = mouse_read(MOUSE_PACKET_BYTE)
+    let buf_base = MOUSE_STATE + MOUSE_PACKET_BUF
+
+    volatile_write_u8(buf_base + pkt_byte, byte)
+
+    if pkt_byte < 2 {
+        mouse_write(MOUSE_PACKET_BYTE, pkt_byte + 1)
+        return
+    }
+
+    // Full 3-byte packet received — process it
+    mouse_write(MOUSE_PACKET_BYTE, 0)
+
+    let flags = volatile_read_u8(buf_base)
+    let raw_dx = volatile_read_u8(buf_base + 1)
+    let raw_dy = volatile_read_u8(buf_base + 2)
+
+    // Validate: bit 3 must be set in flags (packet alignment)
+    if (flags & 8) == 0 { return }
+
+    // Sign-extend dx/dy (PS/2 uses sign bits in flags byte)
+    let mut dx = raw_dx
+    if (flags & 0x10) != 0 { dx = dx - 256 }  // X sign bit
+    let mut dy = raw_dy
+    if (flags & 0x20) != 0 { dy = dy - 256 }  // Y sign bit
+    dy = 0 - dy  // PS/2 Y is inverted (up = positive)
+
+    // Update position (clamp to screen)
+    let screen_w = fb_state_read(FB_WIDTH)
+    let screen_h = fb_state_read(FB_HEIGHT)
+    let max_x = if screen_w > 0 { screen_w - 1 } else { 1023 }
+    let max_y = if screen_h > 0 { screen_h - 1 } else { 767 }
+
+    let old_x = mouse_read(MOUSE_X)
+    let old_y = mouse_read(MOUSE_Y)
+    let mut new_x = old_x + dx
+    let mut new_y = old_y + dy
+    if new_x < 0 { new_x = 0 }
+    if new_x > max_x { new_x = max_x }
+    if new_y < 0 { new_y = 0 }
+    if new_y > max_y { new_y = max_y }
+
+    mouse_write(MOUSE_X, new_x)
+    mouse_write(MOUSE_Y, new_y)
+    mouse_write(MOUSE_DX, dx)
+    mouse_write(MOUSE_DY, dy)
+
+    // Buttons
+    let old_buttons = mouse_read(MOUSE_BUTTONS)
+    let new_buttons = flags & 7  // bits 0-2: left, right, middle
+    mouse_write(MOUSE_BUTTONS, new_buttons)
+
+    // Generate events
+    if dx != 0 || dy != 0 {
+        mouse_write(MOUSE_MOVE_COUNT, mouse_read(MOUSE_MOVE_COUNT) + 1)
+        if mouse_read(MOUSE_DRAG_ACTIVE) == 1 {
+            evt_push(EVT_DRAG, new_x, new_y, new_buttons)
+        } else {
+            evt_push(EVT_MOVE, new_x, new_y, new_buttons)
+        }
+    }
+
+    // Button state changes
+    if new_buttons != old_buttons {
+        let pressed = new_buttons & (old_buttons ^ new_buttons)   // newly pressed
+        let released = old_buttons & (old_buttons ^ new_buttons)  // newly released
+        if pressed != 0 {
+            mouse_write(MOUSE_CLICK_COUNT, mouse_read(MOUSE_CLICK_COUNT) + 1)
+            evt_push(EVT_CLICK, new_x, new_y, pressed)
+            // Start drag
+            if (pressed & MOUSE_BTN_LEFT) != 0 {
+                mouse_write(MOUSE_DRAG_ACTIVE, 1)
+                mouse_write(MOUSE_DRAG_START_X, new_x)
+                mouse_write(MOUSE_DRAG_START_Y, new_y)
+            }
+        }
+        if released != 0 {
+            evt_push(EVT_RELEASE, new_x, new_y, released)
+            if (released & MOUSE_BTN_LEFT) != 0 {
+                mouse_write(MOUSE_DRAG_ACTIVE, 0)
+            }
+        }
+    }
+
+    // Render cursor
+    if mouse_read(MOUSE_VISIBLE) == 1 {
+        cursor_draw(new_x, new_y)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cursor Rendering — 8×12 arrow sprite via XOR
+// ═══════════════════════════════════════════════════════════════
+
+const CURSOR_SAVE_BUF: i64 = 0x927000  // 8×12 pixels backup (for restore)
+const CURSOR_PREV_X: i64 = 0x927100
+const CURSOR_PREV_Y: i64 = 0x927108
+
+// Simple arrow cursor bitmap (8×12, 1 bit per pixel)
+// . = transparent, # = white
+// #.......
+// ##......
+// ###.....
+// ####....
+// #####...
+// ######..
+// #######.
+// ########
+// #####...
+// ##.##...
+// #..##...
+// ....##..
+
+@kernel fn cursor_get_row(row: i64) -> i64 {
+    if row == 0 { return 0x80 }   // 10000000
+    if row == 1 { return 0xC0 }   // 11000000
+    if row == 2 { return 0xE0 }   // 11100000
+    if row == 3 { return 0xF0 }   // 11110000
+    if row == 4 { return 0xF8 }   // 11111000
+    if row == 5 { return 0xFC }   // 11111100
+    if row == 6 { return 0xFE }   // 11111110
+    if row == 7 { return 0xFF }   // 11111111
+    if row == 8 { return 0xF8 }   // 11111000
+    if row == 9 { return 0xD8 }   // 11011000
+    if row == 10 { return 0x98 }  // 10011000
+    if row == 11 { return 0x18 }  // 00011000
+    0
+}
+
+@kernel fn cursor_erase() {
+    // Restore saved pixels under previous cursor position
+    let prev_x = volatile_read_u64(CURSOR_PREV_X)
+    let prev_y = volatile_read_u64(CURSOR_PREV_Y)
+    if prev_x == 0 && prev_y == 0 { return }
+    let mut row: i64 = 0
+    while row < 12 {
+        let mut col: i64 = 0
+        while col < 8 {
+            let saved = volatile_read_u8(CURSOR_SAVE_BUF + row * 8 + col)
+            // Restore via putpixel (simplified — uses saved grayscale)
+            let gray = saved
+            fb_putpixel(prev_x + col, prev_y + row, rgb_pack(gray, gray, gray))
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+@kernel fn cursor_draw(x: i64, y: i64) {
+    // Erase old cursor
+    cursor_erase()
+
+    // Save pixels under new position
+    let fb_addr = fb_state_read(FB_MAPPED)
+    let pitch = fb_state_read(FB_PITCH)
+    let bpp = fb_state_read(FB_BPP)
+    let bytes_pp = bpp / 8
+
+    let mut row: i64 = 0
+    while row < 12 {
+        let mut col: i64 = 0
+        while col < 8 {
+            if fb_addr > 0 {
+                let offset = (y + row) * pitch + (x + col) * bytes_pp
+                let pixel = volatile_read_u8(fb_addr + offset)  // Save B channel as gray proxy
+                volatile_write_u8(CURSOR_SAVE_BUF + row * 8 + col, pixel)
+            }
+            col = col + 1
+        }
+        row = row + 1
+    }
+
+    // Draw cursor sprite
+    row = 0
+    while row < 12 {
+        let bits = cursor_get_row(row)
+        let mut col: i64 = 0
+        while col < 8 {
+            if ((bits >> (7 - col)) & 1) == 1 {
+                fb_putpixel(x + col, y + row, COLOR_WHITE)
+            }
+            col = col + 1
+        }
+        row = row + 1
+    }
+
+    volatile_write_u64(CURSOR_PREV_X, x)
+    volatile_write_u64(CURSOR_PREV_Y, y)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Input IPC Handler
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn input_svc_handle_msg(sender: i64, msg_buf: i64, reply_buf: i64) -> i64 {
+    let msg_type = volatile_read_u32(msg_buf + 8)
+
+    if msg_type == MSG_INPUT_INFO {
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, INPUT_SVC_PID, MSG_INPUT_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, mouse_read(MOUSE_X))
+        volatile_write_u64(reply_buf + 24, mouse_read(MOUSE_Y))
+        volatile_write_u64(reply_buf + 32, mouse_read(MOUSE_BUTTONS))
+        volatile_write_u64(reply_buf + 40, mouse_read(MOUSE_CLICK_COUNT))
+        volatile_write_u64(reply_buf + 48, mouse_read(MOUSE_MOVE_COUNT))
+        return 0
+    }
+
+    if msg_type == MSG_INPUT_POLL {
+        // Pop one event from queue
+        let evt_buf: i64 = 0x927200
+        let got = evt_pop(evt_buf)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, INPUT_SVC_PID, MSG_INPUT_REPLY, 0)
+        if got == 1 {
+            volatile_write_u64(reply_buf + 16, volatile_read_u64(evt_buf))      // type
+            volatile_write_u64(reply_buf + 24, volatile_read_u64(evt_buf + 8))   // x
+            volatile_write_u64(reply_buf + 32, volatile_read_u64(evt_buf + 16))  // y
+            volatile_write_u64(reply_buf + 40, volatile_read_u64(evt_buf + 24))  // buttons
+        } else {
+            volatile_write_u64(reply_buf + 16, 0)  // no event
+        }
+        return 0
+    }
+
+    ipc_msg_clear(reply_buf)
+    ipc_msg_set_header(reply_buf, INPUT_SVC_PID, MSG_INPUT_REPLY, 0)
+    volatile_write_u64(reply_buf + 16, -1)
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Input Service Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn input_svc_init() {
+    // Clear mouse state
+    let mut i: i64 = 0
+    while i < 128 { volatile_write_u8(MOUSE_STATE + i, 0); i = i + 1 }
+    // Clear event queue
+    i = 0
+    while i < EVT_MAX * EVT_SIZE { volatile_write_u8(EVT_QUEUE + i, 0); i = i + 1 }
+    volatile_write_u64(EVT_HEAD, 0)
+    volatile_write_u64(EVT_TAIL, 0)
+    volatile_write_u64(EVT_COUNT, 0)
+    // Center cursor
+    let w = fb_state_read(FB_WIDTH)
+    let h = fb_state_read(FB_HEIGHT)
+    mouse_write(MOUSE_X, if w > 0 { w / 2 } else { 512 })
+    mouse_write(MOUSE_Y, if h > 0 { h / 2 } else { 384 })
+    mouse_write(MOUSE_VISIBLE, 1)
+    // Init PS/2 mouse (only if not in headless serial mode)
+    if fb_state_read(FB_READY) == 1 {
+        ps2_mouse_init()
+        // Register IRQ 12 notification for mouse
+        irq_notify_register(12, INPUT_SVC_PID, NOTIFY_IRQ_0)
+    }
+    // Register /dev/mouse0
+    let name_buf: i64 = 0x927300
+    volatile_write_u8(name_buf, 109)    // m
+    volatile_write_u8(name_buf + 1, 111) // o
+    volatile_write_u8(name_buf + 2, 117) // u
+    volatile_write_u8(name_buf + 3, 115) // s
+    volatile_write_u8(name_buf + 4, 101) // e
+    volatile_write_u8(name_buf + 5, 48)  // 0
+    volatile_write_u8(name_buf + 6, 0)
+    vfs_dev_register(INPUT_SVC_PID, name_buf, 5)  // type 5 = input
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_mouse_test() {
+    cprintln("=== Mouse/Input Test ===", YELLOW_ON_BLACK)
+
+    let fb_ready = fb_state_read(FB_READY)
+    cprint("  Framebuffer: ", WHITE_ON_BLACK)
+    if fb_ready == 1 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("NO (mouse cursor needs FB)", YELLOW_ON_BLACK) }
+
+    // Show current mouse state
+    cprint("  Position: (", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_X), CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_Y), CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+
+    let buttons = mouse_read(MOUSE_BUTTONS)
+    cprint("  Buttons: ", WHITE_ON_BLACK)
+    if buttons == 0 { cprint("none", WHITE_ON_BLACK) }
+    if (buttons & MOUSE_BTN_LEFT) != 0 { cprint("LEFT ", GREEN_ON_BLACK) }
+    if (buttons & MOUSE_BTN_RIGHT) != 0 { cprint("RIGHT ", GREEN_ON_BLACK) }
+    if (buttons & MOUSE_BTN_MIDDLE) != 0 { cprint("MID ", GREEN_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Clicks: ", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_CLICK_COUNT), CYAN_ON_BLACK)
+    cprint("  Moves: ", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_MOVE_COUNT), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Event queue status
+    let evt_count = volatile_read_u64(EVT_COUNT)
+    cprint("  Events queued: ", WHITE_ON_BLACK)
+    cprint_decimal(evt_count, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(EVT_MAX, WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Drain and show last event
+    if evt_count > 0 {
+        let evt_buf: i64 = 0x927200
+        let got = evt_pop(evt_buf)
+        if got == 1 {
+            let etype = volatile_read_u64(evt_buf)
+            cprint("  Last event: ", WHITE_ON_BLACK)
+            if etype == EVT_MOVE { cprint("MOVE", CYAN_ON_BLACK) }
+            else if etype == EVT_CLICK { cprint("CLICK", GREEN_ON_BLACK) }
+            else if etype == EVT_RELEASE { cprint("RELEASE", YELLOW_ON_BLACK) }
+            else if etype == EVT_DRAG { cprint("DRAG", RED_ON_BLACK) }
+            else if etype == EVT_SCROLL { cprint("SCROLL", WHITE_ON_BLACK) }
+            cprint(" at (", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(evt_buf + 8), CYAN_ON_BLACK)
+            cprint(",", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(evt_buf + 16), CYAN_ON_BLACK)
+            cprintln(")", WHITE_ON_BLACK)
+        }
+    }
+
+    cprintln("=== Mouse test complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_mouse_info() {
+    cprintln("Input Service:", YELLOW_ON_BLACK)
+    cprint("  Mouse: (", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_X), CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_Y), CYAN_ON_BLACK)
+    cprint(") buttons=0x", WHITE_ON_BLACK)
+    cprint_hex(mouse_read(MOUSE_BUTTONS), 1, CYAN_ON_BLACK)
+    cprint(" visible=", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_VISIBLE), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Stats: ", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_CLICK_COUNT), GREEN_ON_BLACK)
+    cprint(" clicks, ", WHITE_ON_BLACK)
+    cprint_decimal(mouse_read(MOUSE_MOVE_COUNT), GREEN_ON_BLACK)
+    cprintln(" moves", WHITE_ON_BLACK)
+    cprint("  Drag: ", WHITE_ON_BLACK)
+    if mouse_read(MOUSE_DRAG_ACTIVE) == 1 {
+        cprint("ACTIVE from (", YELLOW_ON_BLACK)
+        cprint_decimal(mouse_read(MOUSE_DRAG_START_X), CYAN_ON_BLACK)
+        cprint(",", WHITE_ON_BLACK)
+        cprint_decimal(mouse_read(MOUSE_DRAG_START_Y), CYAN_ON_BLACK)
+        cprintln(")", WHITE_ON_BLACK)
+    } else { cprintln("none", WHITE_ON_BLACK) }
+    cprint("  Events: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(EVT_COUNT), CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(EVT_MAX, WHITE_ON_BLACK)
+    cprintln(" queued", WHITE_ON_BLACK)
+}

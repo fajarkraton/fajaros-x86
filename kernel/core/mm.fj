@@ -1,0 +1,392 @@
+// FajarOS Nova v2.0 — Microkernel Memory Manager
+// kernel/core/mm.fj — Ring 0 ONLY
+// Consolidated from: frames.fj + paging.fj + heap.fj + slab.fj
+// NO shell commands (cmd_*) — those stay in monolithic shell
+
+// ═══════════════════════════════════════════════════
+// Frame Allocator: 128MB = 32768 × 4KB frames
+// Bitmap at 0x580000 (4096 bytes)
+// ═══════════════════════════════════════════════════
+
+const FRAME_SIZE: i64 = 4096
+const TOTAL_FRAMES: i64 = 32768
+const BITMAP_BASE: i64 = 0x580000
+
+@kernel fn frames_init() {
+    let mut i: i64 = 0
+    while i < 4096 { volatile_write_u8(BITMAP_BASE + i, 0); i = i + 1 }
+    // Mark reserved regions
+    let mut f: i64 = 0
+    while f < 128 { frame_mark_used(f); f = f + 1 }       // Low 512KB
+    f = 256
+    while f < 288 { frame_mark_used(f); f = f + 1 }       // Kernel .text
+    f = 112
+    while f < 116 { frame_mark_used(f); f = f + 1 }       // Page tables
+    f = 1024
+    while f < 1408 { frame_mark_used(f); f = f + 1 }      // Heap
+    frame_mark_used(1408)                                    // Bitmap
+    f = 1536
+    while f < 1792 { frame_mark_used(f); f = f + 1 }      // Process table
+    f = 1792
+    while f < 2016 { frame_mark_used(f); f = f + 1 }      // RamFS
+    f = 2032
+    while f < 2048 { frame_mark_used(f); f = f + 1 }      // Stack
+}
+
+@kernel fn frame_mark_used(frame: i64) {
+    let byte_idx = frame / 8
+    let bit_idx = frame % 8
+    let old = volatile_read_u8(BITMAP_BASE + byte_idx)
+    volatile_write_u8(BITMAP_BASE + byte_idx, old | (1 << bit_idx))
+}
+
+@kernel fn frame_mark_free(frame: i64) {
+    let byte_idx = frame / 8
+    let bit_idx = frame % 8
+    let old = volatile_read_u8(BITMAP_BASE + byte_idx)
+    volatile_write_u8(BITMAP_BASE + byte_idx, old & (255 - (1 << bit_idx)))
+}
+
+@kernel fn frame_is_used(frame: i64) -> i64 {
+    let byte_idx = frame / 8
+    let bit_idx = frame % 8
+    let val = volatile_read_u8(BITMAP_BASE + byte_idx)
+    if (val & (1 << bit_idx)) != 0 { 1 } else { 0 }
+}
+
+@kernel fn frame_alloc() -> i64 {
+    let mut f: i64 = 0
+    while f < TOTAL_FRAMES {
+        if frame_is_used(f) == 0 { frame_mark_used(f); return f * FRAME_SIZE }
+        f = f + 1
+    }
+    -1
+}
+
+@kernel fn frame_free(addr: i64) {
+    let frame = addr / FRAME_SIZE
+    if frame >= 0 && frame < TOTAL_FRAMES { frame_mark_free(frame) }
+}
+
+@kernel fn frame_alloc_contiguous(count: i64) -> i64 {
+    let mut start: i64 = 2048
+    while start + count <= TOTAL_FRAMES {
+        let mut ok: i64 = 1
+        let mut i: i64 = 0
+        while i < count && ok == 1 {
+            if frame_is_used(start + i) == 1 { ok = 0 }
+            i = i + 1
+        }
+        if ok == 1 {
+            i = 0
+            while i < count { frame_mark_used(start + i); i = i + 1 }
+            return start * FRAME_SIZE
+        }
+        start = start + 1
+    }
+    -1
+}
+
+@kernel fn frame_stats_used() -> i64 {
+    let mut count: i64 = 0
+    let mut f: i64 = 0
+    while f < TOTAL_FRAMES { if frame_is_used(f) == 1 { count = count + 1 }; f = f + 1 }
+    count
+}
+
+// ═══════════════════════════════════════════════════
+// Page Table Management
+// PML4 at 0x70000 — 4-level paging, 4KB granularity
+// ═══════════════════════════════════════════════════
+
+const PML4_BASE: i64 = 0x70000
+const PAGE_PRESENT: i64 = 1
+const PAGE_WRITABLE: i64 = 2
+const PAGE_USER: i64 = 4
+const PAGE_HUGE: i64 = 128
+
+@kernel fn page_table_entry(table_base: i64, index: i64) -> i64 {
+    volatile_read(table_base + index * 8)
+}
+
+@kernel fn page_table_set(table_base: i64, index: i64, value: i64) {
+    volatile_write(table_base + index * 8, value)
+}
+
+@kernel fn map_page(virt: i64, phys: i64, flags: i64) {
+    let pml4_idx = (virt >> 39) & 0x1FF
+    let pdpt_idx = (virt >> 30) & 0x1FF
+    let pd_idx = (virt >> 21) & 0x1FF
+    let pt_idx = (virt >> 12) & 0x1FF
+    let user_flag = flags & PAGE_USER
+
+    let mut pdpt_addr: i64 = 0
+    let pml4_entry = page_table_entry(PML4_BASE, pml4_idx)
+    if (pml4_entry & PAGE_PRESENT) != 0 {
+        pdpt_addr = pml4_entry & 0xFFFFF000
+        if user_flag != 0 && (pml4_entry & PAGE_USER) == 0 {
+            page_table_set(PML4_BASE, pml4_idx, pml4_entry | PAGE_USER)
+        }
+    } else {
+        pdpt_addr = frame_alloc()
+        if pdpt_addr == -1 { return }
+        let mut i: i64 = 0
+        while i < 4096 { volatile_write_u8(pdpt_addr + i, 0); i = i + 1 }
+        page_table_set(PML4_BASE, pml4_idx, pdpt_addr | PAGE_PRESENT | PAGE_WRITABLE | user_flag)
+    }
+
+    let mut pd_addr: i64 = 0
+    let pdpt_entry = page_table_entry(pdpt_addr, pdpt_idx)
+    if (pdpt_entry & PAGE_PRESENT) != 0 {
+        pd_addr = pdpt_entry & 0xFFFFF000
+        if user_flag != 0 && (pdpt_entry & PAGE_USER) == 0 {
+            page_table_set(pdpt_addr, pdpt_idx, pdpt_entry | PAGE_USER)
+        }
+    } else {
+        pd_addr = frame_alloc()
+        if pd_addr == -1 { return }
+        let mut i: i64 = 0
+        while i < 4096 { volatile_write_u8(pd_addr + i, 0); i = i + 1 }
+        page_table_set(pdpt_addr, pdpt_idx, pd_addr | PAGE_PRESENT | PAGE_WRITABLE | user_flag)
+    }
+
+    let pd_entry = page_table_entry(pd_addr, pd_idx)
+    if (pd_entry & PAGE_HUGE) != 0 {
+        if user_flag != 0 && (pd_entry & PAGE_USER) == 0 {
+            page_table_set(pd_addr, pd_idx, pd_entry | PAGE_USER)
+        }
+        return
+    }
+
+    let mut pt_addr: i64 = 0
+    if (pd_entry & PAGE_PRESENT) != 0 {
+        pt_addr = pd_entry & 0xFFFFF000
+    } else {
+        pt_addr = frame_alloc()
+        if pt_addr == -1 { return }
+        let mut i: i64 = 0
+        while i < 4096 { volatile_write_u8(pt_addr + i, 0); i = i + 1 }
+        page_table_set(pd_addr, pd_idx, pt_addr | PAGE_PRESENT | PAGE_WRITABLE)
+    }
+
+    page_table_set(pt_addr, pt_idx, phys | flags)
+}
+
+@kernel fn unmap_page(virt: i64) {
+    let pml4_idx = (virt >> 39) & 0x1FF
+    let pdpt_idx = (virt >> 30) & 0x1FF
+    let pd_idx = (virt >> 21) & 0x1FF
+    let pt_idx = (virt >> 12) & 0x1FF
+
+    let pml4_entry = page_table_entry(PML4_BASE, pml4_idx)
+    if (pml4_entry & PAGE_PRESENT) == 0 { return }
+    let pdpt_addr = pml4_entry & 0xFFFFF000
+    let pdpt_entry = page_table_entry(pdpt_addr, pdpt_idx)
+    if (pdpt_entry & PAGE_PRESENT) == 0 { return }
+    let pd_addr = pdpt_entry & 0xFFFFF000
+    let pd_entry = page_table_entry(pd_addr, pd_idx)
+    if (pd_entry & PAGE_PRESENT) == 0 || (pd_entry & PAGE_HUGE) != 0 { return }
+    let pt_addr = pd_entry & 0xFFFFF000
+
+    page_table_set(pt_addr, pt_idx, 0)
+    invlpg(virt)
+}
+
+// ═══════════════════════════════════════════════════
+// Per-Process Page Tables (Sprint 1.3.6)
+// Clone kernel page tables for new process
+// ═══════════════════════════════════════════════════
+
+const KERNEL_REGION_END: i64 = 0x200000   // First 2MB reserved for kernel
+
+@kernel fn clone_page_table() -> i64 {
+    // Allocate new PML4 for a process
+    let new_pml4 = frame_alloc()
+    if new_pml4 == -1 { return -1 }
+    // Clear
+    let mut i: i64 = 0
+    while i < 4096 { volatile_write_u8(new_pml4 + i, 0); i = i + 1 }
+    // Copy kernel mappings (PML4 entry 0 — first 512GB, covers our 128MB identity)
+    let kernel_entry = page_table_entry(PML4_BASE, 0)
+    page_table_set(new_pml4, 0, kernel_entry)
+    // Copy high-half entries if any (MMIO: LAPIC, IOAPIC)
+    i = 256
+    while i < 512 {
+        let entry = page_table_entry(PML4_BASE, i)
+        if (entry & PAGE_PRESENT) != 0 {
+            page_table_set(new_pml4, i, entry)
+        }
+        i = i + 1
+    }
+    new_pml4
+}
+
+@kernel fn switch_page_table(pml4_phys: i64) {
+    // Load new CR3 (page table root)
+    write_cr3(pml4_phys)
+}
+
+@kernel fn get_current_page_table() -> i64 {
+    read_cr3()
+}
+
+// ═══════════════════════════════════════════════════
+// Kernel Memory Protection (Sprint 1.3.8)
+// Mark 0x0-0x1FFFFF as supervisor-only
+// ═══════════════════════════════════════════════════
+
+@kernel fn memory_protect_kernel() {
+    // The first 2MB is identity-mapped as a huge page by the boot trampoline.
+    // We ensure it does NOT have the USER bit set.
+    // Higher addresses for user processes get PAGE_USER flag.
+    // Note: with 2MB huge pages, we can't split the first page further
+    // without breaking the identity mapping. The trampoline sets PD[0]
+    // with P|RW|PS (no USER), which is correct for kernel-only access.
+    // This function validates that invariant.
+
+    // Verify PD entry 0 (first 2MB) does NOT have USER bit
+    let pdpt_addr = page_table_entry(PML4_BASE, 0) & 0xFFFFF000
+    if pdpt_addr == 0 { return }
+    let pd_addr = page_table_entry(pdpt_addr, 0) & 0xFFFFF000
+    if pd_addr == 0 { return }
+    let pd_entry = page_table_entry(pd_addr, 0)
+    if (pd_entry & PAGE_USER) != 0 {
+        // Strip USER bit from kernel region
+        page_table_set(pd_addr, 0, pd_entry & (0x7FFFFFFFFFFFFFFF ^ PAGE_USER))
+        invlpg(0)
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// Heap Allocator — freelist at 0x400000-0x580000
+// ═══════════════════════════════════════════════════
+
+const HEAP_START: i64 = 0x400000
+const HEAP_END: i64 = 0x580000
+const HEAP_HDR: i64 = 16
+const HEAP_MAGIC: i64 = 0xABCD1234
+
+@kernel fn heap_init() {
+    volatile_write(HEAP_START, HEAP_END - HEAP_START - HEAP_HDR)
+    volatile_write(HEAP_START + 8, 0)
+    volatile_write(0x581010, 0)
+    volatile_write(0x581018, HEAP_END - HEAP_START)
+    volatile_write(0x581020, 0)
+}
+
+@kernel fn kmalloc(size: i64) -> i64 {
+    let aligned_size = ((size + 7) / 8) * 8
+    let mut prev: i64 = 0
+    let mut curr = HEAP_START
+    while curr != 0 {
+        let blk_size = volatile_read(curr)
+        if blk_size >= aligned_size {
+            if blk_size >= aligned_size + HEAP_HDR + 16 {
+                let new_free = curr + HEAP_HDR + aligned_size
+                volatile_write(new_free, blk_size - aligned_size - HEAP_HDR)
+                volatile_write(new_free + 8, volatile_read(curr + 8))
+                volatile_write(curr, aligned_size)
+                if prev != 0 { volatile_write(prev + 8, new_free) }
+                else { volatile_write(0x581008, new_free) }
+            } else {
+                if prev != 0 { volatile_write(prev + 8, volatile_read(curr + 8)) }
+                else { volatile_write(0x581008, volatile_read(curr + 8)) }
+            }
+            volatile_write(curr + 8, HEAP_MAGIC)
+            volatile_write(0x581010, volatile_read(0x581010) + aligned_size)
+            volatile_write(0x581020, volatile_read(0x581020) + 1)
+            return curr + HEAP_HDR
+        }
+        prev = curr
+        curr = volatile_read(curr + 8)
+    }
+    -1
+}
+
+@kernel fn kfree(ptr: i64) {
+    if ptr <= HEAP_START || ptr >= HEAP_END { return }
+    let hdr = ptr - HEAP_HDR
+    let magic = volatile_read(hdr + 8)
+    if magic != HEAP_MAGIC { kernel_panic_reason(1); return }
+    let size = volatile_read(hdr)
+    volatile_write(hdr + 8, 0)
+    let old_head = volatile_read(0x581008)
+    volatile_write(hdr + 8, old_head)
+    volatile_write(0x581008, hdr)
+    volatile_write(0x581010, volatile_read(0x581010) - size)
+    volatile_write(0x581020, volatile_read(0x581020) - 1)
+}
+
+// ═══════════════════════════════════════════════════
+// Slab Allocator — fixed-size pools at 0x590000
+// ═══════════════════════════════════════════════════
+
+const SLAB_BASE: i64 = 0x590000
+const SLAB_SIZES: i64 = 6
+
+@kernel fn slab_init() {
+    let mut i: i64 = 0
+    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
+    let mut data_off: i64 = SLAB_BASE + 256
+    while i < SLAB_SIZES {
+        let meta = SLAB_BASE + i * 40
+        let obj_size = sizes[i]
+        let capacity = 4096 / obj_size
+        volatile_write(meta, obj_size)
+        volatile_write(meta + 8, capacity)
+        volatile_write(meta + 16, 0)
+        volatile_write(meta + 24, data_off)
+        volatile_write(meta + 32, data_off + capacity)
+        let mut j: i64 = 0
+        while j < capacity { volatile_write_u8(data_off + j, 0); j = j + 1 }
+        data_off = data_off + capacity + capacity * obj_size
+        i = i + 1
+    }
+}
+
+@kernel fn slab_alloc(size: i64) -> i64 {
+    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
+    let mut i: i64 = 0
+    while i < SLAB_SIZES {
+        if sizes[i] >= size {
+            let meta = SLAB_BASE + i * 40
+            let capacity = volatile_read(meta + 8)
+            let used = volatile_read(meta + 16)
+            if used < capacity {
+                let bitmap = volatile_read(meta + 24)
+                let data = volatile_read(meta + 32)
+                let mut j: i64 = 0
+                while j < capacity {
+                    if volatile_read_u8(bitmap + j) == 0 {
+                        volatile_write_u8(bitmap + j, 1)
+                        volatile_write(meta + 16, used + 1)
+                        return data + j * sizes[i]
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn slab_free(ptr: i64, size: i64) {
+    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
+    let mut i: i64 = 0
+    while i < SLAB_SIZES {
+        if sizes[i] >= size {
+            let meta = SLAB_BASE + i * 40
+            let data = volatile_read(meta + 32)
+            let bitmap = volatile_read(meta + 24)
+            let slot = (ptr - data) / sizes[i]
+            if slot >= 0 && slot < volatile_read(meta + 8) {
+                volatile_write_u8(bitmap + slot, 0)
+                let used = volatile_read(meta + 16)
+                if used > 0 { volatile_write(meta + 16, used - 1) }
+            }
+            return
+        }
+        i = i + 1
+    }
+}

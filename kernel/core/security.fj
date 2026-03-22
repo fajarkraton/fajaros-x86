@@ -1,0 +1,299 @@
+// FajarOS Nova v2.0 — Security Hardening (Sprint 2.3)
+// SMEP/SMAP, stack canary, ASLR, NX enforcement, capability revocation
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// SMEP/SMAP — Supervisor Mode Execution/Access Prevention
+//
+// SMEP (CR4 bit 20): prevents kernel from executing user pages
+// SMAP (CR4 bit 21): prevents kernel from accessing user data
+// Both require CPU support (CPUID leaf 7, EBX bits 7/20)
+// ═══════════════════════════════════════════════════════════════
+
+const CPUID_SMEP_BIT: i64 = 7    // EBX bit 7 of CPUID(7,0)
+const CPUID_SMAP_BIT: i64 = 20   // EBX bit 20 of CPUID(7,0)
+const CR4_SMEP: i64 = 1048576    // 1 << 20
+const CR4_SMAP: i64 = 2097152    // 1 << 21
+
+// Feature bitmap bits returned by security_check_cpu_features()
+const FEAT_SMEP: i64 = 1         // bit 0
+const FEAT_SMAP: i64 = 2         // bit 1
+const FEAT_NX: i64 = 4           // bit 2
+const FEAT_RDRAND: i64 = 8       // bit 3
+
+@kernel fn security_check_cpu_features() -> i64 {
+    let mut features: i64 = 0
+    // CPUID leaf 7 sub-leaf 0 — structured extended features
+    let ebx = cpuid_ebx(7)
+    if (ebx & (1 << CPUID_SMEP_BIT)) != 0 { features = features | FEAT_SMEP }
+    if (ebx & (1 << CPUID_SMAP_BIT)) != 0 { features = features | FEAT_SMAP }
+    // NX support: check EFER.NXE (bit 11) — set by kernel_main at boot
+    let efer = read_msr(0xC0000080)
+    if (efer & (1 << 11)) != 0 { features = features | FEAT_NX }
+    // RDRAND: CPUID leaf 1, ECX bit 30
+    let ecx = cpuid_ecx(1)
+    if (ecx & (1 << 30)) != 0 { features = features | FEAT_RDRAND }
+    features
+}
+
+@kernel fn security_enable_smep() {
+    let features = security_check_cpu_features()
+    if (features & FEAT_SMEP) == 0 { return }
+    let cr4 = read_cr4()
+    if (cr4 & CR4_SMEP) != 0 { return }  // Already enabled
+    write_cr4(cr4 | CR4_SMEP)
+}
+
+@kernel fn security_enable_smap() {
+    let features = security_check_cpu_features()
+    if (features & FEAT_SMAP) == 0 { return }
+    let cr4 = read_cr4()
+    if (cr4 & CR4_SMAP) != 0 { return }  // Already enabled
+    write_cr4(cr4 | CR4_SMAP)
+}
+
+@kernel fn security_enable_all() {
+    security_enable_smep()
+    security_enable_smap()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Stack Canary — detect stack smashing on context switch
+//
+// Each process has a canary value at the bottom of its stack.
+// On every context switch we verify it hasn't been overwritten.
+// Canary stored at CANARY_TABLE + pid * 16:
+//   +0 = canary value, +8 = stack bottom address
+// ═══════════════════════════════════════════════════════════════
+
+const STACK_CANARY: i64 = 0x5AFEC0DE
+const CANARY_TABLE: i64 = 0x8F7800   // 16 procs x 16 bytes = 256 bytes (was 0x8F7000, moved to avoid PROC_MEM_STATS overlap)
+
+@kernel fn stack_canary_init(pid: i64) {
+    if pid < 0 || pid >= PROC_V2_MAX { return }
+    // Get process kernel stack base from process table
+    let kernel_rsp = volatile_read_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE + 40)
+    if kernel_rsp == 0 { return }
+    if kernel_rsp < 4096 { return }  // Prevent underflow
+    // Stack grows down — bottom is RSP base minus stack size (4KB per process)
+    let stack_bottom = kernel_rsp - 4096
+    // Write canary at stack bottom
+    volatile_write_u64(stack_bottom, STACK_CANARY)
+    // Record in canary table
+    let entry = CANARY_TABLE + pid * 16
+    volatile_write_u64(entry, STACK_CANARY)
+    volatile_write_u64(entry + 8, stack_bottom)
+}
+
+@kernel fn stack_canary_check(pid: i64) -> i64 {
+    if pid < 0 || pid >= PROC_V2_MAX { return 1 }  // invalid = corrupted
+    let entry = CANARY_TABLE + pid * 16
+    let expected = volatile_read_u64(entry)
+    let stack_bottom = volatile_read_u64(entry + 8)
+    if stack_bottom == 0 { return 0 }  // Not initialized, skip
+    let actual = volatile_read_u64(stack_bottom)
+    if actual != expected { return 1 }  // Corrupted!
+    0  // OK
+}
+
+@kernel fn stack_canary_check_all() -> i64 {
+    let mut corrupted: i64 = 0
+    let mut pid: i64 = 0
+    while pid < PROC_V2_MAX {
+        let state = volatile_read_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE)
+        if state != PROC_STATE_FREE {
+            if stack_canary_check(pid) != 0 {
+                corrupted = corrupted | (1 << pid)
+            }
+        }
+        pid = pid + 1
+    }
+    corrupted  // Bitmap of PIDs with corrupted stacks
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ASLR — Address Space Layout Randomization
+//
+// Randomize user process base address within a safe range.
+// Uses RDRAND if available, falls back to RDTSC.
+// User range: 0x1000000 (16MB) to 0x3000000 (48MB), 4KB aligned
+// ═══════════════════════════════════════════════════════════════
+
+const ASLR_BASE_MIN: i64 = 0x1000000   // 16MB
+const ASLR_BASE_MAX: i64 = 0x3000000   // 48MB
+const ASLR_RANGE: i64 = 0x2000000      // 32MB range
+const ASLR_ALIGN: i64 = 4096           // 4KB alignment
+
+@kernel fn aslr_get_entropy() -> i64 {
+    let features = security_check_cpu_features()
+    let mut entropy: i64 = 0
+    if (features & FEAT_RDRAND) != 0 {
+        entropy = rdrand()
+    } else {
+        // Fallback: use TSC + tick count for entropy
+        entropy = rdtsc() ^ (read_timer_ticks() * 6364136223846793005)
+    }
+    // Ensure positive
+    if entropy < 0 { entropy = 0 - entropy }
+    entropy
+}
+
+@kernel fn aslr_randomize_base() -> i64 {
+    let entropy = aslr_get_entropy()
+    // Map entropy into ASLR range, 4KB aligned
+    let pages = ASLR_RANGE / ASLR_ALIGN  // 8192 possible pages
+    let page_offset = entropy % pages
+    ASLR_BASE_MIN + page_offset * ASLR_ALIGN
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NX Enforcement — ensure data pages are non-executable
+//
+// Walk page tables and set NX bit (bit 63) on non-code pages.
+// Kernel .text (0x100000-0x120000) stays executable.
+// Everything else gets NX.
+// ═══════════════════════════════════════════════════════════════
+
+// NX bit is bit 63 of a PTE = 0x8000000000000000 (negative in signed i64).
+// In Fajar Lang, i64 is signed, so bit 63 = sign bit.
+// We use -1 shifted and masked to construct the NX value:
+//   1 << 62 = 0x4000000000000000 (bit 62)
+//   Bit 63 in signed i64 = minimum i64 value (most negative)
+// To set bit 63: we OR with a value that has ONLY bit 63 set.
+// That value is: -(1 << 62) - (1 << 62) = -0x8000000000000000 ...
+// Simplest: the sign bit is set when value is negative.
+// We can construct it as: (1 << 62) | ((1 << 62) - 1 + 1) ... too complex.
+// PRACTICAL APPROACH: In x86_64, PTE bits 62:59 are available for OS use.
+// NX (bit 63) requires negative i64. We set it by treating the PTE as
+// two 32-bit halves and setting the high bit of the upper half.
+const KERNEL_TEXT_START: i64 = 0x100000
+const KERNEL_TEXT_END: i64 = 0x120000
+
+@kernel fn nx_set_bit(pte_addr: i64) {
+    // Set NX (bit 63) on a page table entry by reading/writing raw bytes.
+    // Bit 63 is the MSB of byte 7 (big-endian bit order in little-endian storage).
+    // In little-endian x86, byte 7 of the 8-byte PTE contains bits 63-56.
+    let byte7 = volatile_read_u8(pte_addr + 7)
+    volatile_write_u8(pte_addr + 7, byte7 | 0x80)  // Set bit 7 of byte 7 = bit 63
+}
+
+@kernel fn nx_enforce_data_pages() {
+    // Enable NX in EFER if not already set
+    let efer = read_msr(0xC0000080)
+    if (efer & (1 << 11)) == 0 {
+        write_msr(0xC0000080, efer | (1 << 11))
+    }
+    // Walk PD entries for first 128MB (identity-mapped region)
+    let pml4_entry = page_table_entry(PML4_BASE, 0)
+    if (pml4_entry & PAGE_PRESENT) == 0 { return }
+    let pdpt_addr = pml4_entry & 0xFFFFF000
+    let pdpt_entry = page_table_entry(pdpt_addr, 0)
+    if (pdpt_entry & PAGE_PRESENT) == 0 { return }
+    let pd_addr = pdpt_entry & 0xFFFFF000
+    // PD entries 1-63 (2MB-128MB): set NX on data regions
+    // Skip PD[0] (first 2MB contains kernel .text — must stay executable)
+    let mut pd_idx: i64 = 1
+    while pd_idx < 64 {
+        let entry = page_table_entry(pd_addr, pd_idx)
+        if (entry & PAGE_PRESENT) != 0 {
+            // Set NX bit (bit 63) via byte-level write
+            nx_set_bit(pd_addr + pd_idx * 8)
+        }
+        pd_idx = pd_idx + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Capability Revocation — remove all caps from a process
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cap_revoke_all(pid: i64) {
+    if pid < 0 || pid >= IPC_EP_MAX { return }
+    if pid == 0 { return }  // Never revoke kernel caps
+    ep_write(pid, EP_CAP_BITS, 0)
+}
+
+@kernel fn cap_audit() {
+    // Log processes with elevated capabilities (more than SAFE default)
+    cprintln("Capability Audit:", YELLOW_ON_BLACK)
+    let mut pid: i64 = 0
+    let mut elevated: i64 = 0
+    while pid < IPC_EP_MAX {
+        let state = volatile_read_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE)
+        if state != PROC_STATE_FREE {
+            let caps = ep_read(pid, EP_CAP_BITS)
+            let is_elevated = caps & (CAP_PORT_IO | CAP_IRQ | CAP_DMA | CAP_MAP_PHYS | CAP_ADMIN)
+            if is_elevated != 0 && pid != 0 {
+                cprint("  PID ", WHITE_ON_BLACK)
+                cprint_decimal(pid, CYAN_ON_BLACK)
+                cprint(": elevated caps 0x", WHITE_ON_BLACK)
+                cprint_hex(caps, 8, CYAN_ON_BLACK)
+                cprint(" [", WHITE_ON_BLACK)
+                if (caps & CAP_PORT_IO) != 0 { cprint("IO ", RED_ON_BLACK) }
+                if (caps & CAP_IRQ) != 0 { cprint("IRQ ", RED_ON_BLACK) }
+                if (caps & CAP_DMA) != 0 { cprint("DMA ", RED_ON_BLACK) }
+                if (caps & CAP_MAP_PHYS) != 0 { cprint("PHYS ", RED_ON_BLACK) }
+                if (caps & CAP_ADMIN) != 0 { cprint("ADMIN ", RED_ON_BLACK) }
+                cprintln("]", WHITE_ON_BLACK)
+                elevated = elevated + 1
+            }
+        }
+        pid = pid + 1
+    }
+    if elevated == 0 {
+        cprintln("  No non-kernel processes with elevated caps", GREEN_ON_BLACK)
+    } else {
+        cprint("  Total elevated: ", WHITE_ON_BLACK)
+        cprint_decimal(elevated, YELLOW_ON_BLACK)
+        cprintln(" process(es)", WHITE_ON_BLACK)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell: cmd_security_status — show all hardening features
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_security_status() {
+    cprintln("Security Hardening Status:", YELLOW_ON_BLACK)
+    // CPU features
+    let features = security_check_cpu_features()
+    let cr4 = read_cr4()
+    // SMEP
+    cprint("  SMEP:        ", WHITE_ON_BLACK)
+    if (features & FEAT_SMEP) != 0 {
+        if (cr4 & CR4_SMEP) != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+        else { cprintln("supported, not enabled", YELLOW_ON_BLACK) }
+    } else { cprintln("not supported", RED_ON_BLACK) }
+    // SMAP
+    cprint("  SMAP:        ", WHITE_ON_BLACK)
+    if (features & FEAT_SMAP) != 0 {
+        if (cr4 & CR4_SMAP) != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+        else { cprintln("supported, not enabled", YELLOW_ON_BLACK) }
+    } else { cprintln("not supported", RED_ON_BLACK) }
+    // NX
+    cprint("  NX (EFER):   ", WHITE_ON_BLACK)
+    if (features & FEAT_NX) != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+    else { cprintln("disabled", RED_ON_BLACK) }
+    // RDRAND
+    cprint("  RDRAND:      ", WHITE_ON_BLACK)
+    if (features & FEAT_RDRAND) != 0 { cprintln("available", GREEN_ON_BLACK) }
+    else { cprintln("not available (using RDTSC fallback)", YELLOW_ON_BLACK) }
+    // Stack canary
+    cprint("  Stack canary:", WHITE_ON_BLACK)
+    let corrupted = stack_canary_check_all()
+    if corrupted == 0 { cprintln(" all OK", GREEN_ON_BLACK) }
+    else {
+        cprint(" CORRUPTED PIDs: 0x", RED_ON_BLACK)
+        cprint_hex(corrupted, 4, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+    // ASLR
+    cprint("  ASLR range:  ", WHITE_ON_BLACK)
+    cprint("0x", WHITE_ON_BLACK)
+    cprint_hex(ASLR_BASE_MIN, 8, CYAN_ON_BLACK)
+    cprint(" - 0x", WHITE_ON_BLACK)
+    cprint_hex(ASLR_BASE_MAX, 8, CYAN_ON_BLACK)
+    cprintln(" (4KB aligned)", WHITE_ON_BLACK)
+    // Capability summary
+    cap_audit()
+}

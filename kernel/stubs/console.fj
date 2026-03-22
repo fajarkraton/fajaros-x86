@@ -1,0 +1,173 @@
+// FajarOS Nova v2.0 — Microkernel Console Stubs
+// kernel/stubs/console.fj — Ring 0 ONLY
+// Consolidated from: serial.fj + vga.fj (essential output functions only)
+// These are the ONLY display functions in the microkernel image
+
+// ═══════════════════════════════════════════════════
+// Serial Port (16550 UART, COM1: 0x3F8)
+// Kernel debug output channel — always available
+// ═══════════════════════════════════════════════════
+
+const SERIAL_COM1_BASE: i64 = 0x3F8
+const SERIAL_COM2_BASE: i64 = 0x2F8
+const LSR_TX_EMPTY: i64 = 0x20
+
+@kernel fn x86_serial_init() {
+    // Initialize COM1 at 115200 baud, 8N1
+    let base = SERIAL_COM1_BASE
+    port_outb(base + 1, 0x00)    // Disable all interrupts
+    port_outb(base + 3, 0x80)    // Enable DLAB
+    port_outb(base + 0, 0x01)    // Divisor low byte (115200 baud)
+    port_outb(base + 1, 0x00)    // Divisor high byte
+    port_outb(base + 3, 0x03)    // 8 bits, no parity, 1 stop bit
+    port_outb(base + 2, 0xC7)    // Enable FIFO, clear TX/RX, 14-byte threshold
+    port_outb(base + 4, 0x0B)    // IRQs enabled, RTS/DSR set
+    port_outb(base + 4, 0x1E)    // Loopback mode for self-test
+
+    // Self-test: send 0xAE, expect it back
+    port_outb(base + 0, 0xAE)
+    let test = port_inb(base + 0)
+
+    if test != 0xAE {
+        // Serial port faulty -- continue anyway (VGA fallback)
+        return
+    }
+
+    // Disable loopback, set normal operation (OUT1 + OUT2 + RTS)
+    port_outb(base + 4, 0x0F)
+}
+
+@kernel fn x86_serial_send(byte: i64) {
+    // Send one byte to COM1 (blocking, waits for TX empty)
+    // Spin-wait for TX empty (no asm!("pause") in Cranelift)
+    let mut wait: i64 = 0
+    while (port_inb(SERIAL_COM1_BASE + 5) & LSR_TX_EMPTY) == 0 {
+        wait = wait + 1
+    }
+    port_outb(SERIAL_COM1_BASE, byte)
+}
+
+@kernel fn x86_serial_send_str(s: str) {
+    // Send each byte of string to COM1
+    let len = str_len(s)
+    let mut i: i64 = 0
+    while i < len {
+        x86_serial_send(str_byte_at(s, i))
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// VGA Text Mode Console (0xB8000)
+// 80x25 character display, cursor tracking at 0x6FA00/0x6FA08
+// ═══════════════════════════════════════════════════
+
+@kernel fn console_init() {
+    let mut i: i64 = 0
+    while i < VGA_COLS * VGA_ROWS {
+        volatile_write(VGA_BASE + i * 2, 0x20)
+        volatile_write(VGA_BASE + i * 2 + 1, WHITE_ON_BLACK)
+        i = i + 1
+    }
+    volatile_write(0x6FA00, 0)  // row = 0
+    volatile_write(0x6FA08, 0)  // col = 0
+}
+
+@kernel fn console_scroll() {
+    let mut i: i64 = 0
+    while i < VGA_COLS * (VGA_ROWS - 1) {
+        let s = VGA_BASE + (i + VGA_COLS) * 2
+        let d = VGA_BASE + i * 2
+        volatile_write(d, volatile_read(s))
+        volatile_write(d + 1, volatile_read(s + 1))
+        i = i + 1
+    }
+    let mut j: i64 = 0
+    while j < VGA_COLS {
+        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2, 0x20)
+        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2 + 1, WHITE_ON_BLACK)
+        j = j + 1
+    }
+}
+
+@kernel fn console_putchar(ch: i64, color: i64) {
+    let row = volatile_read(0x6FA00)
+    let col = volatile_read(0x6FA08)
+    if ch == 10 {
+        volatile_write(0x6FA08, 0)
+        if row >= VGA_ROWS - 1 { console_scroll() }
+        else { volatile_write(0x6FA00, row + 1) }
+        return
+    }
+    if ch == 8 {
+        if col > 0 {
+            volatile_write(0x6FA08, col - 1)
+            let addr = VGA_BASE + (row * VGA_COLS + col - 1) * 2
+            volatile_write(addr, 0x20)
+            volatile_write(addr + 1, color)
+        }
+        return
+    }
+    let addr = VGA_BASE + (row * VGA_COLS + col) * 2
+    volatile_write(addr, ch)
+    volatile_write(addr + 1, color)
+    if col >= VGA_COLS - 1 {
+        volatile_write(0x6FA08, 0)
+        if row >= VGA_ROWS - 1 { console_scroll() }
+        else { volatile_write(0x6FA00, row + 1) }
+    } else {
+        volatile_write(0x6FA08, col + 1)
+    }
+    vga_update_cursor()
+}
+
+@kernel fn cprint(s: str, color: i64) {
+    let len = str_len(s)
+    let mut i: i64 = 0
+    while i < len { console_putchar(str_byte_at(s, i), color); i = i + 1 }
+}
+
+@kernel fn cprintln(s: str, color: i64) {
+    cprint(s, color)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cprint_decimal(val: i64, color: i64) {
+    if val == 0 { console_putchar(48, color); return }
+    let mut buf: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut v = val
+    let mut len: i64 = 0
+    while v > 0 { buf[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
+    let mut i: i64 = 0
+    while i < len { console_putchar(buf[len - 1 - i], color); i = i + 1 }
+}
+
+@kernel fn cprint_hex(val: i64, digits: i64, color: i64) {
+    let mut i = digits - 1
+    while i >= 0 {
+        let n = (val >> (i * 4)) & 0xF
+        if n < 10 { console_putchar(48 + n, color) }
+        else { console_putchar(55 + n, color) }
+        i = i - 1
+    }
+}
+
+@kernel fn vga_update_cursor() {
+    let row = volatile_read(0x6FA00)
+    let col = volatile_read(0x6FA08)
+    let pos = row * VGA_COLS + col
+    port_outb(0x3D4, 14)
+    port_outb(0x3D5, (pos >> 8) & 0xFF)
+    port_outb(0x3D4, 15)
+    port_outb(0x3D5, pos & 0xFF)
+}
+
+// ═══════════════════════════════════════════════════
+// Convenience helper: println
+// Prints string to VGA + newline (white on black)
+// ═══════════════════════════════════════════════════
+
+@kernel fn println(s: str) {
+    cprint(s, WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}

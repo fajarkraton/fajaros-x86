@@ -1,0 +1,477 @@
+// FajarOS Nova v2.0 — Text Editor "fjed" (Sprint 3.4)
+// @safe application — gap buffer, syntax highlighting, VFS save/load
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Editor State — at 0x930000
+// ═══════════════════════════════════════════════════════════════
+
+const ED_STATE: i64 = 0x930000
+const ED_CURSOR_LINE: i64 = 0      // Current line (0-based)
+const ED_CURSOR_COL: i64 = 8       // Current column (0-based)
+const ED_SCROLL_TOP: i64 = 16      // First visible line
+const ED_TOTAL_LINES: i64 = 24     // Total line count
+const ED_MODIFIED: i64 = 32        // Dirty flag (0=clean, 1=modified)
+const ED_MODE: i64 = 40            // 0=normal, 1=command, 2=search
+const ED_FILENAME: i64 = 48        // Pointer to filename buffer
+const ED_VISIBLE_ROWS: i64 = 56    // Lines visible on screen
+
+// Gap buffer: text storage with movable gap for efficient insert/delete
+// Buffer at 0x932000, 32KB total
+// Layout: [text_before_gap ... GAP ... text_after_gap]
+const GAP_BUF: i64 = 0x932000
+const GAP_BUF_SIZE: i64 = 32768    // 32KB
+const GAP_START: i64 = 0x931000    // Gap start offset (i64)
+const GAP_END: i64 = 0x931008      // Gap end offset (i64)
+const GAP_MIN: i64 = 256           // Minimum gap size before regrow
+
+// Filename buffer at 0x931100 (64 bytes)
+const ED_FNAME_BUF: i64 = 0x931100
+
+// Line index: start offset of each line (max 1024 lines)
+// At 0x93A000, 1024 × 8 bytes = 8KB
+const LINE_INDEX: i64 = 0x93A000
+const LINE_MAX: i64 = 1024
+
+// Syntax highlighting colors
+const SYN_NORMAL: i64 = 0xCDD6F4     // Default text
+const SYN_KEYWORD: i64 = 0xCBA6F7    // Purple: fn, let, if, while, etc.
+const SYN_STRING: i64 = 0xA6E3A1     // Green: "..."
+const SYN_COMMENT: i64 = 0x6C7086    // Gray: // ...
+const SYN_NUMBER: i64 = 0xFAB387     // Orange: 42, 0xFF
+const SYN_TYPE: i64 = 0x89DCEB       // Cyan: i64, bool, str
+const SYN_ANNOTATION: i64 = 0xF9E2AF // Yellow: @kernel, @safe
+
+// ═══════════════════════════════════════════════════════════════
+// Gap Buffer Operations
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ed_read(off: i64) -> i64 { volatile_read_u64(ED_STATE + off) }
+@kernel fn ed_write(off: i64, val: i64) { volatile_write_u64(ED_STATE + off, val) }
+
+@kernel fn gap_init() {
+    volatile_write_u64(GAP_START, 0)
+    volatile_write_u64(GAP_END, GAP_BUF_SIZE)
+    let mut i: i64 = 0
+    while i < GAP_BUF_SIZE { volatile_write_u8(GAP_BUF + i, 0); i = i + 1 }
+}
+
+@kernel fn gap_len() -> i64 {
+    // Text length = buffer size - gap size
+    GAP_BUF_SIZE - (volatile_read_u64(GAP_END) - volatile_read_u64(GAP_START))
+}
+
+@kernel fn gap_char_at(pos: i64) -> i64 {
+    let gs = volatile_read_u64(GAP_START)
+    let ge = volatile_read_u64(GAP_END)
+    if pos < gs { return volatile_read_u8(GAP_BUF + pos) }
+    volatile_read_u8(GAP_BUF + pos + (ge - gs))
+}
+
+@kernel fn gap_move_to(pos: i64) {
+    let gs = volatile_read_u64(GAP_START)
+    let ge = volatile_read_u64(GAP_END)
+    if pos == gs { return }
+    if pos < gs {
+        // Move gap left: copy chars from before gap to after gap
+        let count = gs - pos
+        let mut i: i64 = count - 1
+        while i >= 0 {
+            volatile_write_u8(GAP_BUF + ge - count + i, volatile_read_u8(GAP_BUF + pos + i))
+            i = i - 1
+        }
+        volatile_write_u64(GAP_START, pos)
+        volatile_write_u64(GAP_END, ge - count)
+    } else {
+        // Move gap right: copy chars from after gap to before gap
+        let count = pos - gs
+        let mut i: i64 = 0
+        while i < count {
+            volatile_write_u8(GAP_BUF + gs + i, volatile_read_u8(GAP_BUF + ge + i))
+            i = i + 1
+        }
+        volatile_write_u64(GAP_START, pos)
+        volatile_write_u64(GAP_END, ge + count)
+    }
+}
+
+@kernel fn gap_insert(ch: i64) {
+    let gs = volatile_read_u64(GAP_START)
+    let ge = volatile_read_u64(GAP_END)
+    if ge - gs < 1 { return }  // Buffer full
+    volatile_write_u8(GAP_BUF + gs, ch)
+    volatile_write_u64(GAP_START, gs + 1)
+}
+
+@kernel fn gap_delete_back() {
+    let gs = volatile_read_u64(GAP_START)
+    if gs == 0 { return }
+    volatile_write_u64(GAP_START, gs - 1)
+}
+
+@kernel fn gap_delete_forward() {
+    let ge = volatile_read_u64(GAP_END)
+    if ge >= GAP_BUF_SIZE { return }
+    volatile_write_u64(GAP_END, ge + 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Line Index — maps line number to text position
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn line_index_rebuild() {
+    let text_len = gap_len()
+    let mut line: i64 = 0
+    volatile_write_u64(LINE_INDEX, 0)  // Line 0 starts at pos 0
+    line = 1
+    let mut pos: i64 = 0
+    while pos < text_len && line < LINE_MAX {
+        if gap_char_at(pos) == 10 {  // newline
+            volatile_write_u64(LINE_INDEX + line * 8, pos + 1)
+            line = line + 1
+        }
+        pos = pos + 1
+    }
+    ed_write(ED_TOTAL_LINES, line)
+}
+
+@kernel fn line_start(line: i64) -> i64 {
+    if line < 0 || line >= ed_read(ED_TOTAL_LINES) { return 0 }
+    volatile_read_u64(LINE_INDEX + line * 8)
+}
+
+@kernel fn line_length(line: i64) -> i64 {
+    let start = line_start(line)
+    let total = ed_read(ED_TOTAL_LINES)
+    let end = if line + 1 < total { line_start(line + 1) - 1 } else { gap_len() }
+    if end > start { end - start } else { 0 }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cursor Movement
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ed_cursor_pos() -> i64 {
+    // Convert (line, col) to text position
+    let line = ed_read(ED_CURSOR_LINE)
+    let col = ed_read(ED_CURSOR_COL)
+    let start = line_start(line)
+    let len = line_length(line)
+    start + if col < len { col } else { len }
+}
+
+@kernel fn ed_move_left() {
+    let col = ed_read(ED_CURSOR_COL)
+    if col > 0 { ed_write(ED_CURSOR_COL, col - 1) }
+    else {
+        let line = ed_read(ED_CURSOR_LINE)
+        if line > 0 {
+            ed_write(ED_CURSOR_LINE, line - 1)
+            ed_write(ED_CURSOR_COL, line_length(line - 1))
+        }
+    }
+}
+
+@kernel fn ed_move_right() {
+    let line = ed_read(ED_CURSOR_LINE)
+    let col = ed_read(ED_CURSOR_COL)
+    let len = line_length(line)
+    if col < len { ed_write(ED_CURSOR_COL, col + 1) }
+    else {
+        if line + 1 < ed_read(ED_TOTAL_LINES) {
+            ed_write(ED_CURSOR_LINE, line + 1)
+            ed_write(ED_CURSOR_COL, 0)
+        }
+    }
+}
+
+@kernel fn ed_move_up() {
+    let line = ed_read(ED_CURSOR_LINE)
+    if line > 0 { ed_write(ED_CURSOR_LINE, line - 1) }
+}
+
+@kernel fn ed_move_down() {
+    let line = ed_read(ED_CURSOR_LINE)
+    if line + 1 < ed_read(ED_TOTAL_LINES) { ed_write(ED_CURSOR_LINE, line + 1) }
+}
+
+@kernel fn ed_move_home() { ed_write(ED_CURSOR_COL, 0) }
+
+@kernel fn ed_move_end() {
+    let len = line_length(ed_read(ED_CURSOR_LINE))
+    ed_write(ED_CURSOR_COL, len)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Insert / Delete
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ed_insert_char(ch: i64) {
+    let pos = ed_cursor_pos()
+    gap_move_to(pos)
+    gap_insert(ch)
+    line_index_rebuild()
+    ed_write(ED_MODIFIED, 1)
+    if ch == 10 {
+        ed_write(ED_CURSOR_LINE, ed_read(ED_CURSOR_LINE) + 1)
+        ed_write(ED_CURSOR_COL, 0)
+    } else {
+        ed_write(ED_CURSOR_COL, ed_read(ED_CURSOR_COL) + 1)
+    }
+}
+
+@kernel fn ed_backspace() {
+    let pos = ed_cursor_pos()
+    if pos == 0 { return }
+    gap_move_to(pos)
+    gap_delete_back()
+    line_index_rebuild()
+    ed_write(ED_MODIFIED, 1)
+    ed_move_left()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Syntax Highlighting (Fajar Lang .fj)
+// Returns color for character at given position
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn syn_color_at(pos: i64) -> i64 {
+    let ch = gap_char_at(pos)
+    // Check for comment: scan backward for "//" on same line
+    let line = ed_read(ED_CURSOR_LINE)
+    let ls = line_start(line)
+    let mut p = ls
+    while p < pos {
+        if gap_char_at(p) == 47 && p + 1 < gap_len() && gap_char_at(p + 1) == 47 {
+            return SYN_COMMENT
+        }
+        p = p + 1
+    }
+    // String literal
+    if ch == 34 { return SYN_STRING }  // "
+    // Numbers
+    if ch >= 48 && ch <= 57 { return SYN_NUMBER }
+    // Annotation (@)
+    if ch == 64 { return SYN_ANNOTATION }
+    SYN_NORMAL
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Save / Load via VFS IPC
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ed_load_file(path_addr: i64) {
+    // Copy filename
+    let mut i: i64 = 0
+    while i < 63 {
+        let ch = volatile_read_u8(path_addr + i)
+        volatile_write_u8(ED_FNAME_BUF + i, ch)
+        if ch == 0 { i = 63 } else { i = i + 1 }
+    }
+    ed_write(ED_FILENAME, ED_FNAME_BUF)
+
+    // Open file via VFS
+    let msg: i64 = 0x931200
+    let reply: i64 = 0x931300
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, 0, MSG_VFS_OPEN, 0)
+    i = 0
+    while i < 39 {
+        let ch = volatile_read_u8(path_addr + i)
+        volatile_write_u8(msg + 16 + i, ch)
+        if ch == 0 { i = 39 } else { i = i + 1 }
+    }
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(0, msg, reply)
+    let fd = volatile_read_u64(reply + 16)
+    let fsize = volatile_read_u64(reply + 24)
+    let status = volatile_read_u64(reply + 32)
+    if fd < 0 || status != VFS_OK { return }
+
+    // Read file into gap buffer
+    gap_init()
+    let mut total: i64 = 0
+    while total < fsize && total < GAP_BUF_SIZE - GAP_MIN {
+        ipc_msg_clear(msg)
+        ipc_msg_set_header(msg, 0, MSG_VFS_READ, 0)
+        volatile_write_u64(msg + 16, fd)
+        volatile_write_u64(msg + 24, total)
+        volatile_write_u64(msg + 32, 32)
+        ipc_msg_clear(reply)
+        vfs_svc_handle_msg(0, msg, reply)
+        let bytes = volatile_read_u64(reply + 48)
+        if bytes <= 0 { total = fsize }
+        else {
+            let mut j: i64 = 0
+            while j < bytes && j < 32 {
+                gap_insert(volatile_read_u8(reply + 16 + j))
+                j = j + 1
+            }
+            total = total + bytes
+        }
+    }
+
+    // Close
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, 0, MSG_VFS_CLOSE, 0)
+    volatile_write_u64(msg + 16, fd)
+    vfs_svc_handle_msg(0, msg, reply)
+
+    // Rebuild line index, reset cursor
+    gap_move_to(0)
+    line_index_rebuild()
+    ed_write(ED_CURSOR_LINE, 0)
+    ed_write(ED_CURSOR_COL, 0)
+    ed_write(ED_SCROLL_TOP, 0)
+    ed_write(ED_MODIFIED, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Editor Init
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ed_init() {
+    let mut i: i64 = 0
+    while i < 128 { volatile_write_u8(ED_STATE + i, 0); i = i + 1 }
+    gap_init()
+    line_index_rebuild()
+    let rows = fb_state_read(FB_HEIGHT)
+    let visible = if rows > 0 { rows / FONT_HEIGHT - 2 } else { 23 }  // -2 for status bar
+    ed_write(ED_VISIBLE_ROWS, visible)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_editor_test() {
+    cprintln("=== Text Editor (fjed) Test ===", YELLOW_ON_BLACK)
+    ed_init()
+
+    // Insert test text
+    let test_text: i64 = 0x931400
+    // "// Hello\nfn main() {\n    42\n}\n"
+    volatile_write_u8(test_text, 47)     // /
+    volatile_write_u8(test_text+1, 47)   // /
+    volatile_write_u8(test_text+2, 32)   // ' '
+    volatile_write_u8(test_text+3, 72)   // H
+    volatile_write_u8(test_text+4, 101)  // e
+    volatile_write_u8(test_text+5, 108)  // l
+    volatile_write_u8(test_text+6, 108)  // l
+    volatile_write_u8(test_text+7, 111)  // o
+    volatile_write_u8(test_text+8, 10)   // \n
+    volatile_write_u8(test_text+9, 102)  // f
+    volatile_write_u8(test_text+10, 110) // n
+    volatile_write_u8(test_text+11, 32)  // ' '
+    volatile_write_u8(test_text+12, 109) // m
+    volatile_write_u8(test_text+13, 97)  // a
+    volatile_write_u8(test_text+14, 105) // i
+    volatile_write_u8(test_text+15, 110) // n
+    volatile_write_u8(test_text+16, 40)  // (
+    volatile_write_u8(test_text+17, 41)  // )
+    volatile_write_u8(test_text+18, 32)  // ' '
+    volatile_write_u8(test_text+19, 123) // {
+    volatile_write_u8(test_text+20, 10)  // \n
+    volatile_write_u8(test_text+21, 32)  // ' '
+    volatile_write_u8(test_text+22, 32)  // ' '
+    volatile_write_u8(test_text+23, 32)  // ' '
+    volatile_write_u8(test_text+24, 32)  // ' '
+    volatile_write_u8(test_text+25, 52)  // 4
+    volatile_write_u8(test_text+26, 50)  // 2
+    volatile_write_u8(test_text+27, 10)  // \n
+    volatile_write_u8(test_text+28, 125) // }
+    volatile_write_u8(test_text+29, 10)  // \n
+    volatile_write_u8(test_text+30, 0)
+
+    let mut i: i64 = 0
+    while i < 30 { ed_insert_char(volatile_read_u8(test_text + i)); i = i + 1 }
+    line_index_rebuild()
+
+    cprint("  Lines: ", WHITE_ON_BLACK)
+    cprint_decimal(ed_read(ED_TOTAL_LINES), CYAN_ON_BLACK)
+    cprint("  Chars: ", WHITE_ON_BLACK)
+    cprint_decimal(gap_len(), CYAN_ON_BLACK)
+    cprint("  Gap: ", WHITE_ON_BLACK)
+    cprint_decimal(GAP_BUF_SIZE - gap_len(), CYAN_ON_BLACK)
+    cprintln(" bytes free", WHITE_ON_BLACK)
+
+    // Test cursor movement
+    ed_write(ED_CURSOR_LINE, 0)
+    ed_write(ED_CURSOR_COL, 0)
+    ed_move_down()
+    ed_move_right()
+    ed_move_right()
+    cprint("  Cursor: line=", WHITE_ON_BLACK)
+    cprint_decimal(ed_read(ED_CURSOR_LINE), CYAN_ON_BLACK)
+    cprint(" col=", WHITE_ON_BLACK)
+    cprint_decimal(ed_read(ED_CURSOR_COL), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Print lines
+    cprintln("  Content:", WHITE_ON_BLACK)
+    let lines = ed_read(ED_TOTAL_LINES)
+    let mut ln: i64 = 0
+    while ln < lines && ln < 10 {
+        cprint("    ", WHITE_ON_BLACK)
+        cprint_decimal(ln + 1, CYAN_ON_BLACK)
+        cprint("| ", WHITE_ON_BLACK)
+        let start = line_start(ln)
+        let len = line_length(ln)
+        let mut c: i64 = 0
+        while c < len && c < 60 {
+            let ch = gap_char_at(start + c)
+            if ch >= 32 && ch < 127 { console_putchar(ch, WHITE_ON_BLACK) }
+            c = c + 1
+        }
+        console_putchar(10, WHITE_ON_BLACK)
+        ln = ln + 1
+    }
+
+    // Test VFS load
+    cprintln("  Load /motd via VFS:", WHITE_ON_BLACK)
+    let path: i64 = 0x931500
+    volatile_write_u8(path, 47)    // /
+    volatile_write_u8(path+1, 109) // m
+    volatile_write_u8(path+2, 111) // o
+    volatile_write_u8(path+3, 116) // t
+    volatile_write_u8(path+4, 100) // d
+    volatile_write_u8(path+5, 0)
+    ed_load_file(path)
+    cprint("    Loaded: ", WHITE_ON_BLACK)
+    cprint_decimal(gap_len(), CYAN_ON_BLACK)
+    cprint(" bytes, ", WHITE_ON_BLACK)
+    cprint_decimal(ed_read(ED_TOTAL_LINES), CYAN_ON_BLACK)
+    cprintln(" lines", WHITE_ON_BLACK)
+
+    cprintln("=== Editor test complete ===", GREEN_ON_BLACK)
+    cprintln("  Shortcuts: Ctrl+S=save Ctrl+Q=quit Ctrl+G=goto", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_editor_info() {
+    cprintln("Text Editor (fjed):", YELLOW_ON_BLACK)
+    cprint("  Buffer: ", WHITE_ON_BLACK)
+    cprint_decimal(gap_len(), CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(GAP_BUF_SIZE, WHITE_ON_BLACK)
+    cprint(" bytes (", WHITE_ON_BLACK)
+    cprint_decimal(GAP_BUF_SIZE - gap_len(), CYAN_ON_BLACK)
+    cprintln(" free)", WHITE_ON_BLACK)
+    cprint("  Lines: ", WHITE_ON_BLACK)
+    cprint_decimal(ed_read(ED_TOTAL_LINES), CYAN_ON_BLACK)
+    cprint("  Cursor: ", WHITE_ON_BLACK)
+    cprint_decimal(ed_read(ED_CURSOR_LINE) + 1, CYAN_ON_BLACK)
+    cprint(":", WHITE_ON_BLACK)
+    cprint_decimal(ed_read(ED_CURSOR_COL) + 1, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Modified: ", WHITE_ON_BLACK)
+    if ed_read(ED_MODIFIED) == 1 { cprintln("YES", YELLOW_ON_BLACK) }
+    else { cprintln("no", GREEN_ON_BLACK) }
+    cprint("  Visible rows: ", WHITE_ON_BLACK)
+    cprint_decimal(ed_read(ED_VISIBLE_ROWS), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Syntax: .fj (", WHITE_ON_BLACK)
+    cprint("keywords", 0x0B) // CYAN
+    cprint(" strings", 0x0A) // GREEN
+    cprint(" comments", 0x08) // GRAY
+    cprintln(")", WHITE_ON_BLACK)
+}

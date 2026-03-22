@@ -1,0 +1,299 @@
+// FajarOS Nova v2.0 — Fast IPC & Performance (Sprint 2.5)
+// kernel/core/fast_ipc.fj — Ring 0 ONLY
+// Fast path register transfer, batch syscalls, lock-free queue, perf counters
+
+// ═══════════════════════════════════════════════════════════════
+// Section 1: Fast Path IPC — <=16 bytes via register transfer
+// 16 entries x 32 bytes at 0x8FA000
+// Per entry: sender(8), receiver(8), data0(8), data1(8)
+// ═══════════════════════════════════════════════════════════════
+
+const FASTPATH_BASE: i64 = 0x8FA000
+const FASTPATH_MAX: i64 = 16
+const FASTPATH_ENTRY: i64 = 32
+const FP_SENDER: i64 = 0
+const FP_RECEIVER: i64 = 8
+const FP_DATA0: i64 = 16
+const FP_DATA1: i64 = 24
+// Recv scratch area — AFTER the 16 entries (0x8FA000 + 512 = 0x8FA200)
+const FP_RECV_SCRATCH: i64 = 0x8FA200  // 16 bytes (was 0x8FA1F0 which overlapped slot 15!)
+
+@kernel fn fastpath_init() {
+    let mut i: i64 = 0
+    while i < FASTPATH_MAX * FASTPATH_ENTRY { volatile_write_u64(FASTPATH_BASE + i, 0); i = i + 8 }
+}
+
+@kernel fn ipc_fast_send(dst_pid: i64, val0: i64, val1: i64) -> i64 {
+    if dst_pid < 0 || dst_pid >= FASTPATH_MAX { return -1 }
+    let src_pid = volatile_read_u64(0x6FE00)
+    // Check if receiver is waiting
+    let mut slot: i64 = 0
+    while slot < FASTPATH_MAX {
+        let entry = FASTPATH_BASE + slot * FASTPATH_ENTRY
+        if volatile_read_u64(entry + FP_RECEIVER) == dst_pid && volatile_read_u64(entry + FP_SENDER) == 0 {
+            volatile_write_u64(entry + FP_SENDER, src_pid)
+            volatile_write_u64(entry + FP_DATA0, val0)
+            volatile_write_u64(entry + FP_DATA1, val1)
+            // Note: IPC latency is measured externally by callers using rdtsc()
+            return 0
+        }
+        slot = slot + 1
+    }
+    // No waiting receiver — deposit in empty slot
+    slot = 0
+    while slot < FASTPATH_MAX {
+        let entry = FASTPATH_BASE + slot * FASTPATH_ENTRY
+        if volatile_read_u64(entry + FP_SENDER) == 0 && volatile_read_u64(entry + FP_RECEIVER) == 0 {
+            volatile_write_u64(entry + FP_SENDER, src_pid)
+            volatile_write_u64(entry + FP_RECEIVER, dst_pid)
+            volatile_write_u64(entry + FP_DATA0, val0)
+            volatile_write_u64(entry + FP_DATA1, val1)
+            return 0
+        }
+        slot = slot + 1
+    }
+    -1
+}
+
+@kernel fn ipc_fast_recv() -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+    let mut slot: i64 = 0
+    while slot < FASTPATH_MAX {
+        let entry = FASTPATH_BASE + slot * FASTPATH_ENTRY
+        let recv = volatile_read_u64(entry + FP_RECEIVER)
+        let sender = volatile_read_u64(entry + FP_SENDER)
+        if recv == my_pid && sender != 0 {
+            let s = sender
+            volatile_write_u64(FP_RECV_SCRATCH, volatile_read_u64(entry + FP_DATA0))
+            volatile_write_u64(FP_RECV_SCRATCH + 8, volatile_read_u64(entry + FP_DATA1))
+            volatile_write_u64(entry + FP_SENDER, 0)
+            volatile_write_u64(entry + FP_RECEIVER, 0)
+            volatile_write_u64(entry + FP_DATA0, 0)
+            volatile_write_u64(entry + FP_DATA1, 0)
+            return s
+        }
+        slot = slot + 1
+    }
+    -1
+}
+
+@kernel fn ipc_fast_recv_data0() -> i64 { volatile_read_u64(FP_RECV_SCRATCH) }
+@kernel fn ipc_fast_recv_data1() -> i64 { volatile_read_u64(FP_RECV_SCRATCH + 8) }
+
+// ═══════════════════════════════════════════════════════════════
+// Section 2: Batch Syscalls — submit multiple ops in one trap
+// 16 ops x 32 bytes at 0x8FA200
+// Per op: syscall_num(8), arg0(8), arg1(8), result(8)
+// ═══════════════════════════════════════════════════════════════
+
+const BATCH_BASE: i64 = 0x8FA220     // after FP_RECV_SCRATCH (0x8FA200 + 32 pad)
+const BATCH_MAX: i64 = 16
+const BATCH_ENTRY: i64 = 32
+const BATCH_COUNT_ADDR: i64 = 0x8FA420  // after batch entries (0x8FA220 + 16*32 = 0x8FA420)
+const BATCH_NUM: i64 = 0
+const BATCH_ARG0: i64 = 8
+const BATCH_ARG1: i64 = 16
+const BATCH_RESULT: i64 = 24
+
+@kernel fn batch_init() {
+    let mut i: i64 = 0
+    while i < BATCH_MAX * BATCH_ENTRY { volatile_write_u64(BATCH_BASE + i, 0); i = i + 8 }
+    volatile_write_u64(BATCH_COUNT_ADDR, 0)
+}
+
+@kernel fn batch_add(num: i64, arg0: i64, arg1: i64) -> i64 {
+    let count = volatile_read_u64(BATCH_COUNT_ADDR)
+    if count >= BATCH_MAX { return -1 }
+    let entry = BATCH_BASE + count * BATCH_ENTRY
+    volatile_write_u64(entry + BATCH_NUM, num)
+    volatile_write_u64(entry + BATCH_ARG0, arg0)
+    volatile_write_u64(entry + BATCH_ARG1, arg1)
+    volatile_write_u64(entry + BATCH_RESULT, 0)
+    volatile_write_u64(BATCH_COUNT_ADDR, count + 1)
+    count
+}
+
+@kernel fn batch_submit(count: i64) -> i64 {
+    let actual = if count > BATCH_MAX { BATCH_MAX } else { count }
+    let mut i: i64 = 0
+    while i < actual {
+        let entry = BATCH_BASE + i * BATCH_ENTRY
+        let num = volatile_read_u64(entry + BATCH_NUM)
+        let a0 = volatile_read_u64(entry + BATCH_ARG0)
+        let a1 = volatile_read_u64(entry + BATCH_ARG1)
+        volatile_write_u64(entry + BATCH_RESULT, batch_dispatch(num, a0, a1))
+        i = i + 1
+    }
+    volatile_write_u64(BATCH_COUNT_ADDR, 0)
+    actual
+}
+
+@kernel fn batch_get_result(slot: i64) -> i64 {
+    if slot < 0 || slot >= BATCH_MAX { return -1 }
+    volatile_read_u64(BATCH_BASE + slot * BATCH_ENTRY + BATCH_RESULT)
+}
+
+@kernel fn batch_dispatch(num: i64, arg0: i64, arg1: i64) -> i64 {
+    // Syscall numbers match kernel/syscall/dispatch.fj: SYS_GETPID=3, SYS_YIELD=4, SYS_SEND=10, SYS_RECV=11
+    if num == 3 { return volatile_read_u64(0x6FE00) }       // SYS_GETPID
+    if num == 4 { return 0 }                                 // SYS_YIELD
+    if num == 10 { ipc2_send(arg0, arg1); return 0 }        // SYS_SEND
+    if num == 11 { return ipc2_recv(arg0, arg1) }            // SYS_RECV
+    if num == 100 { return ipc_fast_send(arg0, arg1, 0) }   // Fast IPC send
+    if num == 101 { return ipc_fast_recv() }                 // Fast IPC recv
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 3: Lock-Free SPSC Queue
+// head(8), tail(8), capacity(8), pad(8), data[16x8]
+// ═══════════════════════════════════════════════════════════════
+
+const LFQ_HEAD: i64 = 0
+const LFQ_TAIL: i64 = 8
+const LFQ_CAP: i64 = 16
+const LFQ_DATA: i64 = 32
+const LFQ_SLOTS: i64 = 16
+
+@kernel fn lockfree_init(queue_base: i64) {
+    volatile_write_u64(queue_base + LFQ_HEAD, 0)
+    volatile_write_u64(queue_base + LFQ_TAIL, 0)
+    volatile_write_u64(queue_base + LFQ_CAP, LFQ_SLOTS)
+    let mut i: i64 = 0
+    while i < LFQ_SLOTS { volatile_write_u64(queue_base + LFQ_DATA + i * 8, 0); i = i + 1 }
+}
+
+@kernel fn lockfree_enqueue(queue_base: i64, value: i64) -> i64 {
+    let tail = volatile_read_u64(queue_base + LFQ_TAIL)
+    let head = volatile_read_u64(queue_base + LFQ_HEAD)
+    let cap = volatile_read_u64(queue_base + LFQ_CAP)
+    let next_tail = (tail + 1) % cap
+    if next_tail == head { return -1 }  // Full
+    volatile_write_u64(queue_base + LFQ_DATA + tail * 8, value)
+    volatile_write_u64(queue_base + LFQ_TAIL, next_tail)
+    0
+}
+
+@kernel fn lockfree_dequeue(queue_base: i64) -> i64 {
+    let head = volatile_read_u64(queue_base + LFQ_HEAD)
+    let tail = volatile_read_u64(queue_base + LFQ_TAIL)
+    if head == tail { return -1 }  // Empty
+    let value = volatile_read_u64(queue_base + LFQ_DATA + head * 8)
+    let cap = volatile_read_u64(queue_base + LFQ_CAP)
+    volatile_write_u64(queue_base + LFQ_HEAD, (head + 1) % cap)
+    value
+}
+
+@kernel fn lockfree_count(queue_base: i64) -> i64 {
+    let head = volatile_read_u64(queue_base + LFQ_HEAD)
+    let tail = volatile_read_u64(queue_base + LFQ_TAIL)
+    let cap = volatile_read_u64(queue_base + LFQ_CAP)
+    if cap == 0 { return 0 }
+    if tail >= head { tail - head } else { cap - head + tail }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 4: Performance Counters — 6 x 8 bytes at 0x8FA400
+// ═══════════════════════════════════════════════════════════════
+
+const PERF_BASE: i64 = 0x8FA430     // after BATCH_COUNT_ADDR + 16 pad
+const PERF_IPC_COUNT: i64 = 0
+const PERF_IPC_TOTAL: i64 = 8
+const PERF_IPC_MIN: i64 = 16
+const PERF_IPC_MAX: i64 = 24
+const PERF_CTX_COUNT: i64 = 32
+const PERF_CTX_TOTAL: i64 = 40
+
+@kernel fn perf_init() {
+    volatile_write_u64(PERF_BASE + PERF_IPC_COUNT, 0)
+    volatile_write_u64(PERF_BASE + PERF_IPC_TOTAL, 0)
+    volatile_write_u64(PERF_BASE + PERF_IPC_MIN, 0x7FFFFFFFFFFFFFFF)
+    volatile_write_u64(PERF_BASE + PERF_IPC_MAX, 0)
+    volatile_write_u64(PERF_BASE + PERF_CTX_COUNT, 0)
+    volatile_write_u64(PERF_BASE + PERF_CTX_TOTAL, 0)
+}
+
+@kernel fn perf_record_ipc(cycles: i64) {
+    if cycles <= 0 { return }
+    let count = volatile_read_u64(PERF_BASE + PERF_IPC_COUNT)
+    volatile_write_u64(PERF_BASE + PERF_IPC_COUNT, count + 1)
+    let total = volatile_read_u64(PERF_BASE + PERF_IPC_TOTAL)
+    volatile_write_u64(PERF_BASE + PERF_IPC_TOTAL, total + cycles)
+    let mn = volatile_read_u64(PERF_BASE + PERF_IPC_MIN)
+    if cycles < mn { volatile_write_u64(PERF_BASE + PERF_IPC_MIN, cycles) }
+    let mx = volatile_read_u64(PERF_BASE + PERF_IPC_MAX)
+    if cycles > mx { volatile_write_u64(PERF_BASE + PERF_IPC_MAX, cycles) }
+}
+
+@kernel fn perf_record_ctx_switch(cycles: i64) {
+    if cycles <= 0 { return }
+    let count = volatile_read_u64(PERF_BASE + PERF_CTX_COUNT)
+    volatile_write_u64(PERF_BASE + PERF_CTX_COUNT, count + 1)
+    let total = volatile_read_u64(PERF_BASE + PERF_CTX_TOTAL)
+    volatile_write_u64(PERF_BASE + PERF_CTX_TOTAL, total + cycles)
+}
+
+@kernel fn perf_reset() { perf_init() }
+
+// ═══════════════════════════════════════════════════════════════
+// Section 5: Shell Commands — Benchmarks & Diagnostics
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_ipc_fast_test() {
+    cprintln("=== Fast IPC Benchmark ===", YELLOW_ON_BLACK)
+    fastpath_init()
+    perf_reset()
+    let my_pid = volatile_read_u64(0x6FE00)
+    // Fast path: 100 send/recv
+    let t0 = rdtsc()
+    let mut i: i64 = 0
+    while i < 100 {
+        ipc_fast_send(my_pid, 0xAAAA + i, 0xBBBB + i)
+        if ipc_fast_recv() < 0 { cprintln("  FAIL", RED_ON_BLACK); return }
+        i = i + 1
+    }
+    let fast = rdtsc() - t0
+    cprint("  Fast 100 msgs: ", WHITE_ON_BLACK)
+    cprint_decimal(fast, CYAN_ON_BLACK)
+    cprint(" cyc (", WHITE_ON_BLACK)
+    cprint_decimal(fast / 100, GREEN_ON_BLACK)
+    cprintln("/msg)", WHITE_ON_BLACK)
+    // Normal IPC queue: 100 send/recv
+    let t2 = rdtsc()
+    let mb: i64 = 0x8FA1C0
+    let rb: i64 = 0x8FA1D0
+    let so: i64 = 0x8FA1E0
+    i = 0
+    while i < 100 {
+        ipc_msg_clear(mb)
+        ipc_msg_set_header(mb, my_pid, 0x42, i)
+        ipc_queue_push(my_pid, my_pid, mb)
+        ipc_queue_pop(my_pid, so, rb)
+        i = i + 1
+    }
+    let normal = rdtsc() - t2
+    cprint("  Queue 100 msgs: ", WHITE_ON_BLACK)
+    cprint_decimal(normal, CYAN_ON_BLACK)
+    cprint(" cyc (", WHITE_ON_BLACK)
+    cprint_decimal(normal / 100, GREEN_ON_BLACK)
+    cprintln("/msg)", WHITE_ON_BLACK)
+    if fast > 0 { cprint("  Speedup: ~", WHITE_ON_BLACK); cprint_decimal(normal / fast, GREEN_ON_BLACK); cprintln("x", GREEN_ON_BLACK) }
+}
+
+@kernel fn cmd_perf() {
+    cprintln("=== Performance Counters ===", YELLOW_ON_BLACK)
+    let ic = volatile_read_u64(PERF_BASE + PERF_IPC_COUNT)
+    cprint("  IPC msgs: ", WHITE_ON_BLACK); cprint_decimal(ic, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    if ic > 0 {
+        let t = volatile_read_u64(PERF_BASE + PERF_IPC_TOTAL)
+        cprint("  IPC avg: ", WHITE_ON_BLACK); cprint_decimal(t / ic, CYAN_ON_BLACK); cprintln(" cyc", WHITE_ON_BLACK)
+        cprint("  IPC min: ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(PERF_BASE + PERF_IPC_MIN), GREEN_ON_BLACK); cprintln(" cyc", WHITE_ON_BLACK)
+        cprint("  IPC max: ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(PERF_BASE + PERF_IPC_MAX), YELLOW_ON_BLACK); cprintln(" cyc", WHITE_ON_BLACK)
+    }
+    let cc = volatile_read_u64(PERF_BASE + PERF_CTX_COUNT)
+    cprint("  Ctx switches: ", WHITE_ON_BLACK); cprint_decimal(cc, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    if cc > 0 {
+        let ct = volatile_read_u64(PERF_BASE + PERF_CTX_TOTAL)
+        cprint("  Ctx avg: ", WHITE_ON_BLACK); cprint_decimal(ct / cc, CYAN_ON_BLACK); cprintln(" cyc", WHITE_ON_BLACK)
+    }
+}

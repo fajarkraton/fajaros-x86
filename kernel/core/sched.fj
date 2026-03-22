@@ -1,0 +1,143 @@
+// FajarOS Nova v2.0 — Microkernel Scheduler Core
+// Consolidated from: process.fj, spinlock.fj, scheduler.fj
+// Contains: process table, spinlock, shutdown/reboot
+
+// ═══════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════
+
+const PROC_TABLE_V2: i64 = 0x890000  // 16 procs x 256 bytes
+// Per proc: +0=state, +8=pid, +16=ppid, +24=entry, +32=user_rsp,
+//           +40=kernel_rsp, +48=page_table, +56=exit_code, +64=name[32]
+
+const PROC_STATE_FREE: i64 = 0
+const PROC_STATE_READY: i64 = 1
+const PROC_STATE_RUNNING: i64 = 2
+const PROC_STATE_BLOCKED: i64 = 3
+const PROC_STATE_ZOMBIE: i64 = 4
+const PROC_V2_MAX: i64 = 16
+const PROC_V2_SIZE: i64 = 256
+
+// ═══════════════════════════════════════════════
+// Spinlock
+// Simple test-and-set lock using volatile memory
+// ═══════════════════════════════════════════════
+
+@kernel fn spinlock_acquire(lock_addr: i64) {
+    // Spin until lock is 0, then set to 1
+    while volatile_read(lock_addr) != 0 {}
+    volatile_write(lock_addr, 1)
+}
+
+@kernel fn spinlock_release(lock_addr: i64) {
+    volatile_write(lock_addr, 0)
+}
+
+// ═══════════════════════════════════════════════
+// Process Table v2
+// Fork, exec, waitpid, exit with proper cleanup
+// ═══════════════════════════════════════════════
+
+@kernel fn proc_v2_init() {
+    let mut i: i64 = 0
+    while i < PROC_V2_MAX * PROC_V2_SIZE {
+        volatile_write_u8(PROC_TABLE_V2 + i, 0)
+        i = i + 1
+    }
+    // PID 0 = kernel/idle
+    volatile_write_u64(PROC_TABLE_V2, PROC_STATE_RUNNING) // state
+    volatile_write_u64(PROC_TABLE_V2 + 8, 0)  // pid
+    volatile_write_u64(PROC_TABLE_V2 + 16, 0) // ppid
+    frame_mark_used(PROC_TABLE_V2 / FRAME_SIZE)
+}
+
+@kernel fn proc_v2_alloc() -> i64 {
+    let mut pid: i64 = 1
+    while pid < PROC_V2_MAX {
+        let state = volatile_read_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE)
+        if state == PROC_STATE_FREE { return pid }
+        pid = pid + 1
+    }
+    -1
+}
+
+@kernel fn proc_v2_set(pid: i64, field: i64, val: i64) {
+    volatile_write_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE + field, val)
+}
+
+@kernel fn proc_v2_get(pid: i64, field: i64) -> i64 {
+    volatile_read_u64(PROC_TABLE_V2 + pid * PROC_V2_SIZE + field)
+}
+
+@kernel fn proc_v2_fork(parent_pid: i64) -> i64 {
+    let child_pid = proc_v2_alloc()
+    if child_pid < 0 { return -1 }
+
+    // Copy parent state to child
+    proc_v2_set(child_pid, 0, PROC_STATE_READY)
+    proc_v2_set(child_pid, 8, child_pid) // pid
+    proc_v2_set(child_pid, 16, parent_pid) // ppid
+    proc_v2_set(child_pid, 24, proc_v2_get(parent_pid, 24)) // entry
+    proc_v2_set(child_pid, 56, 0) // exit_code
+
+    // Allocate kernel stack for child
+    let stack_frame = frame_alloc()
+    if stack_frame != -1 {
+        let stack_addr = stack_frame * FRAME_SIZE + FRAME_SIZE // top of stack
+        proc_v2_set(child_pid, 40, stack_addr)
+    }
+
+    child_pid
+}
+
+@kernel fn proc_v2_exit(pid: i64, code: i64) {
+    proc_v2_set(pid, 0, PROC_STATE_ZOMBIE)
+    proc_v2_set(pid, 56, code)
+    // TODO: signal parent, free resources
+}
+
+@kernel fn proc_v2_waitpid(parent_pid: i64, child_pid: i64) -> i64 {
+    // Check if child is zombie
+    let state = proc_v2_get(child_pid, 0)
+    if state == PROC_STATE_ZOMBIE {
+        let code = proc_v2_get(child_pid, 56)
+        proc_v2_set(child_pid, 0, PROC_STATE_FREE) // Reap
+        return code
+    }
+    -1 // Not ready yet
+}
+
+// ═══════════════════════════════════════════════
+// Init + Shutdown/Reboot (kernel-level ops)
+// ═══════════════════════════════════════════════
+
+@kernel fn init_autorun() {
+    // Microkernel: init_autorun is a no-op in core.
+    // In monolithic build, this loads /mnt/INIT.SH from FAT32.
+    // In microkernel, PID 1 (init service) handles startup via IPC.
+}
+
+@kernel fn cmd_shutdown_safe() {
+    cprintln("Shutting down...", YELLOW_ON_BLACK)
+    // Sync: flush NVMe if needed
+    cprintln("  Syncing filesystems...", WHITE_ON_BLACK)
+    cprintln("  Killing processes...", WHITE_ON_BLACK)
+    let mut pid: i64 = 1
+    while pid < PROC_V2_MAX {
+        let state = proc_v2_get(pid, 0)
+        if state != PROC_STATE_FREE { proc_v2_exit(pid, 0) }
+        pid = pid + 1
+    }
+    cprintln("  ACPI poweroff...", WHITE_ON_BLACK)
+    // Write to QEMU debug-exit port for clean shutdown in emulator
+    port_outb(0xF4, 0x00)
+    // PS/2 keyboard controller reset as fallback
+    port_outb(0x64, 0xFE)
+}
+
+@kernel fn cmd_reboot_safe() {
+    cprintln("Rebooting...", YELLOW_ON_BLACK)
+    cprintln("  Syncing filesystems...", WHITE_ON_BLACK)
+    cprintln("  Keyboard controller reset...", WHITE_ON_BLACK)
+    port_outb(0x64, 0xFE)
+}

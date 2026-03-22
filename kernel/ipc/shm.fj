@@ -1,0 +1,401 @@
+// FajarOS Nova v2.0 — Shared Memory + Zero-Copy (Sprint 1.2.7-1.2.8)
+// Map physical pages into multiple address spaces for zero-copy IPC
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Shared Memory Region Table
+// 32 regions × 64 bytes = 2KB at 0x8AA000
+//
+// Per region (64 bytes):
+//   +0:  state        — SHM_FREE(0), SHM_ACTIVE(1)
+//   +8:  owner_pid    — creator
+//   +16: guest_pid    — who else has access (-1 = unmapped)
+//   +24: phys_base    — physical frame base address
+//   +32: size         — size in bytes (page-aligned)
+//   +40: owner_vaddr  — virtual address in owner's space
+//   +48: guest_vaddr  — virtual address in guest's space
+//   +56: flags        — SHM_READ, SHM_WRITE
+//
+// Usage (zero-copy IPC for large data):
+//   Server:  region = shm_create(4096)
+//   Server:  shm_share(region, client_pid)
+//   Server:  → writes data to shared region
+//   Server:  → sends IPC msg with region_id + offset + length
+//   Client:  → reads directly from mapped region (zero copy!)
+//   Client:  → sends reply
+//   Server:  shm_destroy(region)
+// ═══════════════════════════════════════════════════════════════
+
+const SHM_TABLE: i64 = 0x8AB000  // was 0x8AA000 — overlapped IRQ_NOTIFY_TABLE end (0x8AA100)
+const SHM_MAX: i64 = 32
+const SHM_ENTRY_SIZE: i64 = 64
+
+// SHM virtual address base — each region gets 64KB of virtual space
+// Owner mapped at SHM_VADDR_BASE + region_id * SHM_VADDR_STRIDE
+// Guest mapped at SHM_VADDR_BASE + SHM_MAX * SHM_VADDR_STRIDE + region_id * SHM_VADDR_STRIDE
+const SHM_VADDR_BASE: i64 = 0xA000000   // 160 MB
+const SHM_VADDR_STRIDE: i64 = 0x10000   // 64 KB per region
+
+// SHM states
+const SHM_FREE: i64 = 0
+const SHM_ACTIVE: i64 = 1
+
+// SHM flags
+const SHM_FLAG_READ: i64 = 1
+const SHM_FLAG_WRITE: i64 = 2
+const SHM_FLAG_RW: i64 = 3
+
+// SHM error codes
+const SHM_OK: i64 = 0
+const SHM_ERR_FULL: i64 = -1
+const SHM_ERR_INVALID: i64 = -2
+const SHM_ERR_NOT_OWNER: i64 = -3
+const SHM_ERR_ALREADY_MAPPED: i64 = -4
+const SHM_ERR_NO_MEMORY: i64 = -5
+
+// ── SHM entry helpers ──
+
+@kernel fn shm_addr(id: i64) -> i64 {
+    SHM_TABLE + id * SHM_ENTRY_SIZE
+}
+
+@kernel fn shm_read(id: i64, field: i64) -> i64 {
+    volatile_read_u64(shm_addr(id) + field)
+}
+
+@kernel fn shm_write(id: i64, field: i64, val: i64) {
+    volatile_write_u64(shm_addr(id) + field, val)
+}
+
+// ── Initialization ──
+
+@kernel fn shm_init() {
+    let mut i: i64 = 0
+    while i < SHM_MAX * SHM_ENTRY_SIZE {
+        volatile_write_u8(SHM_TABLE + i, 0)
+        i = i + 1
+    }
+}
+
+// ── Core operations ──
+
+@kernel fn shm_create(size: i64) -> i64 {
+    // Align size to page boundary (4KB)
+    let aligned = (size + FRAME_SIZE - 1) / FRAME_SIZE * FRAME_SIZE
+    if aligned <= 0 { return SHM_ERR_INVALID }
+
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    // Find free slot
+    let mut id: i64 = 0
+    while id < SHM_MAX {
+        if shm_read(id, 0) == SHM_FREE {
+            // Allocate physical frames
+            let num_pages = aligned / FRAME_SIZE
+            let first_frame = frame_alloc()
+            if first_frame == -1 { return SHM_ERR_NO_MEMORY }
+            let phys_base = first_frame * FRAME_SIZE
+
+            // Allocate remaining frames (contiguous)
+            let mut pg: i64 = 1
+            while pg < num_pages {
+                let f = frame_alloc()
+                if f == -1 {
+                    // Rollback: free already allocated frames
+                    let mut j: i64 = 0
+                    while j < pg {
+                        frame_free(first_frame + j)
+                        j = j + 1
+                    }
+                    return SHM_ERR_NO_MEMORY
+                }
+                pg = pg + 1
+            }
+
+            // Map into owner's address space
+            let owner_vaddr = SHM_VADDR_BASE + id * SHM_VADDR_STRIDE
+            pg = 0
+            while pg < num_pages {
+                map_page(
+                    owner_vaddr + pg * FRAME_SIZE,
+                    phys_base + pg * FRAME_SIZE,
+                    PAGE_PRESENT | PAGE_WRITABLE
+                )
+                pg = pg + 1
+            }
+
+            // Record in table
+            shm_write(id, 0, SHM_ACTIVE)
+            shm_write(id, 8, my_pid)
+            shm_write(id, 16, -1)  // No guest yet
+            shm_write(id, 24, phys_base)
+            shm_write(id, 32, aligned)
+            shm_write(id, 40, owner_vaddr)
+            shm_write(id, 48, 0)  // No guest vaddr yet
+            shm_write(id, 56, SHM_FLAG_RW)
+
+            return id
+        }
+        id = id + 1
+    }
+
+    SHM_ERR_FULL
+}
+
+@kernel fn shm_share(region_id: i64, guest_pid: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return SHM_ERR_INVALID }
+    if shm_read(region_id, 0) != SHM_ACTIVE { return SHM_ERR_INVALID }
+
+    // Check ownership
+    let my_pid = volatile_read_u64(0x6FE00)
+    let owner = shm_read(region_id, 8)
+    if owner != my_pid { return SHM_ERR_NOT_OWNER }
+
+    // Check not already shared
+    let current_guest = shm_read(region_id, 16)
+    if current_guest >= 0 { return SHM_ERR_ALREADY_MAPPED }
+
+    // Check guest process exists
+    if guest_pid < 0 || guest_pid >= IPC_EP_MAX { return SHM_ERR_INVALID }
+    let guest_state = proc_v2_get(guest_pid, 0)
+    if guest_state == PROC_STATE_FREE { return SHM_ERR_INVALID }
+
+    // Map into guest's address space
+    let phys_base = shm_read(region_id, 24)
+    let size = shm_read(region_id, 32)
+    let num_pages = size / FRAME_SIZE
+    let guest_vaddr = SHM_VADDR_BASE + SHM_MAX * SHM_VADDR_STRIDE + region_id * SHM_VADDR_STRIDE
+
+    let mut pg: i64 = 0
+    while pg < num_pages {
+        map_page(
+            guest_vaddr + pg * FRAME_SIZE,
+            phys_base + pg * FRAME_SIZE,
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+        )
+        pg = pg + 1
+    }
+
+    // Update table
+    shm_write(region_id, 16, guest_pid)
+    shm_write(region_id, 48, guest_vaddr)
+
+    guest_vaddr  // Return mapped address in guest space
+}
+
+@kernel fn shm_unshare(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return SHM_ERR_INVALID }
+    if shm_read(region_id, 0) != SHM_ACTIVE { return SHM_ERR_INVALID }
+
+    let guest_pid = shm_read(region_id, 16)
+    if guest_pid < 0 { return SHM_OK }  // Already unshared
+
+    // Unmap from guest
+    let guest_vaddr = shm_read(region_id, 48)
+    let size = shm_read(region_id, 32)
+    let num_pages = size / FRAME_SIZE
+    let mut pg: i64 = 0
+    while pg < num_pages {
+        unmap_page(guest_vaddr + pg * FRAME_SIZE)
+        pg = pg + 1
+    }
+
+    shm_write(region_id, 16, -1)
+    shm_write(region_id, 48, 0)
+
+    SHM_OK
+}
+
+@kernel fn shm_destroy(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return SHM_ERR_INVALID }
+    if shm_read(region_id, 0) != SHM_ACTIVE { return SHM_ERR_INVALID }
+
+    let my_pid = volatile_read_u64(0x6FE00)
+    let owner = shm_read(region_id, 8)
+    if owner != my_pid { return SHM_ERR_NOT_OWNER }
+
+    // Unshare guest first
+    shm_unshare(region_id)
+
+    // Unmap from owner
+    let owner_vaddr = shm_read(region_id, 40)
+    let phys_base = shm_read(region_id, 24)
+    let size = shm_read(region_id, 32)
+    let num_pages = size / FRAME_SIZE
+    let mut pg: i64 = 0
+    while pg < num_pages {
+        unmap_page(owner_vaddr + pg * FRAME_SIZE)
+        frame_free((phys_base / FRAME_SIZE) + pg)
+        pg = pg + 1
+    }
+
+    // Clear entry
+    let mut i: i64 = 0
+    while i < SHM_ENTRY_SIZE {
+        volatile_write_u8(shm_addr(region_id) + i, 0)
+        i = i + 1
+    }
+
+    SHM_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.2.8: Zero-Copy Transfer Protocol
+//
+// For data > 40 bytes (IPC payload limit):
+//   1. Sender: shm_create(size) → region_id
+//   2. Sender: shm_share(region_id, receiver_pid)
+//   3. Sender: write data to shared region
+//   4. Sender: ipc_call(receiver, msg={SHM_TRANSFER, region_id, offset, len})
+//   5. Receiver: read data directly from mapped region (ZERO COPY!)
+//   6. Receiver: ipc_reply(sender, reply)
+//   7. Sender: shm_destroy(region_id)
+// ═══════════════════════════════════════════════════════════════
+
+// Message types for zero-copy protocol
+const MSG_SHM_TRANSFER: i64 = 0x0600
+const MSG_SHM_ACK: i64 = 0x06FF
+
+@kernel fn ipc2_send_zerocopy(dst_pid: i64, data_addr: i64, data_len: i64, msg_type: i64) -> i64 {
+    // Create shared region
+    let region = shm_create(data_len)
+    if region < 0 { return region }
+
+    // Share with destination
+    let guest_vaddr = shm_share(region, dst_pid)
+    if guest_vaddr < 0 {
+        shm_destroy(region)
+        return guest_vaddr
+    }
+
+    // Copy data into shared region
+    let owner_vaddr = shm_read(region, 40)
+    let mut i: i64 = 0
+    while i < data_len {
+        volatile_write_u8(owner_vaddr + i, volatile_read_u8(data_addr + i))
+        i = i + 1
+    }
+
+    // Build IPC message with shared region info
+    // Payload: region_id(8) + guest_vaddr(8) + length(8) + msg_type(8) + reserved(8)
+    let msg_buf: i64 = 0x8A9200  // Scratch buffer
+    ipc_msg_clear(msg_buf)
+    let my_pid = volatile_read_u64(0x6FE00)
+    ipc_msg_set_header(msg_buf, my_pid, MSG_SHM_TRANSFER, 0)
+    volatile_write_u64(msg_buf + 16, region)      // region_id in payload[0]
+    volatile_write_u64(msg_buf + 24, guest_vaddr)  // vaddr in payload[8]
+    volatile_write_u64(msg_buf + 32, data_len)     // length in payload[16]
+    volatile_write_u64(msg_buf + 40, msg_type)     // original msg_type in payload[24]
+
+    // Send via IPC
+    let result = ipc2_send(dst_pid, msg_buf)
+    if result != IPC_OK {
+        shm_destroy(region)
+        return result
+    }
+
+    region  // Return region_id so caller can destroy after reply
+}
+
+@kernel fn shm_get_owner_vaddr(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return -1 }
+    shm_read(region_id, 40)
+}
+
+@kernel fn shm_get_guest_vaddr(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return -1 }
+    shm_read(region_id, 48)
+}
+
+@kernel fn shm_get_size(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return -1 }
+    shm_read(region_id, 32)
+}
+
+// ── Shell commands ──
+
+@kernel fn cmd_shm() {
+    cprintln("Shared Memory Regions:", YELLOW_ON_BLACK)
+    let mut count: i64 = 0
+    let mut id: i64 = 0
+    while id < SHM_MAX {
+        if shm_read(id, 0) == SHM_ACTIVE {
+            cprint("  [", WHITE_ON_BLACK)
+            cprint_decimal(id, CYAN_ON_BLACK)
+            cprint("] owner=PID ", WHITE_ON_BLACK)
+            cprint_decimal(shm_read(id, 8), CYAN_ON_BLACK)
+            let guest = shm_read(id, 16)
+            if guest >= 0 {
+                cprint(" guest=PID ", WHITE_ON_BLACK)
+                cprint_decimal(guest, CYAN_ON_BLACK)
+            }
+            cprint(" phys=0x", WHITE_ON_BLACK)
+            cprint_hex(shm_read(id, 24), 8, CYAN_ON_BLACK)
+            cprint(" size=", WHITE_ON_BLACK)
+            cprint_decimal(shm_read(id, 32), WHITE_ON_BLACK)
+            cprint(" vaddr=0x", WHITE_ON_BLACK)
+            cprint_hex(shm_read(id, 40), 8, GREEN_ON_BLACK)
+            if guest >= 0 {
+                cprint("→0x", WHITE_ON_BLACK)
+                cprint_hex(shm_read(id, 48), 8, GREEN_ON_BLACK)
+            }
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        id = id + 1
+    }
+    if count == 0 {
+        cprintln("  (no shared regions)", WHITE_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_shm_test() {
+    cprintln("Shared Memory test:", YELLOW_ON_BLACK)
+
+    // Create a 4KB region
+    let region = shm_create(4096)
+    if region < 0 {
+        cprint("  shm_create failed: ", RED_ON_BLACK)
+        cprint_decimal(region, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        return
+    }
+    cprint("  Created region ", WHITE_ON_BLACK)
+    cprint_decimal(region, GREEN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Write test data
+    let vaddr = shm_get_owner_vaddr(region)
+    cprint("  Owner vaddr: 0x", WHITE_ON_BLACK)
+    cprint_hex(vaddr, 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Write "SHM OK!" to shared region
+    volatile_write_u8(vaddr, 83)   // S
+    volatile_write_u8(vaddr + 1, 72)   // H
+    volatile_write_u8(vaddr + 2, 77)   // M
+    volatile_write_u8(vaddr + 3, 32)   // ' '
+    volatile_write_u8(vaddr + 4, 79)   // O
+    volatile_write_u8(vaddr + 5, 75)   // K
+    volatile_write_u8(vaddr + 6, 33)   // !
+    volatile_write_u8(vaddr + 7, 0)
+
+    // Read back
+    cprint("  Data: ", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < 7 {
+        console_putchar(volatile_read_u8(vaddr + i), GREEN_ON_BLACK)
+        i = i + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Verify size
+    cprint("  Size: ", WHITE_ON_BLACK)
+    cprint_decimal(shm_get_size(region), CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+
+    // Destroy
+    let dr = shm_destroy(region)
+    if dr == SHM_OK { cprintln("  Destroyed OK", GREEN_ON_BLACK) }
+    else { cprintln("  Destroy failed", RED_ON_BLACK) }
+}

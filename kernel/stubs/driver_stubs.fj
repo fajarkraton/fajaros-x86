@@ -1,0 +1,41 @@
+// FajarOS Nova v2.0 — Microkernel Driver IRQ Stubs
+// kernel/stubs/driver_stubs.fj — Ring 0 ONLY
+// Minimal IRQ stubs that forward hardware interrupts
+// to user-space driver services via IPC notification.
+// This is the ONLY driver code that stays in Ring 0.
+
+// ═══════════════════════════════════════════════════
+// IRQ Stubs
+// Each stub is called from the IDT when a hardware IRQ fires.
+// It notifies the registered user-space driver via ipc2_notify,
+// then sends EOI to the LAPIC so the interrupt controller
+// knows we handled it.
+// ═══════════════════════════════════════════════════
+
+@kernel fn stub_nvme_irq() {
+    // Called from IDT when NVMe IRQ fires
+    // Forward to block device service via notification
+    irq_notify_fire(11)  // NVMe typically on IRQ 11
+    lapic_eoi()
+}
+
+@kernel fn stub_net_irq() {
+    // Called from IDT when network IRQ fires
+    // Forward to network service via notification
+    irq_notify_fire(10)  // Virtio-net typically on IRQ 10
+    lapic_eoi()
+}
+
+@kernel fn stub_usb_irq() {
+    // Called from IDT when USB (XHCI) IRQ fires
+    // Forward to USB service via notification
+    irq_notify_fire(9)   // XHCI typically on IRQ 9
+    lapic_eoi()
+}
+
+@kernel fn stub_keyboard_irq() {
+    // Keyboard stays in kernel for now (needed for shell in monolithic mode)
+    // In full microkernel, this would also forward to a user-space input service
+    irq_notify_fire(1)   // IRQ 1 = PS/2 keyboard
+    lapic_eoi()
+}

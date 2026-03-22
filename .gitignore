@@ -24,4 +24,4 @@ Thumbs.db
 
 # Debug
 *.log
-core
+/core

@@ -1,23 +1,24 @@
-# FajarOS Nova v1.0.0 "Genesis" — x86_64 Operating System in Fajar Lang
+# FajarOS Nova v2.0 "Sovereignty" — Microkernel OS in Fajar Lang
 
-> The world's first OS written 100% in [Fajar Lang](https://github.com/fajarkraton/fajar-lang)
-> that natively unifies kernel safety, hardware drivers, and AI inference —
-> targeting Intel x86_64 processors.
+> The world's first **microkernel OS with compiler-enforced safety** — written 100% in
+> [Fajar Lang](https://github.com/fajarkraton/fajar-lang). `@kernel/@device/@safe` annotations
+> prevent privilege violations at compile time. No other OS has this.
 
-**Codename:** "Nova" (Indonesian: bintang baru — a new star)
+**Codename:** "Sovereignty" (Indonesian: Kedaulatan — sovereign control)
 
 ## Highlights
 
 | Metric | Value |
 |--------|-------|
-| **LOC** | 11,615 lines of Fajar Lang |
-| **Commands** | 160+ shell commands |
-| **Files** | 35 modular `.fj` source files |
-| **Scheduler** | Preemptive multitasking (timer-driven context switch) |
-| **Ring 3** | 3 user programs run + return to kernel via SYSCALL |
-| **Memory** | Per-process page tables (CR3 switch), page fault handler |
-| **Storage** | NVMe + USB Mass Storage (XHCI→SCSI) + FAT32 + VFS |
-| **Network** | DHCP + ARP + IPv4 + ICMP (real ping!) + UDP + TCP + HTTP |
+| **LOC** | 20,416 lines of Fajar Lang |
+| **ELF** | 405 KB monolithic / 22 KB microkernel core |
+| **Services** | 9 IPC-based (init, blk, vfs, net, shell, display, input, gui, compiler) |
+| **Commands** | 200+ shell commands |
+| **Sprints** | 21 complete (Phase 1: Core, Phase 2: Hardening, Phase 3: GUI+Self-hosting) |
+| **Safety** | 8 error codes, 12 capability bits, 3 context annotations |
+| **Hardware** | x86_64 (QEMU) + ARM64 (Radxa Dragon Q6A — 10/10 tests passed) |
+| **Bugs Found** | 19 critical bugs found & fixed during systematic review |
+| **Compiler** | 4,903 tests pass, 38 context enforcement tests |
 | **SMP** | AP trampoline, INIT-SIPI-SIPI, per-CPU |
 | **AI** | MNIST classifier (784 -> 10, softmax) |
 | **Process** | Init (PID 1), 16 PIDs, fork/exit/waitpid, pipes, FD table |

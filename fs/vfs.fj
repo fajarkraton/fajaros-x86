@@ -216,32 +216,7 @@ const VFS_MOUNT_NAMES: i64 = 0x806200
     -1
 }
 
-// ── Shell Commands ──
-
-@kernel fn cmd_vfs_mounts() {
-    cprintln("VFS Mount Table:", YELLOW_ON_BLACK)
-    let mut slot: i64 = 0
-    while slot < VFS_MAX_MOUNTS {
-        let fs_type = volatile_read_u64(VFS_MOUNT_TABLE + slot * VFS_MOUNT_SIZE)
-        if fs_type != VFS_FS_NONE {
-            cprint("  ", WHITE_ON_BLACK)
-            let name_base = VFS_MOUNT_NAMES + slot * 32
-            let mut k: i64 = 0
-            while k < 31 {
-                let ch = volatile_read_u8(name_base + k)
-                if ch == 0 { k = 31 }
-                else { console_putchar(ch, CYAN_ON_BLACK); k = k + 1 }
-            }
-            cprint(" -> ", WHITE_ON_BLACK)
-            if fs_type == VFS_FS_RAMFS { cprintln("ramfs", GREEN_ON_BLACK) }
-            else if fs_type == VFS_FS_FAT32 { cprintln("fat32", GREEN_ON_BLACK) }
-            else if fs_type == VFS_FS_DEVFS { cprintln("devfs", GREEN_ON_BLACK) }
-            else if fs_type == VFS_FS_PROCFS { cprintln("procfs", GREEN_ON_BLACK) }
-            else { cprintln("unknown", RED_ON_BLACK) }
-        }
-        slot = slot + 1
-    }
-}
+// Note: cmd_vfs_mounts moved to services/vfs/main.fj (Sprint 1.4)
 
 @kernel fn cmd_dev_read() {
     // "devread <device> <size>" — e.g., "devread random 16"

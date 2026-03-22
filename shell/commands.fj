@@ -1,180 +1,10 @@
-// FajarOS Nova v0.5.0 — Shell Commands
+// FajarOS Nova v1.0.0 — Shell Commands
 // Part of the modular kernel build (concatenated by Makefile)
-// Contains: VGA console, scancode mapping, command buffer, history,
-// all 142 shell commands (cmd_*), and the command dispatcher.
+// Contains: scancode mapping, command buffer, history,
+// all 160+ shell commands (cmd_*), and the command dispatcher.
+// Note: VGA console functions (console_init, cprint, etc.) are in drivers/vga.fj
 
-// ═══════════════════════════════════════════════
-// VGA Console Engine
-// ═══════════════════════════════════════════════
-
-@kernel fn console_init() {
-    let mut i: i64 = 0
-    while i < VGA_COLS * VGA_ROWS {
-        volatile_write(VGA_BASE + i * 2, 0x20)
-        volatile_write(VGA_BASE + i * 2 + 1, WHITE_ON_BLACK)
-        i = i + 1
-    }
-    volatile_write(0x6FA00, 0)
-    volatile_write(0x6FA08, 0)
-}
-
-@kernel fn console_scroll() {
-    let mut i: i64 = 0
-    while i < VGA_COLS * (VGA_ROWS - 1) {
-        let s = VGA_BASE + (i + VGA_COLS) * 2
-        let d = VGA_BASE + i * 2
-        volatile_write(d, volatile_read(s))
-        volatile_write(d + 1, volatile_read(s + 1))
-        i = i + 1
-    }
-    let mut j: i64 = 0
-    while j < VGA_COLS {
-        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2, 0x20)
-        volatile_write(VGA_BASE + (VGA_COLS * (VGA_ROWS - 1) + j) * 2 + 1, WHITE_ON_BLACK)
-        j = j + 1
-    }
-}
-
-@kernel fn console_putchar(ch: i64, color: i64) {
-    let row = volatile_read(0x6FA00)
-    let col = volatile_read(0x6FA08)
-    if ch == 10 {
-        volatile_write(0x6FA08, 0)
-        if row >= VGA_ROWS - 1 { console_scroll() }
-        else { volatile_write(0x6FA00, row + 1) }
-        return
-    }
-    if ch == 8 {
-        if col > 0 {
-            volatile_write(0x6FA08, col - 1)
-            let addr = VGA_BASE + (row * VGA_COLS + col - 1) * 2
-            volatile_write(addr, 0x20)
-            volatile_write(addr + 1, color)
-        }
-        return
-    }
-    let addr = VGA_BASE + (row * VGA_COLS + col) * 2
-    volatile_write(addr, ch)
-    volatile_write(addr + 1, color)
-    if col >= VGA_COLS - 1 {
-        volatile_write(0x6FA08, 0)
-        if row >= VGA_ROWS - 1 { console_scroll() }
-        else { volatile_write(0x6FA00, row + 1) }
-    } else {
-        volatile_write(0x6FA08, col + 1)
-    }
-    vga_update_cursor()
-}
-
-@kernel fn cprint(s: str, color: i64) {
-    let len = str_len(s)
-    let mut i: i64 = 0
-    while i < len { console_putchar(str_byte_at(s, i), color); i = i + 1 }
-}
-
-@kernel fn cprintln(s: str, color: i64) {
-    cprint(s, color)
-    console_putchar(10, WHITE_ON_BLACK)
-}
-
-@kernel fn cprint_decimal(val: i64, color: i64) {
-    if val == 0 { console_putchar(48, color); return }
-    let mut buf: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    let mut v = val
-    let mut len: i64 = 0
-    while v > 0 { buf[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
-    let mut i: i64 = 0
-    while i < len { console_putchar(buf[len - 1 - i], color); i = i + 1 }
-}
-
-@kernel fn cprint_hex(val: i64, digits: i64, color: i64) {
-    let mut i = digits - 1
-    while i >= 0 {
-        let n = (val >> (i * 4)) & 0xF
-        if n < 10 { console_putchar(48 + n, color) }
-        else { console_putchar(55 + n, color) }
-        i = i - 1
-    }
-}
-
-// ═══════════════════════════════════════════════
-// Scancode → ASCII (with shift support)
-// Shift state at 0x6FBE0: 0=normal, 1=shifted
-// Caps lock at 0x6FBE8: 0=off, 1=on
-// ═══════════════════════════════════════════════
-
-@kernel fn sc2ascii(sc: i64) -> i64 {
-    let shift = volatile_read(0x6FBE0)
-    let caps = volatile_read(0x6FBE8)
-    if sc == 0x1C { return 10 }   // Enter
-    if sc == 0x0E { return 8 }    // Backspace
-    if sc == 0x0F { return 9 }    // Tab
-    if sc == 0x39 { return 32 }   // Space
-    if sc == 0x01 { return 27 }   // Escape
-    // Number row (with shift → symbols)
-    if sc == 0x02 { if shift == 1 { return 33 } return 49 }  // 1 / !
-    if sc == 0x03 { if shift == 1 { return 64 } return 50 }  // 2 / @
-    if sc == 0x04 { if shift == 1 { return 35 } return 51 }  // 3 / #
-    if sc == 0x05 { if shift == 1 { return 36 } return 52 }  // 4 / $
-    if sc == 0x06 { if shift == 1 { return 37 } return 53 }  // 5 / %
-    if sc == 0x07 { if shift == 1 { return 94 } return 54 }  // 6 / ^
-    if sc == 0x08 { if shift == 1 { return 38 } return 55 }  // 7 / &
-    if sc == 0x09 { if shift == 1 { return 42 } return 56 }  // 8 / *
-    if sc == 0x0A { if shift == 1 { return 40 } return 57 }  // 9 / (
-    if sc == 0x0B { if shift == 1 { return 41 } return 48 }  // 0 / )
-    // Punctuation
-    if sc == 0x0C { if shift == 1 { return 95 } return 45 }  // - / _
-    if sc == 0x0D { if shift == 1 { return 43 } return 61 }  // = / +
-    if sc == 0x1A { if shift == 1 { return 123 } return 91 } // [ / {
-    if sc == 0x1B { if shift == 1 { return 125 } return 93 } // ] / }
-    if sc == 0x27 { if shift == 1 { return 58 } return 59 }  // ; / :
-    if sc == 0x28 { if shift == 1 { return 34 } return 39 }  // ' / "
-    if sc == 0x29 { if shift == 1 { return 126 } return 96 } // ` / ~
-    if sc == 0x2B { if shift == 1 { return 124 } return 92 } // \ / |
-    if sc == 0x33 { if shift == 1 { return 60 } return 44 }  // , / <
-    if sc == 0x34 { if shift == 1 { return 62 } return 46 }  // . / >
-    if sc == 0x35 { if shift == 1 { return 63 } return 47 }  // / / ?
-    // Letters — affected by shift XOR caps
-    let upper = (shift == 1 && caps == 0) || (shift == 0 && caps == 1)
-    let base_offset = if upper { 0 } else { 32 }
-    if sc == 0x10 { return 81 + base_offset }  // Q/q
-    if sc == 0x11 { return 87 + base_offset }  // W/w
-    if sc == 0x12 { return 69 + base_offset }  // E/e
-    if sc == 0x13 { return 82 + base_offset }  // R/r
-    if sc == 0x14 { return 84 + base_offset }  // T/t
-    if sc == 0x15 { return 89 + base_offset }  // Y/y
-    if sc == 0x16 { return 85 + base_offset }  // U/u
-    if sc == 0x17 { return 73 + base_offset }  // I/i
-    if sc == 0x18 { return 79 + base_offset }  // O/o
-    if sc == 0x19 { return 80 + base_offset }  // P/p
-    if sc == 0x1E { return 65 + base_offset }  // A/a
-    if sc == 0x1F { return 83 + base_offset }  // S/s
-    if sc == 0x20 { return 68 + base_offset }  // D/d
-    if sc == 0x21 { return 70 + base_offset }  // F/f
-    if sc == 0x22 { return 71 + base_offset }  // G/g
-    if sc == 0x23 { return 72 + base_offset }  // H/h
-    if sc == 0x24 { return 74 + base_offset }  // J/j
-    if sc == 0x25 { return 75 + base_offset }  // K/k
-    if sc == 0x26 { return 76 + base_offset }  // L/l
-    if sc == 0x2C { return 90 + base_offset }  // Z/z
-    if sc == 0x2D { return 88 + base_offset }  // X/x
-    if sc == 0x2E { return 67 + base_offset }  // C/c
-    if sc == 0x2F { return 86 + base_offset }  // V/v
-    if sc == 0x30 { return 66 + base_offset }  // B/b
-    if sc == 0x31 { return 78 + base_offset }  // N/n
-    if sc == 0x32 { return 77 + base_offset }  // M/m
-    0
-}
-
-@kernel fn vga_update_cursor() {
-    let row = volatile_read(0x6FA00)
-    let col = volatile_read(0x6FA08)
-    let pos = row * VGA_COLS + col
-    port_outb(0x3D4, 14)
-    port_outb(0x3D5, (pos >> 8) & 0xFF)
-    port_outb(0x3D4, 15)
-    port_outb(0x3D5, pos & 0xFF)
-}
+// Note: sc2ascii is in drivers/keyboard.fj, vga_update_cursor is in drivers/vga.fj
 
 // ═══════════════════════════════════════════════
 // Command Line Buffer (at 0x6F800, max 64 chars)
@@ -347,6 +177,20 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
     cprintln("  echo rev upcase downcase tr", WHITE_ON_BLACK)
+    cprintln("IPC v2:", WHITE_ON_BLUE)
+    cprintln("  ipc2 channels shm notify-test", WHITE_ON_BLACK)
+    cprintln("  ipc-test ipc-bench ipc2send ipc2recv", WHITE_ON_BLACK)
+    cprintln("  shm-test caps", WHITE_ON_BLACK)
+    cprintln("Microkernel:", WHITE_ON_BLUE)
+    cprintln("  vfs-test vfs-mounts vfs-devs", WHITE_ON_BLACK)
+    cprintln("  blk-test blk-info blk-bench", WHITE_ON_BLACK)
+    cprintln("  net-test net-info net-ping", WHITE_ON_BLACK)
+    cprintln("  shell-test shell-info init-status", WHITE_ON_BLACK)
+    cprintln("  smp-sched mm-stats mm-cow sec-status", WHITE_ON_BLACK)
+    cprintln("  journal jsync fsck ipc-fast perf", WHITE_ON_BLACK)
+    cprintln("  fb-test fbinfo disp-info", WHITE_ON_BLACK)
+    cprintln("  mouse-test mouse-info", WHITE_ON_BLACK)
+    cprintln("  gui-test gui-info test-all", WHITE_ON_BLACK)
     cprintln("Utility:", WHITE_ON_BLUE)
     cprintln("  clear cls seq true false yes dice", WHITE_ON_BLACK)
     cprintln("  logo splash color cowsay fortune", WHITE_ON_BLACK)
@@ -403,121 +247,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  ProcTbl: 0x600000 (4 KB)", WHITE_ON_BLACK)
 }
 
-@kernel fn pci_class_name(class: i64, subclass: i64) {
-    if class == 0x00 { cprint("Legacy", WHITE_ON_BLACK) }
-    else if class == 0x01 {
-        cprint("Storage", WHITE_ON_BLACK)
-        if subclass == 0x01 { cprint("/IDE", CYAN_ON_BLACK) }
-        else if subclass == 0x06 { cprint("/SATA", CYAN_ON_BLACK) }
-        else if subclass == 0x08 { cprint("/NVMe", GREEN_ON_BLACK) }
-    }
-    else if class == 0x02 {
-        cprint("Network", WHITE_ON_BLACK)
-        if subclass == 0x00 { cprint("/Ethernet", CYAN_ON_BLACK) }
-        else if subclass == 0x80 { cprint("/Other", CYAN_ON_BLACK) }
-    }
-    else if class == 0x03 {
-        cprint("Display", WHITE_ON_BLACK)
-        if subclass == 0x00 { cprint("/VGA", CYAN_ON_BLACK) }
-        else if subclass == 0x02 { cprint("/3D", CYAN_ON_BLACK) }
-    }
-    else if class == 0x04 { cprint("Multimedia", WHITE_ON_BLACK) }
-    else if class == 0x05 { cprint("Memory", WHITE_ON_BLACK) }
-    else if class == 0x06 {
-        cprint("Bridge", WHITE_ON_BLACK)
-        if subclass == 0x00 { cprint("/Host", CYAN_ON_BLACK) }
-        else if subclass == 0x01 { cprint("/ISA", CYAN_ON_BLACK) }
-        else if subclass == 0x04 { cprint("/PCI", CYAN_ON_BLACK) }
-    }
-    else if class == 0x07 { cprint("Serial", WHITE_ON_BLACK) }
-    else if class == 0x08 { cprint("System", WHITE_ON_BLACK) }
-    else if class == 0x0C {
-        cprint("Serial Bus", WHITE_ON_BLACK)
-        if subclass == 0x03 { cprint("/USB", CYAN_ON_BLACK) }
-    }
-    else { cprint("Unknown", WHITE_ON_BLACK) }
-}
-
-@kernel fn cmd_lspci() {
-    cprintln("PCI Devices:", YELLOW_ON_BLACK)
-    let mut dev: i64 = 0
-    let mut found: i64 = 0
-    while dev < 32 {
-        let id = pci_read32(0, dev, 0, 0)
-        if id != 0xFFFFFFFF && id != 0 {
-            cprint("  ", WHITE_ON_BLACK)
-            cprint_hex(id & 0xFFFF, 4, CYAN_ON_BLACK)
-            console_putchar(58, WHITE_ON_BLACK)
-            cprint_hex((id >> 16) & 0xFFFF, 4, CYAN_ON_BLACK)
-            let cl = pci_read32(0, dev, 0, 8)
-            let class = (cl >> 24) & 0xFF
-            let subclass = (cl >> 16) & 0xFF
-            cprint(" ", WHITE_ON_BLACK)
-            pci_class_name(class, subclass)
-            console_putchar(10, WHITE_ON_BLACK)
-            found = found + 1
-        }
-        dev = dev + 1
-    }
-    cprint("Total: ", GREEN_ON_BLACK)
-    cprint_decimal(found, GREEN_ON_BLACK)
-    cprintln(" devices", GREEN_ON_BLACK)
-}
-
-@kernel fn cmd_lspci_v() {
-    // lspci -v — verbose with BAR info
-    cprintln("PCI Devices (verbose):", YELLOW_ON_BLACK)
-    let mut dev: i64 = 0
-    while dev < 32 {
-        let id = pci_read32(0, dev, 0, 0)
-        if id != 0xFFFFFFFF && id != 0 {
-            let cl = pci_read32(0, dev, 0, 8)
-            let class = (cl >> 24) & 0xFF
-            let subclass = (cl >> 16) & 0xFF
-            cprint("  Dev ", WHITE_ON_BLACK)
-            cprint_decimal(dev, CYAN_ON_BLACK)
-            cprint(": ", WHITE_ON_BLACK)
-            cprint_hex(id & 0xFFFF, 4, CYAN_ON_BLACK)
-            console_putchar(58, WHITE_ON_BLACK)
-            cprint_hex((id >> 16) & 0xFFFF, 4, CYAN_ON_BLACK)
-            cprint(" ", WHITE_ON_BLACK)
-            pci_class_name(class, subclass)
-            console_putchar(10, WHITE_ON_BLACK)
-            // Read BARs (offset 0x10-0x24, 6 BARs)
-            let mut bar: i64 = 0
-            while bar < 6 {
-                let bar_val = pci_read32(0, dev, 0, 0x10 + bar * 4)
-                if bar_val != 0 {
-                    cprint("    BAR", WHITE_ON_BLACK)
-                    cprint_decimal(bar, WHITE_ON_BLACK)
-                    cprint(": 0x", WHITE_ON_BLACK)
-                    cprint_hex(bar_val, 8, CYAN_ON_BLACK)
-                    if (bar_val & 1) == 1 {
-                        cprint(" (I/O port ", YELLOW_ON_BLACK)
-                        cprint_hex(bar_val & 0xFFFFFFFC, 4, YELLOW_ON_BLACK)
-                        cprintln(")", WHITE_ON_BLACK)
-                    } else {
-                        let bar_type = (bar_val >> 1) & 3
-                        if bar_type == 0 { cprint(" (MMIO 32-bit)", YELLOW_ON_BLACK) }
-                        else if bar_type == 2 { cprint(" (MMIO 64-bit)", YELLOW_ON_BLACK) }
-                        console_putchar(10, WHITE_ON_BLACK)
-                    }
-                }
-                bar = bar + 1
-            }
-            // Read interrupt line
-            let int_reg = pci_read32(0, dev, 0, 0x3C)
-            let irq = int_reg & 0xFF
-            if irq != 0 && irq != 0xFF {
-                cprint("    IRQ: ", WHITE_ON_BLACK)
-                cprint_decimal(irq, CYAN_ON_BLACK)
-                console_putchar(10, WHITE_ON_BLACK)
-            }
-        }
-        dev = dev + 1
-    }
-}
-
+// Note: pci_class_name, cmd_lspci, cmd_lspci_v are in drivers/pci.fj
 
 // ═══════════════════════════════════════════════
 // MNIST Digit Display (Phase 9)
@@ -3381,6 +3111,116 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 5 && volatile_read_u8(0x6F800) == 108 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 103 { cmd_login(); handled = 1 }
     // neofetch — "neofetch" (110,101,111,102)
     if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 110 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 111 && volatile_read_u8(0x6F803) == 102 { cmd_neofetch_v2(); handled = 1 }
+
+    // === Sprint 1.2: IPC v2 commands ===
+    // ipc2 (105,112,99,50) — IPC v2 endpoint status
+    if handled == 0 && len == 4 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 50 { cmd_ipc2(); handled = 1 }
+    // ipc-test (105,112,99,45,116,101,115,116) — full IPC test suite
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_ipc_test(); handled = 1 }
+    // ipc-bench (105,112,99,45,98,101,110,99,104) — IPC benchmark
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 98 { cmd_ipc_bench(); handled = 1 }
+    // ipc2send (105,112,99,50,115,101,110,100) — "ipc2send <pid> <type> <val>"
+    if handled == 0 && len >= 9 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 50 && volatile_read_u8(0x6F804) == 115 { cmd_ipc2_send(); handled = 1 }
+    // ipc2recv (105,112,99,50,114,101,99,118) — "ipc2recv [pid]"
+    if handled == 0 && len >= 8 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 50 && volatile_read_u8(0x6F804) == 114 { cmd_ipc2_recv(); handled = 1 }
+    // channels (99,104,97,110,110,101,108,115) — list named channels
+    if handled == 0 && len == 8 && buf_eq4(99, 104, 97, 110) == 1 && volatile_read_u8(0x6F804) == 110 && volatile_read_u8(0x6F805) == 101 { cmd_channels(); handled = 1 }
+    // shm (115,104,109) — show shared memory regions
+    if handled == 0 && len == 3 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 104 && volatile_read_u8(0x6F802) == 109 { cmd_shm(); handled = 1 }
+    // shm-test (115,104,109,45,116,101,115,116) — test shared memory
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 104 && volatile_read_u8(0x6F802) == 109 && volatile_read_u8(0x6F803) == 45 { cmd_shm_test(); handled = 1 }
+    // notify-test (110,111,116,105,...) — test notifications
+    if handled == 0 && len == 11 && volatile_read_u8(0x6F800) == 110 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 105 && volatile_read_u8(0x6F804) == 102 { cmd_notify_test(); handled = 1 }
+    // caps (99,97,112,115) — show capabilities
+    if handled == 0 && len == 4 && buf_eq4(99, 97, 112, 115) == 1 { cmd_caps(); handled = 1 }
+
+    // === Sprint 1.4: VFS Service commands ===
+    // vfs-test — full VFS IPC test suite
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 118 && volatile_read_u8(0x6F801) == 102 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_vfs_test(); handled = 1 }
+    // vfs-mounts — list VFS mount table
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 118 && volatile_read_u8(0x6F801) == 102 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 109 { cmd_vfs_mounts(); handled = 1 }
+    // vfs-devs — list VFS devices
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 118 && volatile_read_u8(0x6F801) == 102 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 100 { cmd_vfs_devs(); handled = 1 }
+    // init-status — show init service status
+    if handled == 0 && len == 11 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 110 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 116 && volatile_read_u8(0x6F804) == 45 { cmd_init_status(); handled = 1 }
+
+    // === Sprint 1.5: Block service commands ===
+    // blk-test (98,108,107,45,116) — block device test suite
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 98 && volatile_read_u8(0x6F801) == 108 && volatile_read_u8(0x6F802) == 107 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_blk_test(); handled = 1 }
+    // blk-info (98,108,107,45,105) — list block devices
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 98 && volatile_read_u8(0x6F801) == 108 && volatile_read_u8(0x6F802) == 107 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 105 { cmd_blk_info(); handled = 1 }
+    // blk-bench (98,108,107,45,98) — block I/O benchmark
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 98 && volatile_read_u8(0x6F801) == 108 && volatile_read_u8(0x6F802) == 107 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 98 { cmd_blk_bench(); handled = 1 }
+
+    // === Sprint 1.6: Network service commands ===
+    // net-test (110,101,116,45,116) — network test suite
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 110 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_net_test(); handled = 1 }
+    // net-info (110,101,116,45,105) — show network info
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 110 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 105 { cmd_net_info(); handled = 1 }
+    // net-ping (110,101,116,45,112) — ping gateway via IPC
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 110 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 112 { cmd_net_ping(); handled = 1 }
+
+    // === Sprint 1.7: Shell service commands ===
+    // shell-test — shell service IPC test suite
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 104 && volatile_read_u8(0x6F802) == 101 && volatile_read_u8(0x6F803) == 108 && volatile_read_u8(0x6F804) == 108 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 116 { cmd_shell_test(); handled = 1 }
+    // shell-info — shell service status
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 104 && volatile_read_u8(0x6F802) == 101 && volatile_read_u8(0x6F803) == 108 && volatile_read_u8(0x6F804) == 108 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 { cmd_shell_info(); handled = 1 }
+
+    // === Phase 2: Production Hardening commands ===
+    // smp-sched — SMP scheduler status
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 109 && volatile_read_u8(0x6F802) == 112 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 115 { cmd_smp_sched(); handled = 1 }
+    // mm-stats — memory stats per process
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 109 && volatile_read_u8(0x6F801) == 109 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 115 { cmd_mm_stats(); handled = 1 }
+    // mm-cow — CoW entries
+    if handled == 0 && len == 6 && volatile_read_u8(0x6F800) == 109 && volatile_read_u8(0x6F801) == 109 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 99 { cmd_mm_cow(); handled = 1 }
+    // sec-status — security features
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 115 { cmd_security_status(); handled = 1 }
+    // journal — show WAL entries
+    if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 106 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 117 && volatile_read_u8(0x6F803) == 114 { cmd_journal(); handled = 1 }
+    // jsync — flush journal dirty sectors (was "sync" — renamed to avoid duplicate with apps/user_programs.fj)
+    if handled == 0 && len == 5 && volatile_read_u8(0x6F800) == 106 && volatile_read_u8(0x6F801) == 115 && volatile_read_u8(0x6F802) == 121 && volatile_read_u8(0x6F803) == 110 && volatile_read_u8(0x6F804) == 99 { cmd_journal_sync(); handled = 1 }
+    // fsck — filesystem check
+    if handled == 0 && len == 4 && volatile_read_u8(0x6F800) == 102 && volatile_read_u8(0x6F801) == 115 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 107 { cmd_fsck(); handled = 1 }
+    // ipc-fast — fast IPC benchmark
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 102 { cmd_ipc_fast_test(); handled = 1 }
+    // perf — performance counters
+    if handled == 0 && len == 4 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 114 && volatile_read_u8(0x6F803) == 102 { cmd_perf(); handled = 1 }
+    // test-all — run all kernel tests
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 116 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 97 { cmd_test_all(); handled = 1 }
+
+    // === Phase 3: Display commands ===
+    // fb-test (102,98,45,116) — framebuffer test pattern
+    if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 102 && volatile_read_u8(0x6F801) == 98 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 116 { cmd_fb_test(); handled = 1 }
+    // fbinfo — framebuffer info
+    if handled == 0 && len == 6 && volatile_read_u8(0x6F800) == 102 && volatile_read_u8(0x6F801) == 98 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 110 { cmd_fbinfo(); handled = 1 }
+    // disp-info — display service info
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 100 && volatile_read_u8(0x6F801) == 105 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 112 && volatile_read_u8(0x6F804) == 45 { cmd_disp_info(); handled = 1 }
+    // mouse-test (109,111,117,115,101,45,116)
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 109 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 117 && volatile_read_u8(0x6F803) == 115 && volatile_read_u8(0x6F804) == 101 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 116 { cmd_mouse_test(); handled = 1 }
+    // mouse-info (109,111,117,115,101,45,105)
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 109 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 117 && volatile_read_u8(0x6F803) == 115 && volatile_read_u8(0x6F804) == 101 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 { cmd_mouse_info(); handled = 1 }
+    // gui-test (103,117,105,45,116)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 103 && volatile_read_u8(0x6F801) == 117 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_gui_test(); handled = 1 }
+    // gui-info (103,117,105,45,105)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 103 && volatile_read_u8(0x6F801) == 117 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 105 { cmd_gui_info(); handled = 1 }
+    // editor-test (101,100,105,116,111,114,45,116)
+    if handled == 0 && len == 11 && volatile_read_u8(0x6F800) == 101 && volatile_read_u8(0x6F801) == 100 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 116 && volatile_read_u8(0x6F804) == 111 && volatile_read_u8(0x6F805) == 114 && volatile_read_u8(0x6F806) == 45 { cmd_editor_test(); handled = 1 }
+    // editor-info
+    if handled == 0 && len == 11 && volatile_read_u8(0x6F800) == 101 && volatile_read_u8(0x6F801) == 100 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 116 && volatile_read_u8(0x6F804) == 111 && volatile_read_u8(0x6F805) == 114 && volatile_read_u8(0x6F806) == 45 && volatile_read_u8(0x6F807) == 105 { cmd_editor_info(); handled = 1 }
+    // fjc-test (102,106,99,45,116)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 102 && volatile_read_u8(0x6F801) == 106 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_fjc_test(); handled = 1 }
+    // fjc-info (102,106,99,45,105)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 102 && volatile_read_u8(0x6F801) == 106 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 105 { cmd_fjc_info(); handled = 1 }
+    // pkg-list (112,107,103,45,108)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 107 && volatile_read_u8(0x6F802) == 103 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 108 { cmd_pkg_list(); handled = 1 }
+    // pkg-test (112,107,103,45,116)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 107 && volatile_read_u8(0x6F802) == 103 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_pkg_test(); handled = 1 }
+    // pkg-info (112,107,103,45,105)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 107 && volatile_read_u8(0x6F802) == 103 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 105 { cmd_pkg_info(); handled = 1 }
+    // hw-detect (104,119,45,100)
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 100 { cmd_hw_detect(); handled = 1 }
+    // hw-test (104,119,45,116)
+    if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 116 { cmd_hw_test(); handled = 1 }
 
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)

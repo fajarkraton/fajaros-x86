@@ -1,0 +1,308 @@
+// FajarOS Nova v2.0 — Advanced Memory Management (Sprint 2.2)
+// kernel/core/mm_advanced.fj — Ring 0 ONLY
+// Demand paging, CoW fork, per-process stats, OOM killer, shared libs
+
+// Constants
+const MM_ADV_BASE: i64 = 0x8F6000      // CoW table: 64 entries x 32 bytes
+const PROC_MEM_STATS: i64 = 0x8F7000   // 16 procs x 32 bytes
+const COW_MAX: i64 = 64
+const COW_ENTRY_SIZE: i64 = 32         // pid(8) + virt(8) + phys(8) + flags(8)
+const COW_FLAG_ACTIVE: i64 = 1
+const COW_FLAG_SHARED: i64 = 2
+const DEMAND_BASE: i64 = 0xA00000      // Demand page range: 2MB
+const DEMAND_END: i64 = 0xC00000
+const DEMAND_BITMAP: i64 = 0x8F5000    // 64 bytes = 512 bits (512 pages)
+const STAT_PAGES_MAPPED: i64 = 0
+const STAT_PAGES_COW: i64 = 8
+const STAT_PAGES_DEMAND: i64 = 16
+const STAT_PEAK: i64 = 24
+
+// ═══════════════════════════════════════════════════
+// Demand Paging — lazy allocation on first access
+// ═══════════════════════════════════════════════════
+
+@kernel fn demand_page_init() {
+    let mut i: i64 = 0
+    while i < 64 { volatile_write_u8(DEMAND_BITMAP + i, 0); i = i + 1 }
+}
+
+@kernel fn demand_page_is_in_range(virt: i64) -> i64 {
+    if virt >= DEMAND_BASE && virt < DEMAND_END { 1 } else { 0 }
+}
+
+@kernel fn demand_page_alloc(virt: i64) -> i64 {
+    if demand_page_is_in_range(virt) == 0 { return -1 }
+    let page_idx = (virt - DEMAND_BASE) / FRAME_SIZE
+    let byte_idx = page_idx / 8
+    let bit_idx = page_idx % 8
+    let old = volatile_read_u8(DEMAND_BITMAP + byte_idx)
+    if (old & (1 << bit_idx)) != 0 { return -1 }  // Already mapped
+    let phys = frame_alloc()
+    if phys == -1 { return -1 }
+    // Zero the frame
+    let mut i: i64 = 0
+    while i < FRAME_SIZE { volatile_write_u8(phys + i, 0); i = i + 1 }
+    let aligned_virt = (virt / FRAME_SIZE) * FRAME_SIZE
+    map_page(aligned_virt, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+    volatile_write_u8(DEMAND_BITMAP + byte_idx, old | (1 << bit_idx))
+    phys
+}
+
+@kernel fn demand_page_fault_handler(virt: i64) -> i64 {
+    if demand_page_is_in_range(virt) == 0 { return 0 }
+    let pid = volatile_read_u64(0x6FE00)  // current_pid
+    let phys = demand_page_alloc(virt)
+    if phys == -1 { return 0 }
+    mm_proc_stat_add(pid, STAT_PAGES_DEMAND, 1)
+    mm_proc_stat_add(pid, STAT_PAGES_MAPPED, 1)
+    1  // Handled
+}
+
+// ═══════════════════════════════════════════════════
+// Copy-on-Write Fork — CoW table at MM_ADV_BASE
+// Each entry: pid(8), virt(8), phys(8), flags(8)
+// ═══════════════════════════════════════════════════
+
+@kernel fn cow_init() {
+    let mut i: i64 = 0
+    while i < COW_MAX * COW_ENTRY_SIZE { volatile_write_u8(MM_ADV_BASE + i, 0); i = i + 1 }
+}
+
+@kernel fn cow_find_free() -> i64 {
+    let mut i: i64 = 0
+    while i < COW_MAX {
+        let flags = volatile_read_u64(MM_ADV_BASE + i * COW_ENTRY_SIZE + 24)
+        if (flags & COW_FLAG_ACTIVE) == 0 { return i }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn cow_mark_shared(pid: i64, virt: i64) {
+    let slot = cow_find_free()
+    if slot < 0 { return }
+    // Walk page table to find physical address
+    let pml4_idx = (virt >> 39) & 0x1FF
+    let pdpt_idx = (virt >> 30) & 0x1FF
+    let pd_idx = (virt >> 21) & 0x1FF
+    let pt_idx = (virt >> 12) & 0x1FF
+    let pml4_entry = page_table_entry(PML4_BASE, pml4_idx)
+    if (pml4_entry & PAGE_PRESENT) == 0 { return }
+    let pdpt_addr = pml4_entry & 0xFFFFF000
+    let pdpt_entry = page_table_entry(pdpt_addr, pdpt_idx)
+    if (pdpt_entry & PAGE_PRESENT) == 0 { return }
+    let pd_addr = pdpt_entry & 0xFFFFF000
+    let pd_entry = page_table_entry(pd_addr, pd_idx)
+    if (pd_entry & PAGE_PRESENT) == 0 || (pd_entry & PAGE_HUGE) != 0 { return }
+    let pt_addr = pd_entry & 0xFFFFF000
+    let pt_entry = page_table_entry(pt_addr, pt_idx)
+    if (pt_entry & PAGE_PRESENT) == 0 { return }
+    let phys = pt_entry & 0xFFFFF000
+    // Store CoW entry
+    let base = MM_ADV_BASE + slot * COW_ENTRY_SIZE
+    volatile_write_u64(base, pid)
+    volatile_write_u64(base + 8, virt)
+    volatile_write_u64(base + 16, phys)
+    volatile_write_u64(base + 24, COW_FLAG_ACTIVE | COW_FLAG_SHARED)
+    // Remap page as read-only (strip WRITABLE bit)
+    page_table_set(pt_addr, pt_idx, phys | PAGE_PRESENT | PAGE_USER)
+    invlpg(virt)
+    mm_proc_stat_add(pid, STAT_PAGES_COW, 1)
+}
+
+@kernel fn cow_handle_fault(pid: i64, virt: i64) -> i64 {
+    let aligned_virt = (virt / FRAME_SIZE) * FRAME_SIZE
+    let mut i: i64 = 0
+    while i < COW_MAX {
+        let base = MM_ADV_BASE + i * COW_ENTRY_SIZE
+        let flags = volatile_read_u64(base + 24)
+        if (flags & COW_FLAG_ACTIVE) == 0 { i = i + 1; continue }
+        let entry_pid = volatile_read_u64(base)
+        let entry_virt = volatile_read_u64(base + 8)
+        if entry_pid == pid && entry_virt == aligned_virt {
+            let old_phys = volatile_read_u64(base + 16)
+            let new_phys = frame_alloc()
+            if new_phys == -1 { return 0 }
+            // Copy 4KB frame byte-by-byte
+            let mut j: i64 = 0
+            while j < FRAME_SIZE {
+                volatile_write_u8(new_phys + j, volatile_read_u8(old_phys + j))
+                j = j + 1
+            }
+            map_page(aligned_virt, new_phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+            volatile_write_u64(base + 24, 0)  // Clear CoW entry
+            mm_proc_stat_add(pid, STAT_PAGES_MAPPED, 1)
+            return 1
+        }
+        i = i + 1
+    }
+    0  // Not a CoW page
+}
+
+// ═══════════════════════════════════════════════════
+// Per-Process Memory Stats — 16 procs x 32 bytes
+// Fields: pages_mapped(8), pages_cow(8), pages_demand(8), peak(8)
+// ═══════════════════════════════════════════════════
+
+@kernel fn mm_proc_stats_init() {
+    let mut i: i64 = 0
+    while i < 16 * 32 { volatile_write_u8(PROC_MEM_STATS + i, 0); i = i + 1 }
+}
+
+@kernel fn mm_proc_stat_add(pid: i64, field: i64, delta: i64) {
+    if pid < 0 || pid >= 16 { return }
+    if field < 0 || field > STAT_PEAK { return }
+    let addr = PROC_MEM_STATS + pid * 32 + field
+    let old_val = volatile_read_u64(addr)
+    let new_val = old_val + delta
+    // Underflow guard: clamp to 0 if delta is negative
+    if delta < 0 && new_val > old_val { volatile_write_u64(addr, 0); return }
+    volatile_write_u64(addr, new_val)
+    if field == STAT_PAGES_MAPPED {
+        let peak = volatile_read_u64(PROC_MEM_STATS + pid * 32 + STAT_PEAK)
+        if new_val > peak { volatile_write_u64(PROC_MEM_STATS + pid * 32 + STAT_PEAK, new_val) }
+    }
+}
+
+@kernel fn mm_proc_stat_get(pid: i64, field: i64) -> i64 {
+    if pid < 0 || pid >= 16 { return 0 }
+    if field < 0 || field > STAT_PEAK { return 0 }
+    volatile_read_u64(PROC_MEM_STATS + pid * 32 + field)
+}
+
+// ═══════════════════════════════════════════════════
+// OOM Killer — kill lowest-priority, most memory
+// ═══════════════════════════════════════════════════
+
+@kernel fn oom_find_victim() -> i64 {
+    // OOM scoring: prefer killing lowest-priority process with most memory.
+    // Score = pages_mapped * (4 - priority). IDLE(0)→4x, NORMAL(1)→3x, HIGH(2)→2x, RT(3)→1x.
+    // Never kill PID 0 (kernel) or PID 1 (init).
+    let mut victim: i64 = -1
+    let mut max_score: i64 = 0
+    let mut pid: i64 = 2
+    while pid < PROC_V2_MAX {
+        let state = proc_v2_get(pid, 0)
+        if state == PROC_STATE_READY || state == PROC_STATE_RUNNING || state == PROC_STATE_BLOCKED {
+            let pages = mm_proc_stat_get(pid, STAT_PAGES_MAPPED)
+            let prio = smp_get_priority(pid)
+            let score = pages * (4 - prio)  // Lower priority → higher score
+            if score > max_score { max_score = score; victim = pid }
+        }
+        pid = pid + 1
+    }
+    victim
+}
+
+@kernel fn oom_kill(pid: i64) {
+    if pid < 2 || pid >= PROC_V2_MAX { return }
+    // Free all CoW entries for this process
+    let mut i: i64 = 0
+    while i < COW_MAX {
+        let base = MM_ADV_BASE + i * COW_ENTRY_SIZE
+        let flags = volatile_read_u64(base + 24)
+        if (flags & COW_FLAG_ACTIVE) != 0 && volatile_read_u64(base) == pid {
+            volatile_write_u64(base + 24, 0)
+        }
+        i = i + 1
+    }
+    // Mark zombie with exit code 137 (OOM killed, like Linux SIGKILL)
+    proc_v2_set(pid, 0, PROC_STATE_ZOMBIE)
+    proc_v2_set(pid, 56, 137)
+    // Reset stats
+    volatile_write_u64(PROC_MEM_STATS + pid * 32 + STAT_PAGES_MAPPED, 0)
+    volatile_write_u64(PROC_MEM_STATS + pid * 32 + STAT_PAGES_COW, 0)
+    volatile_write_u64(PROC_MEM_STATS + pid * 32 + STAT_PAGES_DEMAND, 0)
+    cprint("[OOM] Killed PID ", RED_ON_BLACK)
+    cprint_decimal(pid, RED_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+// ═══════════════════════════════════════════════════
+// Shared Library Mapping — read-only into multiple processes
+// ═══════════════════════════════════════════════════
+
+@kernel fn shlib_map(phys_base: i64, size: i64, pid: i64) -> i64 {
+    let shlib_virt_base: i64 = 0xC00000
+    let pages = (size + FRAME_SIZE - 1) / FRAME_SIZE
+    let virt = shlib_virt_base + pid * 0x20000  // 128KB per process slot
+    let mut i: i64 = 0
+    while i < pages {
+        map_page(virt + i * FRAME_SIZE, phys_base + i * FRAME_SIZE, PAGE_PRESENT | PAGE_USER)
+        mm_proc_stat_add(pid, STAT_PAGES_MAPPED, 1)
+        i = i + 1
+    }
+    virt
+}
+
+// ═══════════════════════════════════════════════════
+// Init — call from kernel boot
+// ═══════════════════════════════════════════════════
+
+@kernel fn mm_advanced_init() {
+    demand_page_init()
+    cow_init()
+    mm_proc_stats_init()
+}
+
+// ═══════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════
+
+@kernel fn cmd_mm_stats() {
+    cprintln("Per-Process Memory Stats:", YELLOW_ON_BLACK)
+    cprintln("  PID  Mapped  CoW  Demand  Peak", WHITE_ON_BLACK)
+    let mut pid: i64 = 0
+    while pid < PROC_V2_MAX {
+        let mapped = mm_proc_stat_get(pid, STAT_PAGES_MAPPED)
+        let cow = mm_proc_stat_get(pid, STAT_PAGES_COW)
+        let demand = mm_proc_stat_get(pid, STAT_PAGES_DEMAND)
+        let peak = mm_proc_stat_get(pid, STAT_PEAK)
+        if mapped > 0 || cow > 0 || demand > 0 || peak > 0 {
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint("     ", WHITE_ON_BLACK)
+            cprint_decimal(mapped, GREEN_ON_BLACK)
+            cprint("     ", WHITE_ON_BLACK)
+            cprint_decimal(cow, YELLOW_ON_BLACK)
+            cprint("     ", WHITE_ON_BLACK)
+            cprint_decimal(demand, CYAN_ON_BLACK)
+            cprint("     ", WHITE_ON_BLACK)
+            cprint_decimal(peak, WHITE_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        pid = pid + 1
+    }
+}
+
+@kernel fn cmd_mm_cow() {
+    cprintln("Copy-on-Write Table:", YELLOW_ON_BLACK)
+    cprintln("  Slot  PID  Virt        Phys        Flags", WHITE_ON_BLACK)
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < COW_MAX {
+        let base = MM_ADV_BASE + i * COW_ENTRY_SIZE
+        let flags = volatile_read_u64(base + 24)
+        if (flags & COW_FLAG_ACTIVE) != 0 {
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_decimal(i, WHITE_ON_BLACK)
+            cprint("    ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(base), CYAN_ON_BLACK)
+            cprint("    0x", WHITE_ON_BLACK)
+            cprint_hex(volatile_read_u64(base + 8), 8, GREEN_ON_BLACK)
+            cprint("  0x", WHITE_ON_BLACK)
+            cprint_hex(volatile_read_u64(base + 16), 8, GREEN_ON_BLACK)
+            cprint("  ", WHITE_ON_BLACK)
+            if (flags & COW_FLAG_SHARED) != 0 { cprint("SHARED", YELLOW_ON_BLACK) }
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (no active CoW entries)", WHITE_ON_BLACK) }
+    cprint("  Total: ", WHITE_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(COW_MAX, WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}

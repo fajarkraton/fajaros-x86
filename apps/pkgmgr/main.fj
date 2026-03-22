@@ -1,0 +1,367 @@
+// FajarOS Nova v2.0 — Package Manager "fjpkg" (Sprint 3.6)
+// @safe application — install, remove, list, search packages
+// Package format: .fjpkg (name + version + deps + file list)
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Package Database — 32 packages × 128 bytes at 0x950000
+// ═══════════════════════════════════════════════════════════════
+
+const PKG_DB: i64 = 0x950000
+const PKG_MAX: i64 = 32
+const PKG_SIZE: i64 = 128
+
+// Per package entry (128 bytes):
+//   +0:   state (0=free, 1=installed, 2=available, 3=updating)
+//   +8:   name[32] (package name, null-terminated)
+//   +40:  version_major(8)
+//   +48:  version_minor(8)
+//   +56:  version_patch(8)
+//   +64:  dep_count(8) (number of dependencies)
+//   +72:  dep_ids[4×8=32] (package IDs this depends on)
+//   +104: file_count(8)
+//   +112: size_bytes(8)
+//   +120: install_time(8) (tick count when installed)
+
+const PKG_STATE: i64 = 0
+const PKG_NAME: i64 = 8
+const PKG_VER_MAJ: i64 = 40
+const PKG_VER_MIN: i64 = 48
+const PKG_VER_PAT: i64 = 56
+const PKG_DEP_COUNT: i64 = 64
+const PKG_DEPS: i64 = 72
+const PKG_FILE_COUNT: i64 = 104
+const PKG_SIZE_BYTES: i64 = 112
+const PKG_INSTALL_TIME: i64 = 120
+
+const PKG_FREE: i64 = 0
+const PKG_INSTALLED: i64 = 1
+const PKG_AVAILABLE: i64 = 2
+const PKG_UPDATING: i64 = 3
+
+@kernel fn pkg_addr(id: i64) -> i64 { PKG_DB + id * PKG_SIZE }
+@kernel fn pkg_read(id: i64, off: i64) -> i64 { volatile_read_u64(pkg_addr(id) + off) }
+@kernel fn pkg_write(id: i64, off: i64, val: i64) { volatile_write_u64(pkg_addr(id) + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Package Operations
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn pkg_init() {
+    let mut i: i64 = 0
+    while i < PKG_MAX * PKG_SIZE { volatile_write_u8(PKG_DB + i, 0); i = i + 1 }
+}
+
+@kernel fn pkg_find_free() -> i64 {
+    let mut i: i64 = 0
+    while i < PKG_MAX {
+        if pkg_read(i, PKG_STATE) == PKG_FREE { return i }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn pkg_find_by_name(name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < PKG_MAX {
+        if pkg_read(i, PKG_STATE) != PKG_FREE {
+            let match_ok = pkg_name_match(i, name_addr)
+            if match_ok == 1 { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn pkg_name_match(id: i64, name_addr: i64) -> i64 {
+    let base = pkg_addr(id) + PKG_NAME
+    let mut j: i64 = 0
+    while j < 31 {
+        let a = volatile_read_u8(base + j)
+        let b = volatile_read_u8(name_addr + j)
+        if a != b { return 0 }
+        if a == 0 { return 1 }
+        j = j + 1
+    }
+    1
+}
+
+@kernel fn pkg_set_name(id: i64, name_addr: i64) {
+    let base = pkg_addr(id) + PKG_NAME
+    let mut j: i64 = 0
+    while j < 31 {
+        let ch = volatile_read_u8(name_addr + j)
+        volatile_write_u8(base + j, ch)
+        if ch == 0 { return }
+        j = j + 1
+    }
+    volatile_write_u8(base + 31, 0)
+}
+
+@kernel fn pkg_install(name_addr: i64, major: i64, minor: i64, patch: i64, file_count: i64, size_bytes: i64) -> i64 {
+    // Check not already installed
+    let existing = pkg_find_by_name(name_addr)
+    if existing >= 0 && pkg_read(existing, PKG_STATE) == PKG_INSTALLED { return -1 }
+
+    let id = if existing >= 0 { existing } else { pkg_find_free() }
+    if id < 0 { return -2 }  // No space
+
+    pkg_write(id, PKG_STATE, PKG_INSTALLED)
+    pkg_set_name(id, name_addr)
+    pkg_write(id, PKG_VER_MAJ, major)
+    pkg_write(id, PKG_VER_MIN, minor)
+    pkg_write(id, PKG_VER_PAT, patch)
+    pkg_write(id, PKG_FILE_COUNT, file_count)
+    pkg_write(id, PKG_SIZE_BYTES, size_bytes)
+    pkg_write(id, PKG_INSTALL_TIME, read_timer_ticks())
+    id
+}
+
+@kernel fn pkg_remove(name_addr: i64) -> i64 {
+    let id = pkg_find_by_name(name_addr)
+    if id < 0 { return -1 }
+    // Check no other packages depend on this
+    let mut i: i64 = 0
+    while i < PKG_MAX {
+        if pkg_read(i, PKG_STATE) == PKG_INSTALLED && i != id {
+            let dep_count = pkg_read(i, PKG_DEP_COUNT)
+            let mut d: i64 = 0
+            while d < dep_count && d < 4 {
+                if volatile_read_u64(pkg_addr(i) + PKG_DEPS + d * 8) == id { return -2 }  // depended upon
+                d = d + 1
+            }
+        }
+        i = i + 1
+    }
+    // Clear entry
+    let mut j: i64 = 0
+    while j < PKG_SIZE { volatile_write_u8(pkg_addr(id) + j, 0); j = j + 1 }
+    0
+}
+
+@kernel fn pkg_add_dep(pkg_id: i64, dep_id: i64) {
+    let count = pkg_read(pkg_id, PKG_DEP_COUNT)
+    if count >= 4 { return }
+    volatile_write_u64(pkg_addr(pkg_id) + PKG_DEPS + count * 8, dep_id)
+    pkg_write(pkg_id, PKG_DEP_COUNT, count + 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Dependency Resolution — topological order check
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn pkg_deps_satisfied(id: i64) -> i64 {
+    let dep_count = pkg_read(id, PKG_DEP_COUNT)
+    let mut d: i64 = 0
+    while d < dep_count && d < 4 {
+        let dep_id = volatile_read_u64(pkg_addr(id) + PKG_DEPS + d * 8)
+        if dep_id >= 0 && dep_id < PKG_MAX {
+            if pkg_read(dep_id, PKG_STATE) != PKG_INSTALLED { return 0 }
+        }
+        d = d + 1
+    }
+    1  // All deps satisfied
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Built-in Standard Packages (pre-registered at init)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn pkg_register_stdlib() {
+    let name: i64 = 0x954000  // scratch
+    // fj-core (always installed)
+    volatile_write_u8(name, 102); volatile_write_u8(name+1, 106)  // fj
+    volatile_write_u8(name+2, 45); volatile_write_u8(name+3, 99)  // -c
+    volatile_write_u8(name+4, 111); volatile_write_u8(name+5, 114) // or
+    volatile_write_u8(name+6, 101); volatile_write_u8(name+7, 0)   // e
+    pkg_install(name, 2, 0, 0, 12, 4096)
+
+    // fj-math
+    volatile_write_u8(name, 102); volatile_write_u8(name+1, 106)
+    volatile_write_u8(name+2, 45); volatile_write_u8(name+3, 109) // m
+    volatile_write_u8(name+4, 97); volatile_write_u8(name+5, 116) // at
+    volatile_write_u8(name+6, 104); volatile_write_u8(name+7, 0)  // h
+    let math_id = pkg_install(name, 1, 2, 0, 8, 2048)
+
+    // fj-nn (depends on fj-math)
+    volatile_write_u8(name, 102); volatile_write_u8(name+1, 106)
+    volatile_write_u8(name+2, 45); volatile_write_u8(name+3, 110) // n
+    volatile_write_u8(name+4, 110); volatile_write_u8(name+5, 0)  // n
+    let nn_id = pkg_install(name, 1, 0, 0, 15, 8192)
+    if math_id >= 0 && nn_id >= 0 { pkg_add_dep(nn_id, math_id) }
+
+    // fj-hal
+    volatile_write_u8(name, 102); volatile_write_u8(name+1, 106)
+    volatile_write_u8(name+2, 45); volatile_write_u8(name+3, 104) // h
+    volatile_write_u8(name+4, 97); volatile_write_u8(name+5, 108) // al
+    volatile_write_u8(name+6, 0)
+    pkg_install(name, 1, 0, 0, 6, 1024)
+
+    // fj-http
+    volatile_write_u8(name, 102); volatile_write_u8(name+1, 106)
+    volatile_write_u8(name+2, 45); volatile_write_u8(name+3, 104) // h
+    volatile_write_u8(name+4, 116); volatile_write_u8(name+5, 116) // tt
+    volatile_write_u8(name+6, 112); volatile_write_u8(name+7, 0)  // p
+    pkg_install(name, 0, 3, 0, 4, 2048)
+
+    // fj-json
+    volatile_write_u8(name, 102); volatile_write_u8(name+1, 106)
+    volatile_write_u8(name+2, 45); volatile_write_u8(name+3, 106) // j
+    volatile_write_u8(name+4, 115); volatile_write_u8(name+5, 111) // so
+    volatile_write_u8(name+6, 110); volatile_write_u8(name+7, 0)  // n
+    pkg_install(name, 0, 2, 0, 3, 1024)
+
+    // fj-crypto
+    volatile_write_u8(name, 102); volatile_write_u8(name+1, 106)
+    volatile_write_u8(name+2, 45); volatile_write_u8(name+3, 99)  // c
+    volatile_write_u8(name+4, 114); volatile_write_u8(name+5, 121) // ry
+    volatile_write_u8(name+6, 112); volatile_write_u8(name+7, 116) // pt
+    volatile_write_u8(name+8, 111); volatile_write_u8(name+9, 0)  // o
+    pkg_install(name, 0, 1, 0, 5, 3072)
+}
+
+@kernel fn pkgmgr_init() {
+    pkg_init()
+    pkg_register_stdlib()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_pkg_list() {
+    cprintln("Installed Packages:", YELLOW_ON_BLACK)
+    let mut count: i64 = 0
+    let mut total_size: i64 = 0
+    let mut i: i64 = 0
+    while i < PKG_MAX {
+        if pkg_read(i, PKG_STATE) == PKG_INSTALLED {
+            cprint("  ", WHITE_ON_BLACK)
+            // Print name
+            let base = pkg_addr(i) + PKG_NAME
+            let mut j: i64 = 0
+            while j < 31 {
+                let ch = volatile_read_u8(base + j)
+                if ch == 0 { j = 31 } else { console_putchar(ch, CYAN_ON_BLACK); j = j + 1 }
+            }
+            // Version
+            cprint(" v", WHITE_ON_BLACK)
+            cprint_decimal(pkg_read(i, PKG_VER_MAJ), WHITE_ON_BLACK)
+            console_putchar(46, WHITE_ON_BLACK)
+            cprint_decimal(pkg_read(i, PKG_VER_MIN), WHITE_ON_BLACK)
+            console_putchar(46, WHITE_ON_BLACK)
+            cprint_decimal(pkg_read(i, PKG_VER_PAT), WHITE_ON_BLACK)
+            // Size
+            cprint(" (", WHITE_ON_BLACK)
+            let sz = pkg_read(i, PKG_SIZE_BYTES)
+            total_size = total_size + sz
+            if sz >= 1024 {
+                cprint_decimal(sz / 1024, WHITE_ON_BLACK)
+                cprint("KB", WHITE_ON_BLACK)
+            } else {
+                cprint_decimal(sz, WHITE_ON_BLACK)
+                cprint("B", WHITE_ON_BLACK)
+            }
+            cprint(", ", WHITE_ON_BLACK)
+            cprint_decimal(pkg_read(i, PKG_FILE_COUNT), WHITE_ON_BLACK)
+            cprint(" files", WHITE_ON_BLACK)
+            // Deps
+            let deps = pkg_read(i, PKG_DEP_COUNT)
+            if deps > 0 {
+                cprint(", deps=", WHITE_ON_BLACK)
+                cprint_decimal(deps, YELLOW_ON_BLACK)
+            }
+            cprintln(")", WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    cprint("Total: ", GREEN_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprint(" packages, ", WHITE_ON_BLACK)
+    cprint_decimal(total_size / 1024, CYAN_ON_BLACK)
+    cprintln(" KB", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_pkg_test() {
+    cprintln("=== Package Manager Test ===", YELLOW_ON_BLACK)
+
+    // Show installed
+    cprint("  Installed: ", WHITE_ON_BLACK)
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < PKG_MAX {
+        if pkg_read(i, PKG_STATE) == PKG_INSTALLED { count = count + 1 }
+        i = i + 1
+    }
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprintln(" packages", WHITE_ON_BLACK)
+
+    // Test install new package
+    let name: i64 = 0x954100
+    volatile_write_u8(name, 109); volatile_write_u8(name+1, 121)  // my
+    volatile_write_u8(name+2, 45); volatile_write_u8(name+3, 97)  // -a
+    volatile_write_u8(name+4, 112); volatile_write_u8(name+5, 112) // pp
+    volatile_write_u8(name+6, 0)
+    let id = pkg_install(name, 0, 1, 0, 2, 512)
+    cprint("  Install 'my-app': ", WHITE_ON_BLACK)
+    if id >= 0 { cprint("OK id=", GREEN_ON_BLACK); cprint_decimal(id, CYAN_ON_BLACK) }
+    else { cprint("FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test duplicate install
+    let dup = pkg_install(name, 0, 1, 0, 2, 512)
+    cprint("  Duplicate install: ", WHITE_ON_BLACK)
+    if dup < 0 { cprintln("rejected (correct)", GREEN_ON_BLACK) }
+    else { cprintln("allowed (wrong!)", RED_ON_BLACK) }
+
+    // Test dep check
+    if id >= 0 {
+        let satisfied = pkg_deps_satisfied(id)
+        cprint("  Deps satisfied: ", WHITE_ON_BLACK)
+        if satisfied == 1 { cprintln("yes (no deps)", GREEN_ON_BLACK) }
+        else { cprintln("no", RED_ON_BLACK) }
+    }
+
+    // Test remove
+    let rm = pkg_remove(name)
+    cprint("  Remove 'my-app': ", WHITE_ON_BLACK)
+    if rm == 0 { cprintln("OK", GREEN_ON_BLACK) }
+    else { cprintln("FAIL", RED_ON_BLACK) }
+
+    // Test find missing
+    let missing = pkg_find_by_name(name)
+    cprint("  Find after remove: ", WHITE_ON_BLACK)
+    if missing < 0 { cprintln("not found (correct)", GREEN_ON_BLACK) }
+    else { cprintln("still found (wrong!)", RED_ON_BLACK) }
+
+    cprintln("=== Package manager test complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_pkg_info() {
+    cprintln("Package Manager (fjpkg):", YELLOW_ON_BLACK)
+    let mut installed: i64 = 0
+    let mut available: i64 = 0
+    let mut total_size: i64 = 0
+    let mut total_files: i64 = 0
+    let mut i: i64 = 0
+    while i < PKG_MAX {
+        let state = pkg_read(i, PKG_STATE)
+        if state == PKG_INSTALLED { installed = installed + 1; total_size = total_size + pkg_read(i, PKG_SIZE_BYTES); total_files = total_files + pkg_read(i, PKG_FILE_COUNT) }
+        if state == PKG_AVAILABLE { available = available + 1 }
+        i = i + 1
+    }
+    cprint("  Installed: ", WHITE_ON_BLACK)
+    cprint_decimal(installed, CYAN_ON_BLACK)
+    cprint("  Available: ", WHITE_ON_BLACK)
+    cprint_decimal(available, CYAN_ON_BLACK)
+    cprint("  Slots: ", WHITE_ON_BLACK)
+    cprint_decimal(PKG_MAX, WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Total size: ", WHITE_ON_BLACK)
+    cprint_decimal(total_size / 1024, CYAN_ON_BLACK)
+    cprint(" KB (", WHITE_ON_BLACK)
+    cprint_decimal(total_files, CYAN_ON_BLACK)
+    cprintln(" files)", WHITE_ON_BLACK)
+    cprintln("  Std packages: fj-core fj-math fj-nn fj-hal fj-http fj-json fj-crypto", WHITE_ON_BLACK)
+}

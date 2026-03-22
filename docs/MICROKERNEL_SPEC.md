@@ -7,7 +7,7 @@
 
 ## 1. Microkernel Boundary
 
-### Ring 0 — Kernel Core (target: <1,500 LOC, 110 functions)
+### Ring 0 — Kernel Core (actual: ~2,500 LOC — IPC larger than original 300 LOC estimate)
 
 ```
 kernel/
@@ -56,20 +56,25 @@ services/
 
 ---
 
-## 2. Syscall API (20 calls)
+## 2. Syscall API (18 calls — as implemented)
 
-### Process Management
+> **Note:** Numbering preserved from monolithic v1.0 for backward compatibility.
+> Original spec had SYS_SPAWN=1, SYS_WAIT=2, SYS_KILL=3 — deferred to Phase 3.
+
+### Console + Process (legacy numbers 0-7)
 
 | # | Name | Args | Returns | Description |
 |---|------|------|---------|-------------|
 | 0 | SYS_EXIT | code:i64 | — | Terminate process |
-| 1 | SYS_SPAWN | elf_path:ptr, len:i64 | pid:i64 | Load ELF + create process |
-| 2 | SYS_WAIT | pid:i64 | exit_code:i64 | Wait for child |
-| 3 | SYS_KILL | pid:i64, sig:i64 | 0/-1 | Signal process |
-| 4 | SYS_GETPID | — | pid:i64 | Get current PID |
-| 5 | SYS_YIELD | — | 0 | Voluntary reschedule |
+| 1 | SYS_WRITE | fd:i64, buf:ptr, len:i64 | written:i64 | Write to stdout/serial |
+| 2 | SYS_READ | fd:i64, buf:ptr, len:i64 | read:i64 | Read from stdin/keyboard |
+| 3 | SYS_GETPID | — | pid:i64 | Get current PID |
+| 4 | SYS_YIELD | — | 0 | Voluntary reschedule |
+| 5 | SYS_SLEEP | ms:i64 | 0 | Sleep for N milliseconds |
+| 6 | SYS_MMAP | size:i64 | addr:i64 | Map memory pages |
+| 7 | SYS_BRK | — | — | (reserved) |
 
-### IPC
+### IPC (numbers 10-14)
 
 | # | Name | Args | Returns | Description |
 |---|------|------|---------|-------------|
@@ -79,15 +84,14 @@ services/
 | 13 | SYS_REPLY | dst:i64, msg:ptr | 0/-1 | Reply to received message |
 | 14 | SYS_NOTIFY | dst:i64, bits:i64 | 0/-1 | Async notification |
 
-### Memory
+### Memory (numbers 20-22)
 
 | # | Name | Args | Returns | Description |
 |---|------|------|---------|-------------|
-| 20 | SYS_MMAP | addr:i64, len:i64, prot:i64 | addr:i64 | Map memory pages |
 | 21 | SYS_MUNMAP | addr:i64, len:i64 | 0/-1 | Unmap pages |
-| 22 | SYS_SHARE | pid:i64, addr:i64, len:i64 | remote_addr:i64 | Share pages with process |
+| 22 | SYS_SHARE | region:i64, pid:i64 | remote_addr:i64 | Share pages with process |
 
-### I/O (Kernel-mediated, for driver stubs)
+### I/O (numbers 30-32, kernel-mediated, capability required)
 
 | # | Name | Args | Returns | Description |
 |---|------|------|---------|-------------|
@@ -95,12 +99,12 @@ services/
 | 31 | SYS_PORT_IO | port:i64, val:i64, dir:i64 | val:i64 | Port read/write (cap required) |
 | 32 | SYS_DMA_ALLOC | size:i64 | phys:i64 | Allocate DMA-safe memory |
 
-### Console (temporary, until display service)
+### Not Yet Implemented (deferred to Phase 3)
 
-| # | Name | Args | Returns | Description |
-|---|------|------|---------|-------------|
-| 40 | SYS_WRITE | fd:i64, buf:ptr, len:i64 | written:i64 | Write to stdout/serial |
-| 41 | SYS_READ | fd:i64, buf:ptr, len:i64 | read:i64 | Read from stdin/keyboard |
+| # | Name | Description |
+|---|------|-------------|
+| 8 | SYS_SPAWN | Load ELF + create process |
+| 9 | SYS_KILL | Signal/terminate process |
 
 ---
 

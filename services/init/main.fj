@@ -1,0 +1,107 @@
+// FajarOS Nova v2.0 — Init Service (Sprint 1.4.7)
+// @safe process — PID 1, spawns and monitors services
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Init Service
+// First user process (PID 1), spawns all other services
+// Registers on "init" channel
+// ═══════════════════════════════════════════════════════════════
+
+// Service PIDs (well-known)
+const INIT_PID: i64 = 1
+const BLK_PID: i64 = 2
+// VFS_PID = 3 (defined in vfs/main.fj)
+const NET_PID_DEFAULT: i64 = 4
+const SHELL_PID: i64 = 5
+
+// Service state tracking at 0x8B7000
+const INIT_SVC_TABLE: i64 = 0x8B7000
+const INIT_SVC_MAX: i64 = 8
+const INIT_SVC_SIZE: i64 = 32
+// Per service: +0=pid, +8=state (0=stopped, 1=running, 2=crashed), +16=restarts, +24=name_hash
+
+const SVC_STOPPED: i64 = 0
+const SVC_RUNNING: i64 = 1
+const SVC_CRASHED: i64 = 2
+
+@kernel fn init_svc_set(slot: i64, pid: i64, state: i64) {
+    let addr = INIT_SVC_TABLE + slot * INIT_SVC_SIZE
+    volatile_write_u64(addr, pid)
+    volatile_write_u64(addr + 8, state)
+    volatile_write_u64(addr + 16, 0)  // restarts
+}
+
+@kernel fn init_svc_get_state(slot: i64) -> i64 {
+    volatile_read_u64(INIT_SVC_TABLE + slot * INIT_SVC_SIZE + 8)
+}
+
+@kernel fn init_svc_init() {
+    // Clear service table
+    let mut i: i64 = 0
+    while i < INIT_SVC_MAX * INIT_SVC_SIZE {
+        volatile_write_u8(INIT_SVC_TABLE + i, 0)
+        i = i + 1
+    }
+
+    // Register services
+    init_svc_set(0, VFS_PID, SVC_RUNNING)      // VFS
+    init_svc_set(1, BLK_PID, SVC_RUNNING)       // Block device service
+    init_svc_set(2, NET_PID_DEFAULT, SVC_RUNNING)  // Network service
+    init_svc_set(3, SHELL_PID, SVC_STOPPED)     // Shell (not started yet)
+
+    // Initialize block device service
+    blk_svc_init()
+
+    // Initialize network service
+    net_svc_init()
+
+    // Initialize display + input + GUI + pkgmgr services
+    display_svc_init()
+    input_svc_init()
+    gui_svc_init()
+    pkgmgr_init()
+
+    // Initialize shell service
+    shell_svc_init()
+    init_svc_set(3, SHELL_PID, SVC_RUNNING)
+
+    // Initialize VFS service
+    vfs_svc_init()
+}
+
+@kernel fn init_svc_name(slot: i64) {
+    if slot == 0 { cprint("vfs", CYAN_ON_BLACK) }
+    else if slot == 1 { cprint("blk", CYAN_ON_BLACK) }
+    else if slot == 2 { cprint("net", CYAN_ON_BLACK) }
+    else if slot == 3 { cprint("shell", CYAN_ON_BLACK) }
+    else { cprint("???", CYAN_ON_BLACK) }
+}
+
+@kernel fn cmd_init_status() {
+    cprintln("Init Service Status:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    while i < INIT_SVC_MAX {
+        let addr = INIT_SVC_TABLE + i * INIT_SVC_SIZE
+        let pid = volatile_read_u64(addr)
+        let state = volatile_read_u64(addr + 8)
+        let restarts = volatile_read_u64(addr + 16)
+        if pid > 0 {
+            cprint("  ", WHITE_ON_BLACK)
+            init_svc_name(i)
+            cprint(" (PID ", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint("): ", WHITE_ON_BLACK)
+            if state == SVC_RUNNING { cprint("RUNNING", GREEN_ON_BLACK) }
+            else if state == SVC_STOPPED { cprint("STOPPED", YELLOW_ON_BLACK) }
+            else if state == SVC_CRASHED { cprint("CRASHED", RED_ON_BLACK) }
+            if restarts > 0 {
+                cprint(" (", WHITE_ON_BLACK)
+                cprint_decimal(restarts, WHITE_ON_BLACK)
+                cprint(" restarts)", WHITE_ON_BLACK)
+            }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        i = i + 1
+    }
+}

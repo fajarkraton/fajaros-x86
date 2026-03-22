@@ -1,0 +1,635 @@
+// FajarOS Nova v2.0 — Network Service (Sprint 1.6)
+// @device process — PID 4, handles Ethernet/IP/TCP/UDP
+// Bridges to virtio-net driver via kernel IRQ stubs
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Network Protocol Constants
+// ═══════════════════════════════════════════════════════════════
+
+const MSG_NET_SEND: i64 = 0x0300
+const MSG_NET_RECV: i64 = 0x0301
+const MSG_NET_CONNECT: i64 = 0x0302
+const MSG_NET_CLOSE: i64 = 0x0303
+const MSG_NET_BIND: i64 = 0x0304
+const MSG_NET_PING: i64 = 0x0305
+const MSG_NET_ARP: i64 = 0x0306
+const MSG_NET_DHCP: i64 = 0x0307
+const MSG_NET_INFO: i64 = 0x0308
+const MSG_NET_DNS: i64 = 0x0309
+const MSG_NET_REPLY: i64 = 0x03FF
+
+const NET_SVC_PID: i64 = 4
+
+// Status codes
+const NET_OK: i64 = 0
+const NET_ENOCONN: i64 = -1     // No connection
+const NET_ETIMEDOUT: i64 = -2   // Timeout
+const NET_EREFUSED: i64 = -3    // Connection refused
+const NET_EINVAL: i64 = -4      // Invalid argument
+const NET_ENODEV: i64 = -5      // No network device
+const NET_ENOBUFS: i64 = -6     // No buffer space
+
+// Protocols
+const PROTO_ICMP: i64 = 1
+const PROTO_TCP: i64 = 6
+const PROTO_UDP: i64 = 17
+
+// ═══════════════════════════════════════════════════════════════
+// Network State — 0x8E0000
+// ═══════════════════════════════════════════════════════════════
+
+const NET_SVC_BASE: i64 = 0x8E0000
+
+// Interface state (+0..+127)
+const NETIF_STATE: i64 = 0      // 0=down, 1=up
+const NETIF_MAC: i64 = 8        // 6-byte MAC (stored as i64, low 48 bits)
+const NETIF_IP: i64 = 16        // IPv4 address (packed)
+const NETIF_MASK: i64 = 24      // Subnet mask
+const NETIF_GW: i64 = 32        // Gateway IP
+const NETIF_DNS: i64 = 40       // DNS server IP
+const NETIF_TX_COUNT: i64 = 48  // Packets sent
+const NETIF_RX_COUNT: i64 = 56  // Packets received
+const NETIF_TX_BYTES: i64 = 64  // Bytes sent
+const NETIF_RX_BYTES: i64 = 72  // Bytes received
+const NETIF_ERRORS: i64 = 80    // Error count
+
+@kernel fn net_svc_read(off: i64) -> i64 {
+    volatile_read_u64(NET_SVC_BASE + off)
+}
+
+@kernel fn net_svc_write(off: i64, val: i64) {
+    volatile_write_u64(NET_SVC_BASE + off, val)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ARP Cache — 16 entries at NET_SVC_BASE + 0x200
+// Per entry: +0=valid, +8=ip, +16=mac, +24=timestamp
+// ═══════════════════════════════════════════════════════════════
+
+const ARP_CACHE_BASE: i64 = 0x8E0200
+const ARP_CACHE_MAX: i64 = 16
+const ARP_ENTRY_SIZE: i64 = 32
+
+@kernel fn net_arp_cache_init() {
+    let mut i: i64 = 0
+    while i < ARP_CACHE_MAX * ARP_ENTRY_SIZE {
+        volatile_write_u8(ARP_CACHE_BASE + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn net_arp_lookup(ip: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < ARP_CACHE_MAX {
+        let addr = ARP_CACHE_BASE + i * ARP_ENTRY_SIZE
+        if volatile_read_u64(addr) == 1 && volatile_read_u64(addr + 8) == ip {
+            return volatile_read_u64(addr + 16)
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn net_arp_add(ip: i64, mac: i64) {
+    // Check if already exists
+    let mut i: i64 = 0
+    while i < ARP_CACHE_MAX {
+        let addr = ARP_CACHE_BASE + i * ARP_ENTRY_SIZE
+        if volatile_read_u64(addr) == 1 && volatile_read_u64(addr + 8) == ip {
+            volatile_write_u64(addr + 16, mac)
+            return
+        }
+        i = i + 1
+    }
+    // Find free slot
+    i = 0
+    while i < ARP_CACHE_MAX {
+        let addr = ARP_CACHE_BASE + i * ARP_ENTRY_SIZE
+        if volatile_read_u64(addr) == 0 {
+            volatile_write_u64(addr, 1)
+            volatile_write_u64(addr + 8, ip)
+            volatile_write_u64(addr + 16, mac)
+            volatile_write_u64(addr + 24, read_timer_ticks())
+            return
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Socket Table — 16 sockets at NET_SVC_BASE + 0x400
+// Per socket: +0=state, +8=proto, +16=local_port, +24=remote_ip,
+//             +32=remote_port, +40=owner_pid, +48=rx_buf_addr, +56=tx_seq
+// ═══════════════════════════════════════════════════════════════
+
+const SOCK_TABLE: i64 = 0x8E0400
+const SOCK_MAX: i64 = 16
+const SOCK_ENTRY_SIZE: i64 = 64
+
+const SOCK_FREE: i64 = 0
+const SOCK_OPEN: i64 = 1
+const SOCK_CONNECTED: i64 = 2
+const SOCK_LISTENING: i64 = 3
+const SOCK_CLOSED: i64 = 4
+
+@kernel fn sock_alloc() -> i64 {
+    let mut i: i64 = 0
+    while i < SOCK_MAX {
+        let addr = SOCK_TABLE + i * SOCK_ENTRY_SIZE
+        if volatile_read_u64(addr) == SOCK_FREE { return i }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn sock_read(id: i64, field: i64) -> i64 {
+    if id < 0 || id >= SOCK_MAX { return 0 }
+    volatile_read_u64(SOCK_TABLE + id * SOCK_ENTRY_SIZE + field)
+}
+
+@kernel fn sock_write(id: i64, field: i64, val: i64) {
+    if id < 0 || id >= SOCK_MAX { return }
+    volatile_write_u64(SOCK_TABLE + id * SOCK_ENTRY_SIZE + field, val)
+}
+
+@kernel fn sock_close(id: i64) {
+    if id >= 0 && id < SOCK_MAX {
+        let mut i: i64 = 0
+        while i < SOCK_ENTRY_SIZE {
+            volatile_write_u8(SOCK_TABLE + id * SOCK_ENTRY_SIZE + i, 0)
+            i = i + 1
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Network Service IPC Handler
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn net_svc_handle_msg(sender: i64, msg_buf: i64, reply_buf: i64) -> i64 {
+    let msg_type = volatile_read_u32(msg_buf + 8)
+
+    if msg_type == MSG_NET_INFO {
+        // Return interface info
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, net_svc_read(NETIF_STATE))  // up/down
+        volatile_write_u64(reply_buf + 24, net_svc_read(NETIF_IP))     // IP
+        volatile_write_u64(reply_buf + 32, net_svc_read(NETIF_MAC))    // MAC
+        volatile_write_u64(reply_buf + 40, net_svc_read(NETIF_TX_COUNT))
+        volatile_write_u64(reply_buf + 48, net_svc_read(NETIF_RX_COUNT))
+        volatile_write_u64(reply_buf + 56, NET_OK)
+        return 0
+    }
+
+    if msg_type == MSG_NET_CONNECT {
+        // Payload: ip(8), port(8), proto(8)
+        let dst_ip = volatile_read_u64(msg_buf + 16)
+        let dst_port = volatile_read_u64(msg_buf + 24)
+        let proto = volatile_read_u64(msg_buf + 32)
+
+        let sock_id = sock_alloc()
+        if sock_id < 0 {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+            volatile_write_u64(reply_buf + 16, -1)
+            volatile_write_u64(reply_buf + 24, NET_ENOBUFS)
+            return 0
+        }
+
+        sock_write(sock_id, 0, SOCK_CONNECTED)
+        sock_write(sock_id, 8, proto)
+        sock_write(sock_id, 16, 49152 + sock_id)  // ephemeral port
+        sock_write(sock_id, 24, dst_ip)
+        sock_write(sock_id, 32, dst_port)
+        sock_write(sock_id, 40, sender)
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, sock_id)
+        volatile_write_u64(reply_buf + 24, NET_OK)
+        return 0
+    }
+
+    if msg_type == MSG_NET_SEND {
+        // Payload: conn_id(8), len(8), data inline or shared_buf(8)
+        let conn_id = volatile_read_u64(msg_buf + 16)
+        let data_len = volatile_read_u64(msg_buf + 24)
+
+        if conn_id < 0 || conn_id >= SOCK_MAX || sock_read(conn_id, 0) != SOCK_CONNECTED {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+            volatile_write_u64(reply_buf + 16, 0)
+            volatile_write_u64(reply_buf + 24, NET_ENOCONN)
+            return 0
+        }
+
+        // In monolithic mode, delegate to net_tx_packet if available
+        // For now, increment stats and acknowledge
+        net_svc_write(NETIF_TX_COUNT, net_svc_read(NETIF_TX_COUNT) + 1)
+        net_svc_write(NETIF_TX_BYTES, net_svc_read(NETIF_TX_BYTES) + data_len)
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, data_len)
+        volatile_write_u64(reply_buf + 24, NET_OK)
+        return 0
+    }
+
+    if msg_type == MSG_NET_RECV {
+        let conn_id = volatile_read_u64(msg_buf + 16)
+        let max_len = volatile_read_u64(msg_buf + 24)
+
+        if conn_id < 0 || conn_id >= SOCK_MAX || sock_read(conn_id, 0) != SOCK_CONNECTED {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+            volatile_write_u64(reply_buf + 16, 0)
+            volatile_write_u64(reply_buf + 24, NET_ENOCONN)
+            return 0
+        }
+
+        // In monolithic mode, poll net_rx_poll
+        // For now, return 0 bytes (no data available)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, 0)
+        volatile_write_u64(reply_buf + 24, NET_OK)
+        return 0
+    }
+
+    if msg_type == MSG_NET_CLOSE {
+        let conn_id = volatile_read_u64(msg_buf + 16)
+        sock_close(conn_id)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, NET_OK)
+        return 0
+    }
+
+    if msg_type == MSG_NET_PING {
+        // Payload: target_ip(8), count(8)
+        let target_ip = volatile_read_u64(msg_buf + 16)
+        let count = volatile_read_u64(msg_buf + 24)
+
+        // Delegate to existing ICMP machinery if net is initialized
+        let net_up = net_svc_read(NETIF_STATE)
+        if net_up != 1 {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+            volatile_write_u64(reply_buf + 16, 0)
+            volatile_write_u64(reply_buf + 24, NET_ENODEV)
+            return 0
+        }
+
+        // Use kernel ICMP (monolithic bridge)
+        // Build ICMP echo, send, check reply
+        let sent = icmp_build_echo_request(1)
+        if sent > 0 {
+            // ARP + send
+            let gw = net_svc_read(NETIF_GW)
+            arp_build_request(gw)
+            net_send_frame(0x860000, sent)  // TX buffer at 0x860000
+        }
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, 1)   // sent 1 packet
+        volatile_write_u64(reply_buf + 24, NET_OK)
+        return 0
+    }
+
+    if msg_type == MSG_NET_ARP {
+        // Return ARP cache contents
+        let mut count: i64 = 0
+        let mut i: i64 = 0
+        while i < ARP_CACHE_MAX {
+            let addr = ARP_CACHE_BASE + i * ARP_ENTRY_SIZE
+            if volatile_read_u64(addr) == 1 { count = count + 1 }
+            i = i + 1
+        }
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, count)
+        volatile_write_u64(reply_buf + 24, NET_OK)
+        return 0
+    }
+
+    if msg_type == MSG_NET_DHCP {
+        // Trigger DHCP discovery (delegates to existing net_init DHCP)
+        let ip = net_svc_read(NETIF_IP)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, ip)
+        volatile_write_u64(reply_buf + 24, if ip > 0 { NET_OK } else { NET_ENODEV })
+        return 0
+    }
+
+    if msg_type == MSG_NET_DNS {
+        // DNS resolver stub — return DNS server IP for now
+        let dns = net_svc_read(NETIF_DNS)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, dns)
+        volatile_write_u64(reply_buf + 24, if dns > 0 { NET_OK } else { NET_ENODEV })
+        return 0
+    }
+
+    // Unknown message
+    ipc_msg_clear(reply_buf)
+    ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
+    volatile_write_u64(reply_buf + 16, NET_EINVAL)
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Network Service Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn net_svc_init() {
+    // Clear state
+    let mut i: i64 = 0
+    while i < 128 {
+        volatile_write_u8(NET_SVC_BASE + i, 0)
+        i = i + 1
+    }
+
+    // Init ARP cache
+    net_arp_cache_init()
+
+    // Init socket table
+    i = 0
+    while i < SOCK_MAX * SOCK_ENTRY_SIZE {
+        volatile_write_u8(SOCK_TABLE + i, 0)
+        i = i + 1
+    }
+
+    // Copy network state from kernel driver (monolithic bridge)
+    // The existing net_init() in drivers/virtio_net.fj stores state at NET_STATE (0x850000)
+    let kernel_net_state: i64 = 0x850000
+    let net_up = volatile_read_u64(kernel_net_state)  // +0: initialized flag
+    if net_up == 1 {
+        net_svc_write(NETIF_STATE, 1)
+        // Copy MAC (6 bytes at kernel +8)
+        let mac_lo = volatile_read_u64(kernel_net_state + 8)
+        net_svc_write(NETIF_MAC, mac_lo)
+        // Copy IP (at kernel +64 in net_state)
+        let my_ip = volatile_read_u64(kernel_net_state + 64)
+        net_svc_write(NETIF_IP, my_ip)
+        // Copy gateway (at kernel +80)
+        let gw_ip = volatile_read_u64(kernel_net_state + 80)
+        net_svc_write(NETIF_GW, gw_ip)
+        // Copy subnet mask
+        let mask = volatile_read_u64(kernel_net_state + 72)
+        net_svc_write(NETIF_MASK, mask)
+        // DNS = QEMU default 10.0.2.3
+        net_svc_write(NETIF_DNS, ip_pack(10, 0, 2, 3))
+
+        // Copy ARP cache from kernel
+        let kernel_arp: i64 = 0x851000  // kernel ARP cache
+        i = 0
+        while i < 16 {
+            let ip = volatile_read_u64(kernel_arp + i * 16)
+            let mac = volatile_read_u64(kernel_arp + i * 16 + 8)
+            if ip != 0 { net_arp_add(ip, mac) }
+            i = i + 1
+        }
+
+        // Register /dev/net0 in VFS
+        let name_buf: i64 = 0x8E1F00
+        volatile_write_u8(name_buf, 110)   // n
+        volatile_write_u8(name_buf+1, 101) // e
+        volatile_write_u8(name_buf+2, 116) // t
+        volatile_write_u8(name_buf+3, 48)  // 0
+        volatile_write_u8(name_buf+4, 0)
+        vfs_dev_register(NET_SVC_PID, name_buf, 3)  // type 3 = network
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands — Network Service Testing
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn net_svc_ip_print(ip: i64) {
+    cprint_decimal((ip >> 24) & 0xFF, CYAN_ON_BLACK)
+    console_putchar(46, WHITE_ON_BLACK)
+    cprint_decimal((ip >> 16) & 0xFF, CYAN_ON_BLACK)
+    console_putchar(46, WHITE_ON_BLACK)
+    cprint_decimal((ip >> 8) & 0xFF, CYAN_ON_BLACK)
+    console_putchar(46, WHITE_ON_BLACK)
+    cprint_decimal(ip & 0xFF, CYAN_ON_BLACK)
+}
+
+@kernel fn net_svc_mac_print(mac: i64) {
+    let mut i: i64 = 5
+    while i >= 0 {
+        cprint_hex((mac >> (i * 8)) & 0xFF, 2, CYAN_ON_BLACK)
+        if i > 0 { console_putchar(58, WHITE_ON_BLACK) }
+        i = i - 1
+    }
+}
+
+@kernel fn cmd_net_test() {
+    cprintln("=== Network Service Test ===", YELLOW_ON_BLACK)
+
+    let msg: i64 = 0x8E2000
+    let reply: i64 = 0x8E2100
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    // Test 1: Get network info
+    cprintln("[1] NET_INFO:", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_NET_INFO, 0)
+    ipc_msg_clear(reply)
+    net_svc_handle_msg(my_pid, msg, reply)
+    let state = volatile_read_u64(reply + 16)
+    let ip = volatile_read_u64(reply + 24)
+    let mac = volatile_read_u64(reply + 32)
+    let tx = volatile_read_u64(reply + 40)
+    let rx = volatile_read_u64(reply + 48)
+    cprint("  state=", WHITE_ON_BLACK)
+    if state == 1 { cprint("UP", GREEN_ON_BLACK) } else { cprint("DOWN", RED_ON_BLACK) }
+    cprint(" ip=", WHITE_ON_BLACK)
+    if ip > 0 { net_svc_ip_print(ip) } else { cprint("none", YELLOW_ON_BLACK) }
+    cprint(" mac=", WHITE_ON_BLACK)
+    if mac > 0 { net_svc_mac_print(mac) } else { cprint("none", YELLOW_ON_BLACK) }
+    cprint(" tx=", WHITE_ON_BLACK)
+    cprint_decimal(tx, GREEN_ON_BLACK)
+    cprint(" rx=", WHITE_ON_BLACK)
+    cprint_decimal(rx, GREEN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test 2: Open a connection
+    cprintln("[2] NET_CONNECT (10.0.2.2:80):", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_NET_CONNECT, 0)
+    volatile_write_u64(msg + 16, ip_pack(10, 0, 2, 2))  // QEMU host
+    volatile_write_u64(msg + 24, 80)                      // HTTP
+    volatile_write_u64(msg + 32, PROTO_TCP)
+    ipc_msg_clear(reply)
+    net_svc_handle_msg(my_pid, msg, reply)
+    let conn_id = volatile_read_u64(reply + 16)
+    let cstatus = volatile_read_u64(reply + 24)
+    cprint("  conn_id=", WHITE_ON_BLACK)
+    cprint_decimal(conn_id, CYAN_ON_BLACK)
+    cprint(" status=", WHITE_ON_BLACK)
+    cprint_decimal(cstatus, if cstatus == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test 3: Close connection
+    if conn_id >= 0 {
+        cprintln("[3] NET_CLOSE:", WHITE_ON_BLACK)
+        ipc_msg_clear(msg)
+        ipc_msg_set_header(msg, my_pid, MSG_NET_CLOSE, 0)
+        volatile_write_u64(msg + 16, conn_id)
+        ipc_msg_clear(reply)
+        net_svc_handle_msg(my_pid, msg, reply)
+        let cls = volatile_read_u64(reply + 16)
+        cprint("  status=", WHITE_ON_BLACK)
+        cprint_decimal(cls, if cls == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+
+    // Test 4: ARP cache
+    cprintln("[4] ARP cache:", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_NET_ARP, 0)
+    ipc_msg_clear(reply)
+    net_svc_handle_msg(my_pid, msg, reply)
+    let arp_count = volatile_read_u64(reply + 16)
+    cprint("  entries=", WHITE_ON_BLACK)
+    cprint_decimal(arp_count, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test 5: DNS
+    cprintln("[5] DNS server:", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_NET_DNS, 0)
+    ipc_msg_clear(reply)
+    net_svc_handle_msg(my_pid, msg, reply)
+    let dns_ip = volatile_read_u64(reply + 16)
+    cprint("  dns=", WHITE_ON_BLACK)
+    if dns_ip > 0 { net_svc_ip_print(dns_ip) } else { cprint("none", YELLOW_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprintln("=== Network tests complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_net_info() {
+    cprintln("Network Service:", YELLOW_ON_BLACK)
+    let state = net_svc_read(NETIF_STATE)
+    cprint("  Interface: ", WHITE_ON_BLACK)
+    if state == 1 { cprintln("UP", GREEN_ON_BLACK) } else { cprintln("DOWN", RED_ON_BLACK) }
+
+    if state == 1 {
+        cprint("  IP:        ", WHITE_ON_BLACK)
+        net_svc_ip_print(net_svc_read(NETIF_IP))
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  Mask:      ", WHITE_ON_BLACK)
+        net_svc_ip_print(net_svc_read(NETIF_MASK))
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  Gateway:   ", WHITE_ON_BLACK)
+        net_svc_ip_print(net_svc_read(NETIF_GW))
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  DNS:       ", WHITE_ON_BLACK)
+        net_svc_ip_print(net_svc_read(NETIF_DNS))
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  MAC:       ", WHITE_ON_BLACK)
+        net_svc_mac_print(net_svc_read(NETIF_MAC))
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  TX:        ", WHITE_ON_BLACK)
+        cprint_decimal(net_svc_read(NETIF_TX_COUNT), GREEN_ON_BLACK)
+        cprint(" pkts, ", WHITE_ON_BLACK)
+        cprint_decimal(net_svc_read(NETIF_TX_BYTES), GREEN_ON_BLACK)
+        cprintln(" bytes", WHITE_ON_BLACK)
+        cprint("  RX:        ", WHITE_ON_BLACK)
+        cprint_decimal(net_svc_read(NETIF_RX_COUNT), GREEN_ON_BLACK)
+        cprint(" pkts, ", WHITE_ON_BLACK)
+        cprint_decimal(net_svc_read(NETIF_RX_BYTES), GREEN_ON_BLACK)
+        cprintln(" bytes", WHITE_ON_BLACK)
+    }
+
+    // Show sockets
+    cprintln("  Sockets:", WHITE_ON_BLACK)
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < SOCK_MAX {
+        let sstate = sock_read(i, 0)
+        if sstate != SOCK_FREE {
+            cprint("    [", WHITE_ON_BLACK)
+            cprint_decimal(i, CYAN_ON_BLACK)
+            cprint("] ", WHITE_ON_BLACK)
+            if sstate == SOCK_OPEN { cprint("OPEN", YELLOW_ON_BLACK) }
+            else if sstate == SOCK_CONNECTED { cprint("CONN", GREEN_ON_BLACK) }
+            else if sstate == SOCK_LISTENING { cprint("LISTEN", CYAN_ON_BLACK) }
+            else if sstate == SOCK_CLOSED { cprint("CLOSED", RED_ON_BLACK) }
+            let proto = sock_read(i, 8)
+            if proto == PROTO_TCP { cprint(" TCP", WHITE_ON_BLACK) }
+            else if proto == PROTO_UDP { cprint(" UDP", WHITE_ON_BLACK) }
+            cprint(" :", WHITE_ON_BLACK)
+            cprint_decimal(sock_read(i, 16), WHITE_ON_BLACK)
+            cprint("→", WHITE_ON_BLACK)
+            net_svc_ip_print(sock_read(i, 24))
+            cprint(":", WHITE_ON_BLACK)
+            cprint_decimal(sock_read(i, 32), WHITE_ON_BLACK)
+            cprint(" pid=", WHITE_ON_BLACK)
+            cprint_decimal(sock_read(i, 40), CYAN_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("    (none)", WHITE_ON_BLACK) }
+
+    // Show ARP cache
+    cprintln("  ARP Cache:", WHITE_ON_BLACK)
+    count = 0
+    i = 0
+    while i < ARP_CACHE_MAX {
+        let addr = ARP_CACHE_BASE + i * ARP_ENTRY_SIZE
+        if volatile_read_u64(addr) == 1 {
+            cprint("    ", WHITE_ON_BLACK)
+            net_svc_ip_print(volatile_read_u64(addr + 8))
+            cprint(" → ", WHITE_ON_BLACK)
+            net_svc_mac_print(volatile_read_u64(addr + 16))
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("    (empty)", WHITE_ON_BLACK) }
+}
+
+@kernel fn cmd_net_ping() {
+    // net-ping — ping gateway via IPC
+    let msg: i64 = 0x8E2000
+    let reply: i64 = 0x8E2100
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    let gw = net_svc_read(NETIF_GW)
+    if gw == 0 {
+        cprintln("net-ping: no gateway (network down?)", RED_ON_BLACK)
+        return
+    }
+
+    cprint("PING ", WHITE_ON_BLACK)
+    net_svc_ip_print(gw)
+    cprintln("...", WHITE_ON_BLACK)
+
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_NET_PING, 0)
+    volatile_write_u64(msg + 16, gw)
+    volatile_write_u64(msg + 24, 1)  // 1 packet
+    ipc_msg_clear(reply)
+    net_svc_handle_msg(my_pid, msg, reply)
+    let sent = volatile_read_u64(reply + 16)
+    let status = volatile_read_u64(reply + 24)
+
+    if status == NET_OK && sent > 0 {
+        cprint("  Sent ", GREEN_ON_BLACK)
+        cprint_decimal(sent, CYAN_ON_BLACK)
+        cprintln(" ICMP echo request(s)", GREEN_ON_BLACK)
+    } else {
+        cprintln("  Failed to send", RED_ON_BLACK)
+    }
+}

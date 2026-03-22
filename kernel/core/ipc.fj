@@ -1,0 +1,984 @@
+// FajarOS Nova v2.0 — Microkernel IPC Core
+// Extracted from Sprint 1.2: ipc.fj, channel.fj, notify.fj, shm.fj
+// Core IPC primitives only — no shell commands, no tests, no benchmarks
+
+// ═══════════════════════════════════════════════════════════════
+// Section 1: IPC Endpoint Table
+// 16 endpoints x 512 bytes = 8KB at 0x8A0000
+//
+// Design: Synchronous rendezvous (L4/seL4 inspired)
+//   - Sender blocks until receiver calls recv
+//   - Receiver blocks until sender calls send
+//   - If partner already waiting -> immediate transfer (no queue)
+//   - CALL = send + wait_reply (atomic RPC)
+//   - REPLY = unblock caller with response
+//
+// Message format (64 bytes):
+//   src_pid(8) + msg_type(4) + msg_id(4) + payload(40) + reserved(8)
+// ═══════════════════════════════════════════════════════════════
+
+const IPC_EP_BASE: i64 = 0x8A0000
+const IPC_EP_SIZE: i64 = 576  // was 512: queue overflow fix (queue at +256, 4×72=288, ends at 544)
+const IPC_EP_MAX: i64 = 16    // 16 × 576 = 9216 bytes, end 0x8A2400
+const IPC_MSG_BYTES: i64 = 64
+
+// Endpoint fields (offsets)
+const EP_STATE: i64 = 0         // IPC state of this process
+const EP_PARTNER: i64 = 8       // PID we're waiting for (-1 = any)
+const EP_NOTIFY_PENDING: i64 = 16  // Notification bits (async)
+const EP_NOTIFY_MASK: i64 = 24     // Which notify bits to wake on
+const EP_CAP_BITS: i64 = 32        // Capability bitmap
+const EP_MSG_BUF: i64 = 40         // 64-byte message buffer
+const EP_REPLY_BUF: i64 = 104      // 64-byte reply buffer
+const EP_CALLER_PID: i64 = 168     // Who called us (for REPLY)
+const EP_SEND_COUNT: i64 = 176     // Stats: messages sent
+const EP_RECV_COUNT: i64 = 184     // Stats: messages received
+const EP_QUEUE_HEAD: i64 = 192
+const EP_QUEUE_TAIL: i64 = 200
+const EP_QUEUE_COUNT: i64 = 208
+const EP_QUEUE_BASE: i64 = 256     // 4 queued messages x 72 bytes (pid(8) + msg(64))
+
+// IPC states
+const IPC_IDLE: i64 = 0
+const IPC_SEND_BLOCKED: i64 = 1
+const IPC_RECV_BLOCKED: i64 = 2
+const IPC_CALL_BLOCKED: i64 = 3
+const IPC_REPLY_BLOCKED: i64 = 4
+
+// IPC queue constants
+const IPC_QUEUE_SLOTS: i64 = 4
+const IPC_QUEUE_ENTRY: i64 = 72    // pid(8) + msg(64)
+
+// IPC error codes
+const IPC_OK: i64 = 0
+const IPC_ERR_INVALID_PID: i64 = -1
+const IPC_ERR_QUEUE_FULL: i64 = -2
+const IPC_ERR_NO_MESSAGE: i64 = -3
+const IPC_ERR_NOT_CALLING: i64 = -4
+const IPC_ERR_NO_CAP: i64 = -5
+const IPC_ERR_DEAD_PROCESS: i64 = -6
+const IPC_ERR_WOULD_BLOCK: i64 = -7
+
+// ── Endpoint helpers ──
+
+@kernel fn ep_addr(pid: i64) -> i64 {
+    IPC_EP_BASE + pid * IPC_EP_SIZE
+}
+
+@kernel fn ep_read(pid: i64, field: i64) -> i64 {
+    volatile_read_u64(ep_addr(pid) + field)
+}
+
+@kernel fn ep_write(pid: i64, field: i64, val: i64) {
+    volatile_write_u64(ep_addr(pid) + field, val)
+}
+
+// ── Initialization ──
+
+@kernel fn ipc2_init() {
+    // Zero all endpoint structures
+    let mut i: i64 = 0
+    while i < IPC_EP_MAX * IPC_EP_SIZE {
+        volatile_write_u8(IPC_EP_BASE + i, 0)
+        i = i + 1
+    }
+
+    // Set default capabilities for PID 0 (kernel) — full access
+    ep_write(0, EP_CAP_BITS, -1)
+}
+
+// ── Message copy helpers ──
+
+@kernel fn ipc_msg_copy(dst: i64, src: i64) {
+    // Copy 64-byte message (8 x i64)
+    let mut i: i64 = 0
+    while i < IPC_MSG_BYTES {
+        volatile_write_u8(dst + i, volatile_read_u8(src + i))
+        i = i + 1
+    }
+}
+
+@kernel fn ipc_msg_clear(addr: i64) {
+    let mut i: i64 = 0
+    while i < IPC_MSG_BYTES {
+        volatile_write_u8(addr + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn ipc_msg_set_header(addr: i64, src_pid: i64, msg_type: i64, msg_id: i64) {
+    volatile_write_u64(addr, src_pid)
+    volatile_write_u32(addr + 8, msg_type)
+    volatile_write_u32(addr + 12, msg_id)
+}
+
+// ── Queue operations (for buffered async sends) ──
+
+@kernel fn ipc_queue_push(pid: i64, sender_pid: i64, msg_addr: i64) -> i64 {
+    let count = ep_read(pid, EP_QUEUE_COUNT)
+    if count >= IPC_QUEUE_SLOTS { return IPC_ERR_QUEUE_FULL }
+    let tail = ep_read(pid, EP_QUEUE_TAIL)
+    let entry_addr = ep_addr(pid) + EP_QUEUE_BASE + tail * IPC_QUEUE_ENTRY
+    volatile_write_u64(entry_addr, sender_pid)
+    ipc_msg_copy(entry_addr + 8, msg_addr)
+    ep_write(pid, EP_QUEUE_TAIL, (tail + 1) % IPC_QUEUE_SLOTS)
+    ep_write(pid, EP_QUEUE_COUNT, count + 1)
+    IPC_OK
+}
+
+@kernel fn ipc_queue_pop(pid: i64, out_sender: i64, out_msg: i64) -> i64 {
+    let count = ep_read(pid, EP_QUEUE_COUNT)
+    if count == 0 { return IPC_ERR_NO_MESSAGE }
+    let head = ep_read(pid, EP_QUEUE_HEAD)
+    let entry_addr = ep_addr(pid) + EP_QUEUE_BASE + head * IPC_QUEUE_ENTRY
+    volatile_write_u64(out_sender, volatile_read_u64(entry_addr))
+    ipc_msg_copy(out_msg, entry_addr + 8)
+    ep_write(pid, EP_QUEUE_HEAD, (head + 1) % IPC_QUEUE_SLOTS)
+    ep_write(pid, EP_QUEUE_COUNT, count - 1)
+    IPC_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ipc2_send(dst_pid, msg_addr) — Synchronous Send
+//
+// If receiver is RECV_BLOCKED waiting for us (or any):
+//   -> Direct transfer: copy msg to receiver's buffer, unblock both
+// Else:
+//   -> Queue message in receiver's queue, mark sender SEND_BLOCKED
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_send(dst_pid: i64, msg_addr: i64) -> i64 {
+    if dst_pid < 0 || dst_pid >= IPC_EP_MAX { return IPC_ERR_INVALID_PID }
+
+    let src_pid = volatile_read_u64(0x6FE00)  // current PID
+
+    // Check destination process is alive
+    let dst_state = proc_v2_get(dst_pid, 0)
+    if dst_state == PROC_STATE_FREE { return IPC_ERR_DEAD_PROCESS }
+
+    // Stamp source PID into message header
+    volatile_write_u64(msg_addr, src_pid)
+
+    // Check if receiver is already waiting for us
+    let recv_state = ep_read(dst_pid, EP_STATE)
+    let recv_partner = ep_read(dst_pid, EP_PARTNER)
+
+    if recv_state == IPC_RECV_BLOCKED && (recv_partner == src_pid || recv_partner == -1) {
+        // Direct transfer — receiver is waiting!
+        let dst_buf = ep_addr(dst_pid) + EP_MSG_BUF
+        ipc_msg_copy(dst_buf, msg_addr)
+
+        // Unblock receiver
+        ep_write(dst_pid, EP_STATE, IPC_IDLE)
+        ep_write(dst_pid, EP_PARTNER, -1)
+        proc_v2_set(dst_pid, 0, PROC_STATE_READY)
+
+        // Update stats
+        ep_write(src_pid, EP_SEND_COUNT, ep_read(src_pid, EP_SEND_COUNT) + 1)
+        ep_write(dst_pid, EP_RECV_COUNT, ep_read(dst_pid, EP_RECV_COUNT) + 1)
+
+        return IPC_OK
+    }
+
+    // Receiver not ready — queue the message
+    let qresult = ipc_queue_push(dst_pid, src_pid, msg_addr)
+    if qresult != IPC_OK { return qresult }
+
+    // Block sender until receiver picks it up
+    ep_write(src_pid, EP_STATE, IPC_SEND_BLOCKED)
+    ep_write(src_pid, EP_PARTNER, dst_pid)
+    proc_v2_set(src_pid, 0, PROC_STATE_BLOCKED)
+
+    // Update stats
+    ep_write(src_pid, EP_SEND_COUNT, ep_read(src_pid, EP_SEND_COUNT) + 1)
+
+    return IPC_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ipc2_recv(from_pid, buf_addr) — Synchronous Receive
+//
+// from_pid = -1 -> receive from any sender
+// from_pid >= 0 -> receive only from specific sender
+//
+// Check queue for matching message -> deliver immediately
+// If sender is SEND_BLOCKED for us -> direct transfer
+// Else -> mark receiver RECV_BLOCKED, wait
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_recv(from_pid: i64, buf_addr: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    // Check for queued messages first
+    let queue_count = ep_read(my_pid, EP_QUEUE_COUNT)
+    if queue_count > 0 {
+        // Temp storage for sender PID
+        let tmp_sender: i64 = ep_addr(my_pid) + EP_REPLY_BUF + 56  // borrow 8 bytes
+        let result = ipc_queue_pop(my_pid, tmp_sender, buf_addr)
+        if result == IPC_OK {
+            let sender = volatile_read_u64(tmp_sender)
+
+            // If sender is blocked waiting for us, unblock them
+            if ep_read(sender, EP_STATE) == IPC_SEND_BLOCKED {
+                let partner = ep_read(sender, EP_PARTNER)
+                if partner == my_pid {
+                    ep_write(sender, EP_STATE, IPC_IDLE)
+                    ep_write(sender, EP_PARTNER, -1)
+                    proc_v2_set(sender, 0, PROC_STATE_READY)
+                }
+            }
+
+            ep_write(my_pid, EP_RECV_COUNT, ep_read(my_pid, EP_RECV_COUNT) + 1)
+            return sender  // Return sender PID on success
+        }
+    }
+
+    // No queued messages — check if specific sender is blocked sending to us
+    if from_pid >= 0 && from_pid < IPC_EP_MAX {
+        if ep_read(from_pid, EP_STATE) == IPC_SEND_BLOCKED {
+            let partner = ep_read(from_pid, EP_PARTNER)
+            if partner == my_pid {
+                // Direct transfer from sender's message buffer
+                let src_buf = ep_addr(from_pid) + EP_MSG_BUF
+                ipc_msg_copy(buf_addr, src_buf)
+
+                // Unblock sender
+                ep_write(from_pid, EP_STATE, IPC_IDLE)
+                ep_write(from_pid, EP_PARTNER, -1)
+                proc_v2_set(from_pid, 0, PROC_STATE_READY)
+
+                ep_write(my_pid, EP_RECV_COUNT, ep_read(my_pid, EP_RECV_COUNT) + 1)
+                return from_pid
+            }
+        }
+    }
+
+    // No messages available — block receiver
+    ep_write(my_pid, EP_STATE, IPC_RECV_BLOCKED)
+    ep_write(my_pid, EP_PARTNER, from_pid)
+    proc_v2_set(my_pid, 0, PROC_STATE_BLOCKED)
+
+    return IPC_ERR_WOULD_BLOCK  // Scheduler will resume us later
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ipc2_call(dst_pid, msg_addr, reply_addr) — RPC
+//
+// Atomic send + wait_reply:
+//   1. Send message to dst (like ipc2_send)
+//   2. Block in CALL_BLOCKED state
+//   3. When server calls ipc2_reply, reply copied to reply_addr
+//   4. Caller unblocked with reply
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_call(dst_pid: i64, msg_addr: i64, reply_addr: i64) -> i64 {
+    if dst_pid < 0 || dst_pid >= IPC_EP_MAX { return IPC_ERR_INVALID_PID }
+
+    let src_pid = volatile_read_u64(0x6FE00)
+
+    // Check destination process is alive
+    let dst_state = proc_v2_get(dst_pid, 0)
+    if dst_state == PROC_STATE_FREE { return IPC_ERR_DEAD_PROCESS }
+
+    // Store reply buffer address in our endpoint
+    // (We use reply_buf field to hold the pointer for the kernel to write into)
+    ep_write(src_pid, EP_CALLER_PID, reply_addr)  // Reuse as reply target addr
+
+    // Stamp source PID
+    volatile_write_u64(msg_addr, src_pid)
+
+    // Check if receiver is already waiting
+    let recv_state = ep_read(dst_pid, EP_STATE)
+    let recv_partner = ep_read(dst_pid, EP_PARTNER)
+
+    if recv_state == IPC_RECV_BLOCKED && (recv_partner == src_pid || recv_partner == -1) {
+        // Direct transfer to receiver
+        let dst_buf = ep_addr(dst_pid) + EP_MSG_BUF
+        ipc_msg_copy(dst_buf, msg_addr)
+
+        // Tell receiver who called (so they can REPLY)
+        ep_write(dst_pid, EP_CALLER_PID, src_pid)
+
+        // Unblock receiver
+        ep_write(dst_pid, EP_STATE, IPC_IDLE)
+        ep_write(dst_pid, EP_PARTNER, -1)
+        proc_v2_set(dst_pid, 0, PROC_STATE_READY)
+    } else {
+        // Queue the message
+        let qresult = ipc_queue_push(dst_pid, src_pid, msg_addr)
+        if qresult != IPC_OK { return qresult }
+    }
+
+    // Block caller waiting for reply
+    ep_write(src_pid, EP_STATE, IPC_CALL_BLOCKED)
+    ep_write(src_pid, EP_PARTNER, dst_pid)
+    proc_v2_set(src_pid, 0, PROC_STATE_BLOCKED)
+
+    // Stats
+    ep_write(src_pid, EP_SEND_COUNT, ep_read(src_pid, EP_SEND_COUNT) + 1)
+
+    return IPC_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ipc2_reply(caller_pid, reply_addr) — Reply to CALL
+//
+// Server sends reply back to caller:
+//   1. Verify caller is in CALL_BLOCKED state
+//   2. Copy reply message to caller's reply buffer
+//   3. Unblock caller
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_reply(caller_pid: i64, reply_addr: i64) -> i64 {
+    if caller_pid < 0 || caller_pid >= IPC_EP_MAX { return IPC_ERR_INVALID_PID }
+
+    // Verify caller is actually waiting for a reply
+    let caller_state = ep_read(caller_pid, EP_STATE)
+    if caller_state != IPC_CALL_BLOCKED { return IPC_ERR_NOT_CALLING }
+
+    // Copy reply to caller's reply buffer
+    let reply_target = ep_read(caller_pid, EP_CALLER_PID)  // We stored reply_addr here
+    let caller_reply_buf = ep_addr(caller_pid) + EP_REPLY_BUF
+    ipc_msg_copy(caller_reply_buf, reply_addr)
+
+    // Stamp source in reply
+    let my_pid = volatile_read_u64(0x6FE00)
+    volatile_write_u64(caller_reply_buf, my_pid)
+
+    // Unblock caller
+    ep_write(caller_pid, EP_STATE, IPC_IDLE)
+    ep_write(caller_pid, EP_PARTNER, -1)
+    proc_v2_set(caller_pid, 0, PROC_STATE_READY)
+
+    // Stats
+    ep_write(my_pid, EP_SEND_COUNT, ep_read(my_pid, EP_SEND_COUNT) + 1)
+    ep_write(caller_pid, EP_RECV_COUNT, ep_read(caller_pid, EP_RECV_COUNT) + 1)
+
+    return IPC_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 2: Named Channels — Service Discovery
+// 32 channels x 64 bytes = 2KB at 0x8A8000
+//
+// Per channel entry (64 bytes):
+//   +0:  name[32]   — ASCII name (null-terminated)
+//   +32: pid        — owner PID
+//   +40: flags      — CHAN_ACTIVE, CHAN_EXCLUSIVE, etc.
+//   +48: ref_count  — number of clients using this channel
+//   +56: reserved
+//
+// Usage:
+//   Server: channel_register("vfs", my_pid)
+//   Client: pid = channel_lookup("vfs")
+//   Client: ipc2_call(pid, msg, reply)
+// ═══════════════════════════════════════════════════════════════
+
+const CHAN_TABLE: i64 = 0x8A8000
+const CHAN_MAX: i64 = 32
+const CHAN_ENTRY_SIZE: i64 = 64
+const CHAN_NAME_LEN: i64 = 32
+
+// Channel flags
+const CHAN_FLAG_ACTIVE: i64 = 1
+const CHAN_FLAG_EXCLUSIVE: i64 = 2  // Only one client at a time
+
+// Channel error codes
+const CHAN_OK: i64 = 0
+const CHAN_ERR_FULL: i64 = -1
+const CHAN_ERR_NOT_FOUND: i64 = -2
+const CHAN_ERR_EXISTS: i64 = -3
+const CHAN_ERR_NAME_TOO_LONG: i64 = -4
+
+@kernel fn channel_init() {
+    let mut i: i64 = 0
+    while i < CHAN_MAX * CHAN_ENTRY_SIZE {
+        volatile_write_u8(CHAN_TABLE + i, 0)
+        i = i + 1
+    }
+}
+
+// ── String helpers for channel names ──
+
+@kernel fn chan_name_match(entry_addr: i64, name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < CHAN_NAME_LEN {
+        let a = volatile_read_u8(entry_addr + i)
+        let b = volatile_read_u8(name_addr + i)
+        if a != b { return 0 }
+        if a == 0 { return 1 }  // Both null — match
+        i = i + 1
+    }
+    1  // All 32 chars match
+}
+
+@kernel fn chan_name_copy(dst: i64, src: i64) {
+    let mut i: i64 = 0
+    while i < CHAN_NAME_LEN {
+        let ch = volatile_read_u8(src + i)
+        volatile_write_u8(dst + i, ch)
+        if ch == 0 { return }
+        i = i + 1
+    }
+    volatile_write_u8(dst + CHAN_NAME_LEN - 1, 0)  // Ensure null-terminated
+}
+
+@kernel fn chan_name_len(addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < CHAN_NAME_LEN {
+        if volatile_read_u8(addr + i) == 0 { return i }
+        i = i + 1
+    }
+    CHAN_NAME_LEN
+}
+
+// ── Channel operations ──
+
+@kernel fn channel_register(name_addr: i64, pid: i64) -> i64 {
+    // Check name length
+    let nlen = chan_name_len(name_addr)
+    if nlen == 0 || nlen >= CHAN_NAME_LEN { return CHAN_ERR_NAME_TOO_LONG }
+
+    // Check for duplicate
+    let mut i: i64 = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) != 0 {
+            if chan_name_match(entry, name_addr) == 1 {
+                return CHAN_ERR_EXISTS
+            }
+        }
+        i = i + 1
+    }
+
+    // Find free slot
+    i = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) == 0 {
+            chan_name_copy(entry, name_addr)
+            volatile_write_u64(entry + 32, pid)
+            volatile_write_u64(entry + 40, CHAN_FLAG_ACTIVE)
+            volatile_write_u64(entry + 48, 0)  // ref_count
+            return i  // Return channel ID
+        }
+        i = i + 1
+    }
+
+    CHAN_ERR_FULL
+}
+
+@kernel fn channel_lookup(name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) != 0 {
+            if chan_name_match(entry, name_addr) == 1 {
+                // Increment ref count
+                let refs = volatile_read_u64(entry + 48)
+                volatile_write_u64(entry + 48, refs + 1)
+                return volatile_read_u64(entry + 32)  // Return PID
+            }
+        }
+        i = i + 1
+    }
+    CHAN_ERR_NOT_FOUND
+}
+
+@kernel fn channel_unregister(name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) != 0 {
+            if chan_name_match(entry, name_addr) == 1 {
+                // Clear entry
+                let mut j: i64 = 0
+                while j < CHAN_ENTRY_SIZE {
+                    volatile_write_u8(entry + j, 0)
+                    j = j + 1
+                }
+                return CHAN_OK
+            }
+        }
+        i = i + 1
+    }
+    CHAN_ERR_NOT_FOUND
+}
+
+@kernel fn channel_get_pid(channel_id: i64) -> i64 {
+    if channel_id < 0 || channel_id >= CHAN_MAX { return -1 }
+    let entry = CHAN_TABLE + channel_id * CHAN_ENTRY_SIZE
+    let flags = volatile_read_u64(entry + 40)
+    if (flags & CHAN_FLAG_ACTIVE) == 0 { return -1 }
+    volatile_read_u64(entry + 32)
+}
+
+// ── Helper: write string to address ──
+
+@kernel fn write_str_to(addr: i64, s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64, len: i64) {
+    if len > 0 { volatile_write_u8(addr, s0) }
+    if len > 1 { volatile_write_u8(addr + 1, s1) }
+    if len > 2 { volatile_write_u8(addr + 2, s2) }
+    if len > 3 { volatile_write_u8(addr + 3, s3) }
+    if len > 4 { volatile_write_u8(addr + 4, s4) }
+    if len > 5 { volatile_write_u8(addr + 5, s5) }
+    if len > 6 { volatile_write_u8(addr + 6, s6) }
+    if len > 7 { volatile_write_u8(addr + 7, s7) }
+    volatile_write_u8(addr + len, 0)
+}
+
+@kernel fn channel_register_builtin_services() {
+    // Pre-register well-known service channels
+    // These will be claimed by actual services when they start
+
+    // "vfs" — Virtual File System
+    let buf: i64 = 0x8A9000  // Scratch buffer for channel names
+    volatile_write_u8(buf, 118)  // v
+    volatile_write_u8(buf + 1, 102)  // f
+    volatile_write_u8(buf + 2, 115)  // s
+    volatile_write_u8(buf + 3, 0)
+    channel_register(buf, 3)  // Default VFS PID = 3
+
+    // "blk" — Block Device Service
+    volatile_write_u8(buf, 98)   // b
+    volatile_write_u8(buf + 1, 108)  // l
+    volatile_write_u8(buf + 2, 107)  // k
+    volatile_write_u8(buf + 3, 0)
+    channel_register(buf, 2)  // Default BLK PID = 2
+
+    // "net" — Network Service
+    volatile_write_u8(buf, 110)  // n
+    volatile_write_u8(buf + 1, 101)  // e
+    volatile_write_u8(buf + 2, 116)  // t
+    volatile_write_u8(buf + 3, 0)
+    channel_register(buf, 4)  // Default NET PID = 4
+
+    // "shell" — Shell Service
+    volatile_write_u8(buf, 115)  // s
+    volatile_write_u8(buf + 1, 104)  // h
+    volatile_write_u8(buf + 2, 101)  // e
+    volatile_write_u8(buf + 3, 108)  // l
+    volatile_write_u8(buf + 4, 108)  // l
+    volatile_write_u8(buf + 5, 0)
+    channel_register(buf, 5)  // Default Shell PID = 5
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 3: Async Notifications (seL4-inspired)
+//
+// Each process has a 64-bit notification word in its IPC endpoint.
+// notify(dst, bits) — OR bits into dst's notify_pending (non-blocking)
+// wait_notify(mask) — block until (notify_pending & mask) != 0
+// poll_notify(mask) — non-blocking check, returns pending & mask
+//
+// Use cases:
+//   - IRQ forwarding: kernel notifies driver (bit per IRQ)
+//   - Wakeup signal: timer fires, notify sleeping process
+//   - Event flag: "data ready" between cooperating services
+// ═══════════════════════════════════════════════════════════════
+
+// Notification bit definitions (well-known)
+const NOTIFY_IRQ_0: i64 = 1          // bit 0: IRQ event
+const NOTIFY_IRQ_1: i64 = 2          // bit 1: second IRQ
+const NOTIFY_IRQ_2: i64 = 4          // bit 2: third IRQ
+const NOTIFY_IRQ_3: i64 = 8          // bit 3: fourth IRQ
+const NOTIFY_TIMER: i64 = 16         // bit 4: timer event
+const NOTIFY_DATA_READY: i64 = 32    // bit 5: data available
+const NOTIFY_CHILD_EXIT: i64 = 64    // bit 6: child process exited
+const NOTIFY_NET_RX: i64 = 128       // bit 7: network packet received
+const NOTIFY_DISK_DONE: i64 = 256    // bit 8: disk I/O complete
+const NOTIFY_USER_0: i64 = 0x10000   // bit 16+: user-defined
+
+// ── Core notification operations ──
+
+@kernel fn ipc2_notify(dst_pid: i64, bits: i64) -> i64 {
+    if dst_pid < 0 || dst_pid >= IPC_EP_MAX { return IPC_ERR_INVALID_PID }
+
+    // Check process is alive
+    let proc_state = proc_v2_get(dst_pid, 0)
+    if proc_state == PROC_STATE_FREE { return IPC_ERR_DEAD_PROCESS }
+
+    // OR bits into pending notifications (atomic-like for single-core)
+    let pending = ep_read(dst_pid, EP_NOTIFY_PENDING)
+    ep_write(dst_pid, EP_NOTIFY_PENDING, pending | bits)
+
+    // If target is blocked waiting for notifications, check mask
+    let ipc_state = ep_read(dst_pid, EP_STATE)
+    if ipc_state == IPC_RECV_BLOCKED {
+        let mask = ep_read(dst_pid, EP_NOTIFY_MASK)
+        if mask != 0 && ((pending | bits) & mask) != 0 {
+            // Wake the process — notification matches mask
+            ep_write(dst_pid, EP_STATE, IPC_IDLE)
+            ep_write(dst_pid, EP_PARTNER, -1)
+            ep_write(dst_pid, EP_NOTIFY_MASK, 0)
+            proc_v2_set(dst_pid, 0, PROC_STATE_READY)
+        }
+    }
+
+    IPC_OK
+}
+
+@kernel fn ipc2_wait_notify(mask: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    // Check if any matching bits already pending
+    let pending = ep_read(my_pid, EP_NOTIFY_PENDING)
+    let matched = pending & mask
+    if matched != 0 {
+        // Clear consumed bits and return them
+        ep_write(my_pid, EP_NOTIFY_PENDING, pending & (-1 ^ matched))
+        return matched
+    }
+
+    // No match — block waiting for notification
+    ep_write(my_pid, EP_NOTIFY_MASK, mask)
+    ep_write(my_pid, EP_STATE, IPC_RECV_BLOCKED)
+    ep_write(my_pid, EP_PARTNER, -1)
+    proc_v2_set(my_pid, 0, PROC_STATE_BLOCKED)
+
+    return IPC_ERR_WOULD_BLOCK  // Will be resumed by notify
+}
+
+@kernel fn ipc2_poll_notify(mask: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+    let pending = ep_read(my_pid, EP_NOTIFY_PENDING)
+    let matched = pending & mask
+    if matched != 0 {
+        // Clear consumed bits
+        ep_write(my_pid, EP_NOTIFY_PENDING, pending & (-1 ^ matched))
+        return matched
+    }
+    0  // No notifications pending
+}
+
+// ── IRQ-to-notification bridge ──
+// Maps hardware IRQs to notification bits for driver processes
+
+const IRQ_NOTIFY_TABLE: i64 = 0x8A9100  // 256 IRQs x 16 bytes (pid + bits)
+
+@kernel fn irq_notify_init() {
+    let mut i: i64 = 0
+    while i < 256 * 16 {
+        volatile_write_u8(IRQ_NOTIFY_TABLE + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn irq_notify_register(irq: i64, pid: i64, bits: i64) {
+    if irq < 0 || irq >= 256 { return }
+    let entry = IRQ_NOTIFY_TABLE + irq * 16
+    volatile_write_u64(entry, pid)
+    volatile_write_u64(entry + 8, bits)
+}
+
+@kernel fn irq_notify_fire(irq: i64) {
+    // Called from ISR — notify the registered driver
+    if irq < 0 || irq >= 256 { return }
+    let entry = IRQ_NOTIFY_TABLE + irq * 16
+    let pid = volatile_read_u64(entry)
+    let bits = volatile_read_u64(entry + 8)
+    if pid > 0 && bits != 0 {
+        ipc2_notify(pid, bits)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 4: Shared Memory + Zero-Copy IPC
+// 32 regions x 64 bytes = 2KB at 0x8AA000
+//
+// Per region (64 bytes):
+//   +0:  state        — SHM_FREE(0), SHM_ACTIVE(1)
+//   +8:  owner_pid    — creator
+//   +16: guest_pid    — who else has access (-1 = unmapped)
+//   +24: phys_base    — physical frame base address
+//   +32: size         — size in bytes (page-aligned)
+//   +40: owner_vaddr  — virtual address in owner's space
+//   +48: guest_vaddr  — virtual address in guest's space
+//   +56: flags        — SHM_READ, SHM_WRITE
+//
+// Usage (zero-copy IPC for large data):
+//   Server:  region = shm_create(4096)
+//   Server:  shm_share(region, client_pid)
+//   Server:  -> writes data to shared region
+//   Server:  -> sends IPC msg with region_id + offset + length
+//   Client:  -> reads directly from mapped region (zero copy!)
+//   Client:  -> sends reply
+//   Server:  shm_destroy(region)
+// ═══════════════════════════════════════════════════════════════
+
+const SHM_TABLE: i64 = 0x8AB000  // was 0x8AA000 — overlap fix with IRQ_NOTIFY_TABLE
+const SHM_MAX: i64 = 32
+const SHM_ENTRY_SIZE: i64 = 64
+
+// SHM virtual address base — each region gets 64KB of virtual space
+// Owner mapped at SHM_VADDR_BASE + region_id * SHM_VADDR_STRIDE
+// Guest mapped at SHM_VADDR_BASE + SHM_MAX * SHM_VADDR_STRIDE + region_id * SHM_VADDR_STRIDE
+const SHM_VADDR_BASE: i64 = 0xA000000   // 160 MB
+const SHM_VADDR_STRIDE: i64 = 0x10000   // 64 KB per region
+
+// SHM states
+const SHM_FREE: i64 = 0
+const SHM_ACTIVE: i64 = 1
+
+// SHM flags
+const SHM_FLAG_READ: i64 = 1
+const SHM_FLAG_WRITE: i64 = 2
+const SHM_FLAG_RW: i64 = 3
+
+// SHM error codes
+const SHM_OK: i64 = 0
+const SHM_ERR_FULL: i64 = -1
+const SHM_ERR_INVALID: i64 = -2
+const SHM_ERR_NOT_OWNER: i64 = -3
+const SHM_ERR_ALREADY_MAPPED: i64 = -4
+const SHM_ERR_NO_MEMORY: i64 = -5
+
+// Message types for zero-copy protocol
+const MSG_SHM_TRANSFER: i64 = 0x0600
+const MSG_SHM_ACK: i64 = 0x06FF
+
+// ── SHM entry helpers ──
+
+@kernel fn shm_addr(id: i64) -> i64 {
+    SHM_TABLE + id * SHM_ENTRY_SIZE
+}
+
+@kernel fn shm_read(id: i64, field: i64) -> i64 {
+    volatile_read_u64(shm_addr(id) + field)
+}
+
+@kernel fn shm_write(id: i64, field: i64, val: i64) {
+    volatile_write_u64(shm_addr(id) + field, val)
+}
+
+// ── Initialization ──
+
+@kernel fn shm_init() {
+    let mut i: i64 = 0
+    while i < SHM_MAX * SHM_ENTRY_SIZE {
+        volatile_write_u8(SHM_TABLE + i, 0)
+        i = i + 1
+    }
+}
+
+// ── Core operations ──
+
+@kernel fn shm_create(size: i64) -> i64 {
+    // Align size to page boundary (4KB)
+    let aligned = (size + FRAME_SIZE - 1) / FRAME_SIZE * FRAME_SIZE
+    if aligned <= 0 { return SHM_ERR_INVALID }
+
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    // Find free slot
+    let mut id: i64 = 0
+    while id < SHM_MAX {
+        if shm_read(id, 0) == SHM_FREE {
+            // Allocate physical frames
+            let num_pages = aligned / FRAME_SIZE
+            let first_frame = frame_alloc()
+            if first_frame == -1 { return SHM_ERR_NO_MEMORY }
+            let phys_base = first_frame * FRAME_SIZE
+
+            // Allocate remaining frames (contiguous)
+            let mut pg: i64 = 1
+            while pg < num_pages {
+                let f = frame_alloc()
+                if f == -1 {
+                    // Rollback: free already allocated frames
+                    let mut j: i64 = 0
+                    while j < pg {
+                        frame_free(first_frame + j)
+                        j = j + 1
+                    }
+                    return SHM_ERR_NO_MEMORY
+                }
+                pg = pg + 1
+            }
+
+            // Map into owner's address space
+            let owner_vaddr = SHM_VADDR_BASE + id * SHM_VADDR_STRIDE
+            pg = 0
+            while pg < num_pages {
+                map_page(
+                    owner_vaddr + pg * FRAME_SIZE,
+                    phys_base + pg * FRAME_SIZE,
+                    PAGE_PRESENT | PAGE_WRITABLE
+                )
+                pg = pg + 1
+            }
+
+            // Record in table
+            shm_write(id, 0, SHM_ACTIVE)
+            shm_write(id, 8, my_pid)
+            shm_write(id, 16, -1)  // No guest yet
+            shm_write(id, 24, phys_base)
+            shm_write(id, 32, aligned)
+            shm_write(id, 40, owner_vaddr)
+            shm_write(id, 48, 0)  // No guest vaddr yet
+            shm_write(id, 56, SHM_FLAG_RW)
+
+            return id
+        }
+        id = id + 1
+    }
+
+    SHM_ERR_FULL
+}
+
+@kernel fn shm_share(region_id: i64, guest_pid: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return SHM_ERR_INVALID }
+    if shm_read(region_id, 0) != SHM_ACTIVE { return SHM_ERR_INVALID }
+
+    // Check ownership
+    let my_pid = volatile_read_u64(0x6FE00)
+    let owner = shm_read(region_id, 8)
+    if owner != my_pid { return SHM_ERR_NOT_OWNER }
+
+    // Check not already shared
+    let current_guest = shm_read(region_id, 16)
+    if current_guest >= 0 { return SHM_ERR_ALREADY_MAPPED }
+
+    // Check guest process exists
+    if guest_pid < 0 || guest_pid >= IPC_EP_MAX { return SHM_ERR_INVALID }
+    let guest_state = proc_v2_get(guest_pid, 0)
+    if guest_state == PROC_STATE_FREE { return SHM_ERR_INVALID }
+
+    // Map into guest's address space
+    let phys_base = shm_read(region_id, 24)
+    let size = shm_read(region_id, 32)
+    let num_pages = size / FRAME_SIZE
+    let guest_vaddr = SHM_VADDR_BASE + SHM_MAX * SHM_VADDR_STRIDE + region_id * SHM_VADDR_STRIDE
+
+    let mut pg: i64 = 0
+    while pg < num_pages {
+        map_page(
+            guest_vaddr + pg * FRAME_SIZE,
+            phys_base + pg * FRAME_SIZE,
+            PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER
+        )
+        pg = pg + 1
+    }
+
+    // Update table
+    shm_write(region_id, 16, guest_pid)
+    shm_write(region_id, 48, guest_vaddr)
+
+    guest_vaddr  // Return mapped address in guest space
+}
+
+@kernel fn shm_unshare(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return SHM_ERR_INVALID }
+    if shm_read(region_id, 0) != SHM_ACTIVE { return SHM_ERR_INVALID }
+
+    let guest_pid = shm_read(region_id, 16)
+    if guest_pid < 0 { return SHM_OK }  // Already unshared
+
+    // Unmap from guest
+    let guest_vaddr = shm_read(region_id, 48)
+    let size = shm_read(region_id, 32)
+    let num_pages = size / FRAME_SIZE
+    let mut pg: i64 = 0
+    while pg < num_pages {
+        unmap_page(guest_vaddr + pg * FRAME_SIZE)
+        pg = pg + 1
+    }
+
+    shm_write(region_id, 16, -1)
+    shm_write(region_id, 48, 0)
+
+    SHM_OK
+}
+
+@kernel fn shm_destroy(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return SHM_ERR_INVALID }
+    if shm_read(region_id, 0) != SHM_ACTIVE { return SHM_ERR_INVALID }
+
+    let my_pid = volatile_read_u64(0x6FE00)
+    let owner = shm_read(region_id, 8)
+    if owner != my_pid { return SHM_ERR_NOT_OWNER }
+
+    // Unshare guest first
+    shm_unshare(region_id)
+
+    // Unmap from owner
+    let owner_vaddr = shm_read(region_id, 40)
+    let phys_base = shm_read(region_id, 24)
+    let size = shm_read(region_id, 32)
+    let num_pages = size / FRAME_SIZE
+    let mut pg: i64 = 0
+    while pg < num_pages {
+        unmap_page(owner_vaddr + pg * FRAME_SIZE)
+        frame_free((phys_base / FRAME_SIZE) + pg)
+        pg = pg + 1
+    }
+
+    // Clear entry
+    let mut i: i64 = 0
+    while i < SHM_ENTRY_SIZE {
+        volatile_write_u8(shm_addr(region_id) + i, 0)
+        i = i + 1
+    }
+
+    SHM_OK
+}
+
+@kernel fn shm_get_owner_vaddr(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return -1 }
+    shm_read(region_id, 40)
+}
+
+@kernel fn shm_get_guest_vaddr(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return -1 }
+    shm_read(region_id, 48)
+}
+
+@kernel fn shm_get_size(region_id: i64) -> i64 {
+    if region_id < 0 || region_id >= SHM_MAX { return -1 }
+    shm_read(region_id, 32)
+}
+
+@kernel fn ipc2_send_zerocopy(dst_pid: i64, data_addr: i64, data_len: i64, msg_type: i64) -> i64 {
+    // Create shared region
+    let region = shm_create(data_len)
+    if region < 0 { return region }
+
+    // Share with destination
+    let guest_vaddr = shm_share(region, dst_pid)
+    if guest_vaddr < 0 {
+        shm_destroy(region)
+        return guest_vaddr
+    }
+
+    // Copy data into shared region
+    let owner_vaddr = shm_read(region, 40)
+    let mut i: i64 = 0
+    while i < data_len {
+        volatile_write_u8(owner_vaddr + i, volatile_read_u8(data_addr + i))
+        i = i + 1
+    }
+
+    // Build IPC message with shared region info
+    // Payload: region_id(8) + guest_vaddr(8) + length(8) + msg_type(8) + reserved(8)
+    let msg_buf: i64 = 0x8A9200  // Scratch buffer
+    ipc_msg_clear(msg_buf)
+    let my_pid = volatile_read_u64(0x6FE00)
+    ipc_msg_set_header(msg_buf, my_pid, MSG_SHM_TRANSFER, 0)
+    volatile_write_u64(msg_buf + 16, region)      // region_id in payload[0]
+    volatile_write_u64(msg_buf + 24, guest_vaddr)  // vaddr in payload[8]
+    volatile_write_u64(msg_buf + 32, data_len)     // length in payload[16]
+    volatile_write_u64(msg_buf + 40, msg_type)     // original msg_type in payload[24]
+
+    // Send via IPC
+    let result = ipc2_send(dst_pid, msg_buf)
+    if result != IPC_OK {
+        shm_destroy(region)
+        return result
+    }
+
+    region  // Return region_id so caller can destroy after reply
+}

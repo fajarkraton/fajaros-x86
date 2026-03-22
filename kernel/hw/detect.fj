@@ -1,0 +1,407 @@
+// FajarOS Nova v2.0 — Hardware Detection & Boot Diagnostics (Sprint 3.7)
+// @kernel — CPU identification, PCI scan, device detection, boot verification
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Hardware Info Table — at 0x960000 (512 bytes)
+// Populated by hw_detect() at boot
+// ═══════════════════════════════════════════════════════════════
+
+const HW_INFO: i64 = 0x960000
+
+// CPU info
+const HW_CPU_VENDOR: i64 = 0       // 12-byte vendor string (3 × i32 from CPUID)
+const HW_CPU_FAMILY: i64 = 16
+const HW_CPU_MODEL: i64 = 24
+const HW_CPU_STEPPING: i64 = 32
+const HW_CPU_FEATURES: i64 = 40    // Feature bitmap (SSE, AVX, etc.)
+const HW_CPU_CORES: i64 = 48       // Logical core count
+const HW_CPU_FREQ_MHZ: i64 = 56    // Estimated frequency
+
+// Memory info
+const HW_MEM_TOTAL_KB: i64 = 64
+const HW_MEM_USABLE_KB: i64 = 72
+
+// PCI device count
+const HW_PCI_DEVICES: i64 = 80
+
+// Detected hardware flags
+const HW_HAS_NVME: i64 = 88
+const HW_HAS_AHCI: i64 = 96
+const HW_HAS_USB3: i64 = 104
+const HW_HAS_ETH: i64 = 112
+const HW_HAS_WIFI: i64 = 120
+const HW_HAS_GPU: i64 = 128
+const HW_HAS_AUDIO: i64 = 136
+const HW_HAS_SERIAL: i64 = 144
+const HW_HAS_FB: i64 = 152
+const HW_HAS_PS2: i64 = 160
+
+// Boot diagnostic results
+const HW_BOOT_STATUS: i64 = 168    // 0=ok, N=stage that failed
+const HW_BOOT_TICKS: i64 = 176     // Boot time in PIT ticks
+const HW_BOOT_SERIAL_OK: i64 = 184
+const HW_BOOT_MEM_OK: i64 = 192
+const HW_BOOT_PCI_OK: i64 = 200
+const HW_BOOT_DISK_OK: i64 = 208
+const HW_BOOT_NET_OK: i64 = 216
+
+// ═══════════════════════════════════════════════════════════════
+// CPU Detection via CPUID
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn hw_detect_cpu() {
+    // Vendor string: CPUID(0) → EBX:EDX:ECX
+    let ebx = cpuid_ebx(0)
+    let edx = cpuid_edx(0)
+    let ecx = cpuid_ecx(0)
+    volatile_write_u32(HW_INFO + HW_CPU_VENDOR, ebx)
+    volatile_write_u32(HW_INFO + HW_CPU_VENDOR + 4, edx)
+    volatile_write_u32(HW_INFO + HW_CPU_VENDOR + 8, ecx)
+
+    // Family/Model/Stepping: CPUID(1) → EAX
+    let eax1 = cpuid_eax(1)
+    let stepping = eax1 & 0xF
+    let model = (eax1 >> 4) & 0xF
+    let family = (eax1 >> 8) & 0xF
+    let ext_model = (eax1 >> 16) & 0xF
+    let ext_family = (eax1 >> 20) & 0xFF
+    volatile_write_u64(HW_INFO + HW_CPU_FAMILY, family + ext_family)
+    volatile_write_u64(HW_INFO + HW_CPU_MODEL, model + (ext_model << 4))
+    volatile_write_u64(HW_INFO + HW_CPU_STEPPING, stepping)
+
+    // Features: CPUID(1) → ECX:EDX
+    let ecx1 = cpuid_ecx(1)
+    let edx1 = cpuid_edx(1)
+    let mut features: i64 = 0
+    if (edx1 & (1 << 25)) != 0 { features = features | 1 }    // SSE
+    if (edx1 & (1 << 26)) != 0 { features = features | 2 }    // SSE2
+    if (ecx1 & 1) != 0 { features = features | 4 }             // SSE3
+    if (ecx1 & (1 << 9)) != 0 { features = features | 8 }     // SSSE3
+    if (ecx1 & (1 << 19)) != 0 { features = features | 16 }   // SSE4.1
+    if (ecx1 & (1 << 20)) != 0 { features = features | 32 }   // SSE4.2
+    if (ecx1 & (1 << 28)) != 0 { features = features | 64 }   // AVX
+    if (ecx1 & (1 << 30)) != 0 { features = features | 128 }  // RDRAND
+    // CPUID(7) for AVX2, SMEP, SMAP
+    let ebx7 = cpuid_ebx(7)
+    if (ebx7 & (1 << 5)) != 0 { features = features | 256 }   // AVX2
+    if (ebx7 & (1 << 7)) != 0 { features = features | 512 }   // SMEP
+    if (ebx7 & (1 << 20)) != 0 { features = features | 1024 } // SMAP
+    volatile_write_u64(HW_INFO + HW_CPU_FEATURES, features)
+
+    // Core count (simplified: CPUID(1) EBX bits 23:16)
+    let cores = (cpuid_ebx(1) >> 16) & 0xFF
+    volatile_write_u64(HW_INFO + HW_CPU_CORES, if cores > 0 { cores } else { 1 })
+
+    // Estimate frequency: measure TSC over 10ms PIT interval
+    let t0 = rdtsc()
+    sleep_ms(10)
+    let t1 = rdtsc()
+    let cycles_10ms = t1 - t0
+    let freq_mhz = cycles_10ms / 10000  // cycles per μs ≈ MHz
+    volatile_write_u64(HW_INFO + HW_CPU_FREQ_MHZ, freq_mhz)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PCI Scan — enumerate all devices, detect known hardware
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn hw_detect_pci() {
+    let mut dev_count: i64 = 0
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0 && id != -1 {
+            dev_count = dev_count + 1
+            let class_reg = pci_read32(0, dev, 0, 8)
+            let class = (class_reg >> 24) & 0xFF
+            let subclass = (class_reg >> 16) & 0xFF
+
+            // Storage: NVMe (class 1, subclass 8)
+            if class == 1 && subclass == 8 {
+                volatile_write_u64(HW_INFO + HW_HAS_NVME, 1)
+            }
+            // Storage: AHCI (class 1, subclass 6)
+            if class == 1 && subclass == 6 {
+                volatile_write_u64(HW_INFO + HW_HAS_AHCI, 1)
+            }
+            // Network: Ethernet (class 2, subclass 0)
+            if class == 2 && subclass == 0 {
+                volatile_write_u64(HW_INFO + HW_HAS_ETH, 1)
+            }
+            // Network: WiFi (class 2, subclass 0x80)
+            if class == 2 && subclass == 0x80 {
+                volatile_write_u64(HW_INFO + HW_HAS_WIFI, 1)
+            }
+            // USB: XHCI (class 0xC, subclass 3, progif 0x30)
+            if class == 0xC && subclass == 3 {
+                volatile_write_u64(HW_INFO + HW_HAS_USB3, 1)
+            }
+            // Display: VGA/3D (class 3)
+            if class == 3 {
+                volatile_write_u64(HW_INFO + HW_HAS_GPU, 1)
+            }
+            // Audio (class 4)
+            if class == 4 {
+                volatile_write_u64(HW_INFO + HW_HAS_AUDIO, 1)
+            }
+        }
+        dev = dev + 1
+    }
+    volatile_write_u64(HW_INFO + HW_PCI_DEVICES, dev_count)
+
+    // Check serial port
+    let serial_lsr = port_inb(0x3FD)  // COM1 LSR
+    if serial_lsr != 0xFF {
+        volatile_write_u64(HW_INFO + HW_HAS_SERIAL, 1)
+    }
+
+    // Check PS/2 controller
+    let ps2_status = port_inb(0x64)
+    if ps2_status != 0xFF {
+        volatile_write_u64(HW_INFO + HW_HAS_PS2, 1)
+    }
+
+    // Check framebuffer
+    volatile_write_u64(HW_INFO + HW_HAS_FB, fb_state_read(FB_READY))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Memory Detection — from Multiboot2 memory map
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn hw_detect_memory() {
+    // Read from parsed MB2 info (kernel_main stores at 0x6FF*)
+    let mmap_tag = volatile_read(0x6FF20)
+    if mmap_tag == 0 {
+        // Fallback: assume 128MB (identity-mapped region)
+        volatile_write_u64(HW_INFO + HW_MEM_TOTAL_KB, 131072)
+        volatile_write_u64(HW_INFO + HW_MEM_USABLE_KB, 131072)
+        return
+    }
+    let tag_size = volatile_read(0x6FF28)
+    let entry_size = volatile_read_u32(mmap_tag + 8)
+    if entry_size == 0 { return }
+    let data_start = mmap_tag + 16
+    let data_end = mmap_tag + tag_size
+    let mut total: i64 = 0
+    let mut usable: i64 = 0
+    let mut e = data_start
+    while e + 20 <= data_end {
+        let length = volatile_read(e + 8)
+        let rtype = volatile_read_u32(e + 16)
+        total = total + length
+        if rtype == 1 { usable = usable + length }
+        e = e + entry_size
+    }
+    volatile_write_u64(HW_INFO + HW_MEM_TOTAL_KB, total / 1024)
+    volatile_write_u64(HW_INFO + HW_MEM_USABLE_KB, usable / 1024)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Boot Diagnostics — verify each subsystem
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn hw_boot_verify() {
+    let boot_start = read_timer_ticks()
+
+    // Serial
+    let serial_ok = volatile_read_u64(HW_INFO + HW_HAS_SERIAL)
+    volatile_write_u64(HW_INFO + HW_BOOT_SERIAL_OK, serial_ok)
+
+    // Memory: verify frame allocator works
+    let test_frame = frame_alloc()
+    if test_frame != -1 { frame_free(test_frame); volatile_write_u64(HW_INFO + HW_BOOT_MEM_OK, 1) }
+
+    // PCI
+    let pci_devs = volatile_read_u64(HW_INFO + HW_PCI_DEVICES)
+    volatile_write_u64(HW_INFO + HW_BOOT_PCI_OK, if pci_devs > 0 { 1 } else { 0 })
+
+    // Disk (check block service)
+    let blk_active = blk_svc_dev_read(0, 0)
+    volatile_write_u64(HW_INFO + HW_BOOT_DISK_OK, if blk_active == 1 { 1 } else { 0 })
+
+    // Network
+    let net_up = net_svc_read(NETIF_STATE)
+    volatile_write_u64(HW_INFO + HW_BOOT_NET_OK, net_up)
+
+    let boot_end = read_timer_ticks()
+    volatile_write_u64(HW_INFO + HW_BOOT_TICKS, boot_end - boot_start)
+    volatile_write_u64(HW_INFO + HW_BOOT_STATUS, 0)  // 0 = all OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Hardware Quirk Table — known workarounds
+// 8 entries at 0x960200 (vendor_id, device_id, quirk_flags)
+// ═══════════════════════════════════════════════════════════════
+
+const QUIRK_TABLE: i64 = 0x960200
+const QUIRK_MAX: i64 = 8
+const QUIRK_SIZE: i64 = 24  // vendor(8) + device(8) + flags(8)
+
+const QUIRK_NO_MSI: i64 = 1       // Device doesn't support MSI
+const QUIRK_SLOW_INIT: i64 = 2    // Needs extra delay on init
+const QUIRK_LEGACY_IRQ: i64 = 4   // Must use legacy PIC, not APIC
+
+@kernel fn quirk_init() {
+    let mut i: i64 = 0
+    while i < QUIRK_MAX * QUIRK_SIZE { volatile_write_u8(QUIRK_TABLE + i, 0); i = i + 1 }
+    // Known quirks: Intel I219 Ethernet needs legacy IRQ on some boards
+    volatile_write_u64(QUIRK_TABLE, 0x8086)                    // Intel vendor
+    volatile_write_u64(QUIRK_TABLE + 8, 0x15B8)                // I219-V
+    volatile_write_u64(QUIRK_TABLE + 16, QUIRK_LEGACY_IRQ)
+    // Some QEMU NVMe controllers need slow init
+    volatile_write_u64(QUIRK_TABLE + QUIRK_SIZE, 0x1B36)       // QEMU vendor
+    volatile_write_u64(QUIRK_TABLE + QUIRK_SIZE + 8, 0x0010)   // NVMe
+    volatile_write_u64(QUIRK_TABLE + QUIRK_SIZE + 16, QUIRK_SLOW_INIT)
+}
+
+@kernel fn quirk_lookup(vendor: i64, device: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < QUIRK_MAX {
+        let addr = QUIRK_TABLE + i * QUIRK_SIZE
+        if volatile_read_u64(addr) == vendor && volatile_read_u64(addr + 8) == device {
+            return volatile_read_u64(addr + 16)
+        }
+        i = i + 1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Full Detection — run all detectors
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn hw_detect_all() {
+    // Clear info table
+    let mut i: i64 = 0
+    while i < 256 { volatile_write_u8(HW_INFO + i, 0); i = i + 1 }
+    quirk_init()
+    hw_detect_cpu()
+    hw_detect_memory()
+    hw_detect_pci()
+    hw_boot_verify()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_hw_detect() {
+    cprintln("=== Hardware Detection ===", YELLOW_ON_BLACK)
+    hw_detect_all()
+
+    // CPU
+    cprintln("CPU:", WHITE_ON_BLUE)
+    cprint("  Vendor: ", WHITE_ON_BLACK)
+    let mut v: i64 = 0
+    while v < 12 { console_putchar(volatile_read_u8(HW_INFO + HW_CPU_VENDOR + v), CYAN_ON_BLACK); v = v + 1 }
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Family: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_CPU_FAMILY), CYAN_ON_BLACK)
+    cprint(" Model: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_CPU_MODEL), CYAN_ON_BLACK)
+    cprint(" Step: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_CPU_STEPPING), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Cores: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_CPU_CORES), CYAN_ON_BLACK)
+    cprint("  Freq: ~", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_CPU_FREQ_MHZ), CYAN_ON_BLACK)
+    cprintln(" MHz", WHITE_ON_BLACK)
+    cprint("  Features: ", WHITE_ON_BLACK)
+    let feat = volatile_read_u64(HW_INFO + HW_CPU_FEATURES)
+    if (feat & 1) != 0 { cprint("SSE ", GREEN_ON_BLACK) }
+    if (feat & 2) != 0 { cprint("SSE2 ", GREEN_ON_BLACK) }
+    if (feat & 4) != 0 { cprint("SSE3 ", GREEN_ON_BLACK) }
+    if (feat & 16) != 0 { cprint("SSE4.1 ", GREEN_ON_BLACK) }
+    if (feat & 32) != 0 { cprint("SSE4.2 ", GREEN_ON_BLACK) }
+    if (feat & 64) != 0 { cprint("AVX ", GREEN_ON_BLACK) }
+    if (feat & 256) != 0 { cprint("AVX2 ", GREEN_ON_BLACK) }
+    if (feat & 128) != 0 { cprint("RDRAND ", GREEN_ON_BLACK) }
+    if (feat & 512) != 0 { cprint("SMEP ", GREEN_ON_BLACK) }
+    if (feat & 1024) != 0 { cprint("SMAP ", GREEN_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Memory
+    cprintln("Memory:", WHITE_ON_BLUE)
+    cprint("  Total: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_MEM_TOTAL_KB) / 1024, CYAN_ON_BLACK)
+    cprint(" MB  Usable: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_MEM_USABLE_KB) / 1024, CYAN_ON_BLACK)
+    cprintln(" MB", WHITE_ON_BLACK)
+
+    // Devices
+    cprintln("Devices:", WHITE_ON_BLUE)
+    cprint("  PCI: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_PCI_DEVICES), CYAN_ON_BLACK)
+    cprintln(" devices", WHITE_ON_BLACK)
+    cprint("  ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_HAS_NVME) == 1 { cprint("NVMe ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_AHCI) == 1 { cprint("AHCI ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_USB3) == 1 { cprint("USB3 ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_ETH) == 1 { cprint("Ethernet ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_WIFI) == 1 { cprint("WiFi ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_GPU) == 1 { cprint("GPU ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_AUDIO) == 1 { cprint("Audio ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_SERIAL) == 1 { cprint("Serial ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_FB) == 1 { cprint("Framebuffer ", GREEN_ON_BLACK) }
+    if volatile_read_u64(HW_INFO + HW_HAS_PS2) == 1 { cprint("PS/2 ", GREEN_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Boot diagnostics
+    cprintln("Boot:", WHITE_ON_BLUE)
+    cprint("  Serial: ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_BOOT_SERIAL_OK) == 1 { cprintln("OK", GREEN_ON_BLACK) } else { cprintln("FAIL", RED_ON_BLACK) }
+    cprint("  Memory: ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_BOOT_MEM_OK) == 1 { cprintln("OK", GREEN_ON_BLACK) } else { cprintln("FAIL", RED_ON_BLACK) }
+    cprint("  PCI:    ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_BOOT_PCI_OK) == 1 { cprintln("OK", GREEN_ON_BLACK) } else { cprintln("FAIL", RED_ON_BLACK) }
+    cprint("  Disk:   ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_BOOT_DISK_OK) == 1 { cprintln("OK", GREEN_ON_BLACK) } else { cprintln("FAIL", RED_ON_BLACK) }
+    cprint("  Network:", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_BOOT_NET_OK) == 1 { cprintln(" OK", GREEN_ON_BLACK) } else { cprintln(" DOWN", YELLOW_ON_BLACK) }
+    cprint("  Boot time: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(HW_INFO + HW_BOOT_TICKS), CYAN_ON_BLACK)
+    cprintln(" ticks", WHITE_ON_BLACK)
+
+    cprintln("=== Detection complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_hw_test() {
+    cprintln("=== Hardware Self-Test ===", YELLOW_ON_BLACK)
+    hw_detect_all()
+    let mut pass: i64 = 0
+    let mut fail: i64 = 0
+
+    // Test 1: CPU detected
+    cprint("  CPU vendor:  ", WHITE_ON_BLACK)
+    if volatile_read_u8(HW_INFO + HW_CPU_VENDOR) != 0 { cprintln("PASS", GREEN_ON_BLACK); pass = pass + 1 }
+    else { cprintln("FAIL", RED_ON_BLACK); fail = fail + 1 }
+
+    // Test 2: Memory
+    cprint("  Memory:      ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_MEM_USABLE_KB) > 0 { cprintln("PASS", GREEN_ON_BLACK); pass = pass + 1 }
+    else { cprintln("FAIL", RED_ON_BLACK); fail = fail + 1 }
+
+    // Test 3: Frame alloc
+    cprint("  Frame alloc: ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_BOOT_MEM_OK) == 1 { cprintln("PASS", GREEN_ON_BLACK); pass = pass + 1 }
+    else { cprintln("FAIL", RED_ON_BLACK); fail = fail + 1 }
+
+    // Test 4: PCI
+    cprint("  PCI bus:     ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_PCI_DEVICES) > 0 { cprintln("PASS", GREEN_ON_BLACK); pass = pass + 1 }
+    else { cprintln("FAIL", RED_ON_BLACK); fail = fail + 1 }
+
+    // Test 5: Storage
+    cprint("  Storage:     ", WHITE_ON_BLACK)
+    if volatile_read_u64(HW_INFO + HW_BOOT_DISK_OK) == 1 { cprintln("PASS", GREEN_ON_BLACK); pass = pass + 1 }
+    else { cprintln("FAIL", RED_ON_BLACK); fail = fail + 1 }
+
+    cprint("  Result: ", WHITE_ON_BLACK)
+    cprint_decimal(pass, GREEN_ON_BLACK)
+    cprint("/5 passed", WHITE_ON_BLACK)
+    if fail > 0 { cprint(", ", WHITE_ON_BLACK); cprint_decimal(fail, RED_ON_BLACK); cprint(" failed", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+}

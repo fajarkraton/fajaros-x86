@@ -1,0 +1,707 @@
+// FajarOS Nova v2.0 — Block Device Service (Sprint 1.5)
+// @device process — PID 2, handles block I/O for VFS
+// Backends: ramdisk (built-in), NVMe (via kernel DMA stub), USB (via kernel XHCI stub)
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Block Device Protocol Constants
+// ═══════════════════════════════════════════════════════════════
+
+const MSG_BLK_READ: i64 = 0x0200
+const MSG_BLK_WRITE: i64 = 0x0201
+const MSG_BLK_INFO: i64 = 0x0202
+const MSG_BLK_FLUSH: i64 = 0x0203
+const MSG_BLK_REPLY: i64 = 0x02FF
+
+const BLK_SVC_PID: i64 = 2
+
+// Block status codes
+const BLK_OK: i64 = 0
+const BLK_EIO: i64 = -1       // I/O error
+const BLK_EINVAL: i64 = -2    // Invalid argument
+const BLK_ENODEV: i64 = -3    // No such device
+const BLK_ENOSPC: i64 = -4    // No space
+const BLK_EBUSY: i64 = -5     // Device busy
+
+// Device types
+const BLK_DEV_RAMDISK: i64 = 0
+const BLK_DEV_NVME: i64 = 1
+const BLK_DEV_USB: i64 = 2
+const BLK_DEV_VIRTIO: i64 = 3
+
+// ═══════════════════════════════════════════════════════════════
+// Block Device Table
+// 8 devices × 128 bytes at BLK_SVC_BASE (0x8B8000)
+// ═══════════════════════════════════════════════════════════════
+
+const BLK_SVC_BASE: i64 = 0x8B8000
+const BLK_DEV_TABLE_MAX: i64 = 8
+const BLK_DEV_ENTRY_SIZE: i64 = 128
+
+// Per device entry:
+//   +0:   active (0/1)
+//   +8:   dev_type (ramdisk/nvme/usb/virtio)
+//   +16:  total_lba (total sectors)
+//   +24:  sector_size (bytes, usually 512)
+//   +32:  name[32] (e.g., "nvme0", "ramdisk0")
+//   +64:  base_addr (for ramdisk: memory base; for NVMe: BAR address)
+//   +72:  flags (readonly, removable, etc.)
+//   +80:  stats_reads (count)
+//   +88:  stats_writes (count)
+//   +96:  stats_errors (count)
+//   +104: cache_addr (block cache pointer, 0 = no cache)
+//   +112: reserved
+
+@kernel fn blk_svc_dev_addr(dev: i64) -> i64 {
+    BLK_SVC_BASE + dev * BLK_DEV_ENTRY_SIZE
+}
+
+@kernel fn blk_svc_dev_read(dev: i64, field: i64) -> i64 {
+    volatile_read_u64(blk_svc_dev_addr(dev) + field)
+}
+
+@kernel fn blk_svc_dev_write(dev: i64, field: i64, val: i64) {
+    volatile_write_u64(blk_svc_dev_addr(dev) + field, val)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Ramdisk Backend (Sprint 1.5.6)
+// Simple in-memory block device, 256KB at 0x8C0000
+// 512 sectors × 512 bytes = 256KB
+// ═══════════════════════════════════════════════════════════════
+
+const RAMDISK_BASE: i64 = 0x8C0000
+const RAMDISK_SECTORS: i64 = 512
+const RAMDISK_SECTOR_SIZE: i64 = 512
+const RAMDISK_SIZE: i64 = 262144  // 256KB
+
+@kernel fn ramdisk_init() {
+    // Zero ramdisk memory
+    let mut i: i64 = 0
+    while i < RAMDISK_SIZE {
+        volatile_write_u8(RAMDISK_BASE + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn ramdisk_read(lba: i64, count: i64, buf: i64) -> i64 {
+    if lba < 0 || lba + count > RAMDISK_SECTORS { return BLK_EINVAL }
+    let src = RAMDISK_BASE + lba * RAMDISK_SECTOR_SIZE
+    let bytes = count * RAMDISK_SECTOR_SIZE
+    let mut i: i64 = 0
+    while i < bytes {
+        volatile_write_u8(buf + i, volatile_read_u8(src + i))
+        i = i + 1
+    }
+    bytes
+}
+
+@kernel fn ramdisk_write(lba: i64, count: i64, buf: i64) -> i64 {
+    if lba < 0 || lba + count > RAMDISK_SECTORS { return BLK_EINVAL }
+    let dst = RAMDISK_BASE + lba * RAMDISK_SECTOR_SIZE
+    let bytes = count * RAMDISK_SECTOR_SIZE
+    let mut i: i64 = 0
+    while i < bytes {
+        volatile_write_u8(dst + i, volatile_read_u8(buf + i))
+        i = i + 1
+    }
+    bytes
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Block Cache (Sprint 1.5.7-1.5.8)
+// Simple LRU cache: 16 entries × (metadata + 512-byte sector)
+// Cache at 0x8D0000 — 16 × 544 bytes = ~8.5KB
+// ═══════════════════════════════════════════════════════════════
+
+const BLK_CACHE_BASE: i64 = 0x910000  // was 0x8D0000 — overlapped RAMDISK (0x8C0000-0x900000)!
+const BLK_CACHE_ENTRIES: i64 = 16
+const BLK_CACHE_ENTRY_SIZE: i64 = 544  // 32 meta + 512 data
+// Per entry: +0=valid, +8=dev, +16=lba, +24=dirty, +32=data[512]
+
+@kernel fn blk_cache_init() {
+    let mut i: i64 = 0
+    while i < BLK_CACHE_ENTRIES * BLK_CACHE_ENTRY_SIZE {
+        volatile_write_u8(BLK_CACHE_BASE + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn blk_cache_lookup(dev: i64, lba: i64) -> i64 {
+    // Returns cache entry index, or -1 if not cached
+    let mut i: i64 = 0
+    while i < BLK_CACHE_ENTRIES {
+        let addr = BLK_CACHE_BASE + i * BLK_CACHE_ENTRY_SIZE
+        let valid = volatile_read_u64(addr)
+        if valid == 1 {
+            let cdev = volatile_read_u64(addr + 8)
+            let clba = volatile_read_u64(addr + 16)
+            if cdev == dev && clba == lba { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn blk_cache_read(entry: i64, buf: i64) {
+    let src = BLK_CACHE_BASE + entry * BLK_CACHE_ENTRY_SIZE + 32
+    let mut i: i64 = 0
+    while i < 512 {
+        volatile_write_u8(buf + i, volatile_read_u8(src + i))
+        i = i + 1
+    }
+}
+
+@kernel fn blk_cache_insert(dev: i64, lba: i64, data: i64) -> i64 {
+    // Find free or evict oldest (simple: use round-robin slot)
+    // Track insertion counter at BLK_CACHE_BASE - 8
+    let counter = volatile_read_u64(BLK_CACHE_BASE - 8)
+    let slot = counter % BLK_CACHE_ENTRIES
+    volatile_write_u64(BLK_CACHE_BASE - 8, counter + 1)
+
+    let addr = BLK_CACHE_BASE + slot * BLK_CACHE_ENTRY_SIZE
+
+    // Flush dirty entry before evicting
+    let old_dirty = volatile_read_u64(addr + 24)
+    if old_dirty == 1 {
+        blk_cache_flush_entry(slot)
+    }
+
+    // Write new entry
+    volatile_write_u64(addr, 1)       // valid
+    volatile_write_u64(addr + 8, dev) // dev
+    volatile_write_u64(addr + 16, lba) // lba
+    volatile_write_u64(addr + 24, 0)  // dirty = 0
+    let dst = addr + 32
+    let mut i: i64 = 0
+    while i < 512 {
+        volatile_write_u8(dst + i, volatile_read_u8(data + i))
+        i = i + 1
+    }
+    slot
+}
+
+@kernel fn blk_cache_mark_dirty(entry: i64) {
+    let addr = BLK_CACHE_BASE + entry * BLK_CACHE_ENTRY_SIZE
+    volatile_write_u64(addr + 24, 1)
+}
+
+@kernel fn blk_cache_flush_entry(entry: i64) {
+    let addr = BLK_CACHE_BASE + entry * BLK_CACHE_ENTRY_SIZE
+    let valid = volatile_read_u64(addr)
+    let dirty = volatile_read_u64(addr + 24)
+    if valid == 1 && dirty == 1 {
+        let dev = volatile_read_u64(addr + 8)
+        let lba = volatile_read_u64(addr + 16)
+        let data = addr + 32
+        // Write back to device
+        blk_svc_raw_write(dev, lba, 1, data)
+        volatile_write_u64(addr + 24, 0)  // clear dirty
+    }
+}
+
+@kernel fn blk_cache_flush_all() {
+    let mut i: i64 = 0
+    while i < BLK_CACHE_ENTRIES {
+        blk_cache_flush_entry(i)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Raw Block I/O — dispatches to backend (ramdisk, NVMe, USB)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn blk_svc_raw_read(dev: i64, lba: i64, count: i64, buf: i64) -> i64 {
+    if dev < 0 || dev >= BLK_DEV_TABLE_MAX { return BLK_ENODEV }
+    let active = blk_svc_dev_read(dev, 0)
+    if active != 1 { return BLK_ENODEV }
+
+    let dev_type = blk_svc_dev_read(dev, 8)
+
+    if dev_type == BLK_DEV_RAMDISK {
+        let result = ramdisk_read(lba, count, buf)
+        blk_svc_dev_write(dev, 80, blk_svc_dev_read(dev, 80) + 1)
+        return result
+    }
+
+    if dev_type == BLK_DEV_NVME {
+        // Delegate to kernel NVMe driver (monolithic mode)
+        let result = nvme_read_sectors(lba, count, buf)
+        blk_svc_dev_write(dev, 80, blk_svc_dev_read(dev, 80) + 1)
+        return result
+    }
+
+    BLK_ENODEV
+}
+
+@kernel fn blk_svc_raw_write(dev: i64, lba: i64, count: i64, buf: i64) -> i64 {
+    if dev < 0 || dev >= BLK_DEV_TABLE_MAX { return BLK_ENODEV }
+    let active = blk_svc_dev_read(dev, 0)
+    if active != 1 { return BLK_ENODEV }
+
+    let dev_type = blk_svc_dev_read(dev, 8)
+
+    if dev_type == BLK_DEV_RAMDISK {
+        let result = ramdisk_write(lba, count, buf)
+        blk_svc_dev_write(dev, 88, blk_svc_dev_read(dev, 88) + 1)
+        return result
+    }
+
+    if dev_type == BLK_DEV_NVME {
+        let result = nvme_write_sectors(lba, count, buf)
+        blk_svc_dev_write(dev, 88, blk_svc_dev_read(dev, 88) + 1)
+        return result
+    }
+
+    BLK_ENODEV
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Cached Block I/O (read-through / write-back)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn blk_svc_cached_read(dev: i64, lba: i64, count: i64, buf: i64) -> i64 {
+    // For single-sector reads, check cache first
+    if count == 1 {
+        let cached = blk_cache_lookup(dev, lba)
+        if cached >= 0 {
+            blk_cache_read(cached, buf)
+            return RAMDISK_SECTOR_SIZE
+        }
+        // Cache miss — read from device and cache it
+        let result = blk_svc_raw_read(dev, lba, 1, buf)
+        if result > 0 {
+            blk_cache_insert(dev, lba, buf)
+        }
+        return result
+    }
+    // Multi-sector: bypass cache
+    blk_svc_raw_read(dev, lba, count, buf)
+}
+
+@kernel fn blk_svc_cached_write(dev: i64, lba: i64, count: i64, buf: i64) -> i64 {
+    // Write-back: update cache, mark dirty, flush later
+    if count == 1 {
+        let cached = blk_cache_lookup(dev, lba)
+        if cached >= 0 {
+            // Update existing cache entry
+            let dst = BLK_CACHE_BASE + cached * BLK_CACHE_ENTRY_SIZE + 32
+            let mut i: i64 = 0
+            while i < 512 {
+                volatile_write_u8(dst + i, volatile_read_u8(buf + i))
+                i = i + 1
+            }
+            blk_cache_mark_dirty(cached)
+            return RAMDISK_SECTOR_SIZE
+        }
+        // Not cached — write through + cache
+        let result = blk_svc_raw_write(dev, lba, 1, buf)
+        if result > 0 {
+            blk_cache_insert(dev, lba, buf)
+        }
+        return result
+    }
+    // Multi-sector: write through, no cache
+    blk_svc_raw_write(dev, lba, count, buf)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Block Service IPC Handler
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn blk_svc_handle_msg(sender: i64, msg_buf: i64, reply_buf: i64) -> i64 {
+    let msg_type = volatile_read_u32(msg_buf + 8)
+
+    if msg_type == MSG_BLK_READ {
+        // Payload: dev(8), lba(8), count(8), buf(8)
+        let dev = volatile_read_u64(msg_buf + 16)
+        let lba = volatile_read_u64(msg_buf + 24)
+        let count = volatile_read_u64(msg_buf + 32)
+
+        // For small reads (1 sector), inline data in reply
+        let sector_buf: i64 = 0x918000  // scratch buffer
+        let bytes = blk_svc_cached_read(dev, lba, count, sector_buf)
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, BLK_SVC_PID, MSG_BLK_REPLY, 0)
+        if bytes > 0 {
+            volatile_write_u64(reply_buf + 16, BLK_OK)
+            volatile_write_u64(reply_buf + 24, bytes)
+            // Copy first 32 bytes of data inline (for small reads)
+            let copy = if bytes < 32 { bytes } else { 32 }
+            let mut i: i64 = 0
+            while i < copy {
+                volatile_write_u8(reply_buf + 32 + i, volatile_read_u8(sector_buf + i))
+                i = i + 1
+            }
+        } else {
+            volatile_write_u64(reply_buf + 16, bytes)  // error code
+            volatile_write_u64(reply_buf + 24, 0)
+        }
+        return 0
+    }
+
+    if msg_type == MSG_BLK_WRITE {
+        let dev = volatile_read_u64(msg_buf + 16)
+        let lba = volatile_read_u64(msg_buf + 24)
+        let count = volatile_read_u64(msg_buf + 32)
+        // Data in shared memory or inline (first 8 bytes of payload[24])
+        let data_addr = volatile_read_u64(msg_buf + 40)
+        let sector_buf: i64 = 0x918000
+
+        // If data_addr is 0, use inline data from message
+        if data_addr == 0 {
+            // Small write: copy from msg payload to sector buffer
+            let mut i: i64 = 0
+            while i < 32 {
+                volatile_write_u8(sector_buf + i, volatile_read_u8(msg_buf + 32 + i))
+                i = i + 1
+            }
+        }
+
+        let buf = if data_addr != 0 { data_addr } else { sector_buf }
+        let bytes = blk_svc_cached_write(dev, lba, count, buf)
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, BLK_SVC_PID, MSG_BLK_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, if bytes > 0 { BLK_OK } else { bytes })
+        volatile_write_u64(reply_buf + 24, bytes)
+        return 0
+    }
+
+    if msg_type == MSG_BLK_INFO {
+        let dev = volatile_read_u64(msg_buf + 16)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, BLK_SVC_PID, MSG_BLK_REPLY, 0)
+        if dev >= 0 && dev < BLK_DEV_TABLE_MAX && blk_svc_dev_read(dev, 0) == 1 {
+            volatile_write_u64(reply_buf + 16, blk_svc_dev_read(dev, 16)) // total_lba
+            volatile_write_u64(reply_buf + 24, blk_svc_dev_read(dev, 24)) // sector_size
+            volatile_write_u64(reply_buf + 32, blk_svc_dev_read(dev, 8))  // dev_type
+            volatile_write_u64(reply_buf + 40, BLK_OK)
+        } else {
+            volatile_write_u64(reply_buf + 40, BLK_ENODEV)
+        }
+        return 0
+    }
+
+    if msg_type == MSG_BLK_FLUSH {
+        blk_cache_flush_all()
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, BLK_SVC_PID, MSG_BLK_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, BLK_OK)
+        return 0
+    }
+
+    // Unknown message
+    ipc_msg_clear(reply_buf)
+    ipc_msg_set_header(reply_buf, BLK_SVC_PID, MSG_BLK_REPLY, 0)
+    volatile_write_u64(reply_buf + 16, BLK_EINVAL)
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Block Service Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn blk_svc_register_dev(dev_type: i64, total_lba: i64, sector_size: i64, base_addr: i64, name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < BLK_DEV_TABLE_MAX {
+        if blk_svc_dev_read(i, 0) == 0 {
+            blk_svc_dev_write(i, 0, 1)             // active
+            blk_svc_dev_write(i, 8, dev_type)       // type
+            blk_svc_dev_write(i, 16, total_lba)     // sectors
+            blk_svc_dev_write(i, 24, sector_size)   // sector size
+            blk_svc_dev_write(i, 64, base_addr)     // base addr
+            // Copy name
+            let mut j: i64 = 0
+            while j < 31 {
+                let ch = volatile_read_u8(name_addr + j)
+                volatile_write_u8(blk_svc_dev_addr(i) + 32 + j, ch)
+                if ch == 0 { j = 31 } else { j = j + 1 }
+            }
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn blk_svc_init() {
+    // Clear device table
+    let mut i: i64 = 0
+    while i < BLK_DEV_TABLE_MAX * BLK_DEV_ENTRY_SIZE {
+        volatile_write_u8(BLK_SVC_BASE + i, 0)
+        i = i + 1
+    }
+
+    // Init ramdisk
+    ramdisk_init()
+
+    // Init cache
+    blk_cache_init()
+
+    // Register ramdisk as device 0
+    let name_buf: i64 = 0x918F00  // scratch
+    volatile_write_u8(name_buf, 114)   // r
+    volatile_write_u8(name_buf+1, 97)  // a
+    volatile_write_u8(name_buf+2, 109) // m
+    volatile_write_u8(name_buf+3, 100) // d
+    volatile_write_u8(name_buf+4, 105) // i
+    volatile_write_u8(name_buf+5, 115) // s
+    volatile_write_u8(name_buf+6, 107) // k
+    volatile_write_u8(name_buf+7, 48)  // 0
+    volatile_write_u8(name_buf+8, 0)
+    blk_svc_register_dev(BLK_DEV_RAMDISK, RAMDISK_SECTORS, RAMDISK_SECTOR_SIZE, RAMDISK_BASE, name_buf)
+
+    // Register NVMe if available (check if nvme_full_init already ran)
+    // In monolithic mode, nvme_full_init runs in kernel_main before us
+    // We check the block device table at 0x820000 (existing driver state)
+    let nvme_ready = volatile_read_u64(0x820000)  // NVMe state: BAR addr
+    if nvme_ready > 0 {
+        volatile_write_u8(name_buf, 110)   // n
+        volatile_write_u8(name_buf+1, 118) // v
+        volatile_write_u8(name_buf+2, 109) // m
+        volatile_write_u8(name_buf+3, 101) // e
+        volatile_write_u8(name_buf+4, 48)  // 0
+        volatile_write_u8(name_buf+5, 0)
+        // Read NVMe capacity from driver state
+        let nvme_total_lba = volatile_read_u64(0x820048)  // NS total_lba
+        let nvme_sector = 512
+        if nvme_total_lba > 0 {
+            blk_svc_register_dev(BLK_DEV_NVME, nvme_total_lba, nvme_sector, nvme_ready, name_buf)
+        }
+    }
+
+    // Register VFS /dev entries for our devices
+    let dev_name: i64 = 0x918F00
+    i = 0
+    while i < BLK_DEV_TABLE_MAX {
+        if blk_svc_dev_read(i, 0) == 1 {
+            // Copy device name to dev_name
+            let mut j: i64 = 0
+            while j < 31 {
+                let ch = volatile_read_u8(blk_svc_dev_addr(i) + 32 + j)
+                volatile_write_u8(dev_name + j, ch)
+                if ch == 0 { j = 31 } else { j = j + 1 }
+            }
+            vfs_dev_register(BLK_SVC_PID, dev_name, blk_svc_dev_read(i, 8))
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands — Block Service Testing
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_blk_test() {
+    cprintln("=== Block Service Test ===", YELLOW_ON_BLACK)
+
+    let msg: i64 = 0x8D9000
+    let reply: i64 = 0x8D9100
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    // Test 1: Get ramdisk info
+    cprintln("[1] BLK_INFO ramdisk (dev 0):", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_BLK_INFO, 0)
+    volatile_write_u64(msg + 16, 0)  // dev 0
+    ipc_msg_clear(reply)
+    blk_svc_handle_msg(my_pid, msg, reply)
+    let total_lba = volatile_read_u64(reply + 16)
+    let sector_sz = volatile_read_u64(reply + 24)
+    let dev_type = volatile_read_u64(reply + 32)
+    let status = volatile_read_u64(reply + 40)
+    cprint("  sectors=", WHITE_ON_BLACK)
+    cprint_decimal(total_lba, CYAN_ON_BLACK)
+    cprint(" size=", WHITE_ON_BLACK)
+    cprint_decimal(sector_sz, CYAN_ON_BLACK)
+    cprint("B type=", WHITE_ON_BLACK)
+    cprint_decimal(dev_type, CYAN_ON_BLACK)
+    cprint(" status=", WHITE_ON_BLACK)
+    cprint_decimal(status, if status == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test 2: Write to ramdisk sector 0
+    cprintln("[2] Write 'HELLO BLK!' to sector 0:", WHITE_ON_BLACK)
+    let write_buf: i64 = 0x8D9200
+    volatile_write_u8(write_buf, 72)   // H
+    volatile_write_u8(write_buf+1, 69) // E
+    volatile_write_u8(write_buf+2, 76) // L
+    volatile_write_u8(write_buf+3, 76) // L
+    volatile_write_u8(write_buf+4, 79) // O
+    volatile_write_u8(write_buf+5, 32) // ' '
+    volatile_write_u8(write_buf+6, 66) // B
+    volatile_write_u8(write_buf+7, 76) // L
+    volatile_write_u8(write_buf+8, 75) // K
+    volatile_write_u8(write_buf+9, 33) // !
+    volatile_write_u8(write_buf+10, 0)
+
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_BLK_WRITE, 0)
+    volatile_write_u64(msg + 16, 0)  // dev 0
+    volatile_write_u64(msg + 24, 0)  // lba 0
+    volatile_write_u64(msg + 32, 1)  // count 1
+    volatile_write_u64(msg + 40, write_buf) // data addr
+    ipc_msg_clear(reply)
+    blk_svc_handle_msg(my_pid, msg, reply)
+    let wstatus = volatile_read_u64(reply + 16)
+    let wbytes = volatile_read_u64(reply + 24)
+    cprint("  status=", WHITE_ON_BLACK)
+    cprint_decimal(wstatus, if wstatus == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    cprint(" bytes=", WHITE_ON_BLACK)
+    cprint_decimal(wbytes, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test 3: Read back sector 0
+    cprintln("[3] Read sector 0:", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_BLK_READ, 0)
+    volatile_write_u64(msg + 16, 0)  // dev 0
+    volatile_write_u64(msg + 24, 0)  // lba 0
+    volatile_write_u64(msg + 32, 1)  // count 1
+    ipc_msg_clear(reply)
+    blk_svc_handle_msg(my_pid, msg, reply)
+    let rstatus = volatile_read_u64(reply + 16)
+    let rbytes = volatile_read_u64(reply + 24)
+    cprint("  status=", WHITE_ON_BLACK)
+    cprint_decimal(rstatus, if rstatus == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    cprint(" data=\"", WHITE_ON_BLACK)
+    let mut ri: i64 = 0
+    while ri < 10 {
+        let ch = volatile_read_u8(reply + 32 + ri)
+        if ch >= 32 && ch < 127 { console_putchar(ch, GREEN_ON_BLACK) }
+        ri = ri + 1
+    }
+    cprintln("\"", WHITE_ON_BLACK)
+
+    // Test 4: Cache test — re-read should hit cache
+    cprintln("[4] Cache re-read (should be cached):", WHITE_ON_BLACK)
+    let tsc0 = rdtsc()
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_BLK_READ, 0)
+    volatile_write_u64(msg + 16, 0)
+    volatile_write_u64(msg + 24, 0)
+    volatile_write_u64(msg + 32, 1)
+    ipc_msg_clear(reply)
+    blk_svc_handle_msg(my_pid, msg, reply)
+    let tsc1 = rdtsc()
+    cprint("  cached read: ", WHITE_ON_BLACK)
+    cprint_decimal(tsc1 - tsc0, CYAN_ON_BLACK)
+    cprintln(" cycles", WHITE_ON_BLACK)
+
+    // Test 5: Flush cache
+    cprintln("[5] Flush cache:", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_BLK_FLUSH, 0)
+    ipc_msg_clear(reply)
+    blk_svc_handle_msg(my_pid, msg, reply)
+    let fstatus = volatile_read_u64(reply + 16)
+    cprint("  status=", WHITE_ON_BLACK)
+    cprint_decimal(fstatus, if fstatus == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprintln("=== Block tests complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_blk_info() {
+    cprintln("Block Devices:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    while i < BLK_DEV_TABLE_MAX {
+        if blk_svc_dev_read(i, 0) == 1 {
+            cprint("  [", WHITE_ON_BLACK)
+            cprint_decimal(i, CYAN_ON_BLACK)
+            cprint("] \"", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < 31 {
+                let ch = volatile_read_u8(blk_svc_dev_addr(i) + 32 + j)
+                if ch == 0 { j = 31 } else { console_putchar(ch, GREEN_ON_BLACK); j = j + 1 }
+            }
+            cprint("\" type=", WHITE_ON_BLACK)
+            let dt = blk_svc_dev_read(i, 8)
+            if dt == BLK_DEV_RAMDISK { cprint("ramdisk", CYAN_ON_BLACK) }
+            else if dt == BLK_DEV_NVME { cprint("nvme", CYAN_ON_BLACK) }
+            else if dt == BLK_DEV_USB { cprint("usb", CYAN_ON_BLACK) }
+            else if dt == BLK_DEV_VIRTIO { cprint("virtio", CYAN_ON_BLACK) }
+            let lba = blk_svc_dev_read(i, 16)
+            let ss = blk_svc_dev_read(i, 24)
+            cprint(" ", WHITE_ON_BLACK)
+            cprint_decimal(lba * ss / 1024, CYAN_ON_BLACK)
+            cprint("KB (", WHITE_ON_BLACK)
+            cprint_decimal(lba, WHITE_ON_BLACK)
+            cprint("×", WHITE_ON_BLACK)
+            cprint_decimal(ss, WHITE_ON_BLACK)
+            cprint(") reads=", WHITE_ON_BLACK)
+            cprint_decimal(blk_svc_dev_read(i, 80), GREEN_ON_BLACK)
+            cprint(" writes=", WHITE_ON_BLACK)
+            cprint_decimal(blk_svc_dev_read(i, 88), GREEN_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        i = i + 1
+    }
+}
+
+@kernel fn cmd_blk_bench() {
+    cprintln("Block I/O Benchmark:", YELLOW_ON_BLACK)
+    let buf: i64 = 0x8D9200
+    let iterations: i64 = 1000
+
+    // Ramdisk sequential read benchmark
+    let tsc0 = rdtsc()
+    let mut i: i64 = 0
+    while i < iterations {
+        ramdisk_read(i % RAMDISK_SECTORS, 1, buf)
+        i = i + 1
+    }
+    let tsc1 = rdtsc()
+    let per_read = (tsc1 - tsc0) / iterations
+    cprint("  Ramdisk read:  ", WHITE_ON_BLACK)
+    cprint_decimal(per_read, GREEN_ON_BLACK)
+    cprint(" cycles/sector (", WHITE_ON_BLACK)
+    cprint_decimal(iterations, CYAN_ON_BLACK)
+    cprintln(" iterations)", WHITE_ON_BLACK)
+
+    // Cached read benchmark
+    let tsc2 = rdtsc()
+    i = 0
+    while i < iterations {
+        blk_svc_cached_read(0, 0, 1, buf)  // Same sector, always cached
+        i = i + 1
+    }
+    let tsc3 = rdtsc()
+    let per_cached = (tsc3 - tsc2) / iterations
+    cprint("  Cached read:   ", WHITE_ON_BLACK)
+    cprint_decimal(per_cached, GREEN_ON_BLACK)
+    cprint(" cycles/sector (", WHITE_ON_BLACK)
+    cprint_decimal(iterations, CYAN_ON_BLACK)
+    cprintln(" iterations)", WHITE_ON_BLACK)
+
+    // IPC overhead benchmark
+    let msg: i64 = 0x8D9000
+    let reply: i64 = 0x8D9100
+    let my_pid = volatile_read_u64(0x6FE00)
+    let tsc4 = rdtsc()
+    i = 0
+    while i < iterations {
+        ipc_msg_clear(msg)
+        ipc_msg_set_header(msg, my_pid, MSG_BLK_READ, 0)
+        volatile_write_u64(msg + 16, 0)
+        volatile_write_u64(msg + 24, 0)
+        volatile_write_u64(msg + 32, 1)
+        ipc_msg_clear(reply)
+        blk_svc_handle_msg(my_pid, msg, reply)
+        i = i + 1
+    }
+    let tsc5 = rdtsc()
+    let per_ipc = (tsc5 - tsc4) / iterations
+    cprint("  IPC+cached:    ", WHITE_ON_BLACK)
+    cprint_decimal(per_ipc, GREEN_ON_BLACK)
+    cprint(" cycles/sector (", WHITE_ON_BLACK)
+    cprint_decimal(iterations, CYAN_ON_BLACK)
+    cprintln(" iterations)", WHITE_ON_BLACK)
+
+    cprint("  IPC overhead:  ", WHITE_ON_BLACK)
+    cprint_decimal(per_ipc - per_cached, YELLOW_ON_BLACK)
+    cprintln(" cycles", WHITE_ON_BLACK)
+}

@@ -1,0 +1,486 @@
+// FajarOS Nova v2.0 — Shell Service (Sprint 1.7)
+// @safe process — PID 5, interactive shell via IPC
+// All I/O goes through services: VFS (files), NET (network), BLK (block)
+// Console I/O via SYS_WRITE/SYS_READ (kernel-mediated)
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Service Constants
+// ═══════════════════════════════════════════════════════════════
+
+const SHELL_SVC_PID: i64 = 5
+const SHELL_STATE: i64 = 0x8F0000
+
+// Shell state offsets
+const SHELL_RUNNING: i64 = 0       // 0=stopped, 1=running
+const SHELL_CMD_COUNT: i64 = 8     // total commands executed
+const SHELL_HIST_BASE: i64 = 16    // history start offset
+const SHELL_HIST_COUNT: i64 = 24   // entries in history
+const SHELL_HIST_MAX: i64 = 32     // max history entries
+
+// History buffer: 32 entries × 64 bytes at SHELL_STATE + 0x100
+const SHELL_HIST_BUF: i64 = 0x8F0100
+const SHELL_HIST_ENTRY_SIZE: i64 = 64
+const SHELL_HIST_ENTRIES_MAX: i64 = 32
+
+// IPC message scratch buffers
+const SHELL_MSG_BUF: i64 = 0x8F1000
+const SHELL_REPLY_BUF: i64 = 0x8F1100
+const SHELL_DATA_BUF: i64 = 0x8F1200  // 4KB for file data
+
+// ═══════════════════════════════════════════════════════════════
+// Command History (Sprint 1.7.6)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn shell_hist_init() {
+    volatile_write_u64(SHELL_STATE + SHELL_HIST_COUNT, 0)
+    volatile_write_u64(SHELL_STATE + SHELL_HIST_MAX, SHELL_HIST_ENTRIES_MAX)
+    let mut i: i64 = 0
+    while i < SHELL_HIST_ENTRIES_MAX * SHELL_HIST_ENTRY_SIZE {
+        volatile_write_u8(SHELL_HIST_BUF + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn shell_hist_add(cmd_addr: i64, cmd_len: i64) {
+    let count = volatile_read_u64(SHELL_STATE + SHELL_HIST_COUNT)
+    let slot = count % SHELL_HIST_ENTRIES_MAX
+    let entry = SHELL_HIST_BUF + slot * SHELL_HIST_ENTRY_SIZE
+    // Copy command (max 63 chars)
+    let copy_len = if cmd_len > 63 { 63 } else { cmd_len }
+    let mut i: i64 = 0
+    while i < copy_len {
+        volatile_write_u8(entry + i, volatile_read_u8(cmd_addr + i))
+        i = i + 1
+    }
+    volatile_write_u8(entry + copy_len, 0)
+    volatile_write_u64(SHELL_STATE + SHELL_HIST_COUNT, count + 1)
+}
+
+@kernel fn shell_hist_get(index: i64, buf: i64) -> i64 {
+    // Get history entry by reverse index (0 = most recent)
+    let count = volatile_read_u64(SHELL_STATE + SHELL_HIST_COUNT)
+    if index >= count || index >= SHELL_HIST_ENTRIES_MAX { return 0 }
+    let slot = (count - 1 - index) % SHELL_HIST_ENTRIES_MAX
+    let entry = SHELL_HIST_BUF + slot * SHELL_HIST_ENTRY_SIZE
+    let mut len: i64 = 0
+    while len < 63 {
+        let ch = volatile_read_u8(entry + len)
+        if ch == 0 { return len }
+        volatile_write_u8(buf + len, ch)
+        len = len + 1
+    }
+    len
+}
+
+// ═══════════════════════════════════════════════════════════════
+// IPC Helpers — send message to service and get reply
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn shell_ipc_call_vfs(msg_type: i64) -> i64 {
+    // Send SHELL_MSG_BUF to VFS, reply in SHELL_REPLY_BUF
+    ipc_msg_set_header(SHELL_MSG_BUF, SHELL_SVC_PID, msg_type, 0)
+    ipc_msg_clear(SHELL_REPLY_BUF)
+    vfs_svc_handle_msg(SHELL_SVC_PID, SHELL_MSG_BUF, SHELL_REPLY_BUF)
+    0
+}
+
+@kernel fn shell_ipc_call_blk(msg_type: i64) -> i64 {
+    ipc_msg_set_header(SHELL_MSG_BUF, SHELL_SVC_PID, msg_type, 0)
+    ipc_msg_clear(SHELL_REPLY_BUF)
+    blk_svc_handle_msg(SHELL_SVC_PID, SHELL_MSG_BUF, SHELL_REPLY_BUF)
+    0
+}
+
+@kernel fn shell_ipc_call_net(msg_type: i64) -> i64 {
+    ipc_msg_set_header(SHELL_MSG_BUF, SHELL_SVC_PID, msg_type, 0)
+    ipc_msg_clear(SHELL_REPLY_BUF)
+    net_svc_handle_msg(SHELL_SVC_PID, SHELL_MSG_BUF, SHELL_REPLY_BUF)
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.7.3: File Commands via VFS IPC
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn shell_cmd_vfs_cat(path_addr: i64) {
+    // Open file via VFS
+    ipc_msg_clear(SHELL_MSG_BUF)
+    // Copy path to payload
+    let mut i: i64 = 0
+    while i < 39 {
+        let ch = volatile_read_u8(path_addr + i)
+        volatile_write_u8(SHELL_MSG_BUF + 16 + i, ch)
+        if ch == 0 { i = 39 } else { i = i + 1 }
+    }
+    shell_ipc_call_vfs(MSG_VFS_OPEN)
+    let fd = volatile_read_u64(SHELL_REPLY_BUF + 16)
+    let fsize = volatile_read_u64(SHELL_REPLY_BUF + 24)
+    let status = volatile_read_u64(SHELL_REPLY_BUF + 32)
+
+    if fd < 0 || status != VFS_OK {
+        cprintln("cat: file not found", RED_ON_BLACK)
+        return
+    }
+
+    // Read in chunks
+    let mut total_read: i64 = 0
+    while total_read < fsize {
+        ipc_msg_clear(SHELL_MSG_BUF)
+        volatile_write_u64(SHELL_MSG_BUF + 16, fd)
+        volatile_write_u64(SHELL_MSG_BUF + 24, total_read)
+        volatile_write_u64(SHELL_MSG_BUF + 32, 32)  // 32 bytes per chunk
+        shell_ipc_call_vfs(MSG_VFS_READ)
+        let bytes_read = volatile_read_u64(SHELL_REPLY_BUF + 48)
+        if bytes_read <= 0 { total_read = fsize }  // EOF or error
+        else {
+            let mut j: i64 = 0
+            while j < bytes_read && j < 32 {
+                let ch = volatile_read_u8(SHELL_REPLY_BUF + 16 + j)
+                if ch >= 32 && ch < 127 { console_putchar(ch, WHITE_ON_BLACK) }
+                else if ch == 10 { console_putchar(10, WHITE_ON_BLACK) }
+                j = j + 1
+            }
+            total_read = total_read + bytes_read
+        }
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Close
+    ipc_msg_clear(SHELL_MSG_BUF)
+    volatile_write_u64(SHELL_MSG_BUF + 16, fd)
+    shell_ipc_call_vfs(MSG_VFS_CLOSE)
+}
+
+@kernel fn shell_cmd_vfs_ls(path_addr: i64) {
+    // List directory via VFS
+    ipc_msg_clear(SHELL_MSG_BUF)
+    let mut i: i64 = 0
+    while i < 39 {
+        let ch = volatile_read_u8(path_addr + i)
+        volatile_write_u8(SHELL_MSG_BUF + 16 + i, ch)
+        if ch == 0 { i = 39 } else { i = i + 1 }
+    }
+    shell_ipc_call_vfs(MSG_VFS_LIST)
+    let count = volatile_read_u64(SHELL_REPLY_BUF + 16)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprintln(" entries", WHITE_ON_BLACK)
+}
+
+@kernel fn shell_cmd_vfs_stat(path_addr: i64) {
+    // Stat file via VFS (open → stat → close)
+    ipc_msg_clear(SHELL_MSG_BUF)
+    let mut i: i64 = 0
+    while i < 39 {
+        let ch = volatile_read_u8(path_addr + i)
+        volatile_write_u8(SHELL_MSG_BUF + 16 + i, ch)
+        if ch == 0 { i = 39 } else { i = i + 1 }
+    }
+    shell_ipc_call_vfs(MSG_VFS_OPEN)
+    let fd = volatile_read_u64(SHELL_REPLY_BUF + 16)
+    let fsize = volatile_read_u64(SHELL_REPLY_BUF + 24)
+    let status = volatile_read_u64(SHELL_REPLY_BUF + 32)
+
+    if fd < 0 || status != VFS_OK {
+        cprintln("stat: not found", RED_ON_BLACK)
+        return
+    }
+
+    ipc_msg_clear(SHELL_MSG_BUF)
+    volatile_write_u64(SHELL_MSG_BUF + 16, fd)
+    shell_ipc_call_vfs(MSG_VFS_STAT)
+    let size = volatile_read_u64(SHELL_REPLY_BUF + 16)
+    let ftype = volatile_read_u64(SHELL_REPLY_BUF + 24)
+
+    cprint("  size=", WHITE_ON_BLACK)
+    cprint_decimal(size, CYAN_ON_BLACK)
+    cprint(" type=", WHITE_ON_BLACK)
+    if ftype == 1 { cprintln("file", GREEN_ON_BLACK) }
+    else if ftype == 2 { cprintln("dir", CYAN_ON_BLACK) }
+    else { cprintln("other", WHITE_ON_BLACK) }
+
+    ipc_msg_clear(SHELL_MSG_BUF)
+    volatile_write_u64(SHELL_MSG_BUF + 16, fd)
+    shell_ipc_call_vfs(MSG_VFS_CLOSE)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.7.4: Process Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn shell_cmd_ps() {
+    cprintln("PID  STATE     NAME", YELLOW_ON_BLACK)
+    let mut pid: i64 = 0
+    while pid < 16 {
+        let state = proc_v2_get(pid, 0)
+        if state != PROC_STATE_FREE {
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint("  ", WHITE_ON_BLACK)
+            if state == PROC_STATE_READY { cprint("READY   ", GREEN_ON_BLACK) }
+            else if state == PROC_STATE_RUNNING { cprint("RUNNING ", CYAN_ON_BLACK) }
+            else if state == PROC_STATE_BLOCKED { cprint("BLOCKED ", YELLOW_ON_BLACK) }
+            else if state == PROC_STATE_ZOMBIE { cprint("ZOMBIE  ", RED_ON_BLACK) }
+            cprint("  ", WHITE_ON_BLACK)
+            // Print well-known service names
+            if pid == 0 { cprintln("kernel", WHITE_ON_BLACK) }
+            else if pid == 1 { cprintln("init", WHITE_ON_BLACK) }
+            else if pid == 2 { cprintln("blk", WHITE_ON_BLACK) }
+            else if pid == 3 { cprintln("vfs", WHITE_ON_BLACK) }
+            else if pid == 4 { cprintln("net", WHITE_ON_BLACK) }
+            else if pid == 5 { cprintln("shell", WHITE_ON_BLACK) }
+            else { cprintln("user", WHITE_ON_BLACK) }
+        }
+        pid = pid + 1
+    }
+}
+
+@kernel fn shell_cmd_kill(pid: i64) {
+    if pid <= 0 || pid >= 16 {
+        cprintln("kill: invalid PID", RED_ON_BLACK)
+        return
+    }
+    if pid <= 5 {
+        cprintln("kill: cannot kill system service", RED_ON_BLACK)
+        return
+    }
+    proc_v2_exit(pid, -9)
+    cprint("Killed PID ", GREEN_ON_BLACK)
+    cprint_decimal(pid, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.7.5: Network Commands via IPC
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn shell_cmd_ifconfig() {
+    ipc_msg_clear(SHELL_MSG_BUF)
+    shell_ipc_call_net(MSG_NET_INFO)
+    let state = volatile_read_u64(SHELL_REPLY_BUF + 16)
+    let ip = volatile_read_u64(SHELL_REPLY_BUF + 24)
+    let mac = volatile_read_u64(SHELL_REPLY_BUF + 32)
+    let tx = volatile_read_u64(SHELL_REPLY_BUF + 40)
+    let rx = volatile_read_u64(SHELL_REPLY_BUF + 48)
+
+    cprint("eth0: ", CYAN_ON_BLACK)
+    if state == 1 { cprintln("UP", GREEN_ON_BLACK) } else { cprintln("DOWN", RED_ON_BLACK) }
+    if ip > 0 {
+        cprint("  inet ", WHITE_ON_BLACK)
+        net_svc_ip_print(ip)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+    if mac > 0 {
+        cprint("  ether ", WHITE_ON_BLACK)
+        net_svc_mac_print(mac)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+    cprint("  TX: ", WHITE_ON_BLACK)
+    cprint_decimal(tx, GREEN_ON_BLACK)
+    cprint(" pkts  RX: ", WHITE_ON_BLACK)
+    cprint_decimal(rx, GREEN_ON_BLACK)
+    cprintln(" pkts", WHITE_ON_BLACK)
+}
+
+@kernel fn shell_cmd_ping_ipc() {
+    // Ping gateway via network service IPC
+    let gw = net_svc_read(NETIF_GW)
+    if gw == 0 { cprintln("ping: network down", RED_ON_BLACK); return }
+
+    cprint("PING ", WHITE_ON_BLACK)
+    net_svc_ip_print(gw)
+    cprintln("...", WHITE_ON_BLACK)
+
+    ipc_msg_clear(SHELL_MSG_BUF)
+    volatile_write_u64(SHELL_MSG_BUF + 16, gw)
+    volatile_write_u64(SHELL_MSG_BUF + 24, 1)
+    shell_ipc_call_net(MSG_NET_PING)
+    let sent = volatile_read_u64(SHELL_REPLY_BUF + 16)
+    let status = volatile_read_u64(SHELL_REPLY_BUF + 24)
+    if status == 0 && sent > 0 {
+        cprintln("  1 ICMP echo sent", GREEN_ON_BLACK)
+    } else {
+        cprintln("  send failed", RED_ON_BLACK)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.7.8: Pipe Support
+// Simple pipe between two IPC commands:
+//   "vfs-cat /proc/version | wc" style
+// ═══════════════════════════════════════════════════════════════
+
+const PIPE_SVC_BUF: i64 = 0x8F2800  // 4KB pipe buffer (was 0x8F2000 — overlapped SHELL_DATA_BUF end)
+
+@kernel fn shell_pipe_init() {
+    volatile_write_u64(PIPE_SVC_BUF, 0)      // write_pos = 0
+    volatile_write_u64(PIPE_SVC_BUF + 8, 0)  // read_pos = 0
+}
+
+@kernel fn shell_pipe_write(data: i64, len: i64) -> i64 {
+    let wpos = volatile_read_u64(PIPE_SVC_BUF)
+    let avail = 4096 - 16 - wpos
+    let to_write = if len < avail { len } else { avail }
+    let mut i: i64 = 0
+    while i < to_write {
+        volatile_write_u8(PIPE_SVC_BUF + 16 + wpos + i, volatile_read_u8(data + i))
+        i = i + 1
+    }
+    volatile_write_u64(PIPE_SVC_BUF, wpos + to_write)
+    to_write
+}
+
+@kernel fn shell_pipe_read(buf: i64, max_len: i64) -> i64 {
+    let wpos = volatile_read_u64(PIPE_SVC_BUF)
+    let rpos = volatile_read_u64(PIPE_SVC_BUF + 8)
+    let avail = wpos - rpos
+    if avail <= 0 { return 0 }
+    let to_read = if max_len < avail { max_len } else { avail }
+    let mut i: i64 = 0
+    while i < to_read {
+        volatile_write_u8(buf + i, volatile_read_u8(PIPE_SVC_BUF + 16 + rpos + i))
+        i = i + 1
+    }
+    volatile_write_u64(PIPE_SVC_BUF + 8, rpos + to_read)
+    to_read
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Service Initialization + Respawn (1.7.10)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn shell_svc_init() {
+    volatile_write_u64(SHELL_STATE + SHELL_RUNNING, 1)
+    volatile_write_u64(SHELL_STATE + SHELL_CMD_COUNT, 0)
+    shell_hist_init()
+    shell_pipe_init()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell IPC Test + Status Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_shell_test() {
+    cprintln("=== Shell Service Test ===", YELLOW_ON_BLACK)
+
+    // Test 1: cat /proc/version via VFS IPC
+    cprintln("[1] vfs-cat /proc/version:", WHITE_ON_BLACK)
+    let path: i64 = 0x8F1200  // reuse SHELL_DATA_BUF for test paths (not reading files simultaneously)
+    volatile_write_u8(path, 47)    // /
+    volatile_write_u8(path+1, 112) // p
+    volatile_write_u8(path+2, 114) // r
+    volatile_write_u8(path+3, 111) // o
+    volatile_write_u8(path+4, 99)  // c
+    volatile_write_u8(path+5, 47)  // /
+    volatile_write_u8(path+6, 118) // v
+    volatile_write_u8(path+7, 101) // e
+    volatile_write_u8(path+8, 114) // r
+    volatile_write_u8(path+9, 115) // s
+    volatile_write_u8(path+10, 105) // i
+    volatile_write_u8(path+11, 111) // o
+    volatile_write_u8(path+12, 110) // n
+    volatile_write_u8(path+13, 0)
+    cprint("  ", WHITE_ON_BLACK)
+    shell_cmd_vfs_cat(path)
+
+    // Test 2: ls /proc via VFS IPC
+    cprintln("[2] vfs-ls /proc:", WHITE_ON_BLACK)
+    volatile_write_u8(path, 47)    // /
+    volatile_write_u8(path+1, 112) // p
+    volatile_write_u8(path+2, 114) // r
+    volatile_write_u8(path+3, 111) // o
+    volatile_write_u8(path+4, 99)  // c
+    volatile_write_u8(path+5, 0)
+    cprint("  ", WHITE_ON_BLACK)
+    shell_cmd_vfs_ls(path)
+
+    // Test 3: stat /motd
+    cprintln("[3] vfs-stat /motd:", WHITE_ON_BLACK)
+    volatile_write_u8(path, 47)    // /
+    volatile_write_u8(path+1, 109) // m
+    volatile_write_u8(path+2, 111) // o
+    volatile_write_u8(path+3, 116) // t
+    volatile_write_u8(path+4, 100) // d
+    volatile_write_u8(path+5, 0)
+    shell_cmd_vfs_stat(path)
+
+    // Test 4: ps via process table
+    cprintln("[4] Process list:", WHITE_ON_BLACK)
+    shell_cmd_ps()
+
+    // Test 5: ifconfig via NET IPC
+    cprintln("[5] Network (ifconfig via IPC):", WHITE_ON_BLACK)
+    shell_cmd_ifconfig()
+
+    // Test 6: History
+    cprintln("[6] History:", WHITE_ON_BLACK)
+    shell_hist_add(path, 5)  // Add "/proc" to history
+    volatile_write_u8(path, 108) // l
+    volatile_write_u8(path+1, 115) // s
+    volatile_write_u8(path+2, 0)
+    shell_hist_add(path, 2)  // Add "ls"
+    let count = volatile_read_u64(SHELL_STATE + SHELL_HIST_COUNT)
+    cprint("  ", WHITE_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprintln(" entries in history", WHITE_ON_BLACK)
+
+    // Test 7: Pipe
+    cprintln("[7] Pipe test:", WHITE_ON_BLACK)
+    shell_pipe_init()
+    volatile_write_u8(0x8F3100, 72)   // H
+    volatile_write_u8(0x8F3101, 101)  // e
+    volatile_write_u8(0x8F3102, 108)  // l
+    volatile_write_u8(0x8F3103, 108)  // l
+    volatile_write_u8(0x8F3104, 111)  // o
+    let pw = shell_pipe_write(0x8F3100, 5)
+    let pr = shell_pipe_read(0x8F3200, 64)
+    cprint("  write=", WHITE_ON_BLACK)
+    cprint_decimal(pw, CYAN_ON_BLACK)
+    cprint(" read=", WHITE_ON_BLACK)
+    cprint_decimal(pr, CYAN_ON_BLACK)
+    cprint(" data=\"", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < pr { console_putchar(volatile_read_u8(0x8F3200 + i), GREEN_ON_BLACK); i = i + 1 }
+    cprintln("\"", WHITE_ON_BLACK)
+
+    cprintln("=== Shell tests complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_shell_info() {
+    cprintln("Shell Service:", YELLOW_ON_BLACK)
+    let running = volatile_read_u64(SHELL_STATE + SHELL_RUNNING)
+    cprint("  State:    ", WHITE_ON_BLACK)
+    if running == 1 { cprintln("RUNNING", GREEN_ON_BLACK) } else { cprintln("STOPPED", RED_ON_BLACK) }
+    cprint("  PID:      ", WHITE_ON_BLACK)
+    cprint_decimal(SHELL_SVC_PID, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Commands: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(SHELL_STATE + SHELL_CMD_COUNT), CYAN_ON_BLACK)
+    cprintln(" executed", WHITE_ON_BLACK)
+    cprint("  History:  ", WHITE_ON_BLACK)
+    let hcount = volatile_read_u64(SHELL_STATE + SHELL_HIST_COUNT)
+    cprint_decimal(hcount, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(SHELL_HIST_ENTRIES_MAX, WHITE_ON_BLACK)
+    cprintln(" entries", WHITE_ON_BLACK)
+    // Show last 5 history entries
+    if hcount > 0 {
+        cprintln("  Recent:", WHITE_ON_BLACK)
+        let show = if hcount < 5 { hcount } else { 5 }
+        let mut i: i64 = 0
+        while i < show {
+            let buf: i64 = 0x8F1300  // inside SHELL_DATA_BUF for temp use
+            let len = shell_hist_get(i, buf)
+            if len > 0 {
+                cprint("    ", WHITE_ON_BLACK)
+                let mut j: i64 = 0
+                while j < len {
+                    console_putchar(volatile_read_u8(buf + j), CYAN_ON_BLACK)
+                    j = j + 1
+                }
+                console_putchar(10, WHITE_ON_BLACK)
+            }
+            i = i + 1
+        }
+    }
+}

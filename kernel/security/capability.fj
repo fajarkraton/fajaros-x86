@@ -1,0 +1,131 @@
+// FajarOS Nova v2.0 — Capability System (Sprint 1.2.10)
+// Per-process capability bitmap for IPC security
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Capability System
+//
+// Each process has a 64-bit capability bitmap stored in its
+// IPC endpoint (EP_CAP_BITS field). Capabilities control:
+//   - Who can send IPC messages
+//   - Who can access ports / IRQs / DMA
+//   - Who can spawn/kill other processes
+//
+// Capabilities are inherited from parent on spawn.
+// Kernel (PID 0) has all capabilities.
+// ═══════════════════════════════════════════════════════════════
+
+// Capability bits (matching MICROKERNEL_SPEC.md Section 5)
+const CAP_IPC_SEND: i64 = 1       // bit 0: can send IPC messages
+const CAP_IPC_RECV: i64 = 2       // bit 1: can receive IPC messages
+const CAP_SPAWN: i64 = 4          // bit 2: can spawn child processes
+const CAP_KILL: i64 = 8           // bit 3: can kill other processes
+const CAP_PORT_IO: i64 = 16       // bit 4: can do port I/O
+const CAP_IRQ: i64 = 32           // bit 5: can wait for IRQs
+const CAP_DMA: i64 = 64           // bit 6: can allocate DMA memory
+const CAP_MAP_PHYS: i64 = 128     // bit 7: can map physical addresses
+const CAP_NET: i64 = 256          // bit 8: can access network service
+const CAP_FS: i64 = 512           // bit 9: can access filesystem service
+const CAP_DEVICE: i64 = 1024      // bit 10: can access device hardware
+const CAP_ADMIN: i64 = 2048       // bit 11: can shutdown/reboot
+const CAP_ALL: i64 = -1
+
+// Default capabilities by annotation context
+const CAP_KERNEL_DEFAULT: i64 = -1  // ALL
+const CAP_DEVICE_DEFAULT: i64 = 1267  // IPC_SEND(1) + IPC_RECV(2) + PORT_IO(16) + IRQ(32) + DMA(64) + MAP_PHYS(128) + DEVICE(1024) — was 1143 (wrong: had SPAWN, missed MAP_PHYS)
+const CAP_SAFE_DEFAULT: i64 = 775     // IPC_SEND + IPC_RECV + SPAWN + FS + NET
+
+// ── Capability checking ──
+
+@kernel fn cap_check(pid: i64, required: i64) -> i64 {
+    let caps = ep_read(pid, EP_CAP_BITS)
+    if (caps & required) == required { return 1 }
+    0
+}
+
+@kernel fn cap_grant(pid: i64, bits: i64) {
+    let caps = ep_read(pid, EP_CAP_BITS)
+    ep_write(pid, EP_CAP_BITS, caps | bits)
+}
+
+@kernel fn cap_revoke(pid: i64, bits: i64) {
+    let caps = ep_read(pid, EP_CAP_BITS)
+    ep_write(pid, EP_CAP_BITS, caps & (-1 ^ bits))
+}
+
+@kernel fn cap_set(pid: i64, bits: i64) {
+    ep_write(pid, EP_CAP_BITS, bits)
+}
+
+@kernel fn cap_init_process(pid: i64, annotation: i64) {
+    // annotation: 0=@safe, 1=@kernel, 2=@device
+    if annotation == 1 { cap_set(pid, CAP_KERNEL_DEFAULT) }
+    else if annotation == 2 { cap_set(pid, CAP_DEVICE_DEFAULT) }
+    else { cap_set(pid, CAP_SAFE_DEFAULT) }
+}
+
+// ── Capability-guarded IPC operations ──
+
+@kernel fn ipc2_send_checked(dst_pid: i64, msg_addr: i64) -> i64 {
+    let src_pid = volatile_read_u64(0x6FE00)
+    if cap_check(src_pid, CAP_IPC_SEND) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_send(dst_pid, msg_addr)
+}
+
+@kernel fn ipc2_recv_checked(from_pid: i64, buf_addr: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+    if cap_check(my_pid, CAP_IPC_RECV) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_recv(from_pid, buf_addr)
+}
+
+@kernel fn ipc2_call_checked(dst_pid: i64, msg_addr: i64, reply_addr: i64) -> i64 {
+    let src_pid = volatile_read_u64(0x6FE00)
+    if cap_check(src_pid, CAP_IPC_SEND | CAP_IPC_RECV) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_call(dst_pid, msg_addr, reply_addr)
+}
+
+@kernel fn ipc2_reply_checked(caller_pid: i64, reply_addr: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+    if cap_check(my_pid, CAP_IPC_SEND) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_reply(caller_pid, reply_addr)
+}
+
+@kernel fn ipc2_notify_checked(dst_pid: i64, bits: i64) -> i64 {
+    let src_pid = volatile_read_u64(0x6FE00)
+    if cap_check(src_pid, CAP_IPC_SEND) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_notify(dst_pid, bits)
+}
+
+// ── Shell command: show capabilities ──
+
+@kernel fn cmd_caps() {
+    cprintln("Process Capabilities:", YELLOW_ON_BLACK)
+    let mut pid: i64 = 0
+    while pid < IPC_EP_MAX {
+        let proc_state = proc_v2_get(pid, 0)
+        if proc_state != PROC_STATE_FREE {
+            let caps = ep_read(pid, EP_CAP_BITS)
+            cprint("  PID ", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint(": 0x", WHITE_ON_BLACK)
+            cprint_hex(caps, 8, CYAN_ON_BLACK)
+            cprint(" [", WHITE_ON_BLACK)
+            if (caps & CAP_IPC_SEND) != 0 { cprint("S", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_IPC_RECV) != 0 { cprint("R", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_SPAWN) != 0 { cprint("P", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_KILL) != 0 { cprint("K", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_PORT_IO) != 0 { cprint("I", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_IRQ) != 0 { cprint("Q", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_DMA) != 0 { cprint("D", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_MAP_PHYS) != 0 { cprint("M", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_NET) != 0 { cprint("N", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_FS) != 0 { cprint("F", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_DEVICE) != 0 { cprint("V", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            if (caps & CAP_ADMIN) != 0 { cprint("A", GREEN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            cprintln("]", WHITE_ON_BLACK)
+        }
+        pid = pid + 1
+    }
+    cprintln("  Legend: S=Send R=Recv P=Spawn K=Kill I=Port Q=IRQ", WHITE_ON_BLACK)
+    cprintln("         D=DMA M=MapPhys N=Net F=FS V=Device A=Admin", WHITE_ON_BLACK)
+}

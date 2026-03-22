@@ -3,7 +3,7 @@
 
 // ── Syscall Dispatch Table ──
 
-const SYSCALL_TABLE: i64 = 0x884000  // 32 entries × 8 bytes (fn pointers)
+const SYSCALL_TABLE: i64 = 0x884000  // 64 entries × 8 bytes (fn pointers)
 const SYS_EXIT: i64 = 0
 const SYS_WRITE: i64 = 1
 const SYS_READ: i64 = 2
@@ -12,6 +12,22 @@ const SYS_YIELD: i64 = 4
 const SYS_SLEEP: i64 = 5
 const SYS_MMAP: i64 = 6
 const SYS_BRK: i64 = 7
+
+// IPC syscalls (Sprint 1.2)
+const SYS_SEND: i64 = 10
+const SYS_RECV: i64 = 11
+const SYS_CALL: i64 = 12
+const SYS_REPLY: i64 = 13
+const SYS_NOTIFY: i64 = 14
+
+// Memory syscalls
+const SYS_MUNMAP: i64 = 21
+const SYS_SHARE: i64 = 22
+
+// I/O syscalls (for drivers)
+const SYS_IRQ_WAIT: i64 = 30
+const SYS_PORT_IO: i64 = 31
+const SYS_DMA_ALLOC: i64 = 32
 
 @kernel fn syscall_init() {
     // Clear syscall table
@@ -63,6 +79,41 @@ const SYS_BRK: i64 = 7
         }
         return base
     }
+
+    // ── IPC v2 Syscalls (Sprint 1.2) ──
+    if num == SYS_SEND {
+        // arg0=dst_pid, arg1=msg_ptr
+        return ipc2_send_checked(arg0, arg1)
+    }
+    if num == SYS_RECV {
+        // arg0=from_pid (-1=any), arg1=buf_ptr
+        return ipc2_recv_checked(arg0, arg1)
+    }
+    if num == SYS_CALL {
+        // arg0=dst_pid, arg1=msg_ptr, arg2=reply_ptr
+        return ipc2_call_checked(arg0, arg1, arg2)
+    }
+    if num == SYS_REPLY {
+        // arg0=caller_pid, arg1=reply_ptr
+        return ipc2_reply_checked(arg0, arg1)
+    }
+    if num == SYS_NOTIFY {
+        // arg0=dst_pid, arg1=bits
+        return ipc2_notify_checked(arg0, arg1)
+    }
+    if num == SYS_SHARE {
+        // arg0=region_id, arg1=guest_pid
+        return shm_share(arg0, arg1)
+    }
+    if num == SYS_IRQ_WAIT {
+        // arg0=irq — block until IRQ fires (driver use)
+        return ipc2_wait_notify(1 << (arg0 & 63))
+    }
+    if num == SYS_DMA_ALLOC {
+        // arg0=size — allocate DMA-safe memory
+        return shm_create(arg0)
+    }
+
     -1 // Unknown syscall
 }
 

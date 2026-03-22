@@ -1,0 +1,163 @@
+// FajarOS Nova v2.0 — Async Notifications (Sprint 1.2.6)
+// Non-blocking signal mechanism for IPC
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Async Notifications (seL4-inspired)
+//
+// Each process has a 64-bit notification word in its IPC endpoint.
+// notify(dst, bits) — OR bits into dst's notify_pending (non-blocking)
+// wait_notify(mask) — block until (notify_pending & mask) != 0
+// poll_notify(mask) — non-blocking check, returns pending & mask
+//
+// Use cases:
+//   - IRQ forwarding: kernel notifies driver (bit per IRQ)
+//   - Wakeup signal: timer fires, notify sleeping process
+//   - Event flag: "data ready" between cooperating services
+// ═══════════════════════════════════════════════════════════════
+
+// Notification bit definitions (well-known)
+const NOTIFY_IRQ_0: i64 = 1          // bit 0: IRQ event
+const NOTIFY_IRQ_1: i64 = 2          // bit 1: second IRQ
+const NOTIFY_IRQ_2: i64 = 4          // bit 2: third IRQ
+const NOTIFY_IRQ_3: i64 = 8          // bit 3: fourth IRQ
+const NOTIFY_TIMER: i64 = 16         // bit 4: timer event
+const NOTIFY_DATA_READY: i64 = 32    // bit 5: data available
+const NOTIFY_CHILD_EXIT: i64 = 64    // bit 6: child process exited
+const NOTIFY_NET_RX: i64 = 128       // bit 7: network packet received
+const NOTIFY_DISK_DONE: i64 = 256    // bit 8: disk I/O complete
+const NOTIFY_USER_0: i64 = 0x10000   // bit 16+: user-defined
+
+// ── Core notification operations ──
+
+@kernel fn ipc2_notify(dst_pid: i64, bits: i64) -> i64 {
+    if dst_pid < 0 || dst_pid >= IPC_EP_MAX { return IPC_ERR_INVALID_PID }
+
+    // Check process is alive
+    let proc_state = proc_v2_get(dst_pid, 0)
+    if proc_state == PROC_STATE_FREE { return IPC_ERR_DEAD_PROCESS }
+
+    // OR bits into pending notifications (atomic-like for single-core)
+    let pending = ep_read(dst_pid, EP_NOTIFY_PENDING)
+    ep_write(dst_pid, EP_NOTIFY_PENDING, pending | bits)
+
+    // If target is blocked waiting for notifications, check mask
+    let ipc_state = ep_read(dst_pid, EP_STATE)
+    if ipc_state == IPC_RECV_BLOCKED {
+        let mask = ep_read(dst_pid, EP_NOTIFY_MASK)
+        if mask != 0 && ((pending | bits) & mask) != 0 {
+            // Wake the process — notification matches mask
+            ep_write(dst_pid, EP_STATE, IPC_IDLE)
+            ep_write(dst_pid, EP_PARTNER, -1)
+            ep_write(dst_pid, EP_NOTIFY_MASK, 0)
+            proc_v2_set(dst_pid, 0, PROC_STATE_READY)
+        }
+    }
+
+    IPC_OK
+}
+
+@kernel fn ipc2_wait_notify(mask: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    // Check if any matching bits already pending
+    let pending = ep_read(my_pid, EP_NOTIFY_PENDING)
+    let matched = pending & mask
+    if matched != 0 {
+        // Clear consumed bits and return them
+        ep_write(my_pid, EP_NOTIFY_PENDING, pending & (-1 ^ matched))
+        return matched
+    }
+
+    // No match — block waiting for notification
+    ep_write(my_pid, EP_NOTIFY_MASK, mask)
+    ep_write(my_pid, EP_STATE, IPC_RECV_BLOCKED)
+    ep_write(my_pid, EP_PARTNER, -1)
+    proc_v2_set(my_pid, 0, PROC_STATE_BLOCKED)
+
+    return IPC_ERR_WOULD_BLOCK  // Will be resumed by notify
+}
+
+@kernel fn ipc2_poll_notify(mask: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+    let pending = ep_read(my_pid, EP_NOTIFY_PENDING)
+    let matched = pending & mask
+    if matched != 0 {
+        // Clear consumed bits
+        ep_write(my_pid, EP_NOTIFY_PENDING, pending & (-1 ^ matched))
+        return matched
+    }
+    0  // No notifications pending
+}
+
+// ── IRQ-to-notification bridge ──
+// Maps hardware IRQs to notification bits for driver processes
+
+const IRQ_NOTIFY_TABLE: i64 = 0x8A9100  // 256 IRQs × 16 bytes (pid + bits)
+
+@kernel fn irq_notify_init() {
+    let mut i: i64 = 0
+    while i < 256 * 16 {
+        volatile_write_u8(IRQ_NOTIFY_TABLE + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn irq_notify_register(irq: i64, pid: i64, bits: i64) {
+    if irq < 0 || irq >= 256 { return }
+    let entry = IRQ_NOTIFY_TABLE + irq * 16
+    volatile_write_u64(entry, pid)
+    volatile_write_u64(entry + 8, bits)
+}
+
+@kernel fn irq_notify_fire(irq: i64) {
+    // Called from ISR — notify the registered driver
+    if irq < 0 || irq >= 256 { return }
+    let entry = IRQ_NOTIFY_TABLE + irq * 16
+    let pid = volatile_read_u64(entry)
+    let bits = volatile_read_u64(entry + 8)
+    if pid > 0 && bits != 0 {
+        ipc2_notify(pid, bits)
+    }
+}
+
+// ── Shell commands ──
+
+@kernel fn cmd_notify_test() {
+    cprintln("Notification test:", YELLOW_ON_BLACK)
+
+    // Self-notification test
+    let my_pid = volatile_read_u64(0x6FE00)
+    ipc2_notify(my_pid, NOTIFY_DATA_READY | NOTIFY_TIMER)
+    let pending = ep_read(my_pid, EP_NOTIFY_PENDING)
+    cprint("  Pending after notify: 0x", WHITE_ON_BLACK)
+    cprint_hex(pending, 4, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Poll for data_ready
+    let got = ipc2_poll_notify(NOTIFY_DATA_READY)
+    cprint("  Poll DATA_READY: 0x", WHITE_ON_BLACK)
+    cprint_hex(got, 4, GREEN_ON_BLACK)
+    if got != 0 { cprint(" (matched!)", GREEN_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Check remaining
+    let remaining = ep_read(my_pid, EP_NOTIFY_PENDING)
+    cprint("  Remaining: 0x", WHITE_ON_BLACK)
+    cprint_hex(remaining, 4, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Poll for timer
+    let got2 = ipc2_poll_notify(NOTIFY_TIMER)
+    cprint("  Poll TIMER: 0x", WHITE_ON_BLACK)
+    cprint_hex(got2, 4, GREEN_ON_BLACK)
+    if got2 != 0 { cprint(" (matched!)", GREEN_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Verify all consumed
+    let final_pending = ep_read(my_pid, EP_NOTIFY_PENDING)
+    cprint("  Final pending: 0x", WHITE_ON_BLACK)
+    cprint_hex(final_pending, 4, CYAN_ON_BLACK)
+    if final_pending == 0 { cprint(" (all consumed)", GREEN_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+}

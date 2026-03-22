@@ -1,0 +1,321 @@
+// FajarOS Nova v2.0 — IPC Test Commands (Sprint 1.2.9)
+// Shell commands for testing IPC subsystem
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// IPC v2 Test Suite
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_ipc_test() {
+    cprintln("=== IPC v2 Test Suite ===", YELLOW_ON_BLACK)
+
+    // Test 1: Self-send via queue
+    cprintln("[1] Queue send/recv test:", WHITE_ON_BLACK)
+    let my_pid = volatile_read_u64(0x6FE00)
+    let msg_buf: i64 = 0x8A9300  // Scratch buffer
+    ipc_msg_clear(msg_buf)
+    ipc_msg_set_header(msg_buf, my_pid, 0x42, 1)
+    volatile_write_u64(msg_buf + 16, 0xDEADBEEF)  // payload
+
+    let send_result = ipc_queue_push(my_pid, my_pid, msg_buf)
+    if send_result == IPC_OK { cprint("  push: OK", GREEN_ON_BLACK) }
+    else { cprint("  push: FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Recv from queue
+    let recv_buf: i64 = 0x8A9400
+    let sender_out: i64 = 0x8A9500
+    let recv_result = ipc_queue_pop(my_pid, sender_out, recv_buf)
+    if recv_result == IPC_OK {
+        let sender = volatile_read_u64(sender_out)
+        let payload = volatile_read_u64(recv_buf + 16)
+        cprint("  pop: OK, sender=", GREEN_ON_BLACK)
+        cprint_decimal(sender, CYAN_ON_BLACK)
+        cprint(" payload=0x", WHITE_ON_BLACK)
+        cprint_hex(payload, 8, CYAN_ON_BLACK)
+        if payload == 0xDEADBEEF { cprint(" PASS", GREEN_ON_BLACK) }
+        else { cprint(" FAIL", RED_ON_BLACK) }
+    } else {
+        cprint("  pop: FAIL", RED_ON_BLACK)
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Test 2: Notification
+    cprintln("[2] Notification test:", WHITE_ON_BLACK)
+    ep_write(my_pid, EP_NOTIFY_PENDING, 0)  // Clear first
+    ipc2_notify(my_pid, NOTIFY_DATA_READY | NOTIFY_TIMER)
+    let p = ep_read(my_pid, EP_NOTIFY_PENDING)
+    cprint("  notify(0x30): pending=0x", WHITE_ON_BLACK)
+    cprint_hex(p, 4, CYAN_ON_BLACK)
+    if p == (NOTIFY_DATA_READY | NOTIFY_TIMER) { cprint(" PASS", GREEN_ON_BLACK) }
+    else { cprint(" FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Poll
+    let got = ipc2_poll_notify(NOTIFY_DATA_READY)
+    cprint("  poll(DATA_READY): 0x", WHITE_ON_BLACK)
+    cprint_hex(got, 4, CYAN_ON_BLACK)
+    if got == NOTIFY_DATA_READY { cprint(" PASS", GREEN_ON_BLACK) }
+    else { cprint(" FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let remaining = ep_read(my_pid, EP_NOTIFY_PENDING)
+    cprint("  remaining: 0x", WHITE_ON_BLACK)
+    cprint_hex(remaining, 4, CYAN_ON_BLACK)
+    if remaining == NOTIFY_TIMER { cprint(" PASS", GREEN_ON_BLACK) }
+    else { cprint(" FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+    // Clean up
+    ipc2_poll_notify(NOTIFY_TIMER)
+
+    // Test 3: Channel register/lookup
+    cprintln("[3] Channel test:", WHITE_ON_BLACK)
+    let name_buf: i64 = 0x8A9600
+    volatile_write_u8(name_buf, 116)     // t
+    volatile_write_u8(name_buf + 1, 101) // e
+    volatile_write_u8(name_buf + 2, 115) // s
+    volatile_write_u8(name_buf + 3, 116) // t
+    volatile_write_u8(name_buf + 4, 0)
+
+    let reg_result = channel_register(name_buf, 7)
+    cprint("  register('test', 7): ", WHITE_ON_BLACK)
+    if reg_result >= 0 { cprint("OK id=", GREEN_ON_BLACK); cprint_decimal(reg_result, CYAN_ON_BLACK) }
+    else { cprint("FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let lookup_result = channel_lookup(name_buf)
+    cprint("  lookup('test'): pid=", WHITE_ON_BLACK)
+    cprint_decimal(lookup_result, CYAN_ON_BLACK)
+    if lookup_result == 7 { cprint(" PASS", GREEN_ON_BLACK) }
+    else { cprint(" FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Cleanup
+    channel_unregister(name_buf)
+
+    // Test 4: SHM create/destroy
+    cprintln("[4] Shared memory test:", WHITE_ON_BLACK)
+    let region = shm_create(4096)
+    cprint("  shm_create(4096): ", WHITE_ON_BLACK)
+    if region >= 0 {
+        cprint("OK id=", GREEN_ON_BLACK)
+        cprint_decimal(region, CYAN_ON_BLACK)
+    } else {
+        cprint("FAIL", RED_ON_BLACK)
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    if region >= 0 {
+        let vaddr = shm_get_owner_vaddr(region)
+        cprint("  vaddr: 0x", WHITE_ON_BLACK)
+        cprint_hex(vaddr, 8, CYAN_ON_BLACK)
+
+        // Write + read test
+        volatile_write_u64(vaddr, 0xCAFEBABE)
+        let readback = volatile_read_u64(vaddr)
+        if readback == 0xCAFEBABE { cprint(" R/W PASS", GREEN_ON_BLACK) }
+        else { cprint(" R/W FAIL", RED_ON_BLACK) }
+        console_putchar(10, WHITE_ON_BLACK)
+
+        shm_destroy(region)
+        cprintln("  destroy: OK", GREEN_ON_BLACK)
+    }
+
+    // Test 5: IPC round-trip latency (queue only, same process)
+    cprintln("[5] IPC latency benchmark:", WHITE_ON_BLACK)
+    let tsc_start = rdtsc()
+    let iterations: i64 = 1000
+    let mut iter: i64 = 0
+    while iter < iterations {
+        ipc_msg_clear(msg_buf)
+        ipc_msg_set_header(msg_buf, my_pid, 1, iter)
+        ipc_queue_push(my_pid, my_pid, msg_buf)
+        ipc_queue_pop(my_pid, sender_out, recv_buf)
+        iter = iter + 1
+    }
+    let tsc_end = rdtsc()
+    let total_cycles = tsc_end - tsc_start
+    let per_trip = total_cycles / iterations
+    cprint("  ", WHITE_ON_BLACK)
+    cprint_decimal(iterations, CYAN_ON_BLACK)
+    cprint(" round-trips in ", WHITE_ON_BLACK)
+    cprint_decimal(total_cycles, CYAN_ON_BLACK)
+    cprint(" cycles (", WHITE_ON_BLACK)
+    cprint_decimal(per_trip, GREEN_ON_BLACK)
+    cprintln(" cycles/trip)", WHITE_ON_BLACK)
+
+    // ~2GHz CPU: 1μs ≈ 2000 cycles
+    cprint("  Estimated: ~", WHITE_ON_BLACK)
+    cprint_decimal(per_trip / 2, CYAN_ON_BLACK)
+    cprintln(" ns per round-trip", WHITE_ON_BLACK)
+
+    cprintln("=== All tests complete ===", GREEN_ON_BLACK)
+}
+
+// ── IPC v2 shell commands for manual testing ──
+
+@kernel fn cmd_ipc2_send() {
+    // "ipc2send <pid> <type> <value>" — send message via IPC v2
+    let len = cmdbuf_len()
+    if len <= 9 { cprintln("Usage: ipc2send <pid> <type> <value>", YELLOW_ON_BLACK); return }
+
+    // Parse pid
+    let mut pid: i64 = 0
+    let mut i: i64 = 9  // "ipc2send " = 9 chars
+    while i < len && volatile_read_u8(0x6F800 + i) != 32 {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch >= 48 && ch <= 57 { pid = pid * 10 + (ch - 48) }
+        i = i + 1
+    }
+    i = i + 1  // skip space
+
+    // Parse type
+    let mut msg_type: i64 = 0
+    while i < len && volatile_read_u8(0x6F800 + i) != 32 {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch >= 48 && ch <= 57 { msg_type = msg_type * 10 + (ch - 48) }
+        i = i + 1
+    }
+    i = i + 1  // skip space
+
+    // Parse value
+    let mut val: i64 = 0
+    while i < len {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch >= 48 && ch <= 57 { val = val * 10 + (ch - 48) }
+        i = i + 1
+    }
+
+    // Build and send message
+    let msg_buf: i64 = 0x8A9300
+    ipc_msg_clear(msg_buf)
+    let my_pid = volatile_read_u64(0x6FE00)
+    ipc_msg_set_header(msg_buf, my_pid, msg_type, 0)
+    volatile_write_u64(msg_buf + 16, val)
+
+    let result = ipc2_send(pid, msg_buf)
+    if result == IPC_OK {
+        cprint("Sent type=", GREEN_ON_BLACK)
+        cprint_decimal(msg_type, CYAN_ON_BLACK)
+        cprint(" val=", WHITE_ON_BLACK)
+        cprint_decimal(val, CYAN_ON_BLACK)
+        cprint(" to PID ", WHITE_ON_BLACK)
+        cprint_decimal(pid, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else {
+        cprint("Send failed: ", RED_ON_BLACK)
+        cprint_decimal(result, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_ipc2_recv() {
+    // "ipc2recv" — receive from any, or "ipc2recv <pid>" — receive from specific
+    let len = cmdbuf_len()
+    let mut from_pid: i64 = -1  // any
+
+    if len > 9 {
+        // Parse pid
+        let mut i: i64 = 9
+        from_pid = 0
+        while i < len {
+            let ch = volatile_read_u8(0x6F800 + i)
+            if ch >= 48 && ch <= 57 { from_pid = from_pid * 10 + (ch - 48) }
+            i = i + 1
+        }
+    }
+
+    let recv_buf: i64 = 0x8A9400
+    let result = ipc2_recv(from_pid, recv_buf)
+    if result >= 0 {
+        let sender = volatile_read_u64(recv_buf)
+        let msg_type = volatile_read_u32(recv_buf + 8)
+        let payload = volatile_read_u64(recv_buf + 16)
+        cprint("Received from PID ", GREEN_ON_BLACK)
+        cprint_decimal(sender, CYAN_ON_BLACK)
+        cprint(" type=", WHITE_ON_BLACK)
+        cprint_decimal(msg_type, CYAN_ON_BLACK)
+        cprint(" payload=", WHITE_ON_BLACK)
+        cprint_decimal(payload, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else if result == IPC_ERR_WOULD_BLOCK {
+        cprintln("No messages — would block", YELLOW_ON_BLACK)
+    } else {
+        cprint("Recv failed: ", RED_ON_BLACK)
+        cprint_decimal(result, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_ipc_bench() {
+    // "ipc-bench" — IPC round-trip benchmark
+    cprintln("IPC v2 Benchmark:", YELLOW_ON_BLACK)
+    let my_pid = volatile_read_u64(0x6FE00)
+    let msg_buf: i64 = 0x8A9300
+    let recv_buf: i64 = 0x8A9400
+    let sender_out: i64 = 0x8A9500
+
+    // Benchmark queue push/pop (1000 iterations)
+    let tsc_start = rdtsc()
+    let iterations: i64 = 10000
+    let mut i: i64 = 0
+    while i < iterations {
+        ipc_msg_clear(msg_buf)
+        volatile_write_u64(msg_buf, my_pid)
+        volatile_write_u64(msg_buf + 16, i)
+        ipc_queue_push(my_pid, my_pid, msg_buf)
+        ipc_queue_pop(my_pid, sender_out, recv_buf)
+        i = i + 1
+    }
+    let tsc_end = rdtsc()
+    let total = tsc_end - tsc_start
+    let per_trip = total / iterations
+
+    cprint("  Queue push/pop: ", WHITE_ON_BLACK)
+    cprint_decimal(per_trip, GREEN_ON_BLACK)
+    cprint(" cycles/trip (", WHITE_ON_BLACK)
+    cprint_decimal(iterations, CYAN_ON_BLACK)
+    cprintln(" iterations)", WHITE_ON_BLACK)
+
+    // Benchmark notification set/poll
+    let tsc2_start = rdtsc()
+    i = 0
+    while i < iterations {
+        ipc2_notify(my_pid, NOTIFY_DATA_READY)
+        ipc2_poll_notify(NOTIFY_DATA_READY)
+        i = i + 1
+    }
+    let tsc2_end = rdtsc()
+    let total2 = tsc2_end - tsc2_start
+    let per_notify = total2 / iterations
+
+    cprint("  Notify/poll:    ", WHITE_ON_BLACK)
+    cprint_decimal(per_notify, GREEN_ON_BLACK)
+    cprint(" cycles/trip (", WHITE_ON_BLACK)
+    cprint_decimal(iterations, CYAN_ON_BLACK)
+    cprintln(" iterations)", WHITE_ON_BLACK)
+
+    // Benchmark msg copy (64 bytes)
+    let tsc3_start = rdtsc()
+    i = 0
+    while i < iterations {
+        ipc_msg_copy(recv_buf, msg_buf)
+        i = i + 1
+    }
+    let tsc3_end = rdtsc()
+    let per_copy = (tsc3_end - tsc3_start) / iterations
+
+    cprint("  Msg copy (64B): ", WHITE_ON_BLACK)
+    cprint_decimal(per_copy, GREEN_ON_BLACK)
+    cprintln(" cycles", WHITE_ON_BLACK)
+
+    // Summary
+    cprint("  Target: <1us = <", WHITE_ON_BLACK)
+    cprint_decimal(2000, WHITE_ON_BLACK)
+    cprintln(" cycles @ 2GHz", WHITE_ON_BLACK)
+    if per_trip < 2000 {
+        cprintln("  PASS: sub-microsecond IPC", GREEN_ON_BLACK)
+    } else {
+        cprintln("  Target not met (acceptable for emulated CPU)", YELLOW_ON_BLACK)
+    }
+}

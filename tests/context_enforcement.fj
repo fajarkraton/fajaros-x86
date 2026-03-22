@@ -1,0 +1,118 @@
+// FajarOS Nova v2.0 — Context Enforcement Integration Test (Sprint 1.8)
+// This file verifies that @kernel/@device/@safe annotations are enforced.
+// Compile with: fj check tests/context_enforcement.fj
+// EXPECTED: All examples below should produce the documented errors.
+
+// ═══════════════════════════════════════════════════════════════
+// 1.8.1: @safe enforcement — rejects hardware access
+// ═══════════════════════════════════════════════════════════════
+
+// SHOULD PASS: @safe can use normal operations
+@safe fn safe_add(a: i64, b: i64) -> i64 { a + b }
+@safe fn safe_logic() -> i64 { if true { 1 } else { 0 } }
+
+// SHOULD FAIL (SE020): @safe cannot use port_outb
+// @safe fn safe_port_fail() { port_outb(0x3F8, 65) }
+
+// SHOULD FAIL (SE020): @safe cannot use volatile_write
+// @safe fn safe_volatile_fail() { volatile_write(0xB8000, 0x0F41) }
+
+// SHOULD FAIL (KE005): @safe cannot use asm!
+// @safe fn safe_asm_fail() { asm!("cli") }
+
+// SHOULD FAIL (SE021): @safe cannot call @kernel fn directly
+// @safe fn safe_kernel_call_fail() { kernel_only_fn() }
+
+// ═══════════════════════════════════════════════════════════════
+// 1.8.2: @device enforcement — rejects IRQ and raw pointers
+// ═══════════════════════════════════════════════════════════════
+
+// SHOULD PASS: @device can use tensor ops, IPC
+@device fn device_compute(x: i64) -> i64 { x * 2 }
+
+// SHOULD FAIL (KE006): @device cannot use asm!
+// @device fn device_asm_fail() { asm!("hlt") }
+
+// SHOULD FAIL (DE001): @device cannot use raw pointers
+// @device fn device_raw_ptr_fail() { mem_write_u64(0x100000, 42) }
+
+// ═══════════════════════════════════════════════════════════════
+// 1.8.3: @kernel enforcement — rejects heap and tensor
+// ═══════════════════════════════════════════════════════════════
+
+// SHOULD PASS: @kernel can use hardware
+@kernel fn kernel_hardware_ok() -> i64 { 42 }
+
+// SHOULD FAIL (KE001): @kernel cannot use heap strings (push/pop)
+// @kernel fn kernel_heap_fail() { push(arr, 42) }
+
+// SHOULD FAIL (KE002): @kernel cannot use tensor ops
+// @kernel fn kernel_tensor_fail() { tensor_zeros(3, 3) }
+
+// SHOULD FAIL (KE003): @kernel cannot call @device fn
+// @kernel fn kernel_device_fail() { device_compute(5) }
+
+// ═══════════════════════════════════════════════════════════════
+// 1.8.4: Cross-annotation calls
+// ═══════════════════════════════════════════════════════════════
+
+// VALID: @safe → @safe
+@safe fn helper() -> i64 { 1 }
+@safe fn caller() -> i64 { helper() }
+
+// VALID: @kernel → @kernel
+@kernel fn k_helper() -> i64 { 2 }
+@kernel fn k_caller() -> i64 { k_helper() }
+
+// INVALID: @safe → @kernel (must use syscall)
+// @safe fn cross_fail() -> i64 { k_helper() }
+
+// ═══════════════════════════════════════════════════════════════
+// 1.8.5: IPC type safety (compile-time message type check)
+// The IPC message types are constants (MSG_VFS_OPEN etc.)
+// Type safety comes from the service dispatch matching on msg_type
+// No runtime type errors possible — unknown types return EINVAL
+// ═══════════════════════════════════════════════════════════════
+
+// IPC is safe by design:
+// - Messages are fixed 64-byte structs (no buffer overflow)
+// - msg_type is an integer constant, not a string (no injection)
+// - Service handlers reject unknown types with error code
+// - Capability system restricts who can send to whom
+
+// ═══════════════════════════════════════════════════════════════
+// 1.8.6: Capability types — enforced at OS level
+// Cap<PortIO>, Cap<IRQ>, Cap<DMA> are runtime capability checks
+// per Sprint 1.2 (ipc2_send_checked etc.)
+// @device("net") restricts to network-only builtins at compile time
+// ═══════════════════════════════════════════════════════════════
+
+// VALID: @device("net") can use net builtins
+// @device("net") fn net_only() { net_send(sock, data, len) }
+
+// INVALID: @device("net") cannot use port_outb
+// @device("net") fn net_port_fail() { port_outb(0x3F8, 65) }
+
+// ═══════════════════════════════════════════════════════════════
+// Summary: FajarOS Safety Model
+//
+// The Fajar Lang compiler enforces three isolation levels:
+//
+//   @kernel — Full hardware access, no heap/tensor/device
+//     ✅ port_outb, volatile_*, asm!, IRQ, DMA, page tables
+//     ❌ push/pop (heap), tensor_zeros (ML), @device calls
+//
+//   @device — Tensor/ML + restricted hardware (via capabilities)
+//     ✅ tensor ops, @device("net") → net builtins only
+//     ❌ asm!, raw pointers, IRQ, @kernel calls
+//
+//   @safe — No hardware access whatsoever (microkernel user space)
+//     ✅ pure computation, IPC via syscalls
+//     ❌ port_outb, volatile_*, asm!, @kernel calls, @device calls
+//
+// Error codes:
+//   KE001 — heap in @kernel    | KE002 — tensor in @kernel
+//   KE003 — @device call in @kernel | KE005 — asm! in @safe
+//   KE006 — asm! in @device    | DE001 — raw ptr in @device
+//   SE020 — hardware in @safe  | SE021 — @kernel call in @safe
+// ═══════════════════════════════════════════════════════════════

@@ -1,0 +1,49 @@
+// FajarOS Nova v2.0 — Microkernel IRQ Core
+// kernel/core/irq.fj — Ring 0 ONLY
+// Consolidated from: lapic.fj + timer.fj
+// LAPIC/IOAPIC constants + timer utilities
+
+// ═══════════════════════════════════════════════════
+// LAPIC / IOAPIC (MMIO at 0xFEE00000 / 0xFEC00000)
+// Identity-mapped in 128MB region
+// ═══════════════════════════════════════════════════
+
+const LAPIC_BASE: i64 = 0xFEE00000
+const LAPIC_ID: i64 = 0x20
+const LAPIC_VER: i64 = 0x30
+const LAPIC_TPR: i64 = 0x80
+const LAPIC_EOI: i64 = 0xB0
+const LAPIC_SVR: i64 = 0xF0
+const LAPIC_ICR_LO: i64 = 0x300
+const LAPIC_ICR_HI: i64 = 0x310
+const LAPIC_TIMER_LVT: i64 = 0x320
+const LAPIC_TIMER_INIT: i64 = 0x380
+const LAPIC_TIMER_CUR: i64 = 0x390
+const LAPIC_TIMER_DIV: i64 = 0x3E0
+
+const IOAPIC_BASE: i64 = 0xFEC00000
+
+@kernel fn lapic_eoi() {
+    // Send End of Interrupt to LAPIC
+    volatile_write_u32(LAPIC_BASE + LAPIC_EOI, 0)
+}
+
+// ═══════════════════════════════════════════════════
+// Timer Utilities
+// PIT-based sleep + TSC-based microsecond delay
+// ═══════════════════════════════════════════════════
+
+@kernel fn sleep_ms(ms: i64) {
+    // Busy-wait using PIT ticks (100 Hz = 10ms per tick)
+    let ticks_to_wait = ms / 10
+    let target = read_timer_ticks() + ticks_to_wait
+    while read_timer_ticks() < target {}
+}
+
+@kernel fn delay_us(us: i64) {
+    // Microsecond delay using TSC
+    // Estimate TSC frequency: ~2 GHz (QEMU default) = 2000 cycles/us
+    let cycles = us * 2000
+    let start = rdtsc()
+    while rdtsc() - start < cycles {}
+}

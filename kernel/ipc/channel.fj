@@ -1,0 +1,251 @@
+// FajarOS Nova v2.0 — Named Channels (Sprint 1.2.5)
+// Service discovery via named IPC channels
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Named Channel Table
+// 32 channels × 64 bytes = 2KB at 0x8A8000
+//
+// Per channel entry (64 bytes):
+//   +0:  name[32]   — ASCII name (null-terminated)
+//   +32: pid        — owner PID
+//   +40: flags      — CHAN_ACTIVE, CHAN_EXCLUSIVE, etc.
+//   +48: ref_count  — number of clients using this channel
+//   +56: reserved
+//
+// Usage:
+//   Server: channel_register("vfs", my_pid)
+//   Client: pid = channel_lookup("vfs")
+//   Client: ipc2_call(pid, msg, reply)
+// ═══════════════════════════════════════════════════════════════
+
+const CHAN_TABLE: i64 = 0x8A8000
+const CHAN_MAX: i64 = 32
+const CHAN_ENTRY_SIZE: i64 = 64
+const CHAN_NAME_LEN: i64 = 32
+
+// Channel flags
+const CHAN_FLAG_ACTIVE: i64 = 1
+const CHAN_FLAG_EXCLUSIVE: i64 = 2  // Only one client at a time
+
+// Channel error codes
+const CHAN_OK: i64 = 0
+const CHAN_ERR_FULL: i64 = -1
+const CHAN_ERR_NOT_FOUND: i64 = -2
+const CHAN_ERR_EXISTS: i64 = -3
+const CHAN_ERR_NAME_TOO_LONG: i64 = -4
+
+@kernel fn channel_init() {
+    let mut i: i64 = 0
+    while i < CHAN_MAX * CHAN_ENTRY_SIZE {
+        volatile_write_u8(CHAN_TABLE + i, 0)
+        i = i + 1
+    }
+}
+
+// ── String helpers for channel names ──
+
+@kernel fn chan_name_match(entry_addr: i64, name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < CHAN_NAME_LEN {
+        let a = volatile_read_u8(entry_addr + i)
+        let b = volatile_read_u8(name_addr + i)
+        if a != b { return 0 }
+        if a == 0 { return 1 }  // Both null — match
+        i = i + 1
+    }
+    1  // All 32 chars match
+}
+
+@kernel fn chan_name_copy(dst: i64, src: i64) {
+    let mut i: i64 = 0
+    while i < CHAN_NAME_LEN {
+        let ch = volatile_read_u8(src + i)
+        volatile_write_u8(dst + i, ch)
+        if ch == 0 { return }
+        i = i + 1
+    }
+    volatile_write_u8(dst + CHAN_NAME_LEN - 1, 0)  // Ensure null-terminated
+}
+
+@kernel fn chan_name_len(addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < CHAN_NAME_LEN {
+        if volatile_read_u8(addr + i) == 0 { return i }
+        i = i + 1
+    }
+    CHAN_NAME_LEN
+}
+
+// ── Channel operations ──
+
+@kernel fn channel_register(name_addr: i64, pid: i64) -> i64 {
+    // Check name length
+    let nlen = chan_name_len(name_addr)
+    if nlen == 0 || nlen >= CHAN_NAME_LEN { return CHAN_ERR_NAME_TOO_LONG }
+
+    // Check for duplicate
+    let mut i: i64 = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) != 0 {
+            if chan_name_match(entry, name_addr) == 1 {
+                return CHAN_ERR_EXISTS
+            }
+        }
+        i = i + 1
+    }
+
+    // Find free slot
+    i = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) == 0 {
+            chan_name_copy(entry, name_addr)
+            volatile_write_u64(entry + 32, pid)
+            volatile_write_u64(entry + 40, CHAN_FLAG_ACTIVE)
+            volatile_write_u64(entry + 48, 0)  // ref_count
+            return i  // Return channel ID
+        }
+        i = i + 1
+    }
+
+    CHAN_ERR_FULL
+}
+
+@kernel fn channel_lookup(name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) != 0 {
+            if chan_name_match(entry, name_addr) == 1 {
+                // Increment ref count
+                let refs = volatile_read_u64(entry + 48)
+                volatile_write_u64(entry + 48, refs + 1)
+                return volatile_read_u64(entry + 32)  // Return PID
+            }
+        }
+        i = i + 1
+    }
+    CHAN_ERR_NOT_FOUND
+}
+
+@kernel fn channel_unregister(name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) != 0 {
+            if chan_name_match(entry, name_addr) == 1 {
+                // Clear entry
+                let mut j: i64 = 0
+                while j < CHAN_ENTRY_SIZE {
+                    volatile_write_u8(entry + j, 0)
+                    j = j + 1
+                }
+                return CHAN_OK
+            }
+        }
+        i = i + 1
+    }
+    CHAN_ERR_NOT_FOUND
+}
+
+@kernel fn channel_get_pid(channel_id: i64) -> i64 {
+    if channel_id < 0 || channel_id >= CHAN_MAX { return -1 }
+    let entry = CHAN_TABLE + channel_id * CHAN_ENTRY_SIZE
+    let flags = volatile_read_u64(entry + 40)
+    if (flags & CHAN_FLAG_ACTIVE) == 0 { return -1 }
+    volatile_read_u64(entry + 32)
+}
+
+// ── Shell commands ──
+
+@kernel fn cmd_channels() {
+    cprintln("Named Channels:", YELLOW_ON_BLACK)
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < CHAN_MAX {
+        let entry = CHAN_TABLE + i * CHAN_ENTRY_SIZE
+        let flags = volatile_read_u64(entry + 40)
+        if (flags & CHAN_FLAG_ACTIVE) != 0 {
+            cprint("  [", WHITE_ON_BLACK)
+            cprint_decimal(i, CYAN_ON_BLACK)
+            cprint("] \"", WHITE_ON_BLACK)
+            // Print name
+            let mut j: i64 = 0
+            while j < CHAN_NAME_LEN {
+                let ch = volatile_read_u8(entry + j)
+                if ch == 0 { j = CHAN_NAME_LEN }
+                else { console_putchar(ch, GREEN_ON_BLACK); j = j + 1 }
+            }
+            cprint("\" → PID ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(entry + 32), CYAN_ON_BLACK)
+            let refs = volatile_read_u64(entry + 48)
+            if refs > 0 {
+                cprint(" (", WHITE_ON_BLACK)
+                cprint_decimal(refs, WHITE_ON_BLACK)
+                cprint(" refs)", WHITE_ON_BLACK)
+            }
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 {
+        cprintln("  (no channels registered)", WHITE_ON_BLACK)
+    }
+}
+
+// ── Helper: write string to address ──
+
+@kernel fn write_str_to(addr: i64, s0: i64, s1: i64, s2: i64, s3: i64, s4: i64, s5: i64, s6: i64, s7: i64, len: i64) {
+    if len > 0 { volatile_write_u8(addr, s0) }
+    if len > 1 { volatile_write_u8(addr + 1, s1) }
+    if len > 2 { volatile_write_u8(addr + 2, s2) }
+    if len > 3 { volatile_write_u8(addr + 3, s3) }
+    if len > 4 { volatile_write_u8(addr + 4, s4) }
+    if len > 5 { volatile_write_u8(addr + 5, s5) }
+    if len > 6 { volatile_write_u8(addr + 6, s6) }
+    if len > 7 { volatile_write_u8(addr + 7, s7) }
+    volatile_write_u8(addr + len, 0)
+}
+
+@kernel fn channel_register_builtin_services() {
+    // Pre-register well-known service channels
+    // These will be claimed by actual services when they start
+
+    // "vfs" — Virtual File System
+    let buf: i64 = 0x8A9000  // Scratch buffer for channel names
+    volatile_write_u8(buf, 118)  // v
+    volatile_write_u8(buf + 1, 102)  // f
+    volatile_write_u8(buf + 2, 115)  // s
+    volatile_write_u8(buf + 3, 0)
+    channel_register(buf, 3)  // Default VFS PID = 3
+
+    // "blk" — Block Device Service
+    volatile_write_u8(buf, 98)   // b
+    volatile_write_u8(buf + 1, 108)  // l
+    volatile_write_u8(buf + 2, 107)  // k
+    volatile_write_u8(buf + 3, 0)
+    channel_register(buf, 2)  // Default BLK PID = 2
+
+    // "net" — Network Service
+    volatile_write_u8(buf, 110)  // n
+    volatile_write_u8(buf + 1, 101)  // e
+    volatile_write_u8(buf + 2, 116)  // t
+    volatile_write_u8(buf + 3, 0)
+    channel_register(buf, 4)  // Default NET PID = 4
+
+    // "shell" — Shell Service
+    volatile_write_u8(buf, 115)  // s
+    volatile_write_u8(buf + 1, 104)  // h
+    volatile_write_u8(buf + 2, 101)  // e
+    volatile_write_u8(buf + 3, 108)  // l
+    volatile_write_u8(buf + 4, 108)  // l
+    volatile_write_u8(buf + 5, 0)
+    channel_register(buf, 5)  // Default Shell PID = 5
+}

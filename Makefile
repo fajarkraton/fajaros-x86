@@ -27,6 +27,11 @@ SOURCES := \
 	kernel/mm/slab.fj \
 	kernel/ipc/message.fj \
 	kernel/ipc/pipe.fj \
+	kernel/ipc/ipc.fj \
+	kernel/ipc/channel.fj \
+	kernel/ipc/notify.fj \
+	kernel/ipc/shm.fj \
+	kernel/ipc/tests.fj \
 	kernel/sched/process.fj \
 	kernel/sched/scheduler.fj \
 	kernel/sched/smp.fj \
@@ -36,6 +41,7 @@ SOURCES := \
 	kernel/syscall/entry.fj \
 	kernel/syscall/dispatch.fj \
 	kernel/syscall/elf.fj \
+	kernel/security/capability.fj \
 	kernel/security/limits.fj \
 	kernel/security/hardening.fj \
 	drivers/serial.fj \
@@ -52,8 +58,27 @@ SOURCES := \
 	fs/vfs.fj \
 	shell/commands.fj \
 	shell/scripting.fj \
+	kernel/core/smp_sched.fj \
+	kernel/core/mm_advanced.fj \
+	kernel/core/security.fj \
+	kernel/core/fast_ipc.fj \
+	kernel/hw/detect.fj \
+	services/blk/main.fj \
+	services/blk/journal.fj \
+	services/net/main.fj \
+	kernel/stubs/framebuffer.fj \
+	services/display/main.fj \
+	services/input/main.fj \
+	services/gui/main.fj \
+	services/shell/main.fj \
+	services/init/main.fj \
+	services/vfs/main.fj \
+	apps/editor/main.fj \
+	apps/compiler/main.fj \
+	apps/pkgmgr/main.fj \
 	apps/user_programs.fj \
 	apps/mnist.fj \
+	tests/kernel_tests.fj \
 	kernel/main.fj
 
 # QEMU settings
@@ -148,10 +173,46 @@ loc:
 	@echo ""
 	@echo "Total .fj files: $(words $(SOURCES))"
 
-# v2.0 Microkernel: build individual services as separate ELFs
-# (Requires services/ directory structure from Sprint 1.3+)
-.PHONY: microkernel services
+# v2.0 Microkernel core — ONLY kernel/core/ + kernel/stubs/ (Ring 0)
+MICRO_SOURCES := \
+	kernel/core/boot.fj \
+	kernel/core/mm.fj \
+	kernel/core/irq.fj \
+	kernel/core/sched.fj \
+	kernel/core/ipc.fj \
+	kernel/core/syscall.fj \
+	kernel/stubs/console.fj \
+	kernel/stubs/driver_stubs.fj
 
+MICRO_COMBINED := $(BUILD_DIR)/micro_combined.fj
+MICRO_ELF := $(BUILD_DIR)/fajaros_micro.elf
+
+.PHONY: micro micro-loc microkernel services
+
+# Build microkernel core only
+$(MICRO_COMBINED): $(MICRO_SOURCES)
+	@mkdir -p $(BUILD_DIR)
+	@echo "// FajarOS Nova v2.0 Microkernel Core — Ring 0 ONLY" > $(MICRO_COMBINED)
+	@for f in $(MICRO_SOURCES); do \
+		echo "" >> $(MICRO_COMBINED); \
+		echo "// Source: $$f" >> $(MICRO_COMBINED); \
+		cat $$f >> $(MICRO_COMBINED); \
+	done
+	@echo "[OK] Micro-combined $(words $(MICRO_SOURCES)) source files → $(MICRO_COMBINED)"
+
+micro: $(MICRO_COMBINED)
+	@echo "[INFO] Microkernel core: $(words $(MICRO_SOURCES)) files"
+	@wc -l $(MICRO_SOURCES) | tail -1
+
+# Count microkernel LOC
+micro-loc:
+	@echo "FajarOS Microkernel — Lines of Code (Ring 0 ONLY)"
+	@echo ""
+	@wc -l $(MICRO_SOURCES) | sort -n
+	@echo ""
+	@echo "Target: <2,000 LOC for core"
+
+# v2.0 Microkernel: build kernel + services as separate ELFs
 microkernel: $(KERNEL_ELF) services
 	@echo "[OK] Microkernel + services built"
 
@@ -188,4 +249,6 @@ help:
 	@echo "  make iso       Create bootable GRUB2 ISO"
 	@echo "  make test      Run tests in QEMU"
 	@echo "  make loc       Count lines of code"
+	@echo "  make micro     Build microkernel core only (Ring 0)"
+	@echo "  make micro-loc Microkernel LOC breakdown"
 	@echo "  make clean     Remove build artifacts"

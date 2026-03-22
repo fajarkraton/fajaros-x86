@@ -1,0 +1,565 @@
+// FajarOS Nova v2.0 — GUI Toolkit + Window Manager (Sprint 3.3)
+// @safe process — PID 8, widget system + event loop + layout
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// GUI IPC Protocol
+// ═══════════════════════════════════════════════════════════════
+
+const MSG_GUI_CREATE_WIN: i64 = 0x0900
+const MSG_GUI_DESTROY_WIN: i64 = 0x0901
+const MSG_GUI_ADD_WIDGET: i64 = 0x0902
+const MSG_GUI_SET_TEXT: i64 = 0x0903
+const MSG_GUI_FOCUS: i64 = 0x0904
+const MSG_GUI_REDRAW: i64 = 0x0905
+const MSG_GUI_INFO: i64 = 0x0906
+const MSG_GUI_REPLY: i64 = 0x09FF
+
+const GUI_SVC_PID: i64 = 8
+
+// ═══════════════════════════════════════════════════════════════
+// Theme System — colors, borders, padding
+// ═══════════════════════════════════════════════════════════════
+
+const THEME_BASE: i64 = 0x928000
+
+const THEME_BG: i64 = 0            // Window background
+const THEME_FG: i64 = 8            // Text color
+const THEME_BORDER: i64 = 16       // Window border
+const THEME_TITLE_BG: i64 = 24     // Title bar background
+const THEME_TITLE_FG: i64 = 32     // Title bar text
+const THEME_BTN_BG: i64 = 40       // Button background
+const THEME_BTN_FG: i64 = 48       // Button text
+const THEME_BTN_HOVER: i64 = 56    // Button hover
+const THEME_INPUT_BG: i64 = 64     // TextBox background
+const THEME_INPUT_FG: i64 = 72     // TextBox text
+const THEME_FOCUS_BORDER: i64 = 80 // Focused widget border
+const THEME_PADDING: i64 = 88      // Default padding (pixels)
+const THEME_BORDER_WIDTH: i64 = 96 // Border width (pixels)
+const THEME_TITLE_HEIGHT: i64 = 104 // Title bar height
+
+@kernel fn theme_init() {
+    // Catppuccin Mocha theme
+    volatile_write_u64(THEME_BASE + THEME_BG, 0x1E1E2E)
+    volatile_write_u64(THEME_BASE + THEME_FG, 0xCDD6F4)
+    volatile_write_u64(THEME_BASE + THEME_BORDER, 0x585B70)
+    volatile_write_u64(THEME_BASE + THEME_TITLE_BG, 0x313244)
+    volatile_write_u64(THEME_BASE + THEME_TITLE_FG, 0xCDD6F4)
+    volatile_write_u64(THEME_BASE + THEME_BTN_BG, 0x45475A)
+    volatile_write_u64(THEME_BASE + THEME_BTN_FG, 0xCDD6F4)
+    volatile_write_u64(THEME_BASE + THEME_BTN_HOVER, 0x585B70)
+    volatile_write_u64(THEME_BASE + THEME_INPUT_BG, 0x11111B)
+    volatile_write_u64(THEME_BASE + THEME_INPUT_FG, 0xCDD6F4)
+    volatile_write_u64(THEME_BASE + THEME_FOCUS_BORDER, 0x89B4FA)
+    volatile_write_u64(THEME_BASE + THEME_PADDING, 4)
+    volatile_write_u64(THEME_BASE + THEME_BORDER_WIDTH, 1)
+    volatile_write_u64(THEME_BASE + THEME_TITLE_HEIGHT, 20)
+}
+
+@kernel fn theme_read(off: i64) -> i64 { volatile_read_u64(THEME_BASE + off) }
+
+// ═══════════════════════════════════════════════════════════════
+// Widget System — 64 widgets max
+// ═══════════════════════════════════════════════════════════════
+
+const WIDGET_BASE: i64 = 0x928200
+const WIDGET_MAX: i64 = 64
+const WIDGET_SIZE: i64 = 96
+
+// Widget entry (96 bytes):
+//   +0:  type (0=free, 1=label, 2=button, 3=textbox, 4=list, 5=window)
+//   +8:  window_id (parent window)
+//   +16: x (relative to window)
+//   +24: y
+//   +32: width
+//   +40: height
+//   +48: flags (visible=1, focused=2, disabled=4)
+//   +56: text_addr (pointer to text buffer)
+//   +64: text_len
+//   +72: callback_id (for button click events)
+//   +80: data0 (scroll offset for list, cursor pos for textbox)
+//   +88: data1 (item count for list, max chars for textbox)
+
+const WTYPE_FREE: i64 = 0
+const WTYPE_LABEL: i64 = 1
+const WTYPE_BUTTON: i64 = 2
+const WTYPE_TEXTBOX: i64 = 3
+const WTYPE_LIST: i64 = 4
+const WTYPE_WINDOW: i64 = 5
+
+const WFLAG_VISIBLE: i64 = 1
+const WFLAG_FOCUSED: i64 = 2
+const WFLAG_DISABLED: i64 = 4
+
+@kernel fn widget_addr(id: i64) -> i64 { WIDGET_BASE + id * WIDGET_SIZE }
+
+@kernel fn widget_read(id: i64, off: i64) -> i64 {
+    if id < 0 || id >= WIDGET_MAX { return 0 }
+    volatile_read_u64(widget_addr(id) + off)
+}
+
+@kernel fn widget_write(id: i64, off: i64, val: i64) {
+    if id < 0 || id >= WIDGET_MAX { return }
+    volatile_write_u64(widget_addr(id) + off, val)
+}
+
+@kernel fn widget_alloc(wtype: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < WIDGET_MAX {
+        if widget_read(i, 0) == WTYPE_FREE {
+            widget_write(i, 0, wtype)
+            widget_write(i, 48, WFLAG_VISIBLE)
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn widget_free(id: i64) {
+    if id < 0 || id >= WIDGET_MAX { return }
+    let mut i: i64 = 0
+    while i < WIDGET_SIZE { volatile_write_u8(widget_addr(id) + i, 0); i = i + 1 }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Window Management — windows are widgets of type WTYPE_WINDOW
+// ═══════════════════════════════════════════════════════════════
+
+const WIN_MAX: i64 = 8
+const WIN_FOCUS: i64 = 0x92A000   // Currently focused window id
+
+@kernel fn win_create(x: i64, y: i64, w: i64, h: i64, title_addr: i64) -> i64 {
+    let id = widget_alloc(WTYPE_WINDOW)
+    if id < 0 { return -1 }
+    widget_write(id, 8, id)   // window_id = self
+    widget_write(id, 16, x)
+    widget_write(id, 24, y)
+    widget_write(id, 32, w)
+    widget_write(id, 40, h)
+    widget_write(id, 56, title_addr)
+    id
+}
+
+@kernel fn win_destroy(win_id: i64) {
+    // Free window and all child widgets
+    let mut i: i64 = 0
+    while i < WIDGET_MAX {
+        if widget_read(i, 8) == win_id { widget_free(i) }
+        i = i + 1
+    }
+}
+
+@kernel fn win_focus(win_id: i64) {
+    volatile_write_u64(WIN_FOCUS, win_id)
+}
+
+@kernel fn win_get_focus() -> i64 { volatile_read_u64(WIN_FOCUS) }
+
+// ═══════════════════════════════════════════════════════════════
+// Widget Creation Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn gui_add_label(win_id: i64, x: i64, y: i64, text_addr: i64, text_len: i64) -> i64 {
+    let id = widget_alloc(WTYPE_LABEL)
+    if id < 0 { return -1 }
+    widget_write(id, 8, win_id)
+    widget_write(id, 16, x)
+    widget_write(id, 24, y)
+    widget_write(id, 32, text_len * FONT_WIDTH)
+    widget_write(id, 40, FONT_HEIGHT)
+    widget_write(id, 56, text_addr)
+    widget_write(id, 64, text_len)
+    id
+}
+
+@kernel fn gui_add_button(win_id: i64, x: i64, y: i64, w: i64, h: i64, text_addr: i64, text_len: i64, callback_id: i64) -> i64 {
+    let id = widget_alloc(WTYPE_BUTTON)
+    if id < 0 { return -1 }
+    widget_write(id, 8, win_id)
+    widget_write(id, 16, x)
+    widget_write(id, 24, y)
+    widget_write(id, 32, w)
+    widget_write(id, 40, h)
+    widget_write(id, 56, text_addr)
+    widget_write(id, 64, text_len)
+    widget_write(id, 72, callback_id)
+    id
+}
+
+@kernel fn gui_add_textbox(win_id: i64, x: i64, y: i64, w: i64, max_chars: i64) -> i64 {
+    let id = widget_alloc(WTYPE_TEXTBOX)
+    if id < 0 { return -1 }
+    widget_write(id, 8, win_id)
+    widget_write(id, 16, x)
+    widget_write(id, 24, y)
+    widget_write(id, 32, w)
+    widget_write(id, 40, FONT_HEIGHT + 8) // height = font + padding
+    widget_write(id, 80, 0)               // cursor_pos = 0
+    widget_write(id, 88, max_chars)
+    id
+}
+
+@kernel fn gui_add_list(win_id: i64, x: i64, y: i64, w: i64, h: i64, item_count: i64) -> i64 {
+    let id = widget_alloc(WTYPE_LIST)
+    if id < 0 { return -1 }
+    widget_write(id, 8, win_id)
+    widget_write(id, 16, x)
+    widget_write(id, 24, y)
+    widget_write(id, 32, w)
+    widget_write(id, 40, h)
+    widget_write(id, 80, 0)               // scroll_offset
+    widget_write(id, 88, item_count)
+    id
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering — draw widgets to framebuffer
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn gui_render_window(id: i64) {
+    let x = widget_read(id, 16)
+    let y = widget_read(id, 24)
+    let w = widget_read(id, 32)
+    let h = widget_read(id, 40)
+    let title_addr = widget_read(id, 56)
+    let focused = win_get_focus() == id
+    let bg = theme_read(THEME_BG)
+    let border = if focused { theme_read(THEME_FOCUS_BORDER) } else { theme_read(THEME_BORDER) }
+    let th = theme_read(THEME_TITLE_HEIGHT)
+
+    // Window body
+    fb_fill_rect(x, y, w, h, bg)
+    fb_draw_rect(x, y, w, h, border)
+    // Title bar
+    fb_fill_rect(x + 1, y + 1, w - 2, th, theme_read(THEME_TITLE_BG))
+    if title_addr != 0 {
+        fb_draw_string(x + 4, y + 2, title_addr, theme_read(THEME_TITLE_FG), theme_read(THEME_TITLE_BG))
+    }
+}
+
+@kernel fn gui_render_label(id: i64) {
+    let win_id = widget_read(id, 8)
+    let wx = widget_read(win_id, 16)
+    let wy = widget_read(win_id, 24)
+    let x = wx + widget_read(id, 16)
+    let y = wy + widget_read(id, 24) + theme_read(THEME_TITLE_HEIGHT)
+    let text = widget_read(id, 56)
+    if text != 0 {
+        fb_draw_string(x, y, text, theme_read(THEME_FG), theme_read(THEME_BG))
+    }
+}
+
+@kernel fn gui_render_button(id: i64) {
+    let win_id = widget_read(id, 8)
+    let wx = widget_read(win_id, 16)
+    let wy = widget_read(win_id, 24)
+    let x = wx + widget_read(id, 16)
+    let y = wy + widget_read(id, 24) + theme_read(THEME_TITLE_HEIGHT)
+    let w = widget_read(id, 32)
+    let h = widget_read(id, 40)
+    let text = widget_read(id, 56)
+    let is_focused = (widget_read(id, 48) & WFLAG_FOCUSED) != 0
+    let btn_bg = if is_focused { theme_read(THEME_BTN_HOVER) } else { theme_read(THEME_BTN_BG) }
+
+    fb_fill_rect(x, y, w, h, btn_bg)
+    fb_draw_rect(x, y, w, h, theme_read(THEME_BORDER))
+    if text != 0 {
+        let pad = theme_read(THEME_PADDING)
+        fb_draw_string(x + pad, y + pad, text, theme_read(THEME_BTN_FG), btn_bg)
+    }
+}
+
+@kernel fn gui_render_textbox(id: i64) {
+    let win_id = widget_read(id, 8)
+    let wx = widget_read(win_id, 16)
+    let wy = widget_read(win_id, 24)
+    let x = wx + widget_read(id, 16)
+    let y = wy + widget_read(id, 24) + theme_read(THEME_TITLE_HEIGHT)
+    let w = widget_read(id, 32)
+    let h = widget_read(id, 40)
+    let is_focused = (widget_read(id, 48) & WFLAG_FOCUSED) != 0
+    let border = if is_focused { theme_read(THEME_FOCUS_BORDER) } else { theme_read(THEME_BORDER) }
+
+    fb_fill_rect(x, y, w, h, theme_read(THEME_INPUT_BG))
+    fb_draw_rect(x, y, w, h, border)
+    let text = widget_read(id, 56)
+    if text != 0 {
+        fb_draw_string(x + 4, y + 4, text, theme_read(THEME_INPUT_FG), theme_read(THEME_INPUT_BG))
+    }
+    // Cursor
+    if is_focused {
+        let cursor_pos = widget_read(id, 80)
+        let cx = x + 4 + cursor_pos * FONT_WIDTH
+        fb_fill_rect(cx, y + 4, 2, FONT_HEIGHT, COLOR_CURSOR)
+    }
+}
+
+@kernel fn gui_render_list(id: i64) {
+    let win_id = widget_read(id, 8)
+    let wx = widget_read(win_id, 16)
+    let wy = widget_read(win_id, 24)
+    let x = wx + widget_read(id, 16)
+    let y = wy + widget_read(id, 24) + theme_read(THEME_TITLE_HEIGHT)
+    let w = widget_read(id, 32)
+    let h = widget_read(id, 40)
+
+    fb_fill_rect(x, y, w, h, theme_read(THEME_INPUT_BG))
+    fb_draw_rect(x, y, w, h, theme_read(THEME_BORDER))
+    // Items rendered by caller via set_text
+}
+
+@kernel fn gui_render_all() {
+    // First pass: render windows
+    let mut i: i64 = 0
+    while i < WIDGET_MAX {
+        if widget_read(i, 0) == WTYPE_WINDOW && (widget_read(i, 48) & WFLAG_VISIBLE) != 0 {
+            gui_render_window(i)
+        }
+        i = i + 1
+    }
+    // Second pass: render child widgets
+    i = 0
+    while i < WIDGET_MAX {
+        let wtype = widget_read(i, 0)
+        if wtype != WTYPE_FREE && wtype != WTYPE_WINDOW && (widget_read(i, 48) & WFLAG_VISIBLE) != 0 {
+            if wtype == WTYPE_LABEL { gui_render_label(i) }
+            if wtype == WTYPE_BUTTON { gui_render_button(i) }
+            if wtype == WTYPE_TEXTBOX { gui_render_textbox(i) }
+            if wtype == WTYPE_LIST { gui_render_list(i) }
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Hit Testing — find widget at (x, y)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn gui_hit_test(px: i64, py: i64) -> i64 {
+    // Check widgets in reverse order (last created = on top)
+    let mut i: i64 = WIDGET_MAX - 1
+    while i >= 0 {
+        let wtype = widget_read(i, 0)
+        if wtype != WTYPE_FREE && (widget_read(i, 48) & WFLAG_VISIBLE) != 0 {
+            let win_id = widget_read(i, 8)
+            let wx = if wtype == WTYPE_WINDOW { 0 } else { widget_read(win_id, 16) }
+            let wy = if wtype == WTYPE_WINDOW { 0 } else { widget_read(win_id, 24) + theme_read(THEME_TITLE_HEIGHT) }
+            let x = wx + widget_read(i, 16)
+            let y = wy + widget_read(i, 24)
+            let w = widget_read(i, 32)
+            let h = widget_read(i, 40)
+            if px >= x && px < x + w && py >= y && py < y + h {
+                return i
+            }
+        }
+        i = i - 1
+    }
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GUI Service Init + IPC Handler
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn gui_svc_init() {
+    theme_init()
+    let mut i: i64 = 0
+    while i < WIDGET_MAX * WIDGET_SIZE { volatile_write_u8(WIDGET_BASE + i, 0); i = i + 1 }
+    volatile_write_u64(WIN_FOCUS, -1)
+}
+
+@kernel fn gui_svc_handle_msg(sender: i64, msg_buf: i64, reply_buf: i64) -> i64 {
+    let msg_type = volatile_read_u32(msg_buf + 8)
+
+    if msg_type == MSG_GUI_CREATE_WIN {
+        let x = volatile_read_u64(msg_buf + 16)
+        let y = volatile_read_u64(msg_buf + 24)
+        let w = volatile_read_u64(msg_buf + 32)
+        let h = volatile_read_u64(msg_buf + 40)
+        let title = volatile_read_u64(msg_buf + 48)
+        let id = win_create(x, y, w, h, title)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GUI_SVC_PID, MSG_GUI_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, id)
+        return 0
+    }
+
+    if msg_type == MSG_GUI_DESTROY_WIN {
+        let id = volatile_read_u64(msg_buf + 16)
+        win_destroy(id)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GUI_SVC_PID, MSG_GUI_REPLY, 0)
+        return 0
+    }
+
+    if msg_type == MSG_GUI_FOCUS {
+        let id = volatile_read_u64(msg_buf + 16)
+        win_focus(id)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GUI_SVC_PID, MSG_GUI_REPLY, 0)
+        return 0
+    }
+
+    if msg_type == MSG_GUI_REDRAW {
+        gui_render_all()
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GUI_SVC_PID, MSG_GUI_REPLY, 0)
+        return 0
+    }
+
+    if msg_type == MSG_GUI_INFO {
+        let mut win_count: i64 = 0
+        let mut widget_count: i64 = 0
+        let mut i: i64 = 0
+        while i < WIDGET_MAX {
+            let wt = widget_read(i, 0)
+            if wt != WTYPE_FREE { widget_count = widget_count + 1 }
+            if wt == WTYPE_WINDOW { win_count = win_count + 1 }
+            i = i + 1
+        }
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GUI_SVC_PID, MSG_GUI_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, win_count)
+        volatile_write_u64(reply_buf + 24, widget_count)
+        volatile_write_u64(reply_buf + 32, win_get_focus())
+        return 0
+    }
+
+    ipc_msg_clear(reply_buf)
+    ipc_msg_set_header(reply_buf, GUI_SVC_PID, MSG_GUI_REPLY, 0)
+    volatile_write_u64(reply_buf + 16, -1)
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_gui_test() {
+    cprintln("=== GUI Toolkit Test ===", YELLOW_ON_BLACK)
+    let fb_ready = fb_state_read(FB_READY)
+    if fb_ready != 1 {
+        cprintln("  No framebuffer — GUI requires graphical mode", YELLOW_ON_BLACK)
+        cprintln("  GUI toolkit structures initialized (headless mode)", WHITE_ON_BLACK)
+    }
+
+    // Create a test window
+    let title: i64 = 0x92AF00
+    volatile_write_u8(title, 84)     // T
+    volatile_write_u8(title + 1, 101) // e
+    volatile_write_u8(title + 2, 115) // s
+    volatile_write_u8(title + 3, 116) // t
+    volatile_write_u8(title + 4, 0)
+    let win = win_create(50, 50, 300, 200, title)
+    cprint("  Window: id=", WHITE_ON_BLACK)
+    cprint_decimal(win, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Add widgets
+    let lbl_text: i64 = 0x92AF10
+    volatile_write_u8(lbl_text, 72)     // H
+    volatile_write_u8(lbl_text + 1, 101) // e
+    volatile_write_u8(lbl_text + 2, 108) // l
+    volatile_write_u8(lbl_text + 3, 108) // l
+    volatile_write_u8(lbl_text + 4, 111) // o
+    volatile_write_u8(lbl_text + 5, 0)
+    let lbl = gui_add_label(win, 10, 10, lbl_text, 5)
+    cprint("  Label: id=", WHITE_ON_BLACK)
+    cprint_decimal(lbl, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let btn_text: i64 = 0x92AF20
+    volatile_write_u8(btn_text, 79)     // O
+    volatile_write_u8(btn_text + 1, 75) // K
+    volatile_write_u8(btn_text + 2, 0)
+    let btn = gui_add_button(win, 10, 40, 60, 24, btn_text, 2, 1)
+    cprint("  Button: id=", WHITE_ON_BLACK)
+    cprint_decimal(btn, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let tb = gui_add_textbox(win, 10, 80, 200, 32)
+    cprint("  TextBox: id=", WHITE_ON_BLACK)
+    cprint_decimal(tb, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let lst = gui_add_list(win, 10, 110, 200, 60, 5)
+    cprint("  List: id=", WHITE_ON_BLACK)
+    cprint_decimal(lst, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Focus + render
+    win_focus(win)
+    if fb_ready == 1 {
+        gui_render_all()
+        cprintln("  Rendered to framebuffer", GREEN_ON_BLACK)
+    }
+
+    // Hit test
+    let hit = gui_hit_test(60, 95 + theme_read(THEME_TITLE_HEIGHT))
+    cprint("  Hit test (60,115): widget=", WHITE_ON_BLACK)
+    cprint_decimal(hit, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Widget count
+    let mut wcount: i64 = 0
+    let mut i: i64 = 0
+    while i < WIDGET_MAX {
+        if widget_read(i, 0) != WTYPE_FREE { wcount = wcount + 1 }
+        i = i + 1
+    }
+    cprint("  Total widgets: ", WHITE_ON_BLACK)
+    cprint_decimal(wcount, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprintln("=== GUI test complete ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_gui_info() {
+    cprintln("GUI Service:", YELLOW_ON_BLACK)
+    let mut win_count: i64 = 0
+    let mut widget_count: i64 = 0
+    let mut i: i64 = 0
+    while i < WIDGET_MAX {
+        let wt = widget_read(i, 0)
+        if wt != WTYPE_FREE { widget_count = widget_count + 1 }
+        if wt == WTYPE_WINDOW { win_count = win_count + 1 }
+        i = i + 1
+    }
+    cprint("  Windows: ", WHITE_ON_BLACK)
+    cprint_decimal(win_count, CYAN_ON_BLACK)
+    cprint("  Widgets: ", WHITE_ON_BLACK)
+    cprint_decimal(widget_count, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(WIDGET_MAX, WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Focus: ", WHITE_ON_BLACK)
+    let focus = win_get_focus()
+    if focus >= 0 { cprint_decimal(focus, CYAN_ON_BLACK) } else { cprint("none", YELLOW_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Theme: Catppuccin Mocha (", WHITE_ON_BLACK)
+    cprint("bg=0x", WHITE_ON_BLACK)
+    cprint_hex(theme_read(THEME_BG), 6, CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+    // List windows
+    if win_count > 0 {
+        cprintln("  Windows:", WHITE_ON_BLACK)
+        i = 0
+        while i < WIDGET_MAX {
+            if widget_read(i, 0) == WTYPE_WINDOW {
+                cprint("    [", WHITE_ON_BLACK)
+                cprint_decimal(i, CYAN_ON_BLACK)
+                cprint("] ", WHITE_ON_BLACK)
+                cprint_decimal(widget_read(i, 32), WHITE_ON_BLACK)
+                cprint("x", WHITE_ON_BLACK)
+                cprint_decimal(widget_read(i, 40), WHITE_ON_BLACK)
+                cprint(" at (", WHITE_ON_BLACK)
+                cprint_decimal(widget_read(i, 16), CYAN_ON_BLACK)
+                cprint(",", WHITE_ON_BLACK)
+                cprint_decimal(widget_read(i, 24), CYAN_ON_BLACK)
+                cprintln(")", WHITE_ON_BLACK)
+            }
+            i = i + 1
+        }
+    }
+}

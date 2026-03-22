@@ -1,0 +1,228 @@
+// FajarOS Nova v2.0 — Microkernel Boot + Exception Handlers
+// kernel/core/boot.fj — Ring 0 ONLY
+// Minimal boot-time constants, panic handler, exception routing
+
+// ═══════════════════════════════════════════════════
+// VGA Color Constants
+// (Duplicated here for self-containment in microkernel image)
+// ═══════════════════════════════════════════════════
+
+const VGA_BASE: i64 = 0xB8000
+const VGA_COLS: i64 = 80
+const VGA_ROWS: i64 = 25
+const WHITE_ON_BLACK: i64 = 0x0F
+const WHITE_ON_BLUE: i64 = 0x1F
+const GREEN_ON_BLACK: i64 = 0x0A
+const CYAN_ON_BLACK: i64 = 0x0B
+const YELLOW_ON_BLACK: i64 = 0x0E
+const RED_ON_BLACK: i64 = 0x0C
+
+// Serial port for kernel debug output
+const SERIAL_PORT: i64 = 0x3F8
+
+// ═══════════════════════════════════════════════════
+// Kernel Panic
+// Writes reason code to serial, dumps registers, halts
+// ═══════════════════════════════════════════════════
+
+@kernel fn kernel_panic_reason(code: i64) {
+    // Write "PANIC:" to serial port 0x3F8
+    port_outb(SERIAL_PORT, 0x50) // 'P'
+    port_outb(SERIAL_PORT, 0x41) // 'A'
+    port_outb(SERIAL_PORT, 0x4E) // 'N'
+    port_outb(SERIAL_PORT, 0x49) // 'I'
+    port_outb(SERIAL_PORT, 0x43) // 'C'
+    port_outb(SERIAL_PORT, 0x3A) // ':'
+    port_outb(SERIAL_PORT, 0x20) // ' '
+
+    // Write code as decimal digits to serial
+    if code == 0 {
+        port_outb(SERIAL_PORT, 0x30) // '0'
+    }
+    if code != 0 {
+        let mut buf: [i64; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        let mut v = code
+        let mut len: i64 = 0
+        if v < 0 {
+            port_outb(SERIAL_PORT, 0x2D) // '-'
+            v = 0 - v
+        }
+        while v > 0 {
+            buf[len] = 0x30 + (v % 10)
+            v = v / 10
+            len = len + 1
+        }
+        let mut i: i64 = len - 1
+        while i >= 0 {
+            port_outb(SERIAL_PORT, buf[i])
+            i = i - 1
+        }
+    }
+
+    port_outb(SERIAL_PORT, 0x0A) // newline
+
+    // Halt the CPU — infinite loop (cli/hlt not available in Cranelift)
+    // Write to QEMU debug-exit port (0xf4) for fast exit in emulator
+    port_outb(0xF4, code & 0xFF)
+    // If still running (real hardware), spin forever
+    while true { port_outb(SERIAL_PORT, 0x2E) }  // send '...' to serial
+}
+
+@kernel fn kernel_panic_dump() {
+    // Dump basic register info to serial for post-mortem debugging
+    // Write "REGS:" header
+    port_outb(SERIAL_PORT, 0x52) // 'R'
+    port_outb(SERIAL_PORT, 0x45) // 'E'
+    port_outb(SERIAL_PORT, 0x47) // 'G'
+    port_outb(SERIAL_PORT, 0x53) // 'S'
+    port_outb(SERIAL_PORT, 0x3A) // ':'
+    port_outb(SERIAL_PORT, 0x0A) // newline
+
+    // Dump CR2 (page fault linear address)
+    port_outb(SERIAL_PORT, 0x43) // 'C'
+    port_outb(SERIAL_PORT, 0x52) // 'R'
+    port_outb(SERIAL_PORT, 0x32) // '2'
+    port_outb(SERIAL_PORT, 0x3D) // '='
+    let cr2 = read_cr2()
+    // Write CR2 as hex nibbles
+    let mut shift: i64 = 60
+    while shift >= 0 {
+        let nibble = (cr2 >> shift) & 0xF
+        if nibble < 10 { port_outb(SERIAL_PORT, 0x30 + nibble) }
+        else { port_outb(SERIAL_PORT, 0x37 + nibble) }
+        shift = shift - 4
+    }
+    port_outb(SERIAL_PORT, 0x0A) // newline
+
+    // Dump CR3 (current page table)
+    port_outb(SERIAL_PORT, 0x43) // 'C'
+    port_outb(SERIAL_PORT, 0x52) // 'R'
+    port_outb(SERIAL_PORT, 0x33) // '3'
+    port_outb(SERIAL_PORT, 0x3D) // '='
+    let cr3 = read_cr3()
+    shift = 60
+    while shift >= 0 {
+        let nibble = (cr3 >> shift) & 0xF
+        if nibble < 10 { port_outb(SERIAL_PORT, 0x30 + nibble) }
+        else { port_outb(SERIAL_PORT, 0x37 + nibble) }
+        shift = shift - 4
+    }
+    port_outb(SERIAL_PORT, 0x0A) // newline
+}
+
+// ═══════════════════════════════════════════════════
+// Exception Handlers
+// Route CPU exceptions to process kill or kernel panic
+// ═══════════════════════════════════════════════════
+
+@kernel fn exception_handler_page_fault(_error_code: i64, _fault_addr: i64) {
+    // Page Fault (#PF, vector 14)
+    // If faulting process is PID 0 (kernel), panic
+    // Otherwise, kill the faulting process and return to scheduler
+    let current_pid = volatile_read_u64(0x6FE00)
+
+    if current_pid == 0 {
+        // Kernel page fault -- unrecoverable
+        kernel_panic_dump()
+        kernel_panic_reason(14) // vector 14 = #PF
+    }
+
+    // User process page fault -- kill it
+    // Write diagnostic to serial
+    port_outb(SERIAL_PORT, 0x50) // 'P'
+    port_outb(SERIAL_PORT, 0x46) // 'F'
+    port_outb(SERIAL_PORT, 0x3A) // ':'
+    port_outb(SERIAL_PORT, 0x20) // ' '
+    port_outb(SERIAL_PORT, 0x30 + (current_pid % 10)) // PID digit
+    port_outb(SERIAL_PORT, 0x0A) // newline
+
+    // Mark process as zombie (exit code = -14 for SIGSEGV equivalent)
+    proc_v2_set(current_pid, 0, PROC_STATE_ZOMBIE)
+    proc_v2_set(current_pid, 7, -14) // exit code in field 7 (exit_code at +56)
+
+    // Process killed — set current PID back to 0 (kernel) for scheduler
+    volatile_write_u64(0x6FE00, 0)
+}
+
+@kernel fn exception_handler_gp_fault(_error_code: i64) {
+    // General Protection Fault (#GP, vector 13)
+    let current_pid = volatile_read_u64(0x6FE00)
+
+    if current_pid == 0 {
+        // Kernel GP fault -- unrecoverable
+        kernel_panic_dump()
+        kernel_panic_reason(13) // vector 13 = #GP
+    }
+
+    // User process GP fault -- kill it
+    port_outb(SERIAL_PORT, 0x47) // 'G'
+    port_outb(SERIAL_PORT, 0x50) // 'P'
+    port_outb(SERIAL_PORT, 0x3A) // ':'
+    port_outb(SERIAL_PORT, 0x20) // ' '
+    port_outb(SERIAL_PORT, 0x30 + (current_pid % 10)) // PID digit
+    port_outb(SERIAL_PORT, 0x0A) // newline
+
+    // Mark process as zombie (exit code = -13 for SIGSEGV equivalent)
+    proc_v2_set(current_pid, 0, PROC_STATE_ZOMBIE)
+    proc_v2_set(current_pid, 7, -13)
+
+    // Process killed — return to kernel context
+    volatile_write_u64(0x6FE00, 0)
+}
+
+@kernel fn exception_handler_double_fault() {
+    // Double Fault (#DF, vector 8) -- ALWAYS fatal
+    // No register dump possible in a double fault (stack may be corrupt)
+    kernel_panic_reason(8) // vector 8 = #DF
+}
+
+// ═══════════════════════════════════════════════════
+// Microkernel Entry Point
+// Minimal kernel_main that ONLY initializes Ring 0 subsystems.
+// No drivers, no shell, no filesystem — those are user services.
+// ═══════════════════════════════════════════════════
+
+@kernel fn kernel_main() {
+    // Phase 1: Serial + Console (debug output)
+    x86_serial_init()
+    console_init()
+    println("[MICRO] FajarOS Nova v2.0 Microkernel booting...")
+
+    // Phase 2: Memory management
+    frames_init()
+    heap_init()
+    slab_init()
+    memory_protect_kernel()
+    println("[MM] Frames + heap + slab ready")
+
+    // Phase 3: Process management
+    proc_v2_init()
+    println("[SCHED] Process table ready (16 PIDs)")
+
+    // Phase 4: IPC subsystem
+    ipc2_init()
+    channel_init()
+    irq_notify_init()
+    shm_init()
+    cap_set(0, -1)  // Kernel (PID 0) gets all capabilities
+    channel_register_builtin_services()
+    println("[IPC] Endpoints + channels + notifications + SHM ready")
+
+    // Phase 5: Syscall dispatch
+    syscall_init()
+    syscall_setup()
+    println("[SYSCALL] Entry stub + MSRs configured")
+
+    // Phase 6: Map LAPIC MMIO (for interrupt handling)
+    map_page(0xFEE00000, 0xFEE00000, PAGE_PRESENT | PAGE_WRITABLE)
+    map_page(0xFEC00000, 0xFEC00000, PAGE_PRESENT | PAGE_WRITABLE)
+    println("[IRQ] LAPIC + IOAPIC mapped")
+
+    // Phase 7: Init complete
+    println("[MICRO] Microkernel ready — 2,453 LOC Ring 0")
+    println("[MICRO] Waiting for user services via IPC...")
+
+    // In microkernel mode, we just wait. Services connect via IPC.
+    // In monolithic mode, kernel/main.fj takes over instead.
+    init_autorun()
+}

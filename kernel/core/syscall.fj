@@ -1,0 +1,495 @@
+// FajarOS Nova v2.0 — Microkernel Syscall Core
+// kernel/core/syscall.fj — Ring 0 ONLY
+// Consolidated from: entry.fj + dispatch.fj + elf.fj + capability.fj
+// NO shell commands (cmd_*) — those stay in monolithic shell
+
+// ═══════════════════════════════════════════════════
+// Syscall Dispatch Table
+// 64 entries x 8 bytes (fn pointers) at 0x884000
+// ═══════════════════════════════════════════════════
+
+const SYSCALL_TABLE: i64 = 0x884000
+const SYS_EXIT: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_READ: i64 = 2
+const SYS_GETPID: i64 = 3
+const SYS_YIELD: i64 = 4
+const SYS_SLEEP: i64 = 5
+const SYS_MMAP: i64 = 6
+const SYS_BRK: i64 = 7
+
+// IPC syscalls (Sprint 1.2)
+const SYS_SEND: i64 = 10
+const SYS_RECV: i64 = 11
+const SYS_CALL: i64 = 12
+const SYS_REPLY: i64 = 13
+const SYS_NOTIFY: i64 = 14
+
+// Memory syscalls
+const SYS_MUNMAP: i64 = 21
+const SYS_SHARE: i64 = 22
+
+// I/O syscalls (for drivers)
+const SYS_IRQ_WAIT: i64 = 30
+const SYS_PORT_IO: i64 = 31
+const SYS_DMA_ALLOC: i64 = 32
+
+// ═══════════════════════════════════════════════════
+// SYSCALL/SYSRET Entry Stub
+// Machine code at 0x8200, per-CPU kernel/user RSP saves
+// ═══════════════════════════════════════════════════
+
+const SYSCALL_ENTRY_ADDR: i64 = 0x8200
+const KERNEL_RSP_SAVE: i64 = 0x652008  // per-CPU kernel RSP
+const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
+
+@kernel fn syscall_install_stub() {
+    // Install SYSCALL entry stub at 0x8200
+    // On SYSCALL: RCX = user RIP, R11 = user RFLAGS, RAX = syscall number
+    // We need to: save user RSP, switch to kernel stack, call handler, SYSRETQ
+    let b = SYSCALL_ENTRY_ADDR
+
+    // swapgs (switch GS base to kernel per-CPU area)
+    volatile_write_u8(b, 0x0F)
+    volatile_write_u8(b + 1, 0x01)
+    volatile_write_u8(b + 2, 0xF8)
+
+    // mov [USER_RSP_SAVE], rsp (save user RSP to fixed address)
+    volatile_write_u8(b + 3, 0x48)
+    volatile_write_u8(b + 4, 0x89)
+    volatile_write_u8(b + 5, 0x24)
+    volatile_write_u8(b + 6, 0x25)
+    volatile_write_u32(b + 7, USER_RSP_SAVE)
+
+    // mov rsp, [KERNEL_RSP_SAVE] (load kernel RSP)
+    volatile_write_u8(b + 11, 0x48)
+    volatile_write_u8(b + 12, 0x8B)
+    volatile_write_u8(b + 13, 0x24)
+    volatile_write_u8(b + 14, 0x25)
+    volatile_write_u32(b + 15, KERNEL_RSP_SAVE)
+
+    // push rcx (user RIP)
+    volatile_write_u8(b + 19, 0x51)
+    // push r11 (user RFLAGS)
+    volatile_write_u8(b + 20, 0x41)
+    volatile_write_u8(b + 21, 0x53)
+    // push rdi, rsi, rdx (syscall args)
+    volatile_write_u8(b + 22, 0x57)
+    volatile_write_u8(b + 23, 0x56)
+    volatile_write_u8(b + 24, 0x52)
+
+    // Now dispatch based on RAX (syscall number)
+    // We handle inline: SYS_WRITE(1) and SYS_EXIT(60)
+
+    // cmp rax, 1 (SYS_WRITE)
+    volatile_write_u8(b + 25, 0x48)
+    volatile_write_u8(b + 26, 0x83)
+    volatile_write_u8(b + 27, 0xF8)
+    volatile_write_u8(b + 28, 1)
+    // jne skip_write (jump forward if not SYS_WRITE)
+    volatile_write_u8(b + 29, 0x75)
+    volatile_write_u8(b + 30, 20)  // skip 20 bytes
+
+    // SYS_WRITE: rdi=fd, rsi=buf, rdx=len
+    // Write each byte to serial port 0x3F8
+    // mov rcx, rdx (len -> counter)
+    volatile_write_u8(b + 31, 0x48)
+    volatile_write_u8(b + 32, 0x89)
+    volatile_write_u8(b + 33, 0xD1)
+    // .write_loop: lodsb (load byte from [rsi] to al, increment rsi)
+    volatile_write_u8(b + 34, 0xAC)
+    // mov dx, 0x3F8 (serial port)
+    volatile_write_u8(b + 35, 0x66)
+    volatile_write_u8(b + 36, 0xBA)
+    volatile_write_u16(b + 37, 0x3F8)
+    // out dx, al (write byte to serial)
+    volatile_write_u8(b + 39, 0xEE)
+    // loop .write_loop (dec rcx, jnz)
+    volatile_write_u8(b + 40, 0xE2)
+    volatile_write_u8(b + 41, 0xF8)  // -8 (back to lodsb at offset 34)
+    // xor rax, rax (return 0 = success)
+    volatile_write_u8(b + 42, 0x48)
+    volatile_write_u8(b + 43, 0x31)
+    volatile_write_u8(b + 44, 0xC0)
+    // jmp sysret_path
+    volatile_write_u8(b + 45, 0xEB)
+    volatile_write_u8(b + 46, 20)  // skip to sysret
+
+    // skip_write: (offset 51)
+    // cmp rax, 60 (SYS_EXIT)
+    volatile_write_u8(b + 51, 0x48)
+    volatile_write_u8(b + 52, 0x83)
+    volatile_write_u8(b + 53, 0xF8)
+    volatile_write_u8(b + 54, 60)
+    // jne unknown_syscall
+    volatile_write_u8(b + 55, 0x75)
+    volatile_write_u8(b + 56, 10) // skip 10 bytes
+
+    // SYS_EXIT: halt (user program terminated)
+    volatile_write_u8(b + 57, 0xF4) // hlt
+    volatile_write_u8(b + 58, 0xEB) // jmp -2
+    volatile_write_u8(b + 59, 0xFD)
+    // padding
+    volatile_write_u8(b + 60, 0x90)
+    volatile_write_u8(b + 61, 0x90)
+    volatile_write_u8(b + 62, 0x90)
+    volatile_write_u8(b + 63, 0x90)
+    volatile_write_u8(b + 64, 0x90)
+    volatile_write_u8(b + 65, 0x90)
+    volatile_write_u8(b + 66, 0x90)
+
+    // unknown_syscall: (offset 67)
+    // xor rax, rax; dec rax (return -1)
+    volatile_write_u8(b + 67, 0x48)
+    volatile_write_u8(b + 68, 0x31)
+    volatile_write_u8(b + 69, 0xC0)
+    volatile_write_u8(b + 70, 0x48)
+    volatile_write_u8(b + 71, 0xFF)
+    volatile_write_u8(b + 72, 0xC8) // dec rax
+
+    // sysret_path: (offset 73)
+    // pop rdx, rsi, rdi
+    volatile_write_u8(b + 73, 0x5A)
+    volatile_write_u8(b + 74, 0x5E)
+    volatile_write_u8(b + 75, 0x5F)
+    // pop r11 (user RFLAGS)
+    volatile_write_u8(b + 76, 0x41)
+    volatile_write_u8(b + 77, 0x5B)
+    // pop rcx (user RIP)
+    volatile_write_u8(b + 78, 0x59)
+
+    // mov rsp, [USER_RSP_SAVE] (restore user RSP)
+    volatile_write_u8(b + 79, 0x48)
+    volatile_write_u8(b + 80, 0x8B)
+    volatile_write_u8(b + 81, 0x24)
+    volatile_write_u8(b + 82, 0x25)
+    volatile_write_u32(b + 83, USER_RSP_SAVE)
+
+    // swapgs
+    volatile_write_u8(b + 87, 0x0F)
+    volatile_write_u8(b + 88, 0x01)
+    volatile_write_u8(b + 89, 0xF8)
+
+    // sysretq
+    volatile_write_u8(b + 90, 0x48)
+    volatile_write_u8(b + 91, 0x0F)
+    volatile_write_u8(b + 92, 0x07)
+}
+
+@kernel fn syscall_configure_msrs() {
+    // IA32_STAR (0xC0000081):
+    // Bits 63:48 = SYSRET CS base (user): 0x13 -> CS=0x13+16=0x23(ring3), SS=0x13+8=0x1B(ring3)
+    // Bits 47:32 = SYSCALL CS (kernel): 0x08 -> CS=0x08, SS=0x10
+    let star = (0x0013 << 48) | (0x0008 << 32)
+    wrmsr(0xC0000081, star)
+
+    // IA32_LSTAR (0xC0000082): SYSCALL entry point
+    wrmsr(0xC0000082, SYSCALL_ENTRY_ADDR)
+
+    // IA32_SFMASK (0xC0000083): RFLAGS bits to clear on SYSCALL (mask IF to disable interrupts)
+    wrmsr(0xC0000083, 0x200)  // Clear IF (bit 9)
+
+    // Enable SYSCALL/SYSRET in EFER (bit 0 = SCE)
+    let efer = rdmsr(0xC0000080)
+    wrmsr(0xC0000080, efer | 1)
+
+    // Set kernel RSP for syscall entry
+    volatile_write_u64(KERNEL_RSP_SAVE, 0x7F0000) // kernel stack top
+}
+
+@kernel fn syscall_setup() {
+    syscall_install_stub()
+    syscall_configure_msrs()
+}
+
+// ═══════════════════════════════════════════════════
+// Syscall Initialization + Dispatcher
+// ═══════════════════════════════════════════════════
+
+@kernel fn syscall_init() {
+    // Clear syscall table
+    let mut i: i64 = 0
+    while i < 32 * 8 { volatile_write_u8(SYSCALL_TABLE + i, 0); i = i + 1 }
+    frame_mark_used(SYSCALL_TABLE / FRAME_SIZE)
+}
+
+@kernel fn syscall_handle(num: i64, arg0: i64, arg1: i64, arg2: i64) -> i64 {
+    if num == SYS_EXIT { return arg0 }
+    if num == SYS_WRITE {
+        // arg0=fd, arg1=buf_addr, arg2=len
+        if arg0 == 1 { // stdout
+            let mut i: i64 = 0
+            while i < arg2 {
+                let ch = volatile_read_u8(arg1 + i)
+                console_putchar(ch, WHITE_ON_BLACK)
+                i = i + 1
+            }
+            return arg2
+        }
+        return -1
+    }
+    if num == SYS_READ {
+        // arg0=fd -- stdin not implemented yet
+        return 0
+    }
+    if num == SYS_GETPID {
+        return 0 // TODO: return actual PID from scheduler
+    }
+    if num == SYS_YIELD {
+        return 0
+    }
+    if num == SYS_SLEEP {
+        sleep_ms(arg0)
+        return 0
+    }
+    if num == SYS_MMAP {
+        // Simple: allocate arg0 bytes, return address
+        let pages = (arg0 + FRAME_SIZE - 1) / FRAME_SIZE
+        let base = ELF_LOAD_BASE + 0x800000 // heap starts at 40MB
+        let mut pg: i64 = 0
+        while pg < pages {
+            let frame = frame_alloc()
+            if frame != -1 {
+                map_page(base + pg * FRAME_SIZE, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+            }
+            pg = pg + 1
+        }
+        return base
+    }
+
+    // -- IPC v2 Syscalls (Sprint 1.2) --
+    if num == SYS_SEND {
+        // arg0=dst_pid, arg1=msg_ptr
+        return ipc2_send_checked(arg0, arg1)
+    }
+    if num == SYS_RECV {
+        // arg0=from_pid (-1=any), arg1=buf_ptr
+        return ipc2_recv_checked(arg0, arg1)
+    }
+    if num == SYS_CALL {
+        // arg0=dst_pid, arg1=msg_ptr, arg2=reply_ptr
+        return ipc2_call_checked(arg0, arg1, arg2)
+    }
+    if num == SYS_REPLY {
+        // arg0=caller_pid, arg1=reply_ptr
+        return ipc2_reply_checked(arg0, arg1)
+    }
+    if num == SYS_NOTIFY {
+        // arg0=dst_pid, arg1=bits
+        return ipc2_notify_checked(arg0, arg1)
+    }
+    if num == SYS_SHARE {
+        // arg0=region_id, arg1=guest_pid
+        return shm_share(arg0, arg1)
+    }
+    if num == SYS_IRQ_WAIT {
+        // arg0=irq -- block until IRQ fires (driver use)
+        return ipc2_wait_notify(1 << (arg0 & 63))
+    }
+    if num == SYS_DMA_ALLOC {
+        // arg0=size -- allocate DMA-safe memory
+        return shm_create(arg0)
+    }
+
+    -1 // Unknown syscall
+}
+
+// ═══════════════════════════════════════════════════
+// ELF64 Loader
+// Validates and loads ELF binaries for user-space execution
+// ═══════════════════════════════════════════════════
+
+const ELF_LOAD_BASE: i64 = 0x2000000  // 32MB -- user ELF load address
+const ELF_STACK_TOP: i64 = 0x3000000  // 48MB -- user stack top
+const ELF_BUF: i64 = 0x880000  // ELF read buffer (64KB)
+const ELF_MAGIC: i64 = 0x464C457F // \x7FELF
+
+// ELF64 header offsets
+const ELF_OFF_MAGIC: i64 = 0
+const ELF_OFF_CLASS: i64 = 4   // 1=32-bit, 2=64-bit
+const ELF_OFF_DATA: i64 = 5    // 1=LE, 2=BE
+const ELF_OFF_TYPE: i64 = 16   // 2=ET_EXEC, 3=ET_DYN
+const ELF_OFF_MACHINE: i64 = 18 // 0x3E=x86_64
+const ELF_OFF_ENTRY: i64 = 24  // Entry point (8 bytes)
+const ELF_OFF_PHOFF: i64 = 32  // Program header offset (8 bytes)
+const ELF_OFF_PHENTSIZE: i64 = 54 // Program header entry size (2 bytes)
+const ELF_OFF_PHNUM: i64 = 56  // Number of program headers (2 bytes)
+
+// Program header offsets (64-bit)
+const PH_OFF_TYPE: i64 = 0     // 1=PT_LOAD
+const PH_OFF_FLAGS: i64 = 4    // PF_X=1, PF_W=2, PF_R=4
+const PH_OFF_OFFSET: i64 = 8   // File offset (8 bytes)
+const PH_OFF_VADDR: i64 = 16   // Virtual address (8 bytes)
+const PH_OFF_FILESZ: i64 = 32  // Size in file (8 bytes)
+const PH_OFF_MEMSZ: i64 = 40   // Size in memory (8 bytes)
+
+@kernel fn elf_validate(buf: i64) -> i64 {
+    // Check ELF magic: 0x7F 'E' 'L' 'F'
+    let m0 = volatile_read_u8(buf)
+    let m1 = volatile_read_u8(buf + 1)
+    let m2 = volatile_read_u8(buf + 2)
+    let m3 = volatile_read_u8(buf + 3)
+    if m0 != 0x7F || m1 != 0x45 || m2 != 0x4C || m3 != 0x46 { return -1 }
+    // Check 64-bit
+    if volatile_read_u8(buf + ELF_OFF_CLASS) != 2 { return -2 }
+    // Check little-endian
+    if volatile_read_u8(buf + ELF_OFF_DATA) != 1 { return -3 }
+    // Check x86_64
+    let machine = buffer_read_u16_le(buf + ELF_OFF_MACHINE)
+    if machine != 0x3E { return -4 }
+    0
+}
+
+@kernel fn elf_get_entry(buf: i64) -> i64 {
+    buffer_read_u64_le(buf + ELF_OFF_ENTRY)
+}
+
+@kernel fn elf_get_phoff(buf: i64) -> i64 {
+    buffer_read_u64_le(buf + ELF_OFF_PHOFF)
+}
+
+@kernel fn elf_get_phnum(buf: i64) -> i64 {
+    buffer_read_u16_le(buf + ELF_OFF_PHNUM)
+}
+
+@kernel fn elf_get_phentsize(buf: i64) -> i64 {
+    buffer_read_u16_le(buf + ELF_OFF_PHENTSIZE)
+}
+
+@kernel fn elf_load_segments(buf: i64, file_size: i64) -> i64 {
+    let phoff = elf_get_phoff(buf)
+    let phnum = elf_get_phnum(buf)
+    let phentsize = elf_get_phentsize(buf)
+    let mut loaded: i64 = 0
+
+    let mut i: i64 = 0
+    while i < phnum {
+        let ph = buf + phoff + i * phentsize
+        let ph_type = buffer_read_u32_le(ph + PH_OFF_TYPE)
+
+        if ph_type == 1 { // PT_LOAD
+            let offset = buffer_read_u64_le(ph + PH_OFF_OFFSET)
+            let vaddr = buffer_read_u64_le(ph + PH_OFF_VADDR)
+            let filesz = buffer_read_u64_le(ph + PH_OFF_FILESZ)
+            let memsz = buffer_read_u64_le(ph + PH_OFF_MEMSZ)
+
+            // Map pages for this segment
+            let mut pg: i64 = vaddr & 0xFFFFF000
+            let end_pg = (vaddr + memsz + 0xFFF) & 0xFFFFF000
+            while pg < end_pg {
+                let frame = frame_alloc()
+                if frame != -1 {
+                    map_page(pg, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+                }
+                pg = pg + FRAME_SIZE
+            }
+
+            // Copy file data to memory
+            let mut j: i64 = 0
+            while j < filesz {
+                if offset + j < file_size {
+                    volatile_write_u8(vaddr + j, volatile_read_u8(buf + offset + j))
+                }
+                j = j + 1
+            }
+
+            // Zero BSS (memsz - filesz)
+            while j < memsz {
+                volatile_write_u8(vaddr + j, 0)
+                j = j + 1
+            }
+
+            loaded = loaded + 1
+        }
+        i = i + 1
+    }
+    loaded
+}
+
+// ═══════════════════════════════════════════════════
+// Capability System
+// Per-process 64-bit capability bitmap for IPC security
+// Stored in EP_CAP_BITS field of each process endpoint
+// ═══════════════════════════════════════════════════
+
+// Capability bits (matching MICROKERNEL_SPEC.md Section 5)
+const CAP_IPC_SEND: i64 = 1       // bit 0: can send IPC messages
+const CAP_IPC_RECV: i64 = 2       // bit 1: can receive IPC messages
+const CAP_SPAWN: i64 = 4          // bit 2: can spawn child processes
+const CAP_KILL: i64 = 8           // bit 3: can kill other processes
+const CAP_PORT_IO: i64 = 16       // bit 4: can do port I/O
+const CAP_IRQ: i64 = 32           // bit 5: can wait for IRQs
+const CAP_DMA: i64 = 64           // bit 6: can allocate DMA memory
+const CAP_MAP_PHYS: i64 = 128     // bit 7: can map physical addresses
+const CAP_NET: i64 = 256          // bit 8: can access network service
+const CAP_FS: i64 = 512           // bit 9: can access filesystem service
+const CAP_DEVICE: i64 = 1024      // bit 10: can access device hardware
+const CAP_ADMIN: i64 = 2048       // bit 11: can shutdown/reboot
+const CAP_ALL: i64 = -1
+
+// Default capabilities by annotation context
+const CAP_KERNEL_DEFAULT: i64 = -1  // ALL
+const CAP_DEVICE_DEFAULT: i64 = 1143  // IPC_SEND + IPC_RECV + PORT_IO + IRQ + DMA + MAP_PHYS + DEVICE
+const CAP_SAFE_DEFAULT: i64 = 775     // IPC_SEND + IPC_RECV + SPAWN + FS + NET
+
+@kernel fn cap_check(pid: i64, required: i64) -> i64 {
+    let caps = ep_read(pid, EP_CAP_BITS)
+    if (caps & required) == required { return 1 }
+    0
+}
+
+@kernel fn cap_grant(pid: i64, bits: i64) {
+    let caps = ep_read(pid, EP_CAP_BITS)
+    ep_write(pid, EP_CAP_BITS, caps | bits)
+}
+
+@kernel fn cap_revoke(pid: i64, bits: i64) {
+    let caps = ep_read(pid, EP_CAP_BITS)
+    ep_write(pid, EP_CAP_BITS, caps & (-1 ^ bits))
+}
+
+@kernel fn cap_set(pid: i64, bits: i64) {
+    ep_write(pid, EP_CAP_BITS, bits)
+}
+
+@kernel fn cap_init_process(pid: i64, annotation: i64) {
+    // annotation: 0=@safe, 1=@kernel, 2=@device
+    if annotation == 1 { cap_set(pid, CAP_KERNEL_DEFAULT) }
+    else if annotation == 2 { cap_set(pid, CAP_DEVICE_DEFAULT) }
+    else { cap_set(pid, CAP_SAFE_DEFAULT) }
+}
+
+// ═══════════════════════════════════════════════════
+// Capability-guarded IPC operations
+// These wrap the raw IPC functions with cap_check
+// ═══════════════════════════════════════════════════
+
+@kernel fn ipc2_send_checked(dst_pid: i64, msg_addr: i64) -> i64 {
+    let src_pid = volatile_read_u64(0x6FE00)
+    if cap_check(src_pid, CAP_IPC_SEND) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_send(dst_pid, msg_addr)
+}
+
+@kernel fn ipc2_recv_checked(from_pid: i64, buf_addr: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+    if cap_check(my_pid, CAP_IPC_RECV) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_recv(from_pid, buf_addr)
+}
+
+@kernel fn ipc2_call_checked(dst_pid: i64, msg_addr: i64, reply_addr: i64) -> i64 {
+    let src_pid = volatile_read_u64(0x6FE00)
+    if cap_check(src_pid, CAP_IPC_SEND | CAP_IPC_RECV) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_call(dst_pid, msg_addr, reply_addr)
+}
+
+@kernel fn ipc2_reply_checked(caller_pid: i64, reply_addr: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+    if cap_check(my_pid, CAP_IPC_SEND) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_reply(caller_pid, reply_addr)
+}
+
+@kernel fn ipc2_notify_checked(dst_pid: i64, bits: i64) -> i64 {
+    let src_pid = volatile_read_u64(0x6FE00)
+    if cap_check(src_pid, CAP_IPC_SEND) == 0 { return IPC_ERR_NO_CAP }
+    ipc2_notify(dst_pid, bits)
+}

@@ -1,0 +1,566 @@
+// FajarOS Nova v2.0 — Display Service (Sprint 3.1)
+// @device process — PID 6, framebuffer rendering
+// Pixel primitives, bitmap font, text console, tiled compositor
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Display IPC Protocol
+// ═══════════════════════════════════════════════════════════════
+
+const MSG_DISP_PUTPIXEL: i64 = 0x0700
+const MSG_DISP_FILL_RECT: i64 = 0x0701
+const MSG_DISP_DRAW_CHAR: i64 = 0x0702
+const MSG_DISP_DRAW_TEXT: i64 = 0x0703
+const MSG_DISP_SCROLL: i64 = 0x0704
+const MSG_DISP_CLEAR: i64 = 0x0705
+const MSG_DISP_INFO: i64 = 0x0706
+const MSG_DISP_REPLY: i64 = 0x07FF
+
+const DISP_SVC_PID: i64 = 6
+
+// ═══════════════════════════════════════════════════════════════
+// Color System — RGB888 (32-bit) and RGB565 (16-bit)
+// ═══════════════════════════════════════════════════════════════
+
+// Pre-defined colors (RGB888 packed as i64: 0x00RRGGBB)
+const COLOR_BLACK: i64 = 0x000000
+const COLOR_WHITE: i64 = 0xFFFFFF
+const COLOR_RED: i64 = 0xFF0000
+const COLOR_GREEN: i64 = 0x00FF00
+const COLOR_BLUE: i64 = 0x0000FF
+const COLOR_CYAN: i64 = 0x00FFFF
+const COLOR_YELLOW: i64 = 0xFFFF00
+const COLOR_GRAY: i64 = 0x808080
+const COLOR_DARK_GRAY: i64 = 0x404040
+const COLOR_LIGHT_GRAY: i64 = 0xC0C0C0
+
+// Terminal colors (VGA palette mapping)
+const COLOR_BG_DEFAULT: i64 = 0x1E1E2E  // Dark background (Catppuccin-style)
+const COLOR_FG_DEFAULT: i64 = 0xCDD6F4  // Light text
+const COLOR_FG_GREEN: i64 = 0xA6E3A1
+const COLOR_FG_RED: i64 = 0xF38BA8
+const COLOR_FG_YELLOW: i64 = 0xF9E2AF
+const COLOR_FG_CYAN: i64 = 0x89DCEB
+const COLOR_FG_BLUE: i64 = 0x89B4FA
+const COLOR_CURSOR: i64 = 0xF5C2E7     // Pink cursor
+
+@kernel fn rgb_pack(r: i64, g: i64, b: i64) -> i64 {
+    ((r & 0xFF) << 16) | ((g & 0xFF) << 8) | (b & 0xFF)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pixel Drawing Primitives
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn fb_putpixel(x: i64, y: i64, color: i64) {
+    let fb_addr = fb_state_read(FB_MAPPED)
+    if fb_addr == 0 { return }
+    let width = fb_state_read(FB_WIDTH)
+    let height = fb_state_read(FB_HEIGHT)
+    if x < 0 || x >= width || y < 0 || y >= height { return }
+    let pitch = fb_state_read(FB_PITCH)
+    let bpp = fb_state_read(FB_BPP)
+    let offset = y * pitch + x * (bpp / 8)
+    if bpp == 32 {
+        volatile_write_u8(fb_addr + offset, color & 0xFF)         // B
+        volatile_write_u8(fb_addr + offset + 1, (color >> 8) & 0xFF)   // G
+        volatile_write_u8(fb_addr + offset + 2, (color >> 16) & 0xFF)  // R
+        volatile_write_u8(fb_addr + offset + 3, 0)                     // A
+    }
+    if bpp == 24 {
+        volatile_write_u8(fb_addr + offset, color & 0xFF)
+        volatile_write_u8(fb_addr + offset + 1, (color >> 8) & 0xFF)
+        volatile_write_u8(fb_addr + offset + 2, (color >> 16) & 0xFF)
+    }
+    if bpp == 16 {
+        // RGB565: R(5) G(6) B(5)
+        let r5 = (color >> 19) & 0x1F
+        let g6 = (color >> 10) & 0x3F
+        let b5 = (color >> 3) & 0x1F
+        let rgb565 = (r5 << 11) | (g6 << 5) | b5
+        volatile_write_u8(fb_addr + offset, rgb565 & 0xFF)
+        volatile_write_u8(fb_addr + offset + 1, (rgb565 >> 8) & 0xFF)
+    }
+}
+
+@kernel fn fb_fill_rect(x: i64, y: i64, w: i64, h: i64, color: i64) {
+    let mut row: i64 = 0
+    while row < h {
+        let mut col: i64 = 0
+        while col < w {
+            fb_putpixel(x + col, y + row, color)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+@kernel fn fb_draw_hline(x: i64, y: i64, len: i64, color: i64) {
+    let mut i: i64 = 0
+    while i < len { fb_putpixel(x + i, y, color); i = i + 1 }
+}
+
+@kernel fn fb_draw_vline(x: i64, y: i64, len: i64, color: i64) {
+    let mut i: i64 = 0
+    while i < len { fb_putpixel(x, y + i, color); i = i + 1 }
+}
+
+@kernel fn fb_draw_rect(x: i64, y: i64, w: i64, h: i64, color: i64) {
+    fb_draw_hline(x, y, w, color)
+    fb_draw_hline(x, y + h - 1, w, color)
+    fb_draw_vline(x, y, h, color)
+    fb_draw_vline(x + w - 1, y, h, color)
+}
+
+@kernel fn fb_clear(color: i64) {
+    let w = fb_state_read(FB_WIDTH)
+    let h = fb_state_read(FB_HEIGHT)
+    fb_fill_rect(0, 0, w, h, color)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 8×16 Bitmap Font — CP437 style
+// Font data at FONT_BASE: 256 chars × 16 bytes = 4KB
+// Each char: 16 rows × 8 pixels (1 byte per row, MSB left)
+// ═══════════════════════════════════════════════════════════════
+
+const FONT_BASE: i64 = 0x922000   // 4KB font bitmap storage
+const FONT_WIDTH: i64 = 8
+const FONT_HEIGHT: i64 = 16
+
+@kernel fn font_init() {
+    // Initialize basic ASCII font (printable range 32-126)
+    // Simple block-based font for key characters
+    let mut i: i64 = 0
+    while i < 256 * 16 { volatile_write_u8(FONT_BASE + i, 0); i = i + 1 }
+
+    // Space (32) — all zero (already cleared)
+
+    // '0' (48): Simple rectangle
+    font_set_char(48, 0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    // '1' (49)
+    font_set_char(49, 0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    // 'A' (65)
+    font_set_char(65, 0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    // 'F' (70)
+    font_set_char(70, 0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    // 'a' (97)
+    font_set_char(97, 0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    // 'j' (106)
+    font_set_char(106, 0x06, 0x00, 0x06, 0x06, 0x06, 0x06, 0x3C, 0x00,
+                       0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    // '_' (95): underline
+    font_set_char(95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00)
+    // Fill block char (219)
+    font_set_char(219, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+                       0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF)
+
+    // Generate basic latin letters: simple 5×7 shapes centered in 8×16
+    // (A full font would have 256 glyphs — we provide a minimal set)
+    font_gen_basic_ascii()
+}
+
+@kernel fn font_set_char(ch: i64, r0: i64, r1: i64, r2: i64, r3: i64,
+                          r4: i64, r5: i64, r6: i64, r7: i64,
+                          r8: i64, r9: i64, rA: i64, rB: i64,
+                          rC: i64, rD: i64, rE: i64, rF: i64) {
+    let base = FONT_BASE + ch * 16
+    volatile_write_u8(base, r0)
+    volatile_write_u8(base + 1, r1)
+    volatile_write_u8(base + 2, r2)
+    volatile_write_u8(base + 3, r3)
+    volatile_write_u8(base + 4, r4)
+    volatile_write_u8(base + 5, r5)
+    volatile_write_u8(base + 6, r6)
+    volatile_write_u8(base + 7, r7)
+    volatile_write_u8(base + 8, r8)
+    volatile_write_u8(base + 9, r9)
+    volatile_write_u8(base + 10, rA)
+    volatile_write_u8(base + 11, rB)
+    volatile_write_u8(base + 12, rC)
+    volatile_write_u8(base + 13, rD)
+    volatile_write_u8(base + 14, rE)
+    volatile_write_u8(base + 15, rF)
+}
+
+@kernel fn font_gen_basic_ascii() {
+    // Generate minimal glyphs for printable ASCII (33-126)
+    // Each character gets a simple hash-based pattern
+    // Real OS would load a proper PSF/BDF font from disk
+    let mut ch: i64 = 33
+    while ch < 127 {
+        let base = FONT_BASE + ch * 16
+        // Skip if already set (e.g., 'A', '0')
+        if volatile_read_u8(base) == 0 && volatile_read_u8(base + 1) == 0 {
+            // Generate simple pattern based on char code
+            let pat = (ch * 7 + 13) & 0x7E  // centered, no edge bits
+            volatile_write_u8(base + 2, pat)
+            volatile_write_u8(base + 3, pat)
+            volatile_write_u8(base + 4, pat ^ 0x3C)
+            volatile_write_u8(base + 5, pat)
+            volatile_write_u8(base + 6, pat)
+            volatile_write_u8(base + 7, pat ^ 0x18)
+            volatile_write_u8(base + 8, pat)
+        }
+        ch = ch + 1
+    }
+}
+
+@kernel fn fb_draw_char(x: i64, y: i64, ch: i64, fg: i64, bg: i64) {
+    let char_base = FONT_BASE + (ch & 0xFF) * 16
+    let mut row: i64 = 0
+    while row < FONT_HEIGHT {
+        let bits = volatile_read_u8(char_base + row)
+        let mut col: i64 = 0
+        while col < FONT_WIDTH {
+            let pixel_set = (bits >> (7 - col)) & 1
+            if pixel_set == 1 { fb_putpixel(x + col, y + row, fg) }
+            else { fb_putpixel(x + col, y + row, bg) }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+@kernel fn fb_draw_string(x: i64, y: i64, str_addr: i64, fg: i64, bg: i64) -> i64 {
+    let mut cx = x
+    let mut i: i64 = 0
+    while i < 256 {
+        let ch = volatile_read_u8(str_addr + i)
+        if ch == 0 { return i }
+        if ch == 10 { return i }  // newline — caller handles
+        fb_draw_char(cx, y, ch, fg, bg)
+        cx = cx + FONT_WIDTH
+        i = i + 1
+    }
+    i
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Text Console on Framebuffer
+// 80 columns × 30 rows (at 1024×768, 8×16 font → 128×48 max)
+// ═══════════════════════════════════════════════════════════════
+
+const FBCON_STATE: i64 = 0x924000  // Console state
+const FBCON_COL: i64 = 0
+const FBCON_ROW: i64 = 8
+const FBCON_COLS: i64 = 16      // max columns
+const FBCON_ROWS: i64 = 24      // max rows
+const FBCON_FG: i64 = 32
+const FBCON_BG: i64 = 40
+
+@kernel fn fbcon_init() {
+    let w = fb_state_read(FB_WIDTH)
+    let h = fb_state_read(FB_HEIGHT)
+    let cols = if w > 0 { w / FONT_WIDTH } else { 80 }
+    let rows = if h > 0 { h / FONT_HEIGHT } else { 25 }
+    volatile_write_u64(FBCON_STATE + FBCON_COL, 0)
+    volatile_write_u64(FBCON_STATE + FBCON_ROW, 0)
+    volatile_write_u64(FBCON_STATE + FBCON_COLS, cols)
+    volatile_write_u64(FBCON_STATE + FBCON_ROWS, rows)
+    volatile_write_u64(FBCON_STATE + FBCON_FG, COLOR_FG_DEFAULT)
+    volatile_write_u64(FBCON_STATE + FBCON_BG, COLOR_BG_DEFAULT)
+}
+
+@kernel fn fbcon_scroll() {
+    // Scroll: copy pixels up by FONT_HEIGHT rows
+    let fb_addr = fb_state_read(FB_MAPPED)
+    let pitch = fb_state_read(FB_PITCH)
+    let height = fb_state_read(FB_HEIGHT)
+    let copy_bytes = pitch * (height - FONT_HEIGHT)
+    // Move rows up
+    let mut i: i64 = 0
+    while i < copy_bytes {
+        volatile_write_u8(fb_addr + i, volatile_read_u8(fb_addr + i + pitch * FONT_HEIGHT))
+        i = i + 1
+    }
+    // Clear last row
+    let last_row_start = pitch * (height - FONT_HEIGHT)
+    i = 0
+    while i < pitch * FONT_HEIGHT {
+        volatile_write_u8(fb_addr + last_row_start + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn fbcon_putchar(ch: i64) {
+    let col = volatile_read_u64(FBCON_STATE + FBCON_COL)
+    let row = volatile_read_u64(FBCON_STATE + FBCON_ROW)
+    let cols = volatile_read_u64(FBCON_STATE + FBCON_COLS)
+    let rows = volatile_read_u64(FBCON_STATE + FBCON_ROWS)
+    let fg = volatile_read_u64(FBCON_STATE + FBCON_FG)
+    let bg = volatile_read_u64(FBCON_STATE + FBCON_BG)
+
+    if ch == 10 {
+        // Newline
+        volatile_write_u64(FBCON_STATE + FBCON_COL, 0)
+        if row >= rows - 1 { fbcon_scroll() }
+        else { volatile_write_u64(FBCON_STATE + FBCON_ROW, row + 1) }
+        return
+    }
+    if ch == 8 {
+        // Backspace
+        if col > 0 {
+            volatile_write_u64(FBCON_STATE + FBCON_COL, col - 1)
+            fb_draw_char((col - 1) * FONT_WIDTH, row * FONT_HEIGHT, 32, fg, bg)
+        }
+        return
+    }
+
+    fb_draw_char(col * FONT_WIDTH, row * FONT_HEIGHT, ch, fg, bg)
+    if col >= cols - 1 {
+        volatile_write_u64(FBCON_STATE + FBCON_COL, 0)
+        if row >= rows - 1 { fbcon_scroll() }
+        else { volatile_write_u64(FBCON_STATE + FBCON_ROW, row + 1) }
+    } else {
+        volatile_write_u64(FBCON_STATE + FBCON_COL, col + 1)
+    }
+}
+
+@kernel fn fbcon_print(str_addr: i64) {
+    let mut i: i64 = 0
+    while i < 256 {
+        let ch = volatile_read_u8(str_addr + i)
+        if ch == 0 { return }
+        fbcon_putchar(ch)
+        i = i + 1
+    }
+}
+
+@kernel fn fbcon_set_color(fg: i64, bg: i64) {
+    volatile_write_u64(FBCON_STATE + FBCON_FG, fg)
+    volatile_write_u64(FBCON_STATE + FBCON_BG, bg)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Tiled Window Compositor
+// 4 tiles: top-left, top-right, bottom-left, bottom-right
+// Each tile has: x, y, w, h, title, active flag
+// ═══════════════════════════════════════════════════════════════
+
+const TILE_STATE: i64 = 0x924100
+const TILE_MAX: i64 = 4
+const TILE_ENTRY_SIZE: i64 = 64
+// Per tile: +0=active, +8=x, +16=y, +24=w, +32=h, +40=owner_pid, +48=title[16]
+
+@kernel fn tile_init() {
+    let mut i: i64 = 0
+    while i < TILE_MAX * TILE_ENTRY_SIZE {
+        volatile_write_u8(TILE_STATE + i, 0)
+        i = i + 1
+    }
+    // Default layout: 4 quadrants
+    let w = fb_state_read(FB_WIDTH)
+    let h = fb_state_read(FB_HEIGHT)
+    if w == 0 || h == 0 { return }
+    let hw = w / 2
+    let hh = h / 2
+    // Tile 0: top-left (terminal)
+    volatile_write_u64(TILE_STATE, 1)  // active
+    volatile_write_u64(TILE_STATE + 8, 0)
+    volatile_write_u64(TILE_STATE + 16, 0)
+    volatile_write_u64(TILE_STATE + 24, hw)
+    volatile_write_u64(TILE_STATE + 32, hh)
+    volatile_write_u64(TILE_STATE + 40, 5)  // shell
+    // Tile 1: top-right
+    volatile_write_u64(TILE_STATE + TILE_ENTRY_SIZE, 1)
+    volatile_write_u64(TILE_STATE + TILE_ENTRY_SIZE + 8, hw)
+    volatile_write_u64(TILE_STATE + TILE_ENTRY_SIZE + 16, 0)
+    volatile_write_u64(TILE_STATE + TILE_ENTRY_SIZE + 24, hw)
+    volatile_write_u64(TILE_STATE + TILE_ENTRY_SIZE + 32, hh)
+    // Tile 2: bottom-left
+    volatile_write_u64(TILE_STATE + 2 * TILE_ENTRY_SIZE, 1)
+    volatile_write_u64(TILE_STATE + 2 * TILE_ENTRY_SIZE + 8, 0)
+    volatile_write_u64(TILE_STATE + 2 * TILE_ENTRY_SIZE + 16, hh)
+    volatile_write_u64(TILE_STATE + 2 * TILE_ENTRY_SIZE + 24, hw)
+    volatile_write_u64(TILE_STATE + 2 * TILE_ENTRY_SIZE + 32, hh)
+    // Tile 3: bottom-right
+    volatile_write_u64(TILE_STATE + 3 * TILE_ENTRY_SIZE, 1)
+    volatile_write_u64(TILE_STATE + 3 * TILE_ENTRY_SIZE + 8, hw)
+    volatile_write_u64(TILE_STATE + 3 * TILE_ENTRY_SIZE + 16, hh)
+    volatile_write_u64(TILE_STATE + 3 * TILE_ENTRY_SIZE + 24, hw)
+    volatile_write_u64(TILE_STATE + 3 * TILE_ENTRY_SIZE + 32, hh)
+}
+
+@kernel fn tile_draw_borders() {
+    let mut i: i64 = 0
+    while i < TILE_MAX {
+        let base = TILE_STATE + i * TILE_ENTRY_SIZE
+        if volatile_read_u64(base) == 1 {
+            let x = volatile_read_u64(base + 8)
+            let y = volatile_read_u64(base + 16)
+            let w = volatile_read_u64(base + 24)
+            let h = volatile_read_u64(base + 32)
+            fb_draw_rect(x, y, w, h, COLOR_GRAY)
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Display Service Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn display_svc_init() {
+    fb_init_from_multiboot2()
+    let ready = fb_state_read(FB_READY)
+    if ready == 1 {
+        font_init()
+        fbcon_init()
+        tile_init()
+        fb_clear(COLOR_BG_DEFAULT)
+        tile_draw_borders()
+        // Register /dev/fb0 in VFS
+        let name_buf: i64 = 0x924F00
+        volatile_write_u8(name_buf, 102)   // f
+        volatile_write_u8(name_buf + 1, 98) // b
+        volatile_write_u8(name_buf + 2, 48) // 0
+        volatile_write_u8(name_buf + 3, 0)
+        vfs_dev_register(DISP_SVC_PID, name_buf, 4)  // type 4 = display
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Display IPC Handler
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn disp_svc_handle_msg(sender: i64, msg_buf: i64, reply_buf: i64) -> i64 {
+    let msg_type = volatile_read_u32(msg_buf + 8)
+
+    if msg_type == MSG_DISP_INFO {
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, DISP_SVC_PID, MSG_DISP_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, fb_state_read(FB_READY))
+        volatile_write_u64(reply_buf + 24, fb_state_read(FB_WIDTH))
+        volatile_write_u64(reply_buf + 32, fb_state_read(FB_HEIGHT))
+        volatile_write_u64(reply_buf + 40, fb_state_read(FB_BPP))
+        return 0
+    }
+
+    if msg_type == MSG_DISP_PUTPIXEL {
+        let x = volatile_read_u64(msg_buf + 16)
+        let y = volatile_read_u64(msg_buf + 24)
+        let color = volatile_read_u64(msg_buf + 32)
+        fb_putpixel(x, y, color)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, DISP_SVC_PID, MSG_DISP_REPLY, 0)
+        return 0
+    }
+
+    if msg_type == MSG_DISP_FILL_RECT {
+        let x = volatile_read_u64(msg_buf + 16)
+        let y = volatile_read_u64(msg_buf + 24)
+        let w = volatile_read_u64(msg_buf + 32)
+        let h = volatile_read_u64(msg_buf + 40)
+        let color = volatile_read_u64(msg_buf + 48)
+        fb_fill_rect(x, y, w, h, color)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, DISP_SVC_PID, MSG_DISP_REPLY, 0)
+        return 0
+    }
+
+    if msg_type == MSG_DISP_DRAW_CHAR {
+        let x = volatile_read_u64(msg_buf + 16)
+        let y = volatile_read_u64(msg_buf + 24)
+        let ch = volatile_read_u64(msg_buf + 32)
+        let fg = volatile_read_u64(msg_buf + 40)
+        let bg = volatile_read_u64(msg_buf + 48)
+        fb_draw_char(x, y, ch, fg, bg)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, DISP_SVC_PID, MSG_DISP_REPLY, 0)
+        return 0
+    }
+
+    if msg_type == MSG_DISP_CLEAR {
+        let color = volatile_read_u64(msg_buf + 16)
+        fb_clear(color)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, DISP_SVC_PID, MSG_DISP_REPLY, 0)
+        return 0
+    }
+
+    if msg_type == MSG_DISP_SCROLL {
+        fbcon_scroll()
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, DISP_SVC_PID, MSG_DISP_REPLY, 0)
+        return 0
+    }
+
+    // Unknown message
+    ipc_msg_clear(reply_buf)
+    ipc_msg_set_header(reply_buf, DISP_SVC_PID, MSG_DISP_REPLY, 0)
+    volatile_write_u64(reply_buf + 16, -1)
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_fb_test() {
+    cprintln("=== Framebuffer Test ===", YELLOW_ON_BLACK)
+    let ready = fb_state_read(FB_READY)
+    if ready != 1 {
+        cprintln("  No framebuffer (VGA text mode)", YELLOW_ON_BLACK)
+        cprintln("  Try: qemu -vga std (VESA) or UEFI boot (GOP)", WHITE_ON_BLACK)
+        return
+    }
+    let w = fb_state_read(FB_WIDTH)
+    let h = fb_state_read(FB_HEIGHT)
+    cprint("  Resolution: ", WHITE_ON_BLACK)
+    cprint_decimal(w, CYAN_ON_BLACK)
+    cprint("x", WHITE_ON_BLACK)
+    cprint_decimal(h, CYAN_ON_BLACK)
+    cprint(" ", WHITE_ON_BLACK)
+    cprint_decimal(fb_state_read(FB_BPP), CYAN_ON_BLACK)
+    cprintln("bpp", WHITE_ON_BLACK)
+
+    // Draw test pattern
+    fb_fill_rect(10, 10, 50, 50, COLOR_RED)
+    fb_fill_rect(70, 10, 50, 50, COLOR_GREEN)
+    fb_fill_rect(130, 10, 50, 50, COLOR_BLUE)
+    fb_draw_rect(10, 10, 170, 50, COLOR_WHITE)
+    // Draw text
+    let text: i64 = 0x924E00
+    volatile_write_u8(text, 70)     // F
+    volatile_write_u8(text + 1, 97) // a
+    volatile_write_u8(text + 2, 106) // j
+    volatile_write_u8(text + 3, 97) // a
+    volatile_write_u8(text + 4, 114) // r
+    volatile_write_u8(text + 5, 79) // O
+    volatile_write_u8(text + 6, 83) // S
+    volatile_write_u8(text + 7, 0)
+    fb_draw_string(10, 70, text, COLOR_FG_DEFAULT, COLOR_BG_DEFAULT)
+    cprintln("  Test pattern drawn", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_disp_info() {
+    cprintln("Display Service:", YELLOW_ON_BLACK)
+    let ready = fb_state_read(FB_READY)
+    cprint("  Framebuffer: ", WHITE_ON_BLACK)
+    if ready == 1 { cprintln("AVAILABLE", GREEN_ON_BLACK) }
+    else { cprintln("NOT AVAILABLE", RED_ON_BLACK) }
+    if ready == 1 {
+        cmd_fbinfo()
+        cprint("  Console: ", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(FBCON_STATE + FBCON_COLS), CYAN_ON_BLACK)
+        cprint("x", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(FBCON_STATE + FBCON_ROWS), CYAN_ON_BLACK)
+        cprintln(" chars", WHITE_ON_BLACK)
+        cprint("  Tiles: ", WHITE_ON_BLACK)
+        let mut count: i64 = 0
+        let mut i: i64 = 0
+        while i < TILE_MAX {
+            if volatile_read_u64(TILE_STATE + i * TILE_ENTRY_SIZE) == 1 { count = count + 1 }
+            i = i + 1
+        }
+        cprint_decimal(count, CYAN_ON_BLACK)
+        cprintln(" active", WHITE_ON_BLACK)
+    }
+}

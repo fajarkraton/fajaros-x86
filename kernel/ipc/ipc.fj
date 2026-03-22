@@ -1,0 +1,417 @@
+// FajarOS Nova v2.0 — IPC Message-Passing Core (Sprint 1.2)
+// Synchronous rendezvous IPC (L4/seL4 inspired)
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// IPC Endpoint Table
+// 16 endpoints × 512 bytes = 8KB at 0x8A0000
+//
+// Design: Synchronous rendezvous
+//   - Sender blocks until receiver calls recv
+//   - Receiver blocks until sender calls send
+//   - If partner already waiting → immediate transfer (no queue)
+//   - CALL = send + wait_reply (atomic RPC)
+//   - REPLY = unblock caller with response
+//
+// Message format (64 bytes):
+//   src_pid(8) + msg_type(4) + msg_id(4) + payload(40) + reserved(8)
+// ═══════════════════════════════════════════════════════════════
+
+const IPC_EP_BASE: i64 = 0x8A0000
+const IPC_EP_SIZE: i64 = 576  // was 512: queue at +256 needs 4×72=288 bytes → ends at 544. 576 provides margin.
+const IPC_EP_MAX: i64 = 16    // 16 × 576 = 9216 bytes (0x2400), end at 0x8A2400
+const IPC_MSG_BYTES: i64 = 64
+
+// Endpoint fields (offsets)
+const EP_STATE: i64 = 0         // IPC state of this process
+const EP_PARTNER: i64 = 8       // PID we're waiting for (-1 = any)
+const EP_NOTIFY_PENDING: i64 = 16  // Notification bits (async)
+const EP_NOTIFY_MASK: i64 = 24     // Which notify bits to wake on
+const EP_CAP_BITS: i64 = 32        // Capability bitmap
+const EP_MSG_BUF: i64 = 40         // 64-byte message buffer
+const EP_REPLY_BUF: i64 = 104      // 64-byte reply buffer
+const EP_CALLER_PID: i64 = 168     // Who called us (for REPLY)
+const EP_SEND_COUNT: i64 = 176     // Stats: messages sent
+const EP_RECV_COUNT: i64 = 184     // Stats: messages received
+const EP_QUEUE_HEAD: i64 = 192
+const EP_QUEUE_TAIL: i64 = 200
+const EP_QUEUE_COUNT: i64 = 208
+const EP_QUEUE_BASE: i64 = 256     // 4 queued messages × 72 bytes (pid(8) + msg(64))
+
+// IPC states
+const IPC_IDLE: i64 = 0
+const IPC_SEND_BLOCKED: i64 = 1
+const IPC_RECV_BLOCKED: i64 = 2
+const IPC_CALL_BLOCKED: i64 = 3
+const IPC_REPLY_BLOCKED: i64 = 4
+
+// IPC queue constants
+const IPC_QUEUE_SLOTS: i64 = 4
+const IPC_QUEUE_ENTRY: i64 = 72    // pid(8) + msg(64)
+
+// IPC error codes
+const IPC_OK: i64 = 0
+const IPC_ERR_INVALID_PID: i64 = -1
+const IPC_ERR_QUEUE_FULL: i64 = -2
+const IPC_ERR_NO_MESSAGE: i64 = -3
+const IPC_ERR_NOT_CALLING: i64 = -4
+const IPC_ERR_NO_CAP: i64 = -5
+const IPC_ERR_DEAD_PROCESS: i64 = -6
+const IPC_ERR_WOULD_BLOCK: i64 = -7
+
+// ── Endpoint helpers ──
+
+@kernel fn ep_addr(pid: i64) -> i64 {
+    IPC_EP_BASE + pid * IPC_EP_SIZE
+}
+
+@kernel fn ep_read(pid: i64, field: i64) -> i64 {
+    volatile_read_u64(ep_addr(pid) + field)
+}
+
+@kernel fn ep_write(pid: i64, field: i64, val: i64) {
+    volatile_write_u64(ep_addr(pid) + field, val)
+}
+
+// ── Initialization ──
+
+@kernel fn ipc2_init() {
+    // Zero all endpoint structures
+    let mut i: i64 = 0
+    while i < IPC_EP_MAX * IPC_EP_SIZE {
+        volatile_write_u8(IPC_EP_BASE + i, 0)
+        i = i + 1
+    }
+
+    // Set default capabilities for PID 0 (kernel) — full access
+    ep_write(0, EP_CAP_BITS, -1)
+}
+
+// ── Message copy helpers ──
+
+@kernel fn ipc_msg_copy(dst: i64, src: i64) {
+    // Copy 64-byte message (8 × i64)
+    let mut i: i64 = 0
+    while i < IPC_MSG_BYTES {
+        volatile_write_u8(dst + i, volatile_read_u8(src + i))
+        i = i + 1
+    }
+}
+
+@kernel fn ipc_msg_clear(addr: i64) {
+    let mut i: i64 = 0
+    while i < IPC_MSG_BYTES {
+        volatile_write_u8(addr + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn ipc_msg_set_header(addr: i64, src_pid: i64, msg_type: i64, msg_id: i64) {
+    volatile_write_u64(addr, src_pid)
+    volatile_write_u32(addr + 8, msg_type)
+    volatile_write_u32(addr + 12, msg_id)
+}
+
+// ── Queue operations (for buffered async sends) ──
+
+@kernel fn ipc_queue_push(pid: i64, sender_pid: i64, msg_addr: i64) -> i64 {
+    let count = ep_read(pid, EP_QUEUE_COUNT)
+    if count >= IPC_QUEUE_SLOTS { return IPC_ERR_QUEUE_FULL }
+    let tail = ep_read(pid, EP_QUEUE_TAIL)
+    let entry_addr = ep_addr(pid) + EP_QUEUE_BASE + tail * IPC_QUEUE_ENTRY
+    volatile_write_u64(entry_addr, sender_pid)
+    ipc_msg_copy(entry_addr + 8, msg_addr)
+    ep_write(pid, EP_QUEUE_TAIL, (tail + 1) % IPC_QUEUE_SLOTS)
+    ep_write(pid, EP_QUEUE_COUNT, count + 1)
+    IPC_OK
+}
+
+@kernel fn ipc_queue_pop(pid: i64, out_sender: i64, out_msg: i64) -> i64 {
+    let count = ep_read(pid, EP_QUEUE_COUNT)
+    if count == 0 { return IPC_ERR_NO_MESSAGE }
+    let head = ep_read(pid, EP_QUEUE_HEAD)
+    let entry_addr = ep_addr(pid) + EP_QUEUE_BASE + head * IPC_QUEUE_ENTRY
+    volatile_write_u64(out_sender, volatile_read_u64(entry_addr))
+    ipc_msg_copy(out_msg, entry_addr + 8)
+    ep_write(pid, EP_QUEUE_HEAD, (head + 1) % IPC_QUEUE_SLOTS)
+    ep_write(pid, EP_QUEUE_COUNT, count - 1)
+    IPC_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.2.1: ipc2_send(dst_pid, msg_addr) — Synchronous Send
+//
+// Semantics:
+//   If receiver is RECV_BLOCKED waiting for us (or any):
+//     → Direct transfer: copy msg to receiver's buffer, unblock both
+//   Else:
+//     → Queue message in receiver's queue, mark sender SEND_BLOCKED
+//     → Sender unblocked when receiver calls recv
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_send(dst_pid: i64, msg_addr: i64) -> i64 {
+    if dst_pid < 0 || dst_pid >= IPC_EP_MAX { return IPC_ERR_INVALID_PID }
+
+    let src_pid = volatile_read_u64(0x6FE00)  // current PID
+
+    // Check destination process is alive
+    let dst_state = proc_v2_get(dst_pid, 0)
+    if dst_state == PROC_STATE_FREE { return IPC_ERR_DEAD_PROCESS }
+
+    // Stamp source PID into message header
+    volatile_write_u64(msg_addr, src_pid)
+
+    // Check if receiver is already waiting for us
+    let recv_state = ep_read(dst_pid, EP_STATE)
+    let recv_partner = ep_read(dst_pid, EP_PARTNER)
+
+    if recv_state == IPC_RECV_BLOCKED && (recv_partner == src_pid || recv_partner == -1) {
+        // Direct transfer — receiver is waiting!
+        let dst_buf = ep_addr(dst_pid) + EP_MSG_BUF
+        ipc_msg_copy(dst_buf, msg_addr)
+
+        // Unblock receiver
+        ep_write(dst_pid, EP_STATE, IPC_IDLE)
+        ep_write(dst_pid, EP_PARTNER, -1)
+        proc_v2_set(dst_pid, 0, PROC_STATE_READY)
+
+        // Update stats
+        ep_write(src_pid, EP_SEND_COUNT, ep_read(src_pid, EP_SEND_COUNT) + 1)
+        ep_write(dst_pid, EP_RECV_COUNT, ep_read(dst_pid, EP_RECV_COUNT) + 1)
+
+        return IPC_OK
+    }
+
+    // Receiver not ready — queue the message
+    let qresult = ipc_queue_push(dst_pid, src_pid, msg_addr)
+    if qresult != IPC_OK { return qresult }
+
+    // Block sender until receiver picks it up
+    ep_write(src_pid, EP_STATE, IPC_SEND_BLOCKED)
+    ep_write(src_pid, EP_PARTNER, dst_pid)
+    proc_v2_set(src_pid, 0, PROC_STATE_BLOCKED)
+
+    // Update stats
+    ep_write(src_pid, EP_SEND_COUNT, ep_read(src_pid, EP_SEND_COUNT) + 1)
+
+    return IPC_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.2.2: ipc2_recv(from_pid, buf_addr) — Synchronous Receive
+//
+// from_pid = -1 → receive from any sender
+// from_pid >= 0 → receive only from specific sender
+//
+// Semantics:
+//   Check queue for matching message → deliver immediately
+//   If sender is SEND_BLOCKED for us → direct transfer
+//   Else → mark receiver RECV_BLOCKED, wait
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_recv(from_pid: i64, buf_addr: i64) -> i64 {
+    let my_pid = volatile_read_u64(0x6FE00)
+
+    // Check for queued messages first
+    let queue_count = ep_read(my_pid, EP_QUEUE_COUNT)
+    if queue_count > 0 {
+        // Temp storage for sender PID
+        let tmp_sender: i64 = ep_addr(my_pid) + EP_REPLY_BUF + 56  // borrow 8 bytes
+        let result = ipc_queue_pop(my_pid, tmp_sender, buf_addr)
+        if result == IPC_OK {
+            let sender = volatile_read_u64(tmp_sender)
+
+            // If sender is blocked waiting for us, unblock them
+            if ep_read(sender, EP_STATE) == IPC_SEND_BLOCKED {
+                let partner = ep_read(sender, EP_PARTNER)
+                if partner == my_pid {
+                    ep_write(sender, EP_STATE, IPC_IDLE)
+                    ep_write(sender, EP_PARTNER, -1)
+                    proc_v2_set(sender, 0, PROC_STATE_READY)
+                }
+            }
+
+            ep_write(my_pid, EP_RECV_COUNT, ep_read(my_pid, EP_RECV_COUNT) + 1)
+            return sender  // Return sender PID on success
+        }
+    }
+
+    // No queued messages — check if specific sender is blocked sending to us
+    if from_pid >= 0 && from_pid < IPC_EP_MAX {
+        if ep_read(from_pid, EP_STATE) == IPC_SEND_BLOCKED {
+            let partner = ep_read(from_pid, EP_PARTNER)
+            if partner == my_pid {
+                // Direct transfer from sender's message buffer
+                let src_buf = ep_addr(from_pid) + EP_MSG_BUF
+                ipc_msg_copy(buf_addr, src_buf)
+
+                // Unblock sender
+                ep_write(from_pid, EP_STATE, IPC_IDLE)
+                ep_write(from_pid, EP_PARTNER, -1)
+                proc_v2_set(from_pid, 0, PROC_STATE_READY)
+
+                ep_write(my_pid, EP_RECV_COUNT, ep_read(my_pid, EP_RECV_COUNT) + 1)
+                return from_pid
+            }
+        }
+    }
+
+    // No messages available — block receiver
+    ep_write(my_pid, EP_STATE, IPC_RECV_BLOCKED)
+    ep_write(my_pid, EP_PARTNER, from_pid)
+    proc_v2_set(my_pid, 0, PROC_STATE_BLOCKED)
+
+    return IPC_ERR_WOULD_BLOCK  // Scheduler will resume us later
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.2.3: ipc2_call(dst_pid, msg_addr, reply_addr) — RPC
+//
+// Atomic send + wait_reply:
+//   1. Send message to dst (like ipc2_send)
+//   2. Block in CALL_BLOCKED state
+//   3. When server calls ipc2_reply, reply copied to reply_addr
+//   4. Caller unblocked with reply
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_call(dst_pid: i64, msg_addr: i64, reply_addr: i64) -> i64 {
+    if dst_pid < 0 || dst_pid >= IPC_EP_MAX { return IPC_ERR_INVALID_PID }
+
+    let src_pid = volatile_read_u64(0x6FE00)
+
+    // Check destination process is alive
+    let dst_state = proc_v2_get(dst_pid, 0)
+    if dst_state == PROC_STATE_FREE { return IPC_ERR_DEAD_PROCESS }
+
+    // Store reply buffer address in our endpoint
+    // (We use reply_buf field to hold the pointer for the kernel to write into)
+    ep_write(src_pid, EP_CALLER_PID, reply_addr)  // Reuse as reply target addr
+
+    // Stamp source PID
+    volatile_write_u64(msg_addr, src_pid)
+
+    // Check if receiver is already waiting
+    let recv_state = ep_read(dst_pid, EP_STATE)
+    let recv_partner = ep_read(dst_pid, EP_PARTNER)
+
+    if recv_state == IPC_RECV_BLOCKED && (recv_partner == src_pid || recv_partner == -1) {
+        // Direct transfer to receiver
+        let dst_buf = ep_addr(dst_pid) + EP_MSG_BUF
+        ipc_msg_copy(dst_buf, msg_addr)
+
+        // Tell receiver who called (so they can REPLY)
+        ep_write(dst_pid, EP_CALLER_PID, src_pid)
+
+        // Unblock receiver
+        ep_write(dst_pid, EP_STATE, IPC_IDLE)
+        ep_write(dst_pid, EP_PARTNER, -1)
+        proc_v2_set(dst_pid, 0, PROC_STATE_READY)
+    } else {
+        // Queue the message
+        let qresult = ipc_queue_push(dst_pid, src_pid, msg_addr)
+        if qresult != IPC_OK { return qresult }
+    }
+
+    // Block caller waiting for reply
+    ep_write(src_pid, EP_STATE, IPC_CALL_BLOCKED)
+    ep_write(src_pid, EP_PARTNER, dst_pid)
+    proc_v2_set(src_pid, 0, PROC_STATE_BLOCKED)
+
+    // Stats
+    ep_write(src_pid, EP_SEND_COUNT, ep_read(src_pid, EP_SEND_COUNT) + 1)
+
+    return IPC_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 1.2.4: ipc2_reply(caller_pid, reply_addr) — Reply to CALL
+//
+// Server sends reply back to caller:
+//   1. Verify caller is in CALL_BLOCKED state
+//   2. Copy reply message to caller's reply buffer
+//   3. Unblock caller
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_reply(caller_pid: i64, reply_addr: i64) -> i64 {
+    if caller_pid < 0 || caller_pid >= IPC_EP_MAX { return IPC_ERR_INVALID_PID }
+
+    // Verify caller is actually waiting for a reply
+    let caller_state = ep_read(caller_pid, EP_STATE)
+    if caller_state != IPC_CALL_BLOCKED { return IPC_ERR_NOT_CALLING }
+
+    // Copy reply to caller's reply buffer
+    let reply_target = ep_read(caller_pid, EP_CALLER_PID)  // We stored reply_addr here
+    let caller_reply_buf = ep_addr(caller_pid) + EP_REPLY_BUF
+    ipc_msg_copy(caller_reply_buf, reply_addr)
+
+    // Stamp source in reply
+    let my_pid = volatile_read_u64(0x6FE00)
+    volatile_write_u64(caller_reply_buf, my_pid)
+
+    // Unblock caller
+    ep_write(caller_pid, EP_STATE, IPC_IDLE)
+    ep_write(caller_pid, EP_PARTNER, -1)
+    proc_v2_set(caller_pid, 0, PROC_STATE_READY)
+
+    // Stats
+    ep_write(my_pid, EP_SEND_COUNT, ep_read(my_pid, EP_SEND_COUNT) + 1)
+    ep_write(caller_pid, EP_RECV_COUNT, ep_read(caller_pid, EP_RECV_COUNT) + 1)
+
+    return IPC_OK
+}
+
+// ═══════════════════════════════════════════════════════════════
+// IPC Endpoint Status — debug view
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ipc2_state_name(state: i64) {
+    if state == IPC_IDLE { cprint("IDLE", WHITE_ON_BLACK) }
+    else if state == IPC_SEND_BLOCKED { cprint("SEND_BLK", YELLOW_ON_BLACK) }
+    else if state == IPC_RECV_BLOCKED { cprint("RECV_BLK", CYAN_ON_BLACK) }
+    else if state == IPC_CALL_BLOCKED { cprint("CALL_BLK", RED_ON_BLACK) }
+    else if state == IPC_REPLY_BLOCKED { cprint("REPLY_BLK", RED_ON_BLACK) }
+    else { cprint("???", RED_ON_BLACK) }
+}
+
+@kernel fn cmd_ipc2() {
+    cprintln("IPC v2 Endpoints:", YELLOW_ON_BLACK)
+    let mut pid: i64 = 0
+    while pid < IPC_EP_MAX {
+        let proc_state = proc_v2_get(pid, 0)
+        if proc_state != PROC_STATE_FREE {
+            let ipc_state = ep_read(pid, EP_STATE)
+            let partner = ep_read(pid, EP_PARTNER)
+            let notify = ep_read(pid, EP_NOTIFY_PENDING)
+            let queue_count = ep_read(pid, EP_QUEUE_COUNT)
+            let sent = ep_read(pid, EP_SEND_COUNT)
+            let recv = ep_read(pid, EP_RECV_COUNT)
+
+            cprint("  PID ", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint(" ipc=", WHITE_ON_BLACK)
+            ipc2_state_name(ipc_state)
+            if partner >= 0 {
+                cprint(" partner=", WHITE_ON_BLACK)
+                cprint_decimal(partner, CYAN_ON_BLACK)
+            }
+            if queue_count > 0 {
+                cprint(" q=", WHITE_ON_BLACK)
+                cprint_decimal(queue_count, CYAN_ON_BLACK)
+                cprint("/", WHITE_ON_BLACK)
+                cprint_decimal(IPC_QUEUE_SLOTS, WHITE_ON_BLACK)
+            }
+            if notify > 0 {
+                cprint(" notify=0x", WHITE_ON_BLACK)
+                cprint_hex(notify, 4, GREEN_ON_BLACK)
+            }
+            if sent > 0 || recv > 0 {
+                cprint(" tx=", WHITE_ON_BLACK)
+                cprint_decimal(sent, GREEN_ON_BLACK)
+                cprint(" rx=", WHITE_ON_BLACK)
+                cprint_decimal(recv, GREEN_ON_BLACK)
+            }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        pid = pid + 1
+    }
+}

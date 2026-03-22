@@ -1,0 +1,380 @@
+// FajarOS Nova v2.0 — SMP Scheduler (Sprint 2.1)
+// Per-CPU run queues, priority scheduling, work stealing,
+// CPU affinity, and periodic load balancing.
+
+// ═══════════════════════════════════════════════════
+// Constants & Memory Layout
+// ═══════════════════════════════════════════════════
+const SMP_MAX_CPU: i64 = 4
+const SMP_QUEUE_SIZE: i64 = 16
+
+// Per-CPU run queue layout (176 bytes per CPU, 4 CPUs = 704 bytes)
+//   +0 cpu_id(8), +8 current_pid(8), +16 queue[16×8](128),
+//   +144 queue_count(8), +152 idle_ticks(8), +160 lock(8), +168 reserved(8)
+// NOTE: volatile_write_u64 on x86_64 is naturally atomic for aligned 8-byte writes.
+// The lock field provides a test-and-set spinlock for QEMU SMP emulation.
+// Real hardware needs LOCK CMPXCHG (see docs/SAFETY_MODEL.md).
+const SMP_SCHED_BASE: i64 = 0x8F4000
+const SMP_CPU_STRIDE: i64 = 176
+const SMP_OFF_CURRENT: i64 = 8
+const SMP_OFF_QUEUE: i64 = 16
+const SMP_OFF_COUNT: i64 = 144
+const SMP_OFF_IDLE: i64 = 152
+const SMP_OFF_LOCK: i64 = 160
+
+// Priority levels
+const PRIO_IDLE: i64 = 0
+const PRIO_NORMAL: i64 = 1
+const PRIO_HIGH: i64 = 2
+const PRIO_REALTIME: i64 = 3
+
+// Process table extended field offsets (within 256-byte proc slot)
+const PROC_FIELD_PRIORITY: i64 = 96
+const PROC_FIELD_AFFINITY: i64 = 104
+
+const SMP_BALANCE_INTERVAL: i64 = 100  // ticks between rebalances
+const SMP_TICK_COUNTER: i64 = 0x8F42C0 // tick counter at end of SMP region (4×176=704=0x2C0)
+
+// ═══════════════════════════════════════════════════
+// Per-CPU Spinlock (test-and-set, adequate for QEMU)
+// For real SMP: replace with x86 LOCK CMPXCHG
+// ═══════════════════════════════════════════════════
+@kernel fn smp_cpu_lock(cpu: i64) {
+    let lock_addr = SMP_SCHED_BASE + cpu * SMP_CPU_STRIDE + SMP_OFF_LOCK
+    let mut spin: i64 = 0
+    while volatile_read_u64(lock_addr) != 0 { spin = spin + 1 }
+    volatile_write_u64(lock_addr, 1)
+}
+
+@kernel fn smp_cpu_unlock(cpu: i64) {
+    let lock_addr = SMP_SCHED_BASE + cpu * SMP_CPU_STRIDE + SMP_OFF_LOCK
+    volatile_write_u64(lock_addr, 0)
+}
+
+// ═══════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════
+@kernel fn smp_sched_init() {
+    let mut cpu: i64 = 0
+    while cpu < SMP_MAX_CPU {
+        let base = SMP_SCHED_BASE + cpu * SMP_CPU_STRIDE
+        volatile_write_u64(base, cpu)           // cpu_id
+        volatile_write_u64(base + SMP_OFF_CURRENT, -1)
+        let mut s: i64 = 0
+        while s < SMP_QUEUE_SIZE {
+            volatile_write_u64(base + SMP_OFF_QUEUE + s * 8, -1)
+            s = s + 1
+        }
+        volatile_write_u64(base + SMP_OFF_COUNT, 0)
+        volatile_write_u64(base + SMP_OFF_IDLE, 0)
+        volatile_write_u64(base + SMP_OFF_LOCK, 0)
+        cpu = cpu + 1
+    }
+    volatile_write_u64(SMP_TICK_COUNTER, 0)
+}
+
+// ═══════════════════════════════════════════════════
+// Priority & Affinity
+// ═══════════════════════════════════════════════════
+@kernel fn smp_set_priority(pid: i64, prio: i64) {
+    if pid < 0 || pid >= PROC_V2_MAX { return }
+    let clamped = if prio < PRIO_IDLE { PRIO_IDLE }
+                  else if prio > PRIO_REALTIME { PRIO_REALTIME }
+                  else { prio }
+    proc_v2_set(pid, PROC_FIELD_PRIORITY, clamped)
+}
+
+@kernel fn smp_get_priority(pid: i64) -> i64 {
+    if pid < 0 || pid >= PROC_V2_MAX { return PRIO_IDLE }
+    proc_v2_get(pid, PROC_FIELD_PRIORITY)
+}
+
+// Affinity bitmask: bit N = allowed on CPU N. 0 = any CPU.
+@kernel fn smp_set_affinity(pid: i64, cpu_mask: i64) {
+    if pid < 0 || pid >= PROC_V2_MAX { return }
+    proc_v2_set(pid, PROC_FIELD_AFFINITY, cpu_mask)
+}
+
+@kernel fn smp_get_affinity(pid: i64) -> i64 {
+    if pid < 0 || pid >= PROC_V2_MAX { return 0 }
+    proc_v2_get(pid, PROC_FIELD_AFFINITY)
+}
+
+@kernel fn smp_affinity_allows(pid: i64, cpu: i64) -> i64 {
+    let mask = smp_get_affinity(pid)
+    if mask == 0 { return 1 }
+    if (mask & (1 << cpu)) != 0 { 1 } else { 0 }
+}
+
+// ═══════════════════════════════════════════════════
+// Per-CPU Queue Operations
+// ═══════════════════════════════════════════════════
+@kernel fn smp_queue_add(cpu: i64, pid: i64) {
+    if cpu < 0 || cpu >= SMP_MAX_CPU { return }
+    smp_cpu_lock(cpu)
+    let base = SMP_SCHED_BASE + cpu * SMP_CPU_STRIDE
+    let count = volatile_read_u64(base + SMP_OFF_COUNT)
+    if count >= SMP_QUEUE_SIZE { smp_cpu_unlock(cpu); return }
+    let mut s: i64 = 0
+    while s < SMP_QUEUE_SIZE {
+        if volatile_read_u64(base + SMP_OFF_QUEUE + s * 8) == -1 {
+            volatile_write_u64(base + SMP_OFF_QUEUE + s * 8, pid)
+            volatile_write_u64(base + SMP_OFF_COUNT, count + 1)
+            smp_cpu_unlock(cpu)
+            return
+        }
+        s = s + 1
+    }
+    smp_cpu_unlock(cpu)
+}
+
+@kernel fn smp_queue_remove(cpu: i64, pid: i64) {
+    if cpu < 0 || cpu >= SMP_MAX_CPU { return }
+    smp_cpu_lock(cpu)
+    let base = SMP_SCHED_BASE + cpu * SMP_CPU_STRIDE
+    let mut s: i64 = 0
+    while s < SMP_QUEUE_SIZE {
+        if volatile_read_u64(base + SMP_OFF_QUEUE + s * 8) == pid {
+            volatile_write_u64(base + SMP_OFF_QUEUE + s * 8, -1)
+            let count = volatile_read_u64(base + SMP_OFF_COUNT)
+            if count > 0 { volatile_write_u64(base + SMP_OFF_COUNT, count - 1) }
+            smp_cpu_unlock(cpu)
+            return
+        }
+        s = s + 1
+    }
+    smp_cpu_unlock(cpu)
+}
+
+@kernel fn smp_queue_count(cpu: i64) -> i64 {
+    if cpu < 0 || cpu >= SMP_MAX_CPU { return 0 }
+    volatile_read_u64(SMP_SCHED_BASE + cpu * SMP_CPU_STRIDE + SMP_OFF_COUNT)
+}
+
+// ═══════════════════════════════════════════════════
+// Scheduler: REALTIME > HIGH > NORMAL > IDLE, round-robin within level
+// ═══════════════════════════════════════════════════
+@kernel fn smp_schedule(cpu_id: i64) -> i64 {
+    if cpu_id < 0 || cpu_id >= SMP_MAX_CPU { return -1 }
+    smp_cpu_lock(cpu_id)
+    let base = SMP_SCHED_BASE + cpu_id * SMP_CPU_STRIDE
+    let count = volatile_read_u64(base + SMP_OFF_COUNT)
+    if count == 0 {
+        let idle = volatile_read_u64(base + SMP_OFF_IDLE)
+        volatile_write_u64(base + SMP_OFF_IDLE, idle + 1)
+        smp_cpu_unlock(cpu_id)
+        return -1
+    }
+    volatile_write_u64(base + SMP_OFF_IDLE, 0)
+    // Scan by descending priority — REALTIME first, then HIGH, NORMAL, IDLE
+    let mut prio: i64 = PRIO_REALTIME
+    while prio >= PRIO_IDLE {
+        let mut s: i64 = 0
+        while s < SMP_QUEUE_SIZE {
+            let pid = volatile_read_u64(base + SMP_OFF_QUEUE + s * 8)
+            if pid != -1 {
+                let state = proc_v2_get(pid, 0)
+                if state == PROC_STATE_READY && smp_get_priority(pid) == prio {
+                    volatile_write_u64(base + SMP_OFF_CURRENT, pid)
+                    proc_v2_set(pid, 0, PROC_STATE_RUNNING)
+                    smp_cpu_unlock(cpu_id)
+                    return pid
+                }
+            }
+            s = s + 1
+        }
+        prio = prio - 1
+    }
+    smp_cpu_unlock(cpu_id)
+    -1
+}
+
+// ═══════════════════════════════════════════════════
+// Work Stealing
+// ═══════════════════════════════════════════════════
+@kernel fn smp_find_busiest_cpu() -> i64 {
+    let mut best_cpu: i64 = -1
+    let mut best_count: i64 = 0
+    let mut cpu: i64 = 0
+    while cpu < SMP_MAX_CPU {
+        let c = smp_queue_count(cpu)
+        if c > best_count { best_count = c; best_cpu = cpu }
+        cpu = cpu + 1
+    }
+    best_cpu
+}
+
+@kernel fn smp_steal_work(from_cpu: i64, to_cpu: i64) -> i64 {
+    if from_cpu < 0 || from_cpu >= SMP_MAX_CPU { return -1 }
+    if to_cpu < 0 || to_cpu >= SMP_MAX_CPU { return -1 }
+    if from_cpu == to_cpu { return -1 }
+    let from_base = SMP_SCHED_BASE + from_cpu * SMP_CPU_STRIDE
+    // Steal lowest-priority READY task (least important first)
+    let mut prio: i64 = PRIO_IDLE
+    while prio <= PRIO_REALTIME {
+        let mut s: i64 = 0
+        while s < SMP_QUEUE_SIZE {
+            let pid = volatile_read_u64(from_base + SMP_OFF_QUEUE + s * 8)
+            if pid != -1 {
+                let state = proc_v2_get(pid, 0)
+                if state == PROC_STATE_READY && smp_get_priority(pid) == prio {
+                    if smp_affinity_allows(pid, to_cpu) == 1 {
+                        smp_queue_remove(from_cpu, pid)
+                        smp_queue_add(to_cpu, pid)
+                        return pid
+                    }
+                }
+            }
+            s = s + 1
+        }
+        prio = prio + 1
+    }
+    -1
+}
+
+@kernel fn smp_try_steal(cpu_id: i64) -> i64 {
+    let busiest = smp_find_busiest_cpu()
+    if busiest == -1 || busiest == cpu_id { return -1 }
+    if smp_queue_count(busiest) <= 1 { return -1 }
+    smp_steal_work(busiest, cpu_id)
+}
+
+// ═══════════════════════════════════════════════════
+// Load Balancing (periodic, every 100 ticks)
+// ═══════════════════════════════════════════════════
+@kernel fn smp_balance() {
+    let mut min_cpu: i64 = 0
+    let mut max_cpu: i64 = 0
+    let mut min_count: i64 = SMP_QUEUE_SIZE + 1
+    let mut max_count: i64 = -1
+    let mut cpu: i64 = 0
+    while cpu < SMP_MAX_CPU {
+        let c = smp_queue_count(cpu)
+        if c < min_count { min_count = c; min_cpu = cpu }
+        if c > max_count { max_count = c; max_cpu = cpu }
+        cpu = cpu + 1
+    }
+    if max_count - min_count <= 1 { return }
+    let mut moves: i64 = 0
+    while smp_queue_count(max_cpu) - smp_queue_count(min_cpu) > 1 && moves < 4 {
+        let result = smp_steal_work(max_cpu, min_cpu)
+        if result == -1 { return }
+        moves = moves + 1
+    }
+}
+
+@kernel fn smp_tick() {
+    // Lock CPU 0's lock to serialize tick counter updates
+    smp_cpu_lock(0)
+    let ticks = volatile_read_u64(SMP_TICK_COUNTER) + 1
+    volatile_write_u64(SMP_TICK_COUNTER, ticks)
+    smp_cpu_unlock(0)
+    if ticks % SMP_BALANCE_INTERVAL == 0 { smp_balance() }
+}
+
+// ═══════════════════════════════════════════════════
+// Enqueue/Dequeue helpers
+// ═══════════════════════════════════════════════════
+@kernel fn smp_enqueue(pid: i64) {
+    if pid < 0 || pid >= PROC_V2_MAX { return }
+    let mut best_cpu: i64 = -1
+    let mut best_count: i64 = SMP_QUEUE_SIZE + 1
+    let mut cpu: i64 = 0
+    while cpu < SMP_MAX_CPU {
+        if smp_affinity_allows(pid, cpu) == 1 {
+            let c = smp_queue_count(cpu)
+            if c < best_count { best_count = c; best_cpu = cpu }
+        }
+        cpu = cpu + 1
+    }
+    if best_cpu != -1 { smp_queue_add(best_cpu, pid) }
+}
+
+@kernel fn smp_dequeue(pid: i64) {
+    let mut cpu: i64 = 0
+    while cpu < SMP_MAX_CPU { smp_queue_remove(cpu, pid); cpu = cpu + 1 }
+}
+
+// ═══════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════
+@kernel fn cmd_smp_sched() {
+    cprintln("SMP Scheduler Status:", YELLOW_ON_BLACK)
+    cprint("  CPUs: ", WHITE_ON_BLACK)
+    cprint_decimal(SMP_MAX_CPU, CYAN_ON_BLACK)
+    cprint("  Queue size: ", WHITE_ON_BLACK)
+    cprint_decimal(SMP_QUEUE_SIZE, CYAN_ON_BLACK)
+    cprint("  Balance: every ", WHITE_ON_BLACK)
+    cprint_decimal(SMP_BALANCE_INTERVAL, CYAN_ON_BLACK)
+    cprintln(" ticks", WHITE_ON_BLACK)
+    let mut cpu: i64 = 0
+    while cpu < SMP_MAX_CPU {
+        let base = SMP_SCHED_BASE + cpu * SMP_CPU_STRIDE
+        let count = volatile_read_u64(base + SMP_OFF_COUNT)
+        let current = volatile_read_u64(base + SMP_OFF_CURRENT)
+        let idle = volatile_read_u64(base + SMP_OFF_IDLE)
+        cprint("  CPU ", WHITE_ON_BLACK)
+        cprint_decimal(cpu, CYAN_ON_BLACK)
+        cprint(": tasks=", WHITE_ON_BLACK)
+        cprint_decimal(count, if count > 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+        cprint(" current=", WHITE_ON_BLACK)
+        if current == -1 { cprint("none", RED_ON_BLACK) }
+        else { cprint_decimal(current, CYAN_ON_BLACK) }
+        cprint(" idle=", WHITE_ON_BLACK)
+        cprint_decimal(idle, WHITE_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        // Show queued PIDs with priority tags
+        if count > 0 {
+            cprint("    queue: [", WHITE_ON_BLACK)
+            let mut s: i64 = 0
+            let mut first: i64 = 1
+            while s < SMP_QUEUE_SIZE {
+                let pid = volatile_read_u64(base + SMP_OFF_QUEUE + s * 8)
+                if pid != -1 {
+                    if first == 0 { cprint(", ", WHITE_ON_BLACK) }
+                    cprint("P", WHITE_ON_BLACK)
+                    cprint_decimal(pid, CYAN_ON_BLACK)
+                    cprint("(", WHITE_ON_BLACK)
+                    let p = smp_get_priority(pid)
+                    if p == PRIO_REALTIME { cprint("RT", RED_ON_BLACK) }
+                    else if p == PRIO_HIGH { cprint("HI", YELLOW_ON_BLACK) }
+                    else if p == PRIO_NORMAL { cprint("NM", GREEN_ON_BLACK) }
+                    else { cprint("ID", WHITE_ON_BLACK) }
+                    cprint(")", WHITE_ON_BLACK)
+                    first = 0
+                }
+                s = s + 1
+            }
+            cprintln("]", WHITE_ON_BLACK)
+        }
+        cpu = cpu + 1
+    }
+    let ticks = volatile_read_u64(SMP_TICK_COUNTER)
+    cprint("  Global ticks: ", WHITE_ON_BLACK)
+    cprint_decimal(ticks, CYAN_ON_BLACK)
+    cprint("  Balances: ", WHITE_ON_BLACK)
+    cprint_decimal(ticks / SMP_BALANCE_INTERVAL, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_smp_balance() {
+    cprintln("Triggering SMP load balance...", YELLOW_ON_BLACK)
+    let mut cpu: i64 = 0
+    cprint("  Before: ", WHITE_ON_BLACK)
+    while cpu < SMP_MAX_CPU {
+        cprint_decimal(smp_queue_count(cpu), CYAN_ON_BLACK)
+        if cpu < SMP_MAX_CPU - 1 { cprint("/", WHITE_ON_BLACK) }
+        cpu = cpu + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+    smp_balance()
+    cpu = 0
+    cprint("  After:  ", WHITE_ON_BLACK)
+    while cpu < SMP_MAX_CPU {
+        cprint_decimal(smp_queue_count(cpu), CYAN_ON_BLACK)
+        if cpu < SMP_MAX_CPU - 1 { cprint("/", WHITE_ON_BLACK) }
+        cpu = cpu + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("  Done.", GREEN_ON_BLACK)
+}
