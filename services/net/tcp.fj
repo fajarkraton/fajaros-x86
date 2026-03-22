@@ -108,8 +108,22 @@ const TCP_PKT: i64 = 0x983000
 @kernel fn tcp_build_pkt(c: i64, flags: i64, data: i64, len: i64) -> i64 {
     let b = TCP_PKT
     let mut i: i64 = 0
-    // Eth dst=broadcast
-    while i < 6 { volatile_write_u8(b + i, 0xFF); i = i + 1 }
+    // Eth dst = ARP-resolved MAC for remote IP, fallback to gateway MAC, fallback to broadcast
+    let rip = tr(c, 16)
+    let cached_mac = arp_cache_lookup(rip)
+    if cached_mac != -1 {
+        while i < 6 { volatile_write_u8(b + i, volatile_read_u8(cached_mac + i)); i = i + 1 }
+    } else {
+        // Try gateway
+        let gw = net_state_read(24)
+        let gw_mac = arp_cache_lookup(gw)
+        if gw_mac != -1 {
+            while i < 6 { volatile_write_u8(b + i, volatile_read_u8(gw_mac + i)); i = i + 1 }
+        } else {
+            // Broadcast fallback
+            while i < 6 { volatile_write_u8(b + i, 0xFF); i = i + 1 }
+        }
+    }
     i = 0
     while i < 6 { volatile_write_u8(b + 6 + i, volatile_read_u8(0x860000 + 8 + i)); i = i + 1 }
     volatile_write_u8(b + 12, 0x08); volatile_write_u8(b + 13, 0x00)
@@ -145,7 +159,13 @@ const TCP_PKT: i64 = 0x983000
     while i < len { volatile_write_u8(b + 54 + i, volatile_read_u8(data + i)); i = i + 1 }
     let tck = tcp_pseudo_cksum(b + 26, b + 34, 20 + len)
     volatile_write_u8(b+50, (tck>>8)&0xFF); volatile_write_u8(b+51, tck&0xFF)
-    14 + ipt
+    let total = 14 + ipt
+    // Pad to minimum 60 bytes (Ethernet minimum frame)
+    if total < 60 {
+        let mut p: i64 = total
+        while p < 60 { volatile_write_u8(b + p, 0); p = p + 1 }
+        60
+    } else { total }
 }
 @kernel fn tcp_cksum16(h: i64, len: i64) -> i64 {
     let mut s: i64 = 0
@@ -275,14 +295,14 @@ const TCP_PKT: i64 = 0x983000
 @kernel fn cmd_tcp_test() {
     cprintln("=== TCP Test ===", YELLOW_ON_BLACK)
     let tip = ip_pack(10, 0, 2, 2)
-    cprint("Connect ", WHITE_ON_BLACK); ip_print(tip); cprintln(":80", WHITE_ON_BLACK)
-    let c = tcp_connect(tip, 80)
+    cprint("Connect ", WHITE_ON_BLACK); ip_print(tip); cprintln(":8080", WHITE_ON_BLACK)
+    let c = tcp_connect(tip, 8080)
     if c < 0 { cprintln("  no slots", RED_ON_BLACK); return }
-    // Wait SYN-ACK
+    // Wait SYN-ACK (process ARP too so SLIRP can route SYN-ACK back)
     let mut a: i64 = 0
-    while a < 10000000 && tr(c,0) == TCP_SYN_SENT {
-        let pl = net_rx_poll()
-        if pl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl - VIRTIO_NET_HDR_SIZE) }
+    while a < 15000000 && tr(c,0) == TCP_SYN_SENT {
+        let fl = net_process_rx()
+        if fl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl) }
         pause(); a = a + 1
     }
     cprint("  state=", WHITE_ON_BLACK); tcp_sn(tr(c,0)); console_putchar(10, WHITE_ON_BLACK)
@@ -300,8 +320,8 @@ const TCP_PKT: i64 = 0x983000
         let mut got: i64 = 0
         a = 0
         while a < 20000000 && got == 0 {
-            let pl = net_rx_poll()
-            if pl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl - VIRTIO_NET_HDR_SIZE) }
+            let fl2 = net_process_rx()
+            if fl2 > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl2) }
             got = tcp_recv(c, resp, 512); pause(); a = a + 1
         }
         if got > 0 {

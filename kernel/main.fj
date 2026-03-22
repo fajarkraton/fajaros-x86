@@ -143,10 +143,27 @@
     vfs_svc_init()
     println("[VFS] VFS service initialized")
 
-    // Sprint 5.3: TCP/HTTP wired via real TCP (not raw Ethernet)
-    // NOTE: Virtio-net TX needs debugging — packets don't leave guest
-    // HTTP get now uses tcp_connect→tcp_send→tcp_recv path
+    // Sprint 5.3: TCP test with serial output
     tcp_init()
+    println("[TEST] 5.3: TCP connect 10.0.2.2:8080...")
+    let tc = tcp_connect(ip_pack(10, 0, 2, 2), 8080)
+    if tc < 0 { println("[TEST] No TCP slots") }
+    else {
+        println("[TEST] SYN sent")
+        let mut ta: i64 = 0
+        while ta < 15000000 && tr(tc, 0) == TCP_SYN_SENT {
+            let fl = net_process_rx()
+            if fl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl) }
+            pause()
+            ta = ta + 1
+        }
+        let st = tr(tc, 0)
+        if st == TCP_ESTABLISHED { println("[TEST] TCP ESTABLISHED!") }
+        else if st == TCP_SYN_SENT { println("[TEST] TCP SYN_SENT timeout") }
+        else { println("[TEST] TCP unexpected state") }
+        tcp_close(tc)
+    }
+    println("[TEST] 5.3 done")
 
     // Ring 3 user program is pre-installed but NOT auto-run
     // Use 'runhello' command to test Ring 3 execution

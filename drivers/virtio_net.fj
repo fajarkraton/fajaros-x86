@@ -28,11 +28,17 @@ const NET_PKT_BUF: i64 = 0x87C000  // Temp packet build buffer (4KB)
 //   + avail ring: 6 + 16*2 = 38 bytes (padded to 4096 boundary)
 //   + used ring: 4 + 16*8 = 132 bytes
 // Total per queue: ~4KB (page-aligned)
-const VQ_NUM_ENTRIES: i64 = 16
-const VQ_RX_BASE: i64 = 0x890000     // RX queue (page 0)
-const VQ_TX_BASE: i64 = 0x894000     // TX queue (page 1)
+// Queue sizes — set at runtime from device (typically 256)
+// Memory: each queue needs desc(N*16) + avail(6+2*N) + used(6+8*N) ≈ N*26+12
+// For N=256: ~6672 bytes per queue → 2 pages (8KB) each
+const VQ_RX_BASE: i64 = 0x890000     // RX queue (needs 8KB: desc+avail+used)
+const VQ_TX_BASE: i64 = 0x894000     // TX queue (must not overlap RX used ring at ~0x892000)
 const VQ_RX_BUFS: i64 = 0x898000    // RX packet buffers: 16 × 2KB = 32KB
-const VIRTIO_NET_HDR_SIZE: i64 = 10  // virtio-net header prepended to each packet
+// NOTE: We pre-fill only 16 RX buffers but queue can hold up to 256 descriptors
+const VQ_RXBUF_COUNT: i64 = 16      // Number of RX buffers to pre-fill
+// Actual queue size stored at NET_STATE+96
+const NET_QSIZE_OFF: i64 = 96       // Queue size (from device)
+const VIRTIO_NET_HDR_SIZE: i64 = 10  // virtio-net header (legacy, no MRG_RXBUF)
 
 // Net state extended offsets:
 // +64: rx_avail_idx (current avail ring index for RX)
@@ -50,6 +56,11 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 // +12: flags (u16) — VRING_DESC_F_*
 // +14: next (u16) — next descriptor index (if F_NEXT)
 
+@kernel fn vq_num() -> i64 {
+    let n = net_state_read(NET_QSIZE_OFF)
+    if n <= 0 { 256 } else { n } // default 256 if not set
+}
+
 @kernel fn vq_desc_set(base: i64, idx: i64, addr: i64, len: i64, flags: i64, next: i64) {
     let off = base + idx * 16
     volatile_write_u64(off, addr)
@@ -65,13 +76,13 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 
 @kernel fn vq_avail_offset(base: i64) -> i64 {
     // Avail ring starts after descriptor table: N * 16 bytes
-    base + VQ_NUM_ENTRIES * 16
+    base + vq_num() * 16
 }
 
 @kernel fn vq_avail_add(base: i64, desc_idx: i64) {
     let avail = vq_avail_offset(base)
     let idx = volatile_read_u16(avail + 2) & 0xFFFF
-    let ring_idx = idx % VQ_NUM_ENTRIES
+    let ring_idx = idx % vq_num()
     volatile_write_u16(avail + 4 + ring_idx * 2, desc_idx)
     // Memory barrier (ensure descriptor is visible before updating idx)
     // On x86 stores are ordered, but add a compiler fence
@@ -86,7 +97,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 @kernel fn vq_used_offset(base: i64) -> i64 {
     // Used ring must be page-aligned (4096 boundary)
     // desc_table = N*16, avail_ring = 6+2*N, pad to 4096
-    let avail_end = base + VQ_NUM_ENTRIES * 16 + 6 + VQ_NUM_ENTRIES * 2
+    let avail_end = base + vq_num() * 16 + 6 + vq_num() * 2
     let aligned = ((avail_end + 4095) / 4096) * 4096
     aligned
 }
@@ -106,24 +117,23 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 }
 
 @kernel fn vq_init_mem(base: i64) {
-    // Zero the entire queue region (4KB should be enough)
+    // Zero entire queue region including used ring (16KB to be safe for 256-entry queues)
     let mut i: i64 = 0
-    while i < 4096 { volatile_write_u8(base + i, 0); i = i + 1 }
+    while i < 16384 { volatile_write_u8(base + i, 0); i = i + 1 }
 }
 
 @kernel fn net_setup_rx_queue() {
-    // Pre-fill RX queue with empty buffers (device writes received packets here)
+    // Fill ALL queue descriptors so QEMU doesn't error on "zero sized buffers"
+    // Reuse 16 physical buffers cyclically across all descriptors
+    let n = vq_num()
     let mut i: i64 = 0
-    while i < VQ_NUM_ENTRIES {
-        let buf_addr = VQ_RX_BUFS + i * 2048  // 2KB per RX buffer
-        // Descriptor: addr=buf, len=2048, flags=WRITE (device fills it), no next
+    while i < n {
+        let buf_addr = VQ_RX_BUFS + (i % VQ_RXBUF_COUNT) * 2048
         vq_desc_set(VQ_RX_BASE, i, buf_addr, 2048, VRING_DESC_F_WRITE, 0)
-        // Add to avail ring
         vq_avail_add(VQ_RX_BASE, i)
         i = i + 1
     }
-    // Store our tracking indices
-    net_state_write(64, VQ_NUM_ENTRIES)  // rx_avail_idx = N (we filled N entries)
+    net_state_write(64, n)
     net_state_write(80, 0)               // rx_used_last = 0
 }
 
@@ -134,7 +144,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     if io_base == 0 { return -1 }
 
     let tx_idx = net_state_read(72) & 0xFFFF
-    let desc_idx = tx_idx % VQ_NUM_ENTRIES
+    let desc_idx = tx_idx % vq_num()
 
     // Set descriptor: point to TX buffer with data
     vq_desc_set(VQ_TX_BASE, desc_idx, data, len, 0, 0)
@@ -163,7 +173,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 
     // Read the used ring entry
     let used_base = vq_used_offset(VQ_RX_BASE)
-    let ring_idx = last % VQ_NUM_ENTRIES
+    let ring_idx = last % vq_num()
     let desc_id = volatile_read_u32(used_base + 4 + ring_idx * 8) & 0xFFFF
     let pkt_len = volatile_read_u32(used_base + 4 + ring_idx * 8 + 4)
 
@@ -174,7 +184,8 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     net_state_write(40, net_state_read(40) + 1)
 
     // Copy received data to NET_RX_BUF for parsing
-    let src = VQ_RX_BUFS + desc_id * 2048
+    // Descriptors cyclically point to 16 buffers, so use modulo
+    let src = VQ_RX_BUFS + (desc_id % VQ_RXBUF_COUNT) * 2048
     let mut i: i64 = 0
     while i < pkt_len && i < 16384 {
         volatile_write_u8(NET_RX_BUF + i, volatile_read_u8(src + i))
@@ -194,17 +205,93 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 
 @kernel fn net_send_frame(frame_data: i64, frame_len: i64) -> i64 {
     // Prepend 10-byte virtio-net header + send via TX queue
-    // Header: flags(1)=0, gso_type(1)=0, hdr_len(2)=0, gso_size(2)=0,
-    //         csum_start(2)=0, csum_offset(2)=0
-    let tx_buf = NET_TX_BUF + 4096  // Use upper part of TX buffer area
+    // Use per-descriptor buffer slot to avoid overwrite race
+    let tx_idx = net_state_read(72) & 0xFF
+    let tx_buf = NET_TX_BUF + 2048 + (tx_idx % 8) * 2048  // 8 rotating 2KB TX slots
     // Zero virtio-net header
     let mut i: i64 = 0
     while i < VIRTIO_NET_HDR_SIZE { volatile_write_u8(tx_buf + i, 0); i = i + 1 }
     // Copy frame after header
     i = 0
-    while i < frame_len { volatile_write_u8(tx_buf + VIRTIO_NET_HDR_SIZE + i, volatile_read_u8(frame_data + i)); i = i + 1 }
+    while i < frame_len && i < 1500 {
+        volatile_write_u8(tx_buf + VIRTIO_NET_HDR_SIZE + i, volatile_read_u8(frame_data + i))
+        i = i + 1
+    }
 
     net_tx_packet(tx_buf, VIRTIO_NET_HDR_SIZE + frame_len)
+}
+
+// Handle incoming ARP: if it's a request for our IP, send reply
+// Call this on every received packet to ensure ARP resolution works
+// pkt = pointer to Ethernet frame (after virtio-net header)
+// pkt_len = length of Ethernet frame
+@kernel fn net_handle_arp(pkt: i64, pkt_len: i64) -> i64 {
+    if pkt_len < 42 { return 0 }
+    // Check ethertype = 0x0806 (ARP)
+    if volatile_read_u8(pkt + 12) != 0x08 || volatile_read_u8(pkt + 13) != 0x06 { return 0 }
+    // Check OPER = 1 (request)
+    if volatile_read_u8(pkt + 20) != 0 || volatile_read_u8(pkt + 21) != 1 { return 0 }
+    // Check target IP = our IP
+    let our_ip = net_state_read(16)
+    let tpa = ((volatile_read_u8(pkt+38)&0xFF)<<24) | ((volatile_read_u8(pkt+39)&0xFF)<<16) | ((volatile_read_u8(pkt+40)&0xFF)<<8) | (volatile_read_u8(pkt+41)&0xFF)
+    if tpa != our_ip { return 0 }
+    // Also cache sender's MAC+IP
+    let spa = ((volatile_read_u8(pkt+28)&0xFF)<<24) | ((volatile_read_u8(pkt+29)&0xFF)<<16) | ((volatile_read_u8(pkt+30)&0xFF)<<8) | (volatile_read_u8(pkt+31)&0xFF)
+    arp_cache_add(spa, pkt + 22) // sender hardware addr at offset 22
+
+    // Build ARP reply in NET_PKT_BUF
+    let r = NET_PKT_BUF
+    // Eth dst = sender MAC (from pkt+6)
+    let mut i: i64 = 0
+    while i < 6 { volatile_write_u8(r + i, volatile_read_u8(pkt + 22 + i)); i = i + 1 }
+    // Eth src = our MAC
+    i = 0
+    while i < 6 { volatile_write_u8(r + 6 + i, volatile_read_u8(NET_STATE + 8 + i)); i = i + 1 }
+    // Ethertype ARP
+    volatile_write_u8(r + 12, 0x08); volatile_write_u8(r + 13, 0x06)
+    // ARP: HTYPE=1 PTYPE=0x0800 HLEN=6 PLEN=4
+    volatile_write_u8(r+14, 0); volatile_write_u8(r+15, 1)
+    volatile_write_u8(r+16, 8); volatile_write_u8(r+17, 0)
+    volatile_write_u8(r+18, 6); volatile_write_u8(r+19, 4)
+    // OPER = 2 (reply)
+    volatile_write_u8(r+20, 0); volatile_write_u8(r+21, 2)
+    // SHA = our MAC
+    i = 0
+    while i < 6 { volatile_write_u8(r + 22 + i, volatile_read_u8(NET_STATE + 8 + i)); i = i + 1 }
+    // SPA = our IP
+    volatile_write_u8(r+28, (our_ip>>24)&0xFF); volatile_write_u8(r+29, (our_ip>>16)&0xFF)
+    volatile_write_u8(r+30, (our_ip>>8)&0xFF); volatile_write_u8(r+31, our_ip&0xFF)
+    // THA = sender MAC
+    i = 0
+    while i < 6 { volatile_write_u8(r + 32 + i, volatile_read_u8(pkt + 22 + i)); i = i + 1 }
+    // TPA = sender IP
+    volatile_write_u8(r+38, volatile_read_u8(pkt+28)); volatile_write_u8(r+39, volatile_read_u8(pkt+29))
+    volatile_write_u8(r+40, volatile_read_u8(pkt+30)); volatile_write_u8(r+41, volatile_read_u8(pkt+31))
+    // Pad to minimum 60 bytes (Ethernet minimum frame without FCS)
+    i = 42
+    while i < 60 { volatile_write_u8(r + i, 0); i = i + 1 }
+    net_send_frame(r, 60)
+    1
+}
+
+// Process an incoming packet: handle ARP, then pass to TCP/ICMP
+@kernel fn net_process_rx() -> i64 {
+    let pkt_len = net_rx_poll()
+    if pkt_len <= 0 { return -1 }
+    // Handle ARP in received packet
+
+    let pkt = NET_RX_BUF + VIRTIO_NET_HDR_SIZE
+    let frame_len = pkt_len - VIRTIO_NET_HDR_SIZE
+
+    // Learn source MAC from any incoming IPv4 frame → populate ARP cache
+    if frame_len >= 34 && volatile_read_u8(pkt + 12) == 0x08 && volatile_read_u8(pkt + 13) == 0x00 {
+        let sip = ((volatile_read_u8(pkt+26)&0xFF)<<24)|((volatile_read_u8(pkt+27)&0xFF)<<16)|((volatile_read_u8(pkt+28)&0xFF)<<8)|(volatile_read_u8(pkt+29)&0xFF)
+        if sip != 0 { arp_cache_add(sip, pkt + 6) }
+    }
+
+    // Handle ARP requests/replies
+    net_handle_arp(pkt, frame_len)
+    frame_len
 }
 
 @kernel fn net_check_icmp_reply() -> i64 {
@@ -212,25 +299,18 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     let t0 = rdtsc()
     let mut attempts: i64 = 0
     while attempts < 50000000 {  // ~5 second timeout
-        let pkt_len = net_rx_poll()
-        if pkt_len > 0 {
-            // Skip virtio-net header (10 bytes)
+        let fl = net_process_rx() // handles ARP + learns MAC
+        if fl > 0 {
             let eth_off = VIRTIO_NET_HDR_SIZE
-            // Check ethertype at offset 12 (after 6+6 MAC addresses)
             let et_hi = volatile_read_u8(NET_RX_BUF + eth_off + 12)
             let et_lo = volatile_read_u8(NET_RX_BUF + eth_off + 13)
             if et_hi == 0x08 && et_lo == 0x00 {
-                // IPv4 — check ip_proto at IP offset 9
                 let ip_off = eth_off + 14
                 let proto = volatile_read_u8(NET_RX_BUF + ip_off + 9)
                 if proto == 1 {
-                    // ICMP — check type at ICMP offset 0
                     let icmp_off = ip_off + 20
                     let icmp_type = volatile_read_u8(NET_RX_BUF + icmp_off)
-                    if icmp_type == 0 {
-                        // Type 0 = Echo Reply!
-                        return rdtsc() - t0
-                    }
+                    if icmp_type == 0 { return rdtsc() - t0 }
                 }
             }
         }
@@ -266,6 +346,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     let dev = net_find_virtio()
     if dev == -1 {
         // No virtio-net — set up with static config for simulation
+        net_state_write(NET_QSIZE_OFF, 16)  // default queue size for non-virtio
         // Use fake MAC 52:54:00:12:34:56 (QEMU default)
         volatile_write_u8(NET_STATE + 8, 0x52)
         volatile_write_u8(NET_STATE + 9, 0x54)
@@ -316,17 +397,22 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 
     // 7.5. Set up virtqueues BEFORE DRIVER_OK
     // Initialize queue memory
+    // Read queue size from device (same for RX and TX)
+    port_outw(io_base + 0x0E, 0) // select queue 0
+    let qsz = port_inw(io_base + 0x0C) & 0xFFFF
+    net_state_write(NET_QSIZE_OFF, if qsz > 0 { qsz } else { 256 })
+
     vq_init_mem(VQ_RX_BASE)
     vq_init_mem(VQ_TX_BASE)
     // Zero RX buffers
     i = 0
-    while i < 16 * 2048 { volatile_write_u8(VQ_RX_BUFS + i, 0); i = i + 1 }
+    while i < VQ_RXBUF_COUNT * 2048 { volatile_write_u8(VQ_RX_BUFS + i, 0); i = i + 1 }
     // Mark queue memory as used in frame allocator
     let mut f: i64 = VQ_RX_BASE / FRAME_SIZE
-    while f < (VQ_RX_BUFS + 16 * 2048) / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
-    // Map queue pages
+    while f < (VQ_RX_BUFS + VQ_RXBUF_COUNT * 2048) / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
+    // Map queue pages (RX queue + TX queue + RX buffers)
     let mut pg: i64 = VQ_RX_BASE
-    while pg < VQ_RX_BUFS + 16 * 2048 {
+    while pg < VQ_RX_BUFS + VQ_RXBUF_COUNT * 2048 {
         map_page(pg, pg, PAGE_PRESENT | PAGE_WRITABLE)
         pg = pg + FRAME_SIZE
     }
@@ -336,10 +422,16 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     vq_setup_queue(io_base, 1, VQ_TX_BASE)
     // Pre-fill RX queue with empty buffers
     net_setup_rx_queue()
-    println("[NET] Virtqueues configured (RX=0, TX=1)")
 
     // 8. Set DRIVER_OK (4) — device is live
     port_outb(io_base + 0x12, 15) // ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK
+
+    // 9. Kick RX queue so device knows buffers are available for receiving
+    // This is CRITICAL — without it, the device won't deliver incoming packets
+    pause() // memory fence
+    port_outw(io_base + 0x10, 0) // notify queue 0 (RX)
+
+    println("[NET] Virtqueues configured (RX=0, TX=1)")
 
     // Default IP config (QEMU user-mode networking)
     net_state_write(16, 0x0A00020F) // 10.0.2.15
@@ -352,7 +444,44 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 
     net_state_write(40, 0) // rx_count
     net_state_write(48, 0) // tx_count
+    net_state_write(72, 0) // tx_avail_idx
+    net_state_write(80, 0) // rx_used_last
     net_state_write(0, 1)  // initialized
+
+    // Send gratuitous ARP to announce our MAC to SLIRP
+    // Without this, SLIRP doesn't know our MAC and can't send us packets
+    let garp = NET_PKT_BUF + 1024
+    // Eth: dst=broadcast
+    let mut gi: i64 = 0
+    while gi < 6 { volatile_write_u8(garp + gi, 0xFF); gi = gi + 1 }
+    // Eth: src=our MAC
+    gi = 0
+    while gi < 6 { volatile_write_u8(garp + 6 + gi, volatile_read_u8(NET_STATE + 8 + gi)); gi = gi + 1 }
+    // Ethertype: ARP (0x0806)
+    volatile_write_u8(garp + 12, 0x08)
+    volatile_write_u8(garp + 13, 0x06)
+    // ARP: HTYPE=1 PTYPE=0x0800 HLEN=6 PLEN=4 OPER=2(reply = gratuitous)
+    volatile_write_u8(garp+14, 0); volatile_write_u8(garp+15, 1)
+    volatile_write_u8(garp+16, 8); volatile_write_u8(garp+17, 0)
+    volatile_write_u8(garp+18, 6); volatile_write_u8(garp+19, 4)
+    volatile_write_u8(garp+20, 0); volatile_write_u8(garp+21, 2) // reply
+    // SHA = our MAC
+    gi = 0
+    while gi < 6 { volatile_write_u8(garp + 22 + gi, volatile_read_u8(NET_STATE + 8 + gi)); gi = gi + 1 }
+    // SPA = our IP (10.0.2.15)
+    let our_ip = net_state_read(16)
+    volatile_write_u8(garp+28, (our_ip>>24)&0xFF); volatile_write_u8(garp+29, (our_ip>>16)&0xFF)
+    volatile_write_u8(garp+30, (our_ip>>8)&0xFF); volatile_write_u8(garp+31, our_ip&0xFF)
+    // THA = broadcast
+    gi = 0
+    while gi < 6 { volatile_write_u8(garp + 32 + gi, 0xFF); gi = gi + 1 }
+    // TPA = our IP
+    volatile_write_u8(garp+38, (our_ip>>24)&0xFF); volatile_write_u8(garp+39, (our_ip>>16)&0xFF)
+    volatile_write_u8(garp+40, (our_ip>>8)&0xFF); volatile_write_u8(garp+41, our_ip&0xFF)
+    // Pad to 60 bytes
+    gi = 42
+    while gi < 60 { volatile_write_u8(garp + gi, 0); gi = gi + 1 }
+    net_send_frame(garp, 60)
 
     0
 }
