@@ -223,7 +223,9 @@ const TCP_PKT: i64 = 0x983000
     let st = tr(c, 0); tw(c, 120, rdtsc())
     if (flags & TCP_RST) != 0 { tw(c, 0, TCP_CLOSED); return }
     if st == TCP_SYN_SENT && (flags & (TCP_SYN|TCP_ACK)) == (TCP_SYN|TCP_ACK) {
-        tw(c, 40, seq+1); tw(c, 48, win); tw(c, 0, TCP_ESTABLISHED)
+        tw(c, 40, seq+1); tw(c, 48, win)
+        tw(c, 32, tr(c, 32) + 1) // advance our seq by 1 (SYN consumed 1 seq number)
+        tw(c, 0, TCP_ESTABLISHED)
         let p = tcp_build_pkt(c, TCP_ACK, 0, 0); if p > 0 { net_send_frame(TCP_PKT, p) }
     } else if st == TCP_SYN_RCVD && (flags & TCP_ACK) != 0 {
         tw(c, 0, TCP_ESTABLISHED)

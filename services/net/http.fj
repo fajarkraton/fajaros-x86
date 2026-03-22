@@ -152,11 +152,11 @@ const HTTP_SCRATCH: i64 = 0x987900   // Scratch buffer for paths
     let c = tcp_connect(ip, port)
     if c < 0 { return -1 }
 
-    // Step 2: Wait for SYN-ACK → ESTABLISHED
+    // Step 2: Wait for SYN-ACK → ESTABLISHED (with ARP handling)
     let mut a: i64 = 0
     while a < 10000000 && tr(c, 0) == TCP_SYN_SENT {
-        let pl = net_rx_poll()
-        if pl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl - VIRTIO_NET_HDR_SIZE) }
+        let fl = net_process_rx()
+        if fl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl) }
         pause()
         a = a + 1
     }
@@ -169,8 +169,8 @@ const HTTP_SCRATCH: i64 = 0x987900   // Scratch buffer for paths
     let mut total_rx: i64 = 0
     a = 0
     while a < 20000000 && total_rx < HTTP_RSP_MAX {
-        let pl = net_rx_poll()
-        if pl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl - VIRTIO_NET_HDR_SIZE) }
+        let fl = net_process_rx()
+        if fl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl) }
         // Check for data in TCP recv buffer
         let resp_tmp: i64 = HTTP_RSP_BUF + total_rx
         let max_chunk = if HTTP_RSP_MAX - total_rx > 1024 { 1024 } else { HTTP_RSP_MAX - total_rx }
@@ -183,8 +183,8 @@ const HTTP_SCRATCH: i64 = 0x987900   // Scratch buffer for paths
                 // Got headers — keep reading a bit more for body
                 let mut extra: i64 = 0
                 while extra < 5000000 {
-                    let pl2 = net_rx_poll()
-                    if pl2 > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl2 - VIRTIO_NET_HDR_SIZE) }
+                    let fl2 = net_process_rx()
+                    if fl2 > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl2) }
                     let g2 = tcp_recv(c, HTTP_RSP_BUF + total_rx, HTTP_RSP_MAX - total_rx)
                     if g2 > 0 { total_rx = total_rx + g2; extra = 0 }
                     pause()

@@ -140,11 +140,11 @@ const DNS_SRV: i64 = 0x0A000203  // 10.0.2.3
     i = 0
     while i < ql { volatile_write_u8(b+42+i, volatile_read_u8(DNS_QBUF+i)); i = i + 1 }
     net_send_frame(b, 14 + ipt)
-    // Poll for DNS response
+    // Poll for DNS response (also handle ARP)
     let mut att: i64 = 0
     while att < 30000000 {
-        let pl = net_rx_poll()
-        if pl > 0 {
+        let fl = net_process_rx()
+        if fl > 0 {
             let rx = NET_RX_BUF + VIRTIO_NET_HDR_SIZE
             if volatile_read_u8(rx+12)==0x08 && volatile_read_u8(rx+13)==0x00 && (volatile_read_u8(rx+23)&0xFF)==17 {
                 let rihl = (volatile_read_u8(rx+14)&0x0F)*4

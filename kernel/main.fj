@@ -143,16 +143,31 @@
     vfs_svc_init()
     println("[VFS] VFS service initialized")
 
-    // Sprint 5.3: HTTP GET via live TCP
+    // Sprint 5.3: HTTP + DNS tests
     tcp_init()
-    println("[TEST] 5.3: HTTP GET http://10.0.2.2:8080/...")
-    volatile_write_u8(HTTP_SCRATCH, 47) // '/'
+    dns_init()
+
+    // Test 1: HTTP GET via TCP
+    println("[TEST] 5.3.5: HTTP GET http://10.0.2.2:8080/...")
+    volatile_write_u8(HTTP_SCRATCH, 47)
     volatile_write_u8(HTTP_SCRATCH + 1, 0)
     let http_status = http_get(ip_pack(10, 0, 2, 2), 8080, HTTP_SCRATCH, 1)
-    if http_status == 200 { println("[TEST] Sprint 5.3: HTTP 200 OK!") }
-    else if http_status > 0 { println("[TEST] Sprint 5.3: HTTP response received") }
-    else if http_status == -2 { println("[TEST] Sprint 5.3: TCP handshake failed") }
-    else { println("[TEST] Sprint 5.3: No response") }
+    if http_status == 200 { println("[TEST] 5.3.5: HTTP 200 OK!") }
+    else if http_status > 0 { println("[TEST] 5.3.5: HTTP non-200 response") }
+    else { println("[TEST] 5.3.5: HTTP failed") }
+
+    // Test 2: DNS query via UDP
+    println("[TEST] 5.3.8: DNS resolve example.com...")
+    let dnb: i64 = DNS_FBUF + 900
+    // "example.com"
+    volatile_write_u8(dnb,101); volatile_write_u8(dnb+1,120); volatile_write_u8(dnb+2,97)
+    volatile_write_u8(dnb+3,109); volatile_write_u8(dnb+4,112); volatile_write_u8(dnb+5,108)
+    volatile_write_u8(dnb+6,101); volatile_write_u8(dnb+7,46); volatile_write_u8(dnb+8,99)
+    volatile_write_u8(dnb+9,111); volatile_write_u8(dnb+10,109); volatile_write_u8(dnb+11,0)
+    let dns_ip = dns_query(dnb, 11)
+    if dns_ip > 0 { println("[TEST] 5.3.8: DNS resolved!") }
+    else { println("[TEST] 5.3.8: DNS timeout (expected without DNS server)") }
+
     println("[TEST] 5.3 done")
 
     // Ring 3 user program is pre-installed but NOT auto-run
