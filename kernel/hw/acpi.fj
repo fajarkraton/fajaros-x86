@@ -1,0 +1,262 @@
+// FajarOS Nova v2.0 — ACPI Table Parsing (Sprint 4.4)
+// @kernel — RSDP search, XSDT/RSDT walk, MADT/MCFG/FADT/HPET parsing
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ACPI Parsed Data — at 0x9A0000 (256 bytes)
+const ACPI_DATA: i64 = 0x9A0000
+const ACPI_RSDP_ADDR: i64 = 0
+const ACPI_RSDP_REV: i64 = 8
+const ACPI_RSDT_ADDR: i64 = 16
+const ACPI_XSDT_ADDR: i64 = 24
+const ACPI_MADT_ADDR: i64 = 32
+const ACPI_CPU_COUNT: i64 = 40
+const ACPI_LAPIC_IDS: i64 = 48    // 16 bytes (1 per CPU)
+const ACPI_IOAPIC_ADDR: i64 = 64
+const ACPI_IOAPIC_GSI: i64 = 72
+const ACPI_ISO_COUNT: i64 = 80
+const ACPI_MCFG_ADDR: i64 = 88
+const ACPI_ECAM_BASE: i64 = 96
+const ACPI_FADT_ADDR: i64 = 104
+const ACPI_SCI_INT: i64 = 112
+const ACPI_PM1A_CNT: i64 = 120
+const ACPI_PM_TMR: i64 = 128
+const ACPI_HAS_MADT: i64 = 144
+const ACPI_HAS_MCFG: i64 = 152
+const ACPI_HAS_FADT: i64 = 160
+const ACPI_HAS_HPET: i64 = 168
+const ACPI_HPET_ADDR: i64 = 176
+const ACPI_MAX_CPUS: i64 = 16
+
+// "RSD PTR " as two 32-bit halves
+const RSDP_SIG_LO: i64 = 0x20445352
+const RSDP_SIG_HI: i64 = 0x20525450
+
+// ═══════════════════════════════════════════════════════════════
+// RSDP Search — scan 0xE0000-0xFFFFF for signature
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn rsdp_find() -> i64 {
+    let mut addr: i64 = 0x000E0000
+    while addr < 0x00100000 {
+        let lo = volatile_read_u32(addr)
+        let hi = volatile_read_u32(addr + 4)
+        if lo == RSDP_SIG_LO && hi == RSDP_SIG_HI {
+            let mut sum: i64 = 0
+            let mut i: i64 = 0
+            while i < 20 { sum = sum + volatile_read_u8(addr + i); i = i + 1 }
+            if (sum & 0xFF) == 0 { return addr }
+        }
+        addr = addr + 16
+    }
+    -1
+}
+
+@kernel fn rsdp_parse(rsdp_addr: i64) {
+    volatile_write_u64(ACPI_DATA + ACPI_RSDP_ADDR, rsdp_addr)
+    let revision = volatile_read_u8(rsdp_addr + 15)
+    volatile_write_u64(ACPI_DATA + ACPI_RSDP_REV, revision)
+    volatile_write_u64(ACPI_DATA + ACPI_RSDT_ADDR, volatile_read_u32(rsdp_addr + 16))
+    if revision >= 2 {
+        volatile_write_u64(ACPI_DATA + ACPI_XSDT_ADDR, volatile_read_u64(rsdp_addr + 24))
+    } else {
+        volatile_write_u64(ACPI_DATA + ACPI_XSDT_ADDR, 0)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// XSDT/RSDT Walking — find tables by 4-char signature
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn acpi_table_sig(addr: i64) -> i64 { volatile_read_u32(addr) }
+@kernel fn acpi_table_length(addr: i64) -> i64 { volatile_read_u32(addr + 4) }
+
+@kernel fn acpi_find_table(signature: i64) -> i64 {
+    let xsdt = volatile_read_u64(ACPI_DATA + ACPI_XSDT_ADDR)
+    if xsdt != 0 {
+        let r = acpi_find_in_xsdt(xsdt, signature)
+        if r != -1 { return r }
+    }
+    let rsdt = volatile_read_u64(ACPI_DATA + ACPI_RSDT_ADDR)
+    if rsdt != 0 { return acpi_find_in_rsdt(rsdt, signature) }
+    -1
+}
+
+@kernel fn acpi_find_in_xsdt(xsdt: i64, signature: i64) -> i64 {
+    let end = xsdt + acpi_table_length(xsdt)
+    let mut ptr = xsdt + 36
+    while ptr + 8 <= end {
+        let entry = volatile_read_u64(ptr)
+        if entry != 0 && acpi_table_sig(entry) == signature { return entry }
+        ptr = ptr + 8
+    }
+    -1
+}
+
+@kernel fn acpi_find_in_rsdt(rsdt: i64, signature: i64) -> i64 {
+    let end = rsdt + acpi_table_length(rsdt)
+    let mut ptr = rsdt + 36
+    while ptr + 4 <= end {
+        let entry = volatile_read_u32(ptr)
+        if entry != 0 && acpi_table_sig(entry) == signature { return entry }
+        ptr = ptr + 4
+    }
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MADT Parsing — "APIC" = 0x43495041
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn madt_parse() {
+    let madt = acpi_find_table(0x43495041)
+    if madt == -1 { return }
+    volatile_write_u64(ACPI_DATA + ACPI_MADT_ADDR, madt)
+    volatile_write_u64(ACPI_DATA + ACPI_HAS_MADT, 1)
+    let length = acpi_table_length(madt)
+    let mut cpu_count: i64 = 0
+    let mut iso_count: i64 = 0
+    let mut off: i64 = 44  // 36-byte SDT + 4 LAPIC addr + 4 flags
+    while off + 2 <= length {
+        let etype = volatile_read_u8(madt + off)
+        let elen = volatile_read_u8(madt + off + 1)
+        if elen == 0 { break }
+        if etype == 0 {
+            let flags = volatile_read_u32(madt + off + 4)
+            if (flags & 3) != 0 && cpu_count < ACPI_MAX_CPUS {
+                volatile_write_u8(ACPI_DATA + ACPI_LAPIC_IDS + cpu_count, volatile_read_u8(madt + off + 3))
+                cpu_count = cpu_count + 1
+            }
+        }
+        if etype == 1 {
+            volatile_write_u64(ACPI_DATA + ACPI_IOAPIC_ADDR, volatile_read_u32(madt + off + 4))
+            volatile_write_u64(ACPI_DATA + ACPI_IOAPIC_GSI, volatile_read_u32(madt + off + 8))
+        }
+        if etype == 2 { iso_count = iso_count + 1 }
+        off = off + elen
+    }
+    volatile_write_u64(ACPI_DATA + ACPI_CPU_COUNT, cpu_count)
+    volatile_write_u64(ACPI_DATA + ACPI_ISO_COUNT, iso_count)
+}
+
+// MCFG — "MCFG" = 0x4746434D
+@kernel fn mcfg_parse() -> i64 {
+    let mcfg = acpi_find_table(0x4746434D)
+    if mcfg == -1 { return 0 }
+    volatile_write_u64(ACPI_DATA + ACPI_MCFG_ADDR, mcfg)
+    volatile_write_u64(ACPI_DATA + ACPI_HAS_MCFG, 1)
+    let ecam = volatile_read_u64(mcfg + 44)
+    volatile_write_u64(ACPI_DATA + ACPI_ECAM_BASE, ecam)
+    ecam
+}
+
+// FADT — "FACP" = 0x50434146
+const SLP_EN: i64 = 0x2000
+
+@kernel fn fadt_parse() {
+    let fadt = acpi_find_table(0x50434146)
+    if fadt == -1 { return }
+    volatile_write_u64(ACPI_DATA + ACPI_FADT_ADDR, fadt)
+    volatile_write_u64(ACPI_DATA + ACPI_HAS_FADT, 1)
+    volatile_write_u64(ACPI_DATA + ACPI_SCI_INT, volatile_read_u16(fadt + 46))
+    volatile_write_u64(ACPI_DATA + ACPI_PM1A_CNT, volatile_read_u32(fadt + 64))
+    volatile_write_u64(ACPI_DATA + ACPI_PM_TMR, volatile_read_u32(fadt + 76))
+}
+
+@kernel fn fadt_get_pm1a_cnt() -> i64 { volatile_read_u64(ACPI_DATA + ACPI_PM1A_CNT) }
+
+@kernel fn acpi_poweroff() {
+    let pm1a = fadt_get_pm1a_cnt()
+    if pm1a == 0 { cprintln("ACPI: No PM1a_CNT — cannot poweroff", RED_ON_BLACK); return }
+    cprintln("ACPI: Powering off...", YELLOW_ON_BLACK)
+    port_outw(pm1a, 0x1400 | SLP_EN)  // SLP_TYPa=5<<10 | SLP_EN
+    port_outw(pm1a, SLP_EN)            // Fallback
+}
+
+// HPET — "HPET" = 0x54455048
+@kernel fn hpet_parse() {
+    let hpet = acpi_find_table(0x54455048)
+    if hpet == -1 { return }
+    volatile_write_u64(ACPI_DATA + ACPI_HAS_HPET, 1)
+    volatile_write_u64(ACPI_DATA + ACPI_HPET_ADDR, volatile_read_u64(hpet + 48))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Compatibility wrappers — called by smp.fj, shell/commands.fj
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn acpi_find_rsdp() -> i64 {
+    let cached = volatile_read_u64(ACPI_DATA + ACPI_RSDP_ADDR)
+    if cached != 0 { return cached }
+    let addr = rsdp_find()
+    if addr != -1 { return addr }
+    0
+}
+
+@kernel fn acpi_get_cpu_count(rsdp: i64) -> i64 {
+    let cached = volatile_read_u64(ACPI_DATA + ACPI_CPU_COUNT)
+    if cached > 0 { return cached }
+    rsdp_parse(rsdp)
+    madt_parse()
+    volatile_read_u64(ACPI_DATA + ACPI_CPU_COUNT)
+}
+
+// Full init — parse all tables
+@kernel fn acpi_init() {
+    let mut i: i64 = 0
+    while i < 256 { volatile_write_u8(ACPI_DATA + i, 0); i = i + 1 }
+    let rsdp = rsdp_find()
+    if rsdp == -1 { return }
+    rsdp_parse(rsdp)
+    madt_parse()
+    mcfg_parse()
+    fadt_parse()
+    hpet_parse()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell: cmd_acpi_info
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_acpi_info() {
+    cprintln("=== ACPI Tables ===", YELLOW_ON_BLACK)
+    if volatile_read_u64(ACPI_DATA + ACPI_RSDP_ADDR) == 0 { acpi_init() }
+    if volatile_read_u64(ACPI_DATA + ACPI_RSDP_ADDR) == 0 {
+        cprintln("  RSDP not found", RED_ON_BLACK); return
+    }
+    cprint("  RSDP: 0x", WHITE_ON_BLACK)
+    cprint_hex(volatile_read_u64(ACPI_DATA + ACPI_RSDP_ADDR), 8, CYAN_ON_BLACK)
+    cprint("  rev=", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(ACPI_DATA + ACPI_RSDP_REV), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    // MADT
+    if volatile_read_u64(ACPI_DATA + ACPI_HAS_MADT) == 1 {
+        cprint("  MADT: CPUs=", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(ACPI_DATA + ACPI_CPU_COUNT), GREEN_ON_BLACK)
+        cprint(" IOAPIC=0x", WHITE_ON_BLACK)
+        cprint_hex(volatile_read_u64(ACPI_DATA + ACPI_IOAPIC_ADDR), 8, CYAN_ON_BLACK)
+        cprint(" ISOs=", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(ACPI_DATA + ACPI_ISO_COUNT), CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else { cprintln("  MADT: not found", YELLOW_ON_BLACK) }
+    // MCFG
+    if volatile_read_u64(ACPI_DATA + ACPI_HAS_MCFG) == 1 {
+        cprint("  MCFG: ECAM=0x", WHITE_ON_BLACK)
+        cprint_hex(volatile_read_u64(ACPI_DATA + ACPI_ECAM_BASE), 8, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else { cprintln("  MCFG: not found", YELLOW_ON_BLACK) }
+    // FADT
+    if volatile_read_u64(ACPI_DATA + ACPI_HAS_FADT) == 1 {
+        cprint("  FADT: SCI=", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(ACPI_DATA + ACPI_SCI_INT), CYAN_ON_BLACK)
+        cprint(" PM1a=0x", WHITE_ON_BLACK)
+        cprint_hex(volatile_read_u64(ACPI_DATA + ACPI_PM1A_CNT), 4, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else { cprintln("  FADT: not found", YELLOW_ON_BLACK) }
+    // HPET
+    if volatile_read_u64(ACPI_DATA + ACPI_HAS_HPET) == 1 {
+        cprint("  HPET: 0x", WHITE_ON_BLACK)
+        cprint_hex(volatile_read_u64(ACPI_DATA + ACPI_HPET_ADDR), 8, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else { cprintln("  HPET: not found", YELLOW_ON_BLACK) }
+    cprintln("=== ACPI done ===", GREEN_ON_BLACK)
+}

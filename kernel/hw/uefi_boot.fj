@@ -1,0 +1,277 @@
+// FajarOS Nova v2.0 — UEFI Boot Support + APIC Timer + NIC Detect (Sprint 4.4)
+// @kernel — GOP info, memory map, LAPIC timer calibration, Intel I219 detect
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// UEFI GOP — Graphics Output Protocol from Multiboot2
+// ═══════════════════════════════════════════════════════════════
+
+const GOP_STATE: i64 = 0x9A4000
+const GOP_WIDTH: i64 = 0
+const GOP_HEIGHT: i64 = 8
+const GOP_BPP: i64 = 16
+const GOP_FB_ADDR: i64 = 24
+const GOP_PITCH: i64 = 32
+const GOP_READY: i64 = 40
+
+@kernel fn uefi_gop_mode() -> i64 {
+    let fb_tag = volatile_read_u64(0x6FF30)
+    if fb_tag == 0 { return 0 }
+    let phys = volatile_read_u64(fb_tag + 8)
+    let w = volatile_read_u32(fb_tag + 20)
+    let h = volatile_read_u32(fb_tag + 24)
+    let bpp = volatile_read_u8(fb_tag + 28)
+    if phys == 0 || w == 0 || h == 0 { return 0 }
+    volatile_write_u64(GOP_STATE + GOP_WIDTH, w)
+    volatile_write_u64(GOP_STATE + GOP_HEIGHT, h)
+    volatile_write_u64(GOP_STATE + GOP_BPP, bpp)
+    volatile_write_u64(GOP_STATE + GOP_FB_ADDR, phys)
+    volatile_write_u64(GOP_STATE + GOP_PITCH, volatile_read_u32(fb_tag + 16))
+    volatile_write_u64(GOP_STATE + GOP_READY, 1)
+    w
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UEFI Memory Map — parse Multiboot2 memory map tag
+// ═══════════════════════════════════════════════════════════════
+
+const MEMMAP_STATE: i64 = 0x9A4100
+const MEMMAP_TOTAL: i64 = 0
+const MEMMAP_USABLE: i64 = 8
+const MEMMAP_RESERVED: i64 = 16
+const MEMMAP_ENTRIES: i64 = 24
+
+@kernel fn uefi_memmap_parse() -> i64 {
+    let mmap_tag = volatile_read_u64(0x6FF20)
+    if mmap_tag == 0 { return 0 }
+    let tag_size = volatile_read_u64(0x6FF28)
+    let entry_size = volatile_read_u32(mmap_tag + 8)
+    if entry_size == 0 { return 0 }
+    let mut total: i64 = 0
+    let mut usable: i64 = 0
+    let mut reserved: i64 = 0
+    let mut entries: i64 = 0
+    let mut e = mmap_tag + 16
+    while e + 20 <= mmap_tag + tag_size {
+        let length = volatile_read_u64(e + 8)
+        let rtype = volatile_read_u32(e + 16)
+        total = total + length
+        if rtype == 1 { usable = usable + length } else { reserved = reserved + length }
+        entries = entries + 1
+        e = e + entry_size
+    }
+    volatile_write_u64(MEMMAP_STATE + MEMMAP_TOTAL, total)
+    volatile_write_u64(MEMMAP_STATE + MEMMAP_USABLE, usable)
+    volatile_write_u64(MEMMAP_STATE + MEMMAP_RESERVED, reserved)
+    volatile_write_u64(MEMMAP_STATE + MEMMAP_ENTRIES, entries)
+    usable / (1024 * 1024)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// APIC Timer — LAPIC timer calibrated against PIT channel 2
+// ═══════════════════════════════════════════════════════════════
+
+const APIC_TIMER_LVT: i64 = 0x320
+const APIC_TIMER_INIT: i64 = 0x380
+const APIC_TIMER_CUR: i64 = 0x390
+const APIC_TIMER_DIV: i64 = 0x3E0
+const APIC_TIMER_PERIODIC: i64 = 0x00020000
+const APIC_TIMER_VECTOR: i64 = 0x20
+
+const APIC_TIMER_STATE: i64 = 0x9A4200
+const APIC_TICKS_PER_MS: i64 = 0
+const APIC_CALIBRATED: i64 = 8
+
+const PIT_CMD: i64 = 0x43
+const PIT_CH2_DATA: i64 = 0x42
+const PIT_CH2_GATE: i64 = 0x61
+const PIT_FREQ: i64 = 1193182
+
+@kernel fn apic_timer_calibrate() -> i64 {
+    // Divider = 16
+    volatile_write_u32(LAPIC_BASE + APIC_TIMER_DIV, 0x03)
+    // PIT channel 2 one-shot for ~10ms
+    let pit_target: i64 = PIT_FREQ / 100
+    let gate = port_inb(PIT_CH2_GATE)
+    port_outb(PIT_CH2_GATE, (gate & 0xFD) | 1)
+    port_outb(PIT_CMD, 0xB0)
+    port_outb(PIT_CH2_DATA, pit_target & 0xFF)
+    port_outb(PIT_CH2_DATA, (pit_target >> 8) & 0xFF)
+    // Toggle gate to start
+    let gate2 = port_inb(PIT_CH2_GATE)
+    port_outb(PIT_CH2_GATE, gate2 & 0xFE)
+    port_outb(PIT_CH2_GATE, gate2 | 1)
+    // Start LAPIC with max count
+    volatile_write_u32(LAPIC_BASE + APIC_TIMER_INIT, 0xFFFFFFFF)
+    // Wait for PIT output (bit 5 of port 0x61)
+    let mut wait: i64 = 0
+    while (port_inb(PIT_CH2_GATE) & 0x20) == 0 {
+        wait = wait + 1
+        if wait > 10000000 { break }
+    }
+    let lapic_end = volatile_read_u32(LAPIC_BASE + APIC_TIMER_CUR)
+    volatile_write_u32(LAPIC_BASE + APIC_TIMER_INIT, 0)
+    let ticks_per_ms: i64 = (0xFFFFFFFF - lapic_end) / 10
+    volatile_write_u64(APIC_TIMER_STATE + APIC_TICKS_PER_MS, ticks_per_ms)
+    volatile_write_u64(APIC_TIMER_STATE + APIC_CALIBRATED, 1)
+    ticks_per_ms
+}
+
+@kernel fn apic_timer_set_periodic(ms: i64) {
+    let tpm = volatile_read_u64(APIC_TIMER_STATE + APIC_TICKS_PER_MS)
+    if tpm == 0 { return }
+    volatile_write_u32(LAPIC_BASE + APIC_TIMER_DIV, 0x03)
+    volatile_write_u32(LAPIC_BASE + APIC_TIMER_LVT, APIC_TIMER_PERIODIC | APIC_TIMER_VECTOR)
+    volatile_write_u32(LAPIC_BASE + APIC_TIMER_INIT, tpm * ms)
+}
+
+@kernel fn apic_timer_init(freq_hz: i64) {
+    let ticks = apic_timer_calibrate()
+    if ticks == 0 { cprintln("APIC timer: calibration failed", RED_ON_BLACK); return }
+    let ms = 1000 / freq_hz
+    if ms == 0 {
+        volatile_write_u32(LAPIC_BASE + APIC_TIMER_DIV, 0x03)
+        volatile_write_u32(LAPIC_BASE + APIC_TIMER_LVT, APIC_TIMER_PERIODIC | APIC_TIMER_VECTOR)
+        volatile_write_u32(LAPIC_BASE + APIC_TIMER_INIT, ticks * 1000 / freq_hz)
+    } else { apic_timer_set_periodic(ms) }
+}
+
+@kernel fn apic_timer_stop() {
+    volatile_write_u32(LAPIC_BASE + APIC_TIMER_LVT, 0x10000)
+    volatile_write_u32(LAPIC_BASE + APIC_TIMER_INIT, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Intel I219/I226 Ethernet — detection only
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn i219_is_device_id(devid: i64) -> i64 {
+    if devid == 0x15B8 || devid == 0x15D8 || devid == 0x15BE { return 1 }  // I219-V
+    if devid == 0x0D4F || devid == 0x15FC || devid == 0x1A1F { return 1 }  // I219-V
+    if devid == 0x550A || devid == 0x15B7 || devid == 0x15D7 { return 1 }  // I219-V/LM
+    if devid == 0x15BD || devid == 0x0D4E || devid == 0x15FB { return 1 }  // I219-LM
+    if devid == 0x1A1E || devid == 0x5509 { return 1 }                     // I219-LM
+    if devid == 0x125B || devid == 0x125C { return 1 }                     // I226-V/LM
+    0
+}
+
+@kernel fn i219_detect() -> i64 {
+    // Check PCIe device table
+    let count = volatile_read_u64(PCIE_DEV_COUNT)
+    let mut i: i64 = 0
+    while i < count {
+        let e = PCIE_DEV_TABLE + i * PCIE_DEV_SIZE
+        let v = volatile_read_u16(e + PCIE_OFF_VENDOR)
+        let d = volatile_read_u16(e + PCIE_OFF_DEVICE)
+        if v == 0x8086 && volatile_read_u8(e + PCIE_OFF_CLASS) == 2 && i219_is_device_id(d) == 1 { return 1 }
+        i = i + 1
+    }
+    // Fallback: legacy PCI bus 0
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0 && id != -1 {
+            let v = id & 0xFFFF
+            let d = (id >> 16) & 0xFFFF
+            if v == 0x8086 && i219_is_device_id(d) == 1 { return 1 }
+        }
+        dev = dev + 1
+    }
+    0
+}
+
+@kernel fn i219_info() {
+    let count = volatile_read_u64(PCIE_DEV_COUNT)
+    let mut i: i64 = 0
+    while i < count {
+        let e = PCIE_DEV_TABLE + i * PCIE_DEV_SIZE
+        let v = volatile_read_u16(e + PCIE_OFF_VENDOR)
+        let d = volatile_read_u16(e + PCIE_OFF_DEVICE)
+        if v == 0x8086 && volatile_read_u8(e + PCIE_OFF_CLASS) == 2 && i219_is_device_id(d) == 1 {
+            cprint("  Device: [", WHITE_ON_BLACK)
+            cprint_hex(v, 4, CYAN_ON_BLACK)
+            console_putchar(58, WHITE_ON_BLACK)
+            cprint_hex(d, 4, CYAN_ON_BLACK)
+            cprintln("]", WHITE_ON_BLACK)
+            let bar0 = (volatile_read_u32(e + PCIE_OFF_BAR0_LO) & 0xFFFFFFF0) + (volatile_read_u32(e + PCIE_OFF_BAR0_HI) << 32)
+            cprint("  BAR0: 0x", WHITE_ON_BLACK)
+            cprint_hex(bar0, 8, CYAN_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+            cprint("  IRQ:  ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u8(e + PCIE_OFF_IRQLINE), CYAN_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+            if bar0 != 0 {
+                cprint("  MAC@: 0x", WHITE_ON_BLACK)
+                cprint_hex(bar0 + 0x5400, 8, CYAN_ON_BLACK)
+                cprintln(" (RAL/RAH)", WHITE_ON_BLACK)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_uefi_info() {
+    cprintln("=== UEFI Boot Info ===", YELLOW_ON_BLACK)
+    uefi_gop_mode()
+    if volatile_read_u64(GOP_STATE + GOP_READY) == 1 {
+        cprint("  GOP: ", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(GOP_STATE + GOP_WIDTH), CYAN_ON_BLACK)
+        console_putchar(120, WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(GOP_STATE + GOP_HEIGHT), CYAN_ON_BLACK)
+        cprint("@", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(GOP_STATE + GOP_BPP), CYAN_ON_BLACK)
+        cprint("bpp FB=0x", WHITE_ON_BLACK)
+        cprint_hex(volatile_read_u64(GOP_STATE + GOP_FB_ADDR), 8, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else { cprintln("  GOP: not available (VGA text)", YELLOW_ON_BLACK) }
+    let usable_mb = uefi_memmap_parse()
+    if usable_mb > 0 {
+        cprint("  RAM: ", WHITE_ON_BLACK)
+        cprint_decimal(usable_mb, GREEN_ON_BLACK)
+        cprint(" MB usable / ", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(MEMMAP_STATE + MEMMAP_TOTAL) / (1024 * 1024), CYAN_ON_BLACK)
+        cprint(" MB total (", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(MEMMAP_STATE + MEMMAP_ENTRIES), CYAN_ON_BLACK)
+        cprintln(" entries)", WHITE_ON_BLACK)
+    } else { cprintln("  RAM: no memory map from bootloader", YELLOW_ON_BLACK) }
+    cprintln("=== UEFI done ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_apic_timer() {
+    cprintln("=== APIC Timer ===", YELLOW_ON_BLACK)
+    let cal = volatile_read_u64(APIC_TIMER_STATE + APIC_CALIBRATED)
+    let mut ticks: i64 = volatile_read_u64(APIC_TIMER_STATE + APIC_TICKS_PER_MS)
+    if cal != 1 {
+        cprint("  Calibrating... ", WHITE_ON_BLACK)
+        ticks = apic_timer_calibrate()
+        if ticks == 0 { cprintln("FAILED", RED_ON_BLACK); return }
+    }
+    cprint("  Ticks/ms: ", WHITE_ON_BLACK)
+    cprint_decimal(ticks, GREEN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  LAPIC freq: ~", WHITE_ON_BLACK)
+    cprint_decimal(ticks / 1000, CYAN_ON_BLACK)
+    cprintln(" MHz (div16)", WHITE_ON_BLACK)
+    let lvt = volatile_read_u32(LAPIC_BASE + APIC_TIMER_LVT)
+    cprint("  LVT: 0x", WHITE_ON_BLACK)
+    cprint_hex(lvt, 8, CYAN_ON_BLACK)
+    if (lvt & 0x10000) != 0 { cprintln(" (masked)", YELLOW_ON_BLACK) }
+    else { cprintln(" (active)", GREEN_ON_BLACK) }
+    cprintln("=== APIC done ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_i219_detect() {
+    cprintln("=== Intel I219/I226 NIC ===", YELLOW_ON_BLACK)
+    if i219_detect() == 1 {
+        cprintln("  Status: DETECTED", GREEN_ON_BLACK)
+        i219_info()
+    } else {
+        cprintln("  Status: not found", YELLOW_ON_BLACK)
+        cprintln("  (QEMU uses virtio-net)", WHITE_ON_BLACK)
+    }
+    cprintln("=== NIC done ===", GREEN_ON_BLACK)
+}

@@ -3219,6 +3219,17 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 100 { cmd_hw_detect(); handled = 1 }
     // hw-test (104,119,45,116)
     if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 116 { cmd_hw_test(); handled = 1 }
+    // === Sprint 4.4: Real hardware commands ===
+    // acpi-info (97,99,112,105,45,105)
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 99 && volatile_read_u8(0x6F802) == 112 && volatile_read_u8(0x6F803) == 105 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 105 { cmd_acpi_info(); handled = 1 }
+    // pcie-scan (112,99,105,101,45,115)
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 99 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 101 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 115 { cmd_pcie_scan(); handled = 1 }
+    // uefi-info (117,101,102,105,45,105)
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 117 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 102 && volatile_read_u8(0x6F803) == 105 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 105 { cmd_uefi_info(); handled = 1 }
+    // apic-timer (97,112,105,99,45,116)
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 99 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 116 { cmd_apic_timer(); handled = 1 }
+    // i219 (105,50,49,57)
+    if handled == 0 && len == 4 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 50 && volatile_read_u8(0x6F802) == 49 && volatile_read_u8(0x6F803) == 57 { cmd_i219_detect(); handled = 1 }
     // === Sprint 4.3: Auth/Multi-user commands ===
     // auth-test (97,117,116,104,45,116)
     if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 117 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 104 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 116 { cmd_auth_login_test(); handled = 1 }

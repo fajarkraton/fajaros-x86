@@ -1,0 +1,218 @@
+// FajarOS Nova v2.0 — PCIe ECAM Enumeration (Sprint 4.4)
+// @kernel — ECAM MMIO config space, full bus scan, BAR reading
+// Part of the modular kernel build (concatenated by Makefile)
+
+// PCIe Device Table — at 0x9A2000 (64 devices x 32 bytes = 2KB)
+const PCIE_DEV_TABLE: i64 = 0x9A2000
+const PCIE_MAX_DEVS: i64 = 64
+const PCIE_DEV_SIZE: i64 = 32
+const PCIE_DEV_COUNT: i64 = 0x9A1FF8
+const PCIE_ECAM_CACHED: i64 = 0x9A1FF0
+
+// Per-device layout (32 bytes)
+const PCIE_OFF_BUS: i64 = 0
+const PCIE_OFF_DEV: i64 = 1
+const PCIE_OFF_FN: i64 = 2
+const PCIE_OFF_VENDOR: i64 = 4     // 2 bytes
+const PCIE_OFF_DEVICE: i64 = 6     // 2 bytes
+const PCIE_OFF_CLASS: i64 = 8
+const PCIE_OFF_SUBCLASS: i64 = 9
+const PCIE_OFF_PROGIF: i64 = 10
+const PCIE_OFF_IRQLINE: i64 = 11
+const PCIE_OFF_BAR0_LO: i64 = 12   // 4 bytes
+const PCIE_OFF_BAR0_HI: i64 = 16   // 4 bytes (64-bit BARs)
+const PCIE_OFF_BAR1_LO: i64 = 20
+const PCIE_OFF_BAR1_HI: i64 = 24
+const PCIE_OFF_FLAGS: i64 = 28     // bit0=mmio, bit1=64bit, bit2=prefetch
+
+// ═══════════════════════════════════════════════════════════════
+// ECAM MMIO — config space: base + (bus<<20 | dev<<15 | fn<<12)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn pcie_init(ecam_base: i64) {
+    volatile_write_u64(PCIE_ECAM_CACHED, ecam_base)
+    volatile_write_u64(PCIE_DEV_COUNT, 0)
+    let mut i: i64 = 0
+    while i < PCIE_MAX_DEVS * PCIE_DEV_SIZE { volatile_write_u8(PCIE_DEV_TABLE + i, 0); i = i + 1 }
+    // Identity-map ECAM for bus 0 (256 devices x 4KB = 1MB)
+    let mut pg: i64 = 0
+    while pg < 256 {
+        map_page(ecam_base + pg * 4096, ecam_base + pg * 4096, PAGE_PRESENT | PAGE_WRITABLE)
+        pg = pg + 1
+    }
+}
+
+@kernel fn pcie_config_addr(bus: i64, dev: i64, func: i64, reg: i64) -> i64 {
+    volatile_read_u64(PCIE_ECAM_CACHED) + (bus << 20) + (dev << 15) + (func << 12) + reg
+}
+
+@kernel fn pcie_read32(bus: i64, dev: i64, func: i64, reg: i64) -> i64 {
+    volatile_read_u32(pcie_config_addr(bus, dev, func, reg))
+}
+
+@kernel fn pcie_write32(bus: i64, dev: i64, func: i64, reg: i64, val: i64) {
+    volatile_write_u32(pcie_config_addr(bus, dev, func, reg), val)
+}
+
+@kernel fn pcie_read16(bus: i64, dev: i64, func: i64, reg: i64) -> i64 {
+    volatile_read_u16(pcie_config_addr(bus, dev, func, reg))
+}
+
+@kernel fn pcie_read8(bus: i64, dev: i64, func: i64, reg: i64) -> i64 {
+    volatile_read_u8(pcie_config_addr(bus, dev, func, reg))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Bus Scan — 256 buses x 32 devices x 8 functions
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn pcie_scan_device(bus: i64, dev: i64, func: i64) {
+    let vendor = pcie_read16(bus, dev, func, 0)
+    if vendor == 0xFFFF || vendor == 0 { return }
+    let count = volatile_read_u64(PCIE_DEV_COUNT)
+    if count >= PCIE_MAX_DEVS { return }
+    let class_reg = pcie_read32(bus, dev, func, 8)
+    let entry = PCIE_DEV_TABLE + count * PCIE_DEV_SIZE
+    volatile_write_u8(entry + PCIE_OFF_BUS, bus)
+    volatile_write_u8(entry + PCIE_OFF_DEV, dev)
+    volatile_write_u8(entry + PCIE_OFF_FN, func)
+    volatile_write_u16(entry + PCIE_OFF_VENDOR, vendor)
+    volatile_write_u16(entry + PCIE_OFF_DEVICE, pcie_read16(bus, dev, func, 2))
+    volatile_write_u8(entry + PCIE_OFF_CLASS, (class_reg >> 24) & 0xFF)
+    volatile_write_u8(entry + PCIE_OFF_SUBCLASS, (class_reg >> 16) & 0xFF)
+    volatile_write_u8(entry + PCIE_OFF_PROGIF, (class_reg >> 8) & 0xFF)
+    volatile_write_u8(entry + PCIE_OFF_IRQLINE, pcie_read8(bus, dev, func, 0x3C))
+    // BAR0
+    let bar0 = pcie_read32(bus, dev, func, 0x10)
+    volatile_write_u32(entry + PCIE_OFF_BAR0_LO, bar0)
+    let mut flags: i64 = 0
+    if (bar0 & 1) == 0 { flags = flags | 1 }
+    if (bar0 & 0x6) == 0x4 {
+        flags = flags | 2
+        volatile_write_u32(entry + PCIE_OFF_BAR0_HI, pcie_read32(bus, dev, func, 0x14))
+    }
+    if (bar0 & 0x8) != 0 { flags = flags | 4 }
+    volatile_write_u32(entry + PCIE_OFF_FLAGS, flags)
+    volatile_write_u64(PCIE_DEV_COUNT, count + 1)
+}
+
+@kernel fn pcie_scan() {
+    volatile_write_u64(PCIE_DEV_COUNT, 0)
+    let mut bus: i64 = 0
+    while bus < 256 {
+        let mut dev: i64 = 0
+        while dev < 32 {
+            let v0 = pcie_read16(bus, dev, 0, 0)
+            if v0 != 0xFFFF && v0 != 0 {
+                pcie_scan_device(bus, dev, 0)
+                if (pcie_read8(bus, dev, 0, 0x0E) & 0x80) != 0 {
+                    let mut func: i64 = 1
+                    while func < 8 { pcie_scan_device(bus, dev, func); func = func + 1 }
+                }
+            }
+            dev = dev + 1
+        }
+        bus = bus + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Device Classification
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn pcie_class_name(class: i64, subclass: i64) {
+    if class == 1 && subclass == 6 { cprint("AHCI", WHITE_ON_BLACK); return }
+    if class == 1 && subclass == 8 { cprint("NVMe", GREEN_ON_BLACK); return }
+    if class == 2 && subclass == 0 { cprint("Ethernet", GREEN_ON_BLACK); return }
+    if class == 2 && subclass == 0x80 { cprint("WiFi", CYAN_ON_BLACK); return }
+    if class == 3 && subclass == 0 { cprint("VGA", CYAN_ON_BLACK); return }
+    if class == 3 && subclass == 2 { cprint("3D GPU", CYAN_ON_BLACK); return }
+    if class == 4 && subclass == 3 { cprint("Audio", WHITE_ON_BLACK); return }
+    if class == 6 && subclass == 0 { cprint("HostBridge", WHITE_ON_BLACK); return }
+    if class == 6 && subclass == 1 { cprint("ISABridge", WHITE_ON_BLACK); return }
+    if class == 6 && subclass == 4 { cprint("PCIBridge", WHITE_ON_BLACK); return }
+    if class == 0xC && subclass == 3 { cprint("USB/XHCI", GREEN_ON_BLACK); return }
+    if class == 0xC && subclass == 5 { cprint("SMBus", WHITE_ON_BLACK); return }
+    cprint_hex(class, 2, WHITE_ON_BLACK)
+    console_putchar(46, WHITE_ON_BLACK)
+    cprint_hex(subclass, 2, WHITE_ON_BLACK)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// BAR Reading
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn pcie_read_bar(bus: i64, dev: i64, func: i64, bar_idx: i64) -> i64 {
+    let reg = 0x10 + bar_idx * 4
+    let bar_lo = pcie_read32(bus, dev, func, reg)
+    if (bar_lo & 1) != 0 { return bar_lo & 0xFFFFFFFC }  // I/O BAR
+    let base = bar_lo & 0xFFFFFFF0
+    if (bar_lo & 0x6) == 0x4 { return base + (pcie_read32(bus, dev, func, reg + 4) << 32) }
+    base
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell: cmd_pcie_scan
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_pcie_scan() {
+    cprintln("=== PCIe Devices ===", YELLOW_ON_BLACK)
+    let ecam = volatile_read_u64(PCIE_ECAM_CACHED)
+    if ecam == 0 {
+        let mcfg_ecam = volatile_read_u64(ACPI_DATA + ACPI_ECAM_BASE)
+        if mcfg_ecam != 0 { pcie_init(mcfg_ecam) }
+        else { cprintln("  No ECAM — legacy PCI fallback", YELLOW_ON_BLACK); cmd_pcie_legacy(); return }
+    }
+    cprint("  ECAM: 0x", WHITE_ON_BLACK)
+    cprint_hex(volatile_read_u64(PCIE_ECAM_CACHED), 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    pcie_scan()
+    let count = volatile_read_u64(PCIE_DEV_COUNT)
+    cprint("  ", WHITE_ON_BLACK)
+    cprint_decimal(count, GREEN_ON_BLACK)
+    cprintln(" devices:", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < count {
+        let e = PCIE_DEV_TABLE + i * PCIE_DEV_SIZE
+        cprint("  ", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u8(e + PCIE_OFF_BUS), CYAN_ON_BLACK)
+        console_putchar(58, WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u8(e + PCIE_OFF_DEV), CYAN_ON_BLACK)
+        console_putchar(46, WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u8(e + PCIE_OFF_FN), CYAN_ON_BLACK)
+        cprint(" [", WHITE_ON_BLACK)
+        cprint_hex(volatile_read_u16(e + PCIE_OFF_VENDOR), 4, CYAN_ON_BLACK)
+        console_putchar(58, WHITE_ON_BLACK)
+        cprint_hex(volatile_read_u16(e + PCIE_OFF_DEVICE), 4, CYAN_ON_BLACK)
+        cprint("] ", WHITE_ON_BLACK)
+        pcie_class_name(volatile_read_u8(e + PCIE_OFF_CLASS), volatile_read_u8(e + PCIE_OFF_SUBCLASS))
+        console_putchar(10, WHITE_ON_BLACK)
+        i = i + 1
+    }
+    cprintln("=== PCIe done ===", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_pcie_legacy() {
+    let mut count: i64 = 0
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0 && id != -1 {
+            let class_reg = pci_read32(0, dev, 0, 8)
+            cprint("  0:", WHITE_ON_BLACK)
+            cprint_decimal(dev, CYAN_ON_BLACK)
+            cprint(".0 [", WHITE_ON_BLACK)
+            cprint_hex(id & 0xFFFF, 4, CYAN_ON_BLACK)
+            console_putchar(58, WHITE_ON_BLACK)
+            cprint_hex((id >> 16) & 0xFFFF, 4, CYAN_ON_BLACK)
+            cprint("] ", WHITE_ON_BLACK)
+            pcie_class_name((class_reg >> 24) & 0xFF, (class_reg >> 16) & 0xFF)
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        dev = dev + 1
+    }
+    cprint("  Legacy: ", WHITE_ON_BLACK)
+    cprint_decimal(count, GREEN_ON_BLACK)
+    cprintln(" devices", WHITE_ON_BLACK)
+}

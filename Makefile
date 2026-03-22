@@ -63,6 +63,9 @@ SOURCES := \
 	kernel/core/security.fj \
 	kernel/core/fast_ipc.fj \
 	kernel/hw/detect.fj \
+	kernel/hw/acpi.fj \
+	kernel/hw/pcie.fj \
+	kernel/hw/uefi_boot.fj \
 	kernel/core/elf_loader.fj \
 	services/blk/main.fj \
 	services/blk/journal.fj \
