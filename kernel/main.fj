@@ -142,7 +142,11 @@
     // Initialize VFS service (Sprint 1.4)
     vfs_svc_init()
     println("[VFS] VFS service initialized")
-    // Sprint 5.2 VERIFIED: vfs-lifecycle test passed (create→write→read→delete)
+
+    // Sprint 5.3: TCP/HTTP wired via real TCP (not raw Ethernet)
+    // NOTE: Virtio-net TX needs debugging — packets don't leave guest
+    // HTTP get now uses tcp_connect→tcp_send→tcp_recv path
+    tcp_init()
 
     // Ring 3 user program is pre-installed but NOT auto-run
     // Use 'runhello' command to test Ring 3 execution

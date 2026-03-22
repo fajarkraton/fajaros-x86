@@ -142,38 +142,67 @@ const HTTP_SCRATCH: i64 = 0x987900   // Scratch buffer for paths
     ip
 }
 
-// HTTP GET — returns status code or -1
+// HTTP GET via real TCP — returns status code or -1
 @kernel fn http_get(ip: i64, port: i64, path_addr: i64, path_len: i64) -> i64 {
     http_init()
     let req_len = http_build_request(ip, path_addr, path_len)
     if req_len <= 0 || req_len >= HTTP_REQ_MAX { return -1 }
-    // Allocate socket
-    let sid = sock_alloc()
-    if sid < 0 { return -1 }
-    sock_write(sid, 0, SOCK_CONNECTED)
-    sock_write(sid, 8, PROTO_TCP)
-    sock_write(sid, 16, 49200 + sid)
-    sock_write(sid, 24, ip)
-    sock_write(sid, 32, port)
-    // Send request
-    let mut i: i64 = 0
-    while i < req_len { volatile_write_u8(NET_TX_BUF + i, volatile_read_u8(HTTP_REQ_BUF + i)); i = i + 1 }
-    net_send_frame(NET_TX_BUF, req_len)
-    // Poll for response
-    let mut total_rx: i64 = 0
-    let mut timeout: i64 = 0
-    while timeout < 10000000 && total_rx < HTTP_RSP_MAX {
-        let rx = net_rx_poll()
-        if rx > 0 {
-            let cp = if rx + total_rx > HTTP_RSP_MAX { HTTP_RSP_MAX - total_rx } else { rx }
-            i = 0
-            while i < cp { volatile_write_u8(HTTP_RSP_BUF + total_rx + i, volatile_read_u8(NET_RX_BUF + i)); i = i + 1 }
-            total_rx = total_rx + cp
-        }
+
+    // Step 1: TCP connect (sends SYN)
+    let c = tcp_connect(ip, port)
+    if c < 0 { return -1 }
+
+    // Step 2: Wait for SYN-ACK → ESTABLISHED
+    let mut a: i64 = 0
+    while a < 10000000 && tr(c, 0) == TCP_SYN_SENT {
+        let pl = net_rx_poll()
+        if pl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl - VIRTIO_NET_HDR_SIZE) }
         pause()
-        timeout = timeout + 1
+        a = a + 1
     }
-    sock_close(sid)
+    if tr(c, 0) != TCP_ESTABLISHED { tcp_close(c); return -2 }
+
+    // Step 3: Send HTTP request over TCP
+    tcp_send(c, HTTP_REQ_BUF, req_len)
+
+    // Step 4: Poll for HTTP response data
+    let mut total_rx: i64 = 0
+    a = 0
+    while a < 20000000 && total_rx < HTTP_RSP_MAX {
+        let pl = net_rx_poll()
+        if pl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl - VIRTIO_NET_HDR_SIZE) }
+        // Check for data in TCP recv buffer
+        let resp_tmp: i64 = HTTP_RSP_BUF + total_rx
+        let max_chunk = if HTTP_RSP_MAX - total_rx > 1024 { 1024 } else { HTTP_RSP_MAX - total_rx }
+        let got = tcp_recv(c, resp_tmp, max_chunk)
+        if got > 0 {
+            total_rx = total_rx + got
+            // Check if we have a complete response (headers + body)
+            let hdr_end = http_find_header_end(HTTP_RSP_BUF, total_rx)
+            if hdr_end > 0 {
+                // Got headers — keep reading a bit more for body
+                let mut extra: i64 = 0
+                while extra < 5000000 {
+                    let pl2 = net_rx_poll()
+                    if pl2 > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl2 - VIRTIO_NET_HDR_SIZE) }
+                    let g2 = tcp_recv(c, HTTP_RSP_BUF + total_rx, HTTP_RSP_MAX - total_rx)
+                    if g2 > 0 { total_rx = total_rx + g2; extra = 0 }
+                    pause()
+                    extra = extra + 1
+                }
+                a = 20000000 // exit outer loop
+            }
+        }
+        // Check for connection close (server sent FIN)
+        let state = tr(c, 0)
+        if state == TCP_CLOSE_WAIT || state == TCP_CLOSED || state == TCP_TIME_WAIT { a = 20000000 }
+        pause()
+        a = a + 1
+    }
+
+    // Step 5: Close TCP connection
+    tcp_close(c)
+
     if total_rx == 0 { return -1 }
     http_parse_response(HTTP_RSP_BUF, total_rx)
     volatile_read_u64(HTTP_STATUS)
