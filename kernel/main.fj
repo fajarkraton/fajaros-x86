@@ -153,10 +153,18 @@
         let mut ta: i64 = 0
         while ta < 15000000 && tr(tc, 0) == TCP_SYN_SENT {
             let fl = net_process_rx()
-            if fl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl) }
+            if fl > 0 {
+                println("[TEST] RX!")
+                tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl)
+            }
             pause()
             ta = ta + 1
         }
+        // Check used ring directly
+        let rui = vq_used_idx(VQ_RX_BASE) & 0xFFFF
+        let rla = net_state_read(80) & 0xFFFF
+        if rui > 0 { println("[TEST] RX used.idx > 0 (device delivered!)") }
+        else { println("[TEST] RX used.idx = 0 (device never delivered)") }
         let st = tr(tc, 0)
         if st == TCP_ESTABLISHED { println("[TEST] TCP ESTABLISHED!") }
         else if st == TCP_SYN_SENT { println("[TEST] TCP SYN_SENT timeout") }

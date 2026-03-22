@@ -114,7 +114,7 @@ const RAMDISK_SIZE: i64 = 262144  // 256KB
 // Cache at 0x8D0000 — 16 × 544 bytes = ~8.5KB
 // ═══════════════════════════════════════════════════════════════
 
-const BLK_CACHE_BASE: i64 = 0x910000  // was 0x8D0000 — overlapped RAMDISK (0x8C0000-0x900000)!
+const BLK_CACHE_BASE: i64 = 0x920000  // moved: 0x910000 overlapped RX buffers (0x898000-0x918000)
 const BLK_CACHE_ENTRIES: i64 = 16
 const BLK_CACHE_ENTRY_SIZE: i64 = 544  // 32 meta + 512 data
 // Per entry: +0=valid, +8=dev, +16=lba, +24=dirty, +32=data[512]

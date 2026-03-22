@@ -33,9 +33,8 @@ const NET_PKT_BUF: i64 = 0x87C000  // Temp packet build buffer (4KB)
 // For N=256: ~6672 bytes per queue → 2 pages (8KB) each
 const VQ_RX_BASE: i64 = 0x890000     // RX queue (needs 8KB: desc+avail+used)
 const VQ_TX_BASE: i64 = 0x894000     // TX queue (must not overlap RX used ring at ~0x892000)
-const VQ_RX_BUFS: i64 = 0x898000    // RX packet buffers: 16 × 2KB = 32KB
-// NOTE: We pre-fill only 16 RX buffers but queue can hold up to 256 descriptors
-const VQ_RXBUF_COUNT: i64 = 16      // Number of RX buffers to pre-fill
+const VQ_RX_BUFS: i64 = 0x898000    // RX packet buffers: 256 × 2KB = 512KB (to 0x918000)
+const VQ_RXBUF_COUNT: i64 = 256     // Must match vq_num() for 1:1 desc→buffer mapping
 // Actual queue size stored at NET_STATE+96
 const NET_QSIZE_OFF: i64 = 96       // Queue size (from device)
 const VIRTIO_NET_HDR_SIZE: i64 = 10  // virtio-net header (legacy, no MRG_RXBUF)
@@ -64,9 +63,9 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 @kernel fn vq_desc_set(base: i64, idx: i64, addr: i64, len: i64, flags: i64, next: i64) {
     let off = base + idx * 16
     volatile_write_u64(off, addr)
-    volatile_write_u32(off + 8, len)
-    volatile_write_u16(off + 12, flags)
-    volatile_write_u16(off + 14, next)
+    // Pack len(32) + flags(16) + next(16) into one u64 write to avoid partial updates
+    let packed = (len & 0xFFFFFFFF) | ((flags & 0xFFFF) << 32) | ((next & 0xFFFF) << 48)
+    volatile_write_u64(off + 8, packed)
 }
 
 // Avail ring layout (after descriptors):
@@ -103,6 +102,8 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 }
 
 @kernel fn vq_used_idx(base: i64) -> i64 {
+    // Memory fence to see DMA writes from device
+    pause()
     volatile_read_u16(vq_used_offset(base) + 2) & 0xFFFF
 }
 
@@ -123,16 +124,26 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 }
 
 @kernel fn net_setup_rx_queue() {
-    // Fill ALL queue descriptors so QEMU doesn't error on "zero sized buffers"
-    // Reuse 16 physical buffers cyclically across all descriptors
+    // Step 1: Set up ALL descriptors first (before making any available)
     let n = vq_num()
     let mut i: i64 = 0
     while i < n {
-        let buf_addr = VQ_RX_BUFS + (i % VQ_RXBUF_COUNT) * 2048
+        let buf_addr = VQ_RX_BUFS + i * 2048
         vq_desc_set(VQ_RX_BASE, i, buf_addr, 2048, VRING_DESC_F_WRITE, 0)
-        vq_avail_add(VQ_RX_BASE, i)
         i = i + 1
     }
+    // Step 2: Now add all descriptors to avail ring
+    // Write ring entries directly (bypass vq_avail_add to avoid premature idx update)
+    let avail = VQ_RX_BASE + n * 16
+    volatile_write_u16(avail, 0) // flags = 0
+    i = 0
+    while i < n {
+        volatile_write_u16(avail + 4 + i * 2, i) // ring[i] = i
+        i = i + 1
+    }
+    // Step 3: Memory fence then update avail.idx atomically
+    pause()
+    volatile_write_u16(avail + 2, n) // avail.idx = N (all at once)
     net_state_write(64, n)
     net_state_write(80, 0)               // rx_used_last = 0
 }
@@ -184,8 +195,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     net_state_write(40, net_state_read(40) + 1)
 
     // Copy received data to NET_RX_BUF for parsing
-    // Descriptors cyclically point to 16 buffers, so use modulo
-    let src = VQ_RX_BUFS + (desc_id % VQ_RXBUF_COUNT) * 2048
+    let src = VQ_RX_BUFS + desc_id * 2048
     let mut i: i64 = 0
     while i < pkt_len && i < 16384 {
         volatile_write_u8(NET_RX_BUF + i, volatile_read_u8(src + i))
@@ -404,15 +414,17 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 
     vq_init_mem(VQ_RX_BASE)
     vq_init_mem(VQ_TX_BASE)
-    // Zero RX buffers
+    // Zero RX buffers (256 × 2KB = 512KB)
+    // Use 8-byte writes for speed
     i = 0
-    while i < VQ_RXBUF_COUNT * 2048 { volatile_write_u8(VQ_RX_BUFS + i, 0); i = i + 1 }
-    // Mark queue memory as used in frame allocator
+    let rx_buf_total = vq_num() * 2048
+    while i < rx_buf_total { volatile_write_u64(VQ_RX_BUFS + i, 0); i = i + 8 }
+    // Mark queue memory + RX buffers as used in frame allocator
     let mut f: i64 = VQ_RX_BASE / FRAME_SIZE
-    while f < (VQ_RX_BUFS + VQ_RXBUF_COUNT * 2048) / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
+    while f < (VQ_RX_BUFS + rx_buf_total) / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
     // Map queue pages (RX queue + TX queue + RX buffers)
     let mut pg: i64 = VQ_RX_BASE
-    while pg < VQ_RX_BUFS + VQ_RXBUF_COUNT * 2048 {
+    while pg < VQ_RX_BUFS + rx_buf_total {
         map_page(pg, pg, PAGE_PRESENT | PAGE_WRITABLE)
         pg = pg + FRAME_SIZE
     }
@@ -427,8 +439,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     port_outb(io_base + 0x12, 15) // ACKNOWLEDGE | DRIVER | FEATURES_OK | DRIVER_OK
 
     // 9. Kick RX queue so device knows buffers are available for receiving
-    // This is CRITICAL — without it, the device won't deliver incoming packets
-    pause() // memory fence
+    pause() // memory fence — ensure all descriptor writes are visible
     port_outw(io_base + 0x10, 0) // notify queue 0 (RX)
 
     println("[NET] Virtqueues configured (RX=0, TX=1)")
