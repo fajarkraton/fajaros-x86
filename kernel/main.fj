@@ -140,8 +140,9 @@
     // VERIFIED: "Hello from Ring 3!" + PID=1 + SYS_EXIT on QEMU serial
 
     // Initialize VFS service (Sprint 1.4)
-    init_svc_init()
-    println("[VFS] VFS service initialized (/, /dev, /proc)")
+    vfs_svc_init()
+    println("[VFS] VFS service initialized")
+    // Sprint 5.2 VERIFIED: vfs-lifecycle test passed (create→write→read→delete)
 
     // Ring 3 user program is pre-installed but NOT auto-run
     // Use 'runhello' command to test Ring 3 execution
