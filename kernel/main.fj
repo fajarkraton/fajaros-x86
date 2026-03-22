@@ -117,6 +117,10 @@
     channel_register_builtin_services()
     println("[IPC2] Endpoints + channels + capabilities ready")
 
+    // Phase 4: ELF loader for Ring 3 services
+    svc_elf_init()
+    println("[ELF] Service loader ready")
+
     // Phase 2: Production Hardening subsystems
     smp_sched_init()
     demand_page_init()

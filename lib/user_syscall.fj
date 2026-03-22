@@ -1,0 +1,222 @@
+// FajarOS Nova v2.0 — User-Mode Syscall Library (Sprint 4.1)
+// lib/user_syscall.fj — SYSCALL wrappers for Ring 3 services
+// Linked into every user-mode service ELF
+// These functions are called by the compiler's user-mode runtime declarations
+
+// ═══════════════════════════════════════════════════════════════
+// Syscall Numbers (must match kernel/syscall/dispatch.fj)
+// ═══════════════════════════════════════════════════════════════
+
+const USR_SYS_EXIT: i64 = 0
+const USR_SYS_WRITE: i64 = 1
+const USR_SYS_READ: i64 = 2
+const USR_SYS_GETPID: i64 = 3
+const USR_SYS_YIELD: i64 = 4
+const USR_SYS_MMAP: i64 = 6
+const USR_SYS_SEND: i64 = 10
+const USR_SYS_RECV: i64 = 11
+const USR_SYS_CALL: i64 = 12
+const USR_SYS_REPLY: i64 = 13
+const USR_SYS_NOTIFY: i64 = 14
+const USR_SYS_SHARE: i64 = 22
+const USR_SYS_IRQ_WAIT: i64 = 30
+const USR_SYS_PORT_IO: i64 = 31
+const USR_SYS_DMA_ALLOC: i64 = 32
+
+// ═══════════════════════════════════════════════════════════════
+// IPC Message Constants
+// ═══════════════════════════════════════════════════════════════
+
+const USR_IPC_MSG_SIZE: i64 = 64
+
+// Well-known service PIDs
+const USR_PID_KERNEL: i64 = 0
+const USR_PID_INIT: i64 = 1
+const USR_PID_BLK: i64 = 2
+const USR_PID_VFS: i64 = 3
+const USR_PID_NET: i64 = 4
+const USR_PID_SHELL: i64 = 5
+
+// ═══════════════════════════════════════════════════════════════
+// Low-level syscall: uses the SYSCALL instruction
+// On x86_64: RAX=syscall_num, RDI=arg0, RSI=arg1, RDX=arg2
+// The kernel's SYSCALL entry stub (kernel/syscall/entry.fj)
+// saves/restores registers and calls syscall_handle()
+// ═══════════════════════════════════════════════════════════════
+
+// Note: In the monolithic build, these are regular function calls
+// that go directly to the kernel. In true Ring 3 ELFs, the compiler
+// generates SYSCALL instructions for these (via x86_64-user target).
+
+// ═══════════════════════════════════════════════════════════════
+// Process Syscalls
+// ═══════════════════════════════════════════════════════════════
+
+@safe fn sys_exit(code: i64) {
+    // SYS_EXIT(0): terminate process
+    syscall(USR_SYS_EXIT, code, 0, 0)
+}
+
+@safe fn sys_getpid() -> i64 {
+    syscall(USR_SYS_GETPID, 0, 0, 0)
+}
+
+@safe fn sys_yield() {
+    syscall(USR_SYS_YIELD, 0, 0, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Console I/O Syscalls
+// ═══════════════════════════════════════════════════════════════
+
+@safe fn sys_write(fd: i64, buf: i64, len: i64) -> i64 {
+    syscall(USR_SYS_WRITE, fd, buf, len)
+}
+
+@safe fn sys_read(fd: i64, buf: i64, len: i64) -> i64 {
+    syscall(USR_SYS_READ, fd, buf, len)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// IPC Syscalls
+// ═══════════════════════════════════════════════════════════════
+
+@safe fn sys_send(dst_pid: i64, msg_ptr: i64) -> i64 {
+    syscall(USR_SYS_SEND, dst_pid, msg_ptr, 0)
+}
+
+@safe fn sys_recv(from_pid: i64, buf_ptr: i64) -> i64 {
+    syscall(USR_SYS_RECV, from_pid, buf_ptr, 0)
+}
+
+@safe fn sys_call(dst_pid: i64, msg_ptr: i64, reply_ptr: i64) -> i64 {
+    syscall(USR_SYS_CALL, dst_pid, msg_ptr, reply_ptr)
+}
+
+@safe fn sys_reply(caller_pid: i64, reply_ptr: i64) -> i64 {
+    syscall(USR_SYS_REPLY, caller_pid, reply_ptr, 0)
+}
+
+@safe fn sys_notify(dst_pid: i64, bits: i64) -> i64 {
+    syscall(USR_SYS_NOTIFY, dst_pid, bits, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Memory Syscalls
+// ═══════════════════════════════════════════════════════════════
+
+@safe fn sys_mmap(size: i64) -> i64 {
+    syscall(USR_SYS_MMAP, size, 0, 0)
+}
+
+@safe fn sys_share(region_id: i64, guest_pid: i64) -> i64 {
+    syscall(USR_SYS_SHARE, region_id, guest_pid, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// I/O Syscalls (for @device services only)
+// ═══════════════════════════════════════════════════════════════
+
+@device fn sys_irq_wait(irq: i64) -> i64 {
+    syscall(USR_SYS_IRQ_WAIT, irq, 0, 0)
+}
+
+@device fn sys_port_io(port: i64, value: i64, direction: i64) -> i64 {
+    syscall(USR_SYS_PORT_IO, port, value, direction)
+}
+
+@device fn sys_dma_alloc(size: i64) -> i64 {
+    syscall(USR_SYS_DMA_ALLOC, size, 0, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// IPC Helpers — build/parse 64-byte messages
+// ═══════════════════════════════════════════════════════════════
+
+// User-mode message buffer (allocated in service's address space)
+const USR_MSG_BUF: i64 = 0x400000 + 0x100000  // 1MB into user space
+const USR_REPLY_BUF: i64 = 0x400000 + 0x100100
+
+@safe fn usr_msg_clear(addr: i64) {
+    let mut i: i64 = 0
+    while i < USR_IPC_MSG_SIZE {
+        volatile_write_u8(addr + i, 0)
+        i = i + 1
+    }
+}
+
+@safe fn usr_msg_set_header(addr: i64, src_pid: i64, msg_type: i64, msg_id: i64) {
+    volatile_write_u64(addr, src_pid)
+    volatile_write_u32(addr + 8, msg_type)
+    volatile_write_u32(addr + 12, msg_id)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// High-level IPC: call a service and get reply
+// ═══════════════════════════════════════════════════════════════
+
+@safe fn usr_ipc_call(dst_pid: i64, msg_type: i64, payload0: i64, payload1: i64, payload2: i64) -> i64 {
+    let my_pid = sys_getpid()
+    usr_msg_clear(USR_MSG_BUF)
+    usr_msg_set_header(USR_MSG_BUF, my_pid, msg_type, 0)
+    volatile_write_u64(USR_MSG_BUF + 16, payload0)
+    volatile_write_u64(USR_MSG_BUF + 24, payload1)
+    volatile_write_u64(USR_MSG_BUF + 32, payload2)
+    usr_msg_clear(USR_REPLY_BUF)
+    sys_call(dst_pid, USR_MSG_BUF, USR_REPLY_BUF)
+    // Return first field of reply payload
+    volatile_read_u64(USR_REPLY_BUF + 16)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Convenience: VFS operations via IPC
+// ═══════════════════════════════════════════════════════════════
+
+const USR_MSG_VFS_OPEN: i64 = 0x0100
+const USR_MSG_VFS_READ: i64 = 0x0101
+const USR_MSG_VFS_WRITE: i64 = 0x0102
+const USR_MSG_VFS_CLOSE: i64 = 0x0103
+
+@safe fn usr_vfs_open(path_addr: i64) -> i64 {
+    let my_pid = sys_getpid()
+    usr_msg_clear(USR_MSG_BUF)
+    usr_msg_set_header(USR_MSG_BUF, my_pid, USR_MSG_VFS_OPEN, 0)
+    // Copy path to payload (max 39 bytes)
+    let mut i: i64 = 0
+    while i < 39 {
+        let ch = volatile_read_u8(path_addr + i)
+        volatile_write_u8(USR_MSG_BUF + 16 + i, ch)
+        if ch == 0 { i = 39 } else { i = i + 1 }
+    }
+    usr_msg_clear(USR_REPLY_BUF)
+    sys_call(USR_PID_VFS, USR_MSG_BUF, USR_REPLY_BUF)
+    volatile_read_u64(USR_REPLY_BUF + 16)  // fd
+}
+
+@safe fn usr_vfs_read(fd: i64, buf: i64, len: i64) -> i64 {
+    let my_pid = sys_getpid()
+    usr_msg_clear(USR_MSG_BUF)
+    usr_msg_set_header(USR_MSG_BUF, my_pid, USR_MSG_VFS_READ, 0)
+    volatile_write_u64(USR_MSG_BUF + 16, fd)
+    volatile_write_u64(USR_MSG_BUF + 24, 0)    // offset
+    volatile_write_u64(USR_MSG_BUF + 32, len)
+    usr_msg_clear(USR_REPLY_BUF)
+    sys_call(USR_PID_VFS, USR_MSG_BUF, USR_REPLY_BUF)
+    let bytes = volatile_read_u64(USR_REPLY_BUF + 48)
+    // Copy inline data to caller's buffer
+    let mut i: i64 = 0
+    while i < bytes && i < 32 {
+        volatile_write_u8(buf + i, volatile_read_u8(USR_REPLY_BUF + 16 + i))
+        i = i + 1
+    }
+    bytes
+}
+
+@safe fn usr_vfs_close(fd: i64) {
+    let my_pid = sys_getpid()
+    usr_msg_clear(USR_MSG_BUF)
+    usr_msg_set_header(USR_MSG_BUF, my_pid, USR_MSG_VFS_CLOSE, 0)
+    volatile_write_u64(USR_MSG_BUF + 16, fd)
+    usr_msg_clear(USR_REPLY_BUF)
+    sys_call(USR_PID_VFS, USR_MSG_BUF, USR_REPLY_BUF)
+}
