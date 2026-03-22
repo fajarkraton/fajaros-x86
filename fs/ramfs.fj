@@ -95,6 +95,71 @@ const FS_ENTRY_SIZE: i64 = 128
     -1
 }
 
+// Write arbitrary data from memory address to a ramfs file (by index)
+@kernel fn ramfs_write_at(index: i64, data_addr: i64, dlen: i64) -> i64 {
+    if index < 0 || index >= volatile_read(FS_BASE) { return -1 }
+    let addr = ramfs_entry_addr(index)
+    let data_offset = volatile_read(FS_BASE + 8)
+    // Check space: data area ends at 0x7E0000
+    if data_offset + dlen > 0x7E0000 { return -3 } // VFS_ENOSPC
+    let mut i: i64 = 0
+    while i < dlen {
+        volatile_write_u8(data_offset + i, volatile_read_u8(data_addr + i))
+        i = i + 1
+    }
+    volatile_write(addr + 32, dlen)             // size
+    volatile_write(addr + 40, data_offset)       // data_ptr
+    volatile_write(addr + 48, 1)                 // type = file
+    volatile_write(FS_BASE + 8, data_offset + dlen) // advance
+    0
+}
+
+// Create file/dir entry by name at memory address (not string literal)
+@kernel fn ramfs_create_at(name_addr: i64, ftype: i64) -> i64 {
+    // Check if already exists
+    let existing = ramfs_find_at(name_addr)
+    if existing >= 0 { return -5 } // VFS_EEXIST
+    let count = volatile_read(FS_BASE)
+    if count >= FS_MAX_FILES { return -3 } // VFS_ENOSPC
+    let addr = ramfs_entry_addr(count)
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(name_addr + i)
+        volatile_write_u8(addr + i, ch)
+        if ch == 0 { i = 31 } else { i = i + 1 }
+    }
+    volatile_write_u8(addr + 31, 0)
+    volatile_write(addr + 48, ftype)
+    volatile_write(addr + 32, 0)  // size = 0
+    volatile_write(addr + 40, 0)  // data_ptr = 0
+    volatile_write(FS_BASE, count + 1)
+    count
+}
+
+// Delete file by index (shift entries down)
+@kernel fn ramfs_delete_at(index: i64) -> i64 {
+    let count = volatile_read(FS_BASE)
+    if index < 0 || index >= count { return -1 }
+    // Shift entries after index down by 1
+    let mut i: i64 = index
+    while i < count - 1 {
+        let src = ramfs_entry_addr(i + 1)
+        let dst = ramfs_entry_addr(i)
+        let mut j: i64 = 0
+        while j < FS_ENTRY_SIZE {
+            volatile_write_u8(dst + j, volatile_read_u8(src + j))
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Clear last entry
+    let last = ramfs_entry_addr(count - 1)
+    let mut k: i64 = 0
+    while k < FS_ENTRY_SIZE { volatile_write_u8(last + k, 0); k = k + 1 }
+    volatile_write(FS_BASE, count - 1)
+    0
+}
+
 @kernel fn ramfs_write_file(name: str, data: str, dlen: i64) {
     let mut idx = ramfs_find(name)
     if idx == -1 { idx = ramfs_create_entry(name, 1) }

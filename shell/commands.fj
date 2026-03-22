@@ -3277,6 +3277,19 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     // ring3 — load and run Ring 3 ELF (Sprint 5.1)
     // "ring3" = 114,105,110,103,51
     if handled == 0 && len == 5 && volatile_read_u8(0x6F800) == 114 && volatile_read_u8(0x6F801) == 105 && volatile_read_u8(0x6F802) == 110 && volatile_read_u8(0x6F803) == 103 && volatile_read_u8(0x6F804) == 51 { cmd_ring3(); handled = 1 }
+    // === Sprint 5.2: IPC-based VFS commands ===
+    // touch-ipc (116,111,117,99,104,45,105,112,99,32) — create file via IPC
+    if handled == 0 && len > 10 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 117 && volatile_read_u8(0x6F803) == 99 && volatile_read_u8(0x6F804) == 104 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 && volatile_read_u8(0x6F807) == 112 && volatile_read_u8(0x6F808) == 99 { cmd_touch_ipc(); handled = 1 }
+    // rm-ipc (114,109,45,105,112,99,32) — delete file via IPC
+    if handled == 0 && len > 7 && volatile_read_u8(0x6F800) == 114 && volatile_read_u8(0x6F801) == 109 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 105 && volatile_read_u8(0x6F804) == 112 && volatile_read_u8(0x6F805) == 99 { cmd_rm_ipc(); handled = 1 }
+    // write-ipc (119,114,105,116,101,45,105,112,99,32) — write file via IPC
+    if handled == 0 && len > 10 && volatile_read_u8(0x6F800) == 119 && volatile_read_u8(0x6F801) == 114 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 116 && volatile_read_u8(0x6F804) == 101 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 && volatile_read_u8(0x6F807) == 112 && volatile_read_u8(0x6F808) == 99 { cmd_write_ipc(); handled = 1 }
+    // cat-ipc (99,97,116,45,105,112,99,32) — read file via IPC
+    if handled == 0 && len > 8 && volatile_read_u8(0x6F800) == 99 && volatile_read_u8(0x6F801) == 97 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 105 && volatile_read_u8(0x6F805) == 112 && volatile_read_u8(0x6F806) == 99 { cmd_cat_ipc(); handled = 1 }
+    // mkdir-ipc (109,107,100,105,114,45,105,112,99,32) — create dir via IPC
+    if handled == 0 && len > 10 && volatile_read_u8(0x6F800) == 109 && volatile_read_u8(0x6F801) == 107 && volatile_read_u8(0x6F802) == 100 && volatile_read_u8(0x6F803) == 105 && volatile_read_u8(0x6F804) == 114 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 && volatile_read_u8(0x6F807) == 112 && volatile_read_u8(0x6F808) == 99 { cmd_mkdir_ipc(); handled = 1 }
+    // vfs-lifecycle — full create+write+read+delete test (Sprint 5.2)
+    if handled == 0 && len == 13 && volatile_read_u8(0x6F800) == 118 && volatile_read_u8(0x6F801) == 102 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 108 { cmd_vfs_lifecycle(); handled = 1 }
 
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)

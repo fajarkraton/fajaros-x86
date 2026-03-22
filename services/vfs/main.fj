@@ -14,6 +14,9 @@ const MSG_VFS_WRITE: i64 = 0x0102
 const MSG_VFS_CLOSE: i64 = 0x0103
 const MSG_VFS_STAT: i64 = 0x0104
 const MSG_VFS_LIST: i64 = 0x0105
+const MSG_VFS_CREATE: i64 = 0x0106
+const MSG_VFS_DELETE: i64 = 0x0107
+const MSG_VFS_MKDIR: i64 = 0x0108
 const MSG_VFS_REPLY: i64 = 0x01FF
 const MSG_DEV_REG: i64 = 0x0400
 
@@ -633,6 +636,84 @@ const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
         return 0
     }
 
+    // ── Sprint 5.2: Writable filesystem via IPC ──
+
+    if msg_type == MSG_VFS_WRITE {
+        // Payload: +16=fd, +24=offset, +32..55=data (max 24 bytes inline), +56=len
+        let fd = volatile_read_u64(msg_buf + 16)
+        if vfs_fd_is_open(sender, fd) == 0 {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+            volatile_write_u64(reply_buf + 56, VFS_EBADF)
+            return 0
+        }
+        let fstype = volatile_read_u64(vfs_fd_addr(sender, fd) + 8)
+        if fstype != FSTYPE_RAMFS {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+            volatile_write_u64(reply_buf + 56, VFS_EACCES)
+            return 0
+        }
+        let inode = vfs_fd_get_inode(sender, fd)
+        let write_len = volatile_read_u64(msg_buf + 56)
+        let max_inline: i64 = 24  // bytes 32..55 = 24 bytes inline data
+        let actual_len = if write_len < max_inline { write_len } else { max_inline }
+
+        // Copy inline data to a scratch buffer, then write to ramfs
+        let scratch: i64 = 0x8B7000  // VFS write scratch (256 bytes)
+        let mut wi: i64 = 0
+        while wi < actual_len {
+            volatile_write_u8(scratch + wi, volatile_read_u8(msg_buf + 32 + wi))
+            wi = wi + 1
+        }
+        let result = ramfs_write_at(inode, scratch, actual_len)
+
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 48, if result == 0 { actual_len } else { 0 })
+        volatile_write_u64(reply_buf + 56, if result == 0 { VFS_OK } else { result })
+        return 0
+    }
+
+    if msg_type == MSG_VFS_CREATE {
+        // Payload: +16..47 = filename (null-terminated, max 32 bytes)
+        let name_addr = msg_buf + 16
+        let idx = ramfs_create_at(name_addr, 1)  // type=1 (file)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, idx)
+        volatile_write_u64(reply_buf + 24, if idx >= 0 { VFS_OK } else { idx })
+        return 0
+    }
+
+    if msg_type == MSG_VFS_DELETE {
+        // Payload: +16..47 = filename (null-terminated)
+        let name_addr = msg_buf + 16
+        let idx = ramfs_find_at(name_addr)
+        if idx < 0 {
+            ipc_msg_clear(reply_buf)
+            ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+            volatile_write_u64(reply_buf + 16, VFS_ENOENT)
+            return 0
+        }
+        let result = ramfs_delete_at(idx)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, if result == 0 { VFS_OK } else { result })
+        return 0
+    }
+
+    if msg_type == MSG_VFS_MKDIR {
+        // Payload: +16..47 = dirname (null-terminated)
+        let name_addr = msg_buf + 16
+        let idx = ramfs_create_at(name_addr, 2)  // type=2 (dir)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, idx)
+        volatile_write_u64(reply_buf + 24, if idx >= 0 { VFS_OK } else { idx })
+        return 0
+    }
+
     if msg_type == MSG_DEV_REG {
         // Device registration: payload = name[32] + type(8)
         let name_addr = msg_buf + 16
@@ -872,4 +953,316 @@ const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
         i = i + 1
     }
     if count == 0 { cprintln("  (no devices)", WHITE_ON_BLACK) }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sprint 5.2: IPC-Based Shell Commands
+// These go through the VFS IPC handler instead of direct ramfs access
+// ═══════════════════════════════════════════════════════════════
+
+const VFS_IPC_MSG: i64 = 0x8B7200    // IPC message buffer for shell VFS ops
+const VFS_IPC_REPLY: i64 = 0x8B7300  // IPC reply buffer
+
+// Helper: copy filename from cmdbuf[offset..] to IPC message payload
+@kernel fn vfs_ipc_set_name(msg: i64, cmd_offset: i64) {
+    let len = cmdbuf_len()
+    let mut i: i64 = 0
+    while i < 31 && cmd_offset + i < len {
+        volatile_write_u8(msg + 16 + i, volatile_read_u8(0x6F800 + cmd_offset + i))
+        i = i + 1
+    }
+    volatile_write_u8(msg + 16 + i, 0)
+}
+
+// touch-ipc <name> — create file via VFS IPC
+@kernel fn cmd_touch_ipc() {
+    let my_pid = volatile_read_u64(0x6FE00)
+    ipc_msg_clear(VFS_IPC_MSG)
+    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_CREATE, 0)
+    vfs_ipc_set_name(VFS_IPC_MSG, 10) // "touch-ipc " = 10 chars
+    ipc_msg_clear(VFS_IPC_REPLY)
+    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+    let idx = volatile_read_u64(VFS_IPC_REPLY + 16)
+    let status = volatile_read_u64(VFS_IPC_REPLY + 24)
+    if idx >= 0 && status == 0 {
+        cprint("Created: index=", GREEN_ON_BLACK)
+        cprint_decimal(idx, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else {
+        cprint("Error: ", RED_ON_BLACK)
+        cprint_decimal(status, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+}
+
+// rm-ipc <name> — delete file via VFS IPC
+@kernel fn cmd_rm_ipc() {
+    let my_pid = volatile_read_u64(0x6FE00)
+    ipc_msg_clear(VFS_IPC_MSG)
+    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_DELETE, 0)
+    vfs_ipc_set_name(VFS_IPC_MSG, 7) // "rm-ipc " = 7 chars
+    ipc_msg_clear(VFS_IPC_REPLY)
+    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+    let status = volatile_read_u64(VFS_IPC_REPLY + 16)
+    if status == 0 { cprintln("Deleted", GREEN_ON_BLACK) }
+    else { cprint("Error: ", RED_ON_BLACK); cprint_decimal(status, RED_ON_BLACK); console_putchar(10, WHITE_ON_BLACK) }
+}
+
+// mkdir-ipc <name> — create directory via VFS IPC
+@kernel fn cmd_mkdir_ipc() {
+    let my_pid = volatile_read_u64(0x6FE00)
+    ipc_msg_clear(VFS_IPC_MSG)
+    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_MKDIR, 0)
+    vfs_ipc_set_name(VFS_IPC_MSG, 10) // "mkdir-ipc " = 10 chars
+    ipc_msg_clear(VFS_IPC_REPLY)
+    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+    let idx = volatile_read_u64(VFS_IPC_REPLY + 16)
+    let status = volatile_read_u64(VFS_IPC_REPLY + 24)
+    if idx >= 0 && status == 0 {
+        cprint("Directory created: index=", GREEN_ON_BLACK)
+        cprint_decimal(idx, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    } else {
+        cprint("Error: ", RED_ON_BLACK)
+        cprint_decimal(status, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+}
+
+// write-ipc <name> <text> — write text to file via VFS IPC (open + write + close)
+@kernel fn cmd_write_ipc() {
+    let my_pid = volatile_read_u64(0x6FE00)
+    // Parse: "write-ipc <name> <text>"
+    // Find first space after "write-ipc " (offset 10)
+    let len = cmdbuf_len()
+    let mut name_end: i64 = 10
+    while name_end < len && volatile_read_u8(0x6F800 + name_end) != 32 { name_end = name_end + 1 }
+    let name_len = name_end - 10
+    if name_len <= 0 { cprintln("Usage: write-ipc <name> <text>", RED_ON_BLACK); return }
+
+    // Create file if it doesn't exist
+    ipc_msg_clear(VFS_IPC_MSG)
+    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_CREATE, 0)
+    vfs_ipc_set_name(VFS_IPC_MSG, 10)
+    // Null-terminate just the name (overwrite space with 0)
+    volatile_write_u8(VFS_IPC_MSG + 16 + name_len, 0)
+    ipc_msg_clear(VFS_IPC_REPLY)
+    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+    // Ignore EEXIST — file may already exist
+
+    // Open file
+    ipc_msg_clear(VFS_IPC_MSG)
+    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_OPEN, 0)
+    // Copy name to payload, strip leading / if not present
+    let mut ni: i64 = 0
+    while ni < name_len && ni < 31 {
+        volatile_write_u8(VFS_IPC_MSG + 16 + ni, volatile_read_u8(0x6F800 + 10 + ni))
+        ni = ni + 1
+    }
+    volatile_write_u8(VFS_IPC_MSG + 16 + ni, 0)
+    ipc_msg_clear(VFS_IPC_REPLY)
+    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+    let fd = volatile_read_u64(VFS_IPC_REPLY + 16)
+    if fd < 0 { cprintln("Error: cannot open file", RED_ON_BLACK); return }
+
+    // Write data (text after "<name> ")
+    let data_start = name_end + 1
+    let data_len = if data_start < len { len - data_start } else { 0 }
+    if data_len > 0 {
+        ipc_msg_clear(VFS_IPC_MSG)
+        ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_WRITE, 0)
+        volatile_write_u64(VFS_IPC_MSG + 16, fd)
+        volatile_write_u64(VFS_IPC_MSG + 24, 0) // offset
+        // Copy data inline (max 24 bytes)
+        let copy_len = if data_len > 24 { 24 } else { data_len }
+        let mut di: i64 = 0
+        while di < copy_len {
+            volatile_write_u8(VFS_IPC_MSG + 32 + di, volatile_read_u8(0x6F800 + data_start + di))
+            di = di + 1
+        }
+        volatile_write_u64(VFS_IPC_MSG + 56, copy_len)
+        ipc_msg_clear(VFS_IPC_REPLY)
+        vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+        let written = volatile_read_u64(VFS_IPC_REPLY + 48)
+        cprint("Wrote ", GREEN_ON_BLACK)
+        cprint_decimal(written, CYAN_ON_BLACK)
+        cprintln(" bytes", GREEN_ON_BLACK)
+    }
+
+    // Close
+    ipc_msg_clear(VFS_IPC_MSG)
+    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_CLOSE, 0)
+    volatile_write_u64(VFS_IPC_MSG + 16, fd)
+    ipc_msg_clear(VFS_IPC_REPLY)
+    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+}
+
+// cat-ipc <name> — read file via VFS IPC (open + read + close)
+@kernel fn cmd_cat_ipc() {
+    let my_pid = volatile_read_u64(0x6FE00)
+    // Open
+    ipc_msg_clear(VFS_IPC_MSG)
+    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_OPEN, 0)
+    vfs_ipc_set_name(VFS_IPC_MSG, 8) // "cat-ipc " = 8 chars
+    ipc_msg_clear(VFS_IPC_REPLY)
+    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+    let fd = volatile_read_u64(VFS_IPC_REPLY + 16)
+    let file_size = volatile_read_u64(VFS_IPC_REPLY + 24)
+    if fd < 0 { cprintln("Error: file not found", RED_ON_BLACK); return }
+
+    // Read in chunks of 32 bytes
+    let mut offset: i64 = 0
+    while offset < file_size {
+        ipc_msg_clear(VFS_IPC_MSG)
+        ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_READ, 0)
+        volatile_write_u64(VFS_IPC_MSG + 16, fd)
+        volatile_write_u64(VFS_IPC_MSG + 24, offset)
+        volatile_write_u64(VFS_IPC_MSG + 32, 32)
+        ipc_msg_clear(VFS_IPC_REPLY)
+        vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+        let bytes_read = volatile_read_u64(VFS_IPC_REPLY + 48)
+        if bytes_read <= 0 { offset = file_size }
+        else {
+            let mut i: i64 = 0
+            while i < bytes_read {
+                let ch = volatile_read_u8(VFS_IPC_REPLY + 16 + i)
+                console_putchar(ch, WHITE_ON_BLACK)
+                i = i + 1
+            }
+            offset = offset + bytes_read
+        }
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Close
+    ipc_msg_clear(VFS_IPC_MSG)
+    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_CLOSE, 0)
+    volatile_write_u64(VFS_IPC_MSG + 16, fd)
+    ipc_msg_clear(VFS_IPC_REPLY)
+    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+}
+
+// vfs-lifecycle — Sprint 5.2 full test: create + write + read + delete
+@kernel fn cmd_vfs_lifecycle() {
+    cprintln("=== VFS Lifecycle Test (Sprint 5.2) ===", YELLOW_ON_BLACK)
+    let my_pid = volatile_read_u64(0x6FE00)
+    let msg = VFS_IPC_MSG
+    let reply = VFS_IPC_REPLY
+
+    // 1. Create "test52"
+    cprint("[1] Create test52: ", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_CREATE, 0)
+    volatile_write_u8(msg+16, 116) // t
+    volatile_write_u8(msg+17, 101) // e
+    volatile_write_u8(msg+18, 115) // s
+    volatile_write_u8(msg+19, 116) // t
+    volatile_write_u8(msg+20, 53)  // 5
+    volatile_write_u8(msg+21, 50)  // 2
+    volatile_write_u8(msg+22, 0)
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let idx = volatile_read_u64(reply + 16)
+    if idx >= 0 { cprint("OK idx=", GREEN_ON_BLACK); cprint_decimal(idx, CYAN_ON_BLACK) }
+    else { cprint("FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // 2. Open test52
+    cprint("[2] Open test52: ", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_OPEN, 0)
+    volatile_write_u8(msg+16, 116)
+    volatile_write_u8(msg+17, 101)
+    volatile_write_u8(msg+18, 115)
+    volatile_write_u8(msg+19, 116)
+    volatile_write_u8(msg+20, 53)
+    volatile_write_u8(msg+21, 50)
+    volatile_write_u8(msg+22, 0)
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let fd = volatile_read_u64(reply + 16)
+    if fd >= 0 { cprint("OK fd=", GREEN_ON_BLACK); cprint_decimal(fd, CYAN_ON_BLACK) }
+    else { cprint("FAIL", RED_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // 3. Write "hello" to test52
+    cprint("[3] Write 'hello': ", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_WRITE, 0)
+    volatile_write_u64(msg + 16, fd)
+    volatile_write_u64(msg + 24, 0) // offset
+    volatile_write_u8(msg + 32, 104) // h
+    volatile_write_u8(msg + 33, 101) // e
+    volatile_write_u8(msg + 34, 108) // l
+    volatile_write_u8(msg + 35, 108) // l
+    volatile_write_u8(msg + 36, 111) // o
+    volatile_write_u64(msg + 56, 5)  // len=5
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let written = volatile_read_u64(reply + 48)
+    if written == 5 { cprintln("OK (5 bytes)", GREEN_ON_BLACK) }
+    else { cprint("FAIL wrote=", RED_ON_BLACK); cprint_decimal(written, RED_ON_BLACK); console_putchar(10, WHITE_ON_BLACK) }
+
+    // 4. Read back from test52
+    cprint("[4] Read back: ", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_READ, 0)
+    volatile_write_u64(msg + 16, fd)
+    volatile_write_u64(msg + 24, 0)
+    volatile_write_u64(msg + 32, 32)
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let bread = volatile_read_u64(reply + 48)
+    cprint("\"", WHITE_ON_BLACK)
+    let mut ri: i64 = 0
+    while ri < bread {
+        console_putchar(volatile_read_u8(reply + 16 + ri), GREEN_ON_BLACK)
+        ri = ri + 1
+    }
+    cprintln("\"", WHITE_ON_BLACK)
+
+    // 5. Close
+    cprint("[5] Close: ", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_CLOSE, 0)
+    volatile_write_u64(msg + 16, fd)
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    cprintln("OK", GREEN_ON_BLACK)
+
+    // 6. Delete test52
+    cprint("[6] Delete test52: ", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_DELETE, 0)
+    volatile_write_u8(msg+16, 116)
+    volatile_write_u8(msg+17, 101)
+    volatile_write_u8(msg+18, 115)
+    volatile_write_u8(msg+19, 116)
+    volatile_write_u8(msg+20, 53)
+    volatile_write_u8(msg+21, 50)
+    volatile_write_u8(msg+22, 0)
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let del_status = volatile_read_u64(reply + 16)
+    if del_status == 0 { cprintln("OK", GREEN_ON_BLACK) }
+    else { cprint("FAIL ", RED_ON_BLACK); cprint_decimal(del_status, RED_ON_BLACK); console_putchar(10, WHITE_ON_BLACK) }
+
+    // 7. Verify deleted (try open again)
+    cprint("[7] Verify deleted: ", WHITE_ON_BLACK)
+    ipc_msg_clear(msg)
+    ipc_msg_set_header(msg, my_pid, MSG_VFS_OPEN, 0)
+    volatile_write_u8(msg+16, 116)
+    volatile_write_u8(msg+17, 101)
+    volatile_write_u8(msg+18, 115)
+    volatile_write_u8(msg+19, 116)
+    volatile_write_u8(msg+20, 53)
+    volatile_write_u8(msg+21, 50)
+    volatile_write_u8(msg+22, 0)
+    ipc_msg_clear(reply)
+    vfs_svc_handle_msg(my_pid, msg, reply)
+    let fd2 = volatile_read_u64(reply + 16)
+    if fd2 < 0 { cprintln("OK (not found)", GREEN_ON_BLACK) }
+    else { cprintln("FAIL (still exists!)", RED_ON_BLACK) }
+
+    cprintln("=== VFS lifecycle test complete ===", GREEN_ON_BLACK)
 }

@@ -212,6 +212,25 @@ const USR_MSG_VFS_CLOSE: i64 = 0x0103
     bytes
 }
 
+@safe fn usr_vfs_write(fd: i64, data_addr: i64, len: i64) -> i64 {
+    let my_pid = sys_getpid()
+    usr_msg_clear(USR_MSG_BUF)
+    usr_msg_set_header(USR_MSG_BUF, my_pid, USR_MSG_VFS_WRITE, 0)
+    volatile_write_u64(USR_MSG_BUF + 16, fd)
+    volatile_write_u64(USR_MSG_BUF + 24, 0)    // offset
+    // Copy data inline (max 24 bytes: msg bytes 32..55)
+    let copy_len = if len > 24 { 24 } else { len }
+    let mut i: i64 = 0
+    while i < copy_len {
+        volatile_write_u8(USR_MSG_BUF + 32 + i, volatile_read_u8(data_addr + i))
+        i = i + 1
+    }
+    volatile_write_u64(USR_MSG_BUF + 56, copy_len)
+    usr_msg_clear(USR_REPLY_BUF)
+    sys_call(USR_PID_VFS, USR_MSG_BUF, USR_REPLY_BUF)
+    volatile_read_u64(USR_REPLY_BUF + 48) // bytes written
+}
+
 @safe fn usr_vfs_close(fd: i64) {
     let my_pid = sys_getpid()
     usr_msg_clear(USR_MSG_BUF)
