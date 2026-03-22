@@ -109,3 +109,64 @@ const SVC_CRASHED: i64 = 2
         i = i + 1
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Sprint 5.4.8: Auto-respawn crashed services
+// Scans service table, detects zombies, marks crashed, restarts
+// ═══════════════════════════════════════════════════════════════
+
+const INIT_MAX_RESTARTS: i64 = 5  // max restart attempts before giving up
+
+@kernel fn init_check_respawn() -> i64 {
+    let mut respawned: i64 = 0
+    let mut slot: i64 = 0
+    while slot < INIT_SVC_MAX {
+        let addr = INIT_SVC_TABLE + slot * INIT_SVC_SIZE
+        let pid = volatile_read_u64(addr)
+        let state = volatile_read_u64(addr + 8)
+        let restarts = volatile_read_u64(addr + 16)
+
+        if pid > 0 && state == SVC_RUNNING {
+            // Check if the process is actually zombie (crashed)
+            let proc_state = proc_v2_get(pid, 0)
+            if proc_state == PROC_STATE_ZOMBIE || proc_state == PROC_STATE_FREE {
+                // Service crashed!
+                volatile_write_u64(addr + 8, SVC_CRASHED)
+
+                if restarts < INIT_MAX_RESTARTS {
+                    // Reap zombie
+                    if proc_state == PROC_STATE_ZOMBIE {
+                        proc_v2_set(pid, 0, PROC_STATE_FREE)
+                    }
+
+                    // Respawn: re-create process at same PID
+                    proc_v2_set(pid, 0, PROC_STATE_READY)
+                    proc_v2_set(pid, 8, pid)
+                    proc_v2_set(pid, 16, 0)  // parent = kernel
+                    proc_v2_set(pid, 56, 0)  // clear exit code
+
+                    // Update service table
+                    volatile_write_u64(addr + 8, SVC_RUNNING)
+                    volatile_write_u64(addr + 16, restarts + 1)
+                    respawned = respawned + 1
+                }
+                // else: exceeded max restarts, leave as CRASHED
+            }
+        }
+        slot = slot + 1
+    }
+    respawned
+}
+
+// Shell command: respawn — check and respawn crashed services
+@kernel fn cmd_init_respawn() {
+    cprintln("Checking services...", YELLOW_ON_BLACK)
+    let count = init_check_respawn()
+    if count > 0 {
+        cprint("Respawned ", GREEN_ON_BLACK)
+        cprint_decimal(count, CYAN_ON_BLACK)
+        cprintln(" service(s)", GREEN_ON_BLACK)
+    } else {
+        cprintln("All services OK", GREEN_ON_BLACK)
+    }
+}

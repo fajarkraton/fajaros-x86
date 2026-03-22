@@ -207,11 +207,12 @@
     cmdbuf_clear()
     cprint("nova> ", GREEN_ON_BLACK)
 
-    // Init shift/caps state
+    // Init shift/caps/ctrl state
     volatile_write(0x6FBE0, 0)  // shift = 0
     volatile_write(0x6FBE8, 0)  // caps = 0
+    volatile_write(0x6FBF0, 0)  // ctrl = 0 (Sprint 5.4.7)
 
-    // Main shell loop — shift, caps lock, arrow history
+    // Main shell loop — shift, caps lock, ctrl, arrow history
     let mut running: i64 = 1
     let mut ext_prefix: i64 = 0
     while running == 1 {
@@ -234,6 +235,13 @@
                 let caps = volatile_read(0x6FBE8)
                 volatile_write(0x6FBE8, 1 - caps)
             }
+            // Ctrl make/break (scancode 0x1D / 0x9D)
+            else if sc == 0x1D {
+                volatile_write(0x6FBF0, 1) // ctrl pressed
+            }
+            else if sc == 0x9D {
+                volatile_write(0x6FBF0, 0) // ctrl released
+            }
             // Arrow keys (after E0 prefix)
             else if ext_prefix == 1 {
                 ext_prefix = 0
@@ -246,6 +254,19 @@
             }
             // Normal key press
             else if sc > 0 && sc < 128 {
+                // Sprint 5.4.7: Ctrl+C — send SIGINT to foreground process
+                let ctrl = volatile_read(0x6FBF0)
+                if ctrl == 1 && sc == 0x2E { // 0x2E = scancode for 'C'
+                    cprintln("^C", RED_ON_BLACK)
+                    // Send SIGINT to current foreground PID (if not kernel)
+                    let fg_pid = volatile_read_u64(0x6FE00)
+                    if fg_pid > 0 && fg_pid < PROC_V2_MAX {
+                        sig_send(fg_pid, SIG_INT)
+                    }
+                    cmdbuf_clear()
+                    cprint("nova> ", GREEN_ON_BLACK)
+                }
+                else {
                 let ascii = sc2ascii(sc)
                 if ascii == 10 {
                     console_putchar(10, WHITE_ON_BLACK)
@@ -266,6 +287,7 @@
                     cmdbuf_push(ascii)
                     console_putchar(ascii, WHITE_ON_BLACK)
                 }
+                } // close Ctrl+C else block
             }
         }
     }

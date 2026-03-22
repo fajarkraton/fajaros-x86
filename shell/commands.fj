@@ -3280,8 +3280,10 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     // vfs-lifecycle — full create+write+read+delete test (Sprint 5.2)
     if handled == 0 && len == 13 && volatile_read_u8(0x6F800) == 118 && volatile_read_u8(0x6F801) == 102 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 108 { cmd_vfs_lifecycle(); handled = 1 }
     // lifecycle — Sprint 5.4 process lifecycle test
-    // "lifecycle" = 108,105,102,101,99,121,99,108,101
     if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 108 && volatile_read_u8(0x6F801) == 105 && volatile_read_u8(0x6F802) == 102 && volatile_read_u8(0x6F803) == 101 { cmd_proc_lifecycle(); handled = 1 }
+    // respawn — check and respawn crashed services (Sprint 5.4.8)
+    // "respawn" = 114,101,115,112,97,119,110
+    if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 114 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 112 { cmd_init_respawn(); handled = 1 }
 
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)
