@@ -5,10 +5,10 @@
 // the privileged operations that cannot run in user space.
 
 // =================================================================
-// GPU Stub State — at 0x9B4000 (64 bytes)
+// GPU Stub State — at 0x9B5000 (was 0x9B4000 — overlapped GPU_SCRATCH end 0x9B4600)
 // =================================================================
 
-const GPU_STUB_STATE: i64 = 0x9B4000
+const GPU_STUB_STATE: i64 = 0x9B5000
 
 // Field offsets
 const GPU_STUB_BAR0_ADDR: i64 = 0     // Mapped BAR0 base address
@@ -99,7 +99,7 @@ const GPU_STUB_INIT_DONE: i64 = 40    // 1 if initialized
 // Per entry: +0 = active (0/1), +8 = phys_addr
 // =================================================================
 
-const GPU_DMA_TABLE: i64 = 0x9B4080
+const GPU_DMA_TABLE: i64 = 0x9B5080  // moved with GPU_STUB_STATE
 const GPU_DMA_MAX: i64 = 8
 const GPU_DMA_ENTRY: i64 = 16
 
