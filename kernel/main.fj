@@ -143,69 +143,16 @@
     vfs_svc_init()
     println("[VFS] VFS service initialized")
 
-    // Sprint 5.3: TCP test with serial output
+    // Sprint 5.3: HTTP GET via live TCP
     tcp_init()
-    println("[TEST] 5.3: TCP connect 10.0.2.2:8080...")
-    let tc = tcp_connect(ip_pack(10, 0, 2, 2), 8080)
-    if tc < 0 { println("[TEST] No TCP slots") }
-    else {
-        println("[TEST] SYN sent")
-        let mut ta: i64 = 0
-        let vio3 = net_state_read(56)
-        while ta < 15000000 && tr(tc, 0) == TCP_SYN_SENT {
-            // Periodically re-kick RX queue (QEMU might need reminder)
-            if ta % 1000000 == 0 && vio3 != 0 { port_outw(vio3 + 0x10, 0) }
-            let fl = net_process_rx()
-            if fl > 0 {
-                println("[TEST] RX!")
-                tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, fl)
-            }
-            pause()
-            ta = ta + 1
-        }
-        // Verify desc[0].len is 2048
-        let d0_len = volatile_read_u32(VQ_RX_BASE + 8)
-        if d0_len == 2048 { println("[TEST] desc[0].len=2048 OK") }
-        else if d0_len == 0 { println("[TEST] desc[0].len=0 BAD!") }
-        else { println("[TEST] desc[0].len unexpected") }
-        // Also check desc[255]
-        let d255_len = volatile_read_u32(VQ_RX_BASE + 255*16 + 8)
-        if d255_len == 2048 { println("[TEST] desc[255].len=2048 OK") }
-        else { println("[TEST] desc[255].len not 2048") }
-
-        // Scan EVERY 4-byte aligned position for used ring marker
-        // The first used ring entry has (id:u32, len:u32). If QEMU wrote something,
-        // there will be a non-zero value (the desc_id or packet length)
-        let mut found_at: i64 = -1
-        let mut sx: i64 = 0x1000 // start after desc+avail area
-        while sx < 0x3000 && found_at == -1 {
-            // Check used.idx (u16 at offset+2)
-            let v = volatile_read_u16(VQ_RX_BASE + sx + 2) & 0xFFFF
-            if v > 0 && v < 100 { found_at = sx }
-            // Also check used ring entry (u32 at offset+4 = first entry's id)
-            let e = volatile_read_u32(VQ_RX_BASE + sx + 4) & 0xFFFFFFFF
-            if e > 0 && e < 256 && found_at == -1 { found_at = sx }
-            sx = sx + 4
-        }
-        if found_at >= 0 {
-            // Print exact offset for debugging
-            if found_at == 0x2000 { println("[TEST] Used@0x2000 MATCH!") }
-            else if found_at == 0x1200 { println("[TEST] Used@0x1200") }
-            else if found_at == 0x1208 { println("[TEST] Used@0x1208") }
-            else if found_at == 0x1204 { println("[TEST] Used@0x1204") }
-            else if found_at > 0x1000 && found_at < 0x1300 { println("[TEST] Used@0x1xxx") }
-            else if found_at > 0x2000 && found_at < 0x2100 { println("[TEST] Used@0x20xx") }
-            else if found_at < 0x1000 { println("[TEST] Used@<0x1000 (in desc table!)") }
-            else if found_at >= 0x1000 && found_at < 0x2000 { println("[TEST] Used@0x1000-0x1FFF (avail area)") }
-            else if found_at >= 0x2000 && found_at < 0x3000 { println("[TEST] Used@0x2000-0x2FFF") }
-            else { println("[TEST] Used@>0x3000") }
-        } else { println("[TEST] No used ring writes") }
-        let st = tr(tc, 0)
-        if st == TCP_ESTABLISHED { println("[TEST] TCP ESTABLISHED!") }
-        else if st == TCP_SYN_SENT { println("[TEST] TCP SYN_SENT timeout") }
-        else { println("[TEST] TCP unexpected state") }
-        tcp_close(tc)
-    }
+    println("[TEST] 5.3: HTTP GET http://10.0.2.2:8080/...")
+    volatile_write_u8(HTTP_SCRATCH, 47) // '/'
+    volatile_write_u8(HTTP_SCRATCH + 1, 0)
+    let http_status = http_get(ip_pack(10, 0, 2, 2), 8080, HTTP_SCRATCH, 1)
+    if http_status == 200 { println("[TEST] Sprint 5.3: HTTP 200 OK!") }
+    else if http_status > 0 { println("[TEST] Sprint 5.3: HTTP response received") }
+    else if http_status == -2 { println("[TEST] Sprint 5.3: TCP handshake failed") }
+    else { println("[TEST] Sprint 5.3: No response") }
     println("[TEST] 5.3 done")
 
     // Ring 3 user program is pre-installed but NOT auto-run
