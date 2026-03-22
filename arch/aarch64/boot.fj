@@ -1,0 +1,293 @@
+// FajarOS Nova v2.0 — ARM64 Boot + UART + GIC (Radxa Dragon Q6A)
+// @kernel — bare-metal ARM64 entry point for QEMU virt + real Q6A
+// Target: aarch64-unknown-none
+
+// ═══════════════════════════════════════════════════════════════
+// UART PL011 (QEMU virt: 0x09000000, Q6A: 0x078C0000)
+// ═══════════════════════════════════════════════════════════════
+
+const UART_BASE_QEMU: i64 = 0x09000000   // QEMU virt machine PL011
+const UART_BASE_Q6A: i64 = 0x078C0000    // QCS6490 UART (ttyMSM0)
+
+// PL011 register offsets
+const UART_DR: i64 = 0x00      // Data register
+const UART_FR: i64 = 0x18      // Flag register
+const UART_IBRD: i64 = 0x24    // Integer baud rate
+const UART_FBRD: i64 = 0x28    // Fractional baud rate
+const UART_LCR: i64 = 0x2C     // Line control
+const UART_CR: i64 = 0x30      // Control register
+const UART_IMSC: i64 = 0x38    // Interrupt mask
+
+const UART_FR_TXFF: i64 = 0x20  // TX FIFO full
+const UART_FR_RXFE: i64 = 0x10  // RX FIFO empty
+
+// Selected UART base (set at boot based on detection)
+const ARM64_STATE: i64 = 0x40100000   // ARM64 kernel state (above 1GB)
+const ARM64_UART: i64 = 0             // +0: active UART base address
+const ARM64_BOARD: i64 = 8            // +8: 0=qemu, 1=q6a
+const ARM64_BOOT_TICKS: i64 = 16
+const ARM64_GIC_BASE: i64 = 24
+
+@kernel fn arm64_read(off: i64) -> i64 { volatile_read_u64(ARM64_STATE + off) }
+@kernel fn arm64_write(off: i64, val: i64) { volatile_write_u64(ARM64_STATE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// UART Operations
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn uart_init() {
+    // Try QEMU first (read UART ID register)
+    let qemu_id = volatile_read_u32(UART_BASE_QEMU + 0xFE0)
+    if qemu_id == 0x11 || qemu_id == 0x41 {
+        arm64_write(ARM64_UART, UART_BASE_QEMU)
+        arm64_write(ARM64_BOARD, 0)
+    } else {
+        arm64_write(ARM64_UART, UART_BASE_Q6A)
+        arm64_write(ARM64_BOARD, 1)
+    }
+
+    let base = arm64_read(ARM64_UART)
+
+    // Disable UART
+    volatile_write_u32(base + UART_CR, 0)
+    // Set baud rate (115200 at 24MHz clock: IBRD=13, FBRD=1)
+    volatile_write_u32(base + UART_IBRD, 13)
+    volatile_write_u32(base + UART_FBRD, 1)
+    // 8N1, FIFO enable
+    volatile_write_u32(base + UART_LCR, (3 << 5) | (1 << 4))  // WLEN=8bit, FEN=1
+    // Enable UART (TX + RX + UART enable)
+    volatile_write_u32(base + UART_CR, (1 << 8) | (1 << 9) | 1)  // TXE + RXE + UARTEN
+}
+
+@kernel fn uart_putc(ch: i64) {
+    let base = arm64_read(ARM64_UART)
+    if base == 0 { return }
+    // Wait for TX FIFO not full
+    let mut wait: i64 = 0
+    while (volatile_read_u32(base + UART_FR) & UART_FR_TXFF) != 0 && wait < 100000 {
+        wait = wait + 1
+    }
+    volatile_write_u32(base + UART_DR, ch & 0xFF)
+}
+
+@kernel fn uart_puts(s: str) {
+    let len = str_len(s)
+    let mut i: i64 = 0
+    while i < len {
+        let ch = str_byte_at(s, i)
+        if ch == 10 { uart_putc(13) }  // CR before LF
+        uart_putc(ch)
+        i = i + 1
+    }
+}
+
+@kernel fn uart_put_hex(val: i64, digits: i64) {
+    let mut i = digits - 1
+    while i >= 0 {
+        let n = (val >> (i * 4)) & 0xF
+        if n < 10 { uart_putc(48 + n) }
+        else { uart_putc(55 + n) }
+        i = i - 1
+    }
+}
+
+@kernel fn uart_put_dec(val: i64) {
+    if val == 0 { uart_putc(48); return }
+    let mut buf: [i64; 20] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut v = val
+    let mut len: i64 = 0
+    while v > 0 { buf[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
+    let mut i: i64 = len - 1
+    while i >= 0 { uart_putc(buf[i]); i = i - 1 }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GICv3 — Generic Interrupt Controller (QEMU virt)
+// QEMU virt: GICD at 0x08000000, GICR at 0x080A0000
+// Q6A: GICD at 0x17A00000 (QCS6490)
+// ═══════════════════════════════════════════════════════════════
+
+const GICD_BASE_QEMU: i64 = 0x08000000
+const GICR_BASE_QEMU: i64 = 0x080A0000
+const GICD_BASE_Q6A: i64 = 0x17A00000
+
+// GICD registers
+const GICD_CTLR: i64 = 0x000
+const GICD_TYPER: i64 = 0x004
+const GICD_ISENABLER: i64 = 0x100
+const GICD_ICENABLER: i64 = 0x180
+const GICD_IPRIORITYR: i64 = 0x400
+const GICD_ITARGETSR: i64 = 0x800
+
+@kernel fn gic_init() {
+    let board = arm64_read(ARM64_BOARD)
+    let gicd = if board == 0 { GICD_BASE_QEMU } else { GICD_BASE_Q6A }
+    arm64_write(ARM64_GIC_BASE, gicd)
+
+    // Enable distributor
+    volatile_write_u32(gicd + GICD_CTLR, 1)
+
+    // Read number of supported interrupts
+    let typer = volatile_read_u32(gicd + GICD_TYPER)
+    let it_lines = (typer & 0x1F) + 1
+    let max_irq = it_lines * 32
+
+    uart_puts("[GIC] Distributor at 0x")
+    uart_put_hex(gicd, 8)
+    uart_puts(", max IRQ: ")
+    uart_put_dec(max_irq)
+    uart_putc(10)
+}
+
+@kernel fn gic_enable_irq(irq: i64) {
+    let gicd = arm64_read(ARM64_GIC_BASE)
+    let reg = gicd + GICD_ISENABLER + (irq / 32) * 4
+    volatile_write_u32(reg, 1 << (irq % 32))
+}
+
+@kernel fn gic_disable_irq(irq: i64) {
+    let gicd = arm64_read(ARM64_GIC_BASE)
+    let reg = gicd + GICD_ICENABLER + (irq / 32) * 4
+    volatile_write_u32(reg, 1 << (irq % 32))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ARM64 Timer — Generic Timer (CNTPCT_EL0)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn arm64_timer_freq() -> i64 {
+    // CNTFRQ_EL0 — counter frequency (typically 62.5MHz on QEMU)
+    // Read via builtin
+    timer_get_freq()
+}
+
+@kernel fn arm64_timer_ticks() -> i64 {
+    timer_get_ticks()
+}
+
+@kernel fn arm64_sleep_ms(ms: i64) {
+    let freq = arm64_timer_freq()
+    let target = arm64_timer_ticks() + (freq / 1000) * ms
+    while arm64_timer_ticks() < target {}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ARM64 Memory — Simple frame allocator
+// 256MB RAM starting at 0x40000000 (QEMU virt)
+// ═══════════════════════════════════════════════════════════════
+
+const ARM64_RAM_BASE: i64 = 0x40000000
+const ARM64_RAM_SIZE: i64 = 0x10000000   // 256MB
+const ARM64_FRAME_SIZE: i64 = 4096
+const ARM64_FRAME_BITMAP: i64 = 0x40200000  // Bitmap at RAM+2MB
+const ARM64_FRAME_TOTAL: i64 = 65536        // 256MB / 4KB
+
+@kernel fn arm64_frame_init() {
+    // Clear bitmap
+    let mut i: i64 = 0
+    while i < ARM64_FRAME_TOTAL / 8 {
+        volatile_write_u8(ARM64_FRAME_BITMAP + i, 0)
+        i = i + 1
+    }
+    // Mark first 4MB as used (kernel + bitmap + stack)
+    i = 0
+    while i < 1024 {  // 1024 frames = 4MB
+        let byte_idx = i / 8
+        let bit_idx = i % 8
+        let old = volatile_read_u8(ARM64_FRAME_BITMAP + byte_idx)
+        volatile_write_u8(ARM64_FRAME_BITMAP + byte_idx, old | (1 << bit_idx))
+        i = i + 1
+    }
+}
+
+@kernel fn arm64_frame_alloc() -> i64 {
+    let mut f: i64 = 1024  // Start after reserved
+    while f < ARM64_FRAME_TOTAL {
+        let byte_idx = f / 8
+        let bit_idx = f % 8
+        let val = volatile_read_u8(ARM64_FRAME_BITMAP + byte_idx)
+        if (val & (1 << bit_idx)) == 0 {
+            volatile_write_u8(ARM64_FRAME_BITMAP + byte_idx, val | (1 << bit_idx))
+            return ARM64_RAM_BASE + f * ARM64_FRAME_SIZE
+        }
+        f = f + 1
+    }
+    -1
+}
+
+@kernel fn arm64_frame_free(addr: i64) {
+    let f = (addr - ARM64_RAM_BASE) / ARM64_FRAME_SIZE
+    if f < 0 || f >= ARM64_FRAME_TOTAL { return }
+    let byte_idx = f / 8
+    let bit_idx = f % 8
+    let old = volatile_read_u8(ARM64_FRAME_BITMAP + byte_idx)
+    volatile_write_u8(ARM64_FRAME_BITMAP + byte_idx, old & (255 - (1 << bit_idx)))
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ARM64 Kernel Entry — kernel_main
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn kernel_main() {
+    // Phase 1: UART init
+    uart_init()
+    uart_puts("\r\n")
+    uart_puts("══════════════════════════════════════════\r\n")
+    uart_puts(" FajarOS Nova v2.0 ARM64 Microkernel\r\n")
+    uart_puts("══════════════════════════════════════════\r\n")
+
+    let board = arm64_read(ARM64_BOARD)
+    uart_puts("[BOOT] Board: ")
+    if board == 0 { uart_puts("QEMU virt\r\n") }
+    else { uart_puts("Radxa Dragon Q6A (QCS6490)\r\n") }
+
+    uart_puts("[BOOT] UART at 0x")
+    uart_put_hex(arm64_read(ARM64_UART), 8)
+    uart_putc(10)
+
+    // Phase 2: GIC init
+    gic_init()
+
+    // Phase 3: Memory init
+    arm64_frame_init()
+    uart_puts("[MEM] Frame allocator ready (256MB, 65536 frames)\r\n")
+
+    // Test frame alloc
+    let frame = arm64_frame_alloc()
+    uart_puts("[MEM] Test alloc: 0x")
+    uart_put_hex(frame, 8)
+    uart_putc(10)
+    if frame != -1 { arm64_frame_free(frame) }
+
+    // Phase 4: Timer
+    let freq = arm64_timer_freq()
+    uart_puts("[TMR] Timer freq: ")
+    uart_put_dec(freq)
+    uart_puts(" Hz\r\n")
+
+    // Phase 5: Summary
+    uart_puts("\r\n")
+    uart_puts("[READY] FajarOS ARM64 kernel running!\r\n")
+    uart_puts("[READY] Services: UART + GIC + Memory + Timer\r\n")
+    uart_puts("[READY] 25K LOC microkernel, 30 sprints\r\n")
+    uart_puts("══════════════════════════════════════════\r\n")
+
+    // Halt — in real OS this would enter shell loop
+    // For QEMU: just spin (Ctrl-A X to exit)
+    while true {
+        arm64_sleep_ms(1000)
+        uart_putc(46)  // Print '.' every second as heartbeat
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Exception Handlers (required by ARM64 startup)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn fj_exception_sync() {
+    uart_puts("[EXC] Synchronous exception!\r\n")
+}
+
+@kernel fn fj_exception_irq() {
+    uart_puts("[IRQ] Interrupt!\r\n")
+}
