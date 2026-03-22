@@ -136,9 +136,8 @@
     syscall_setup()
     println("[SYSCALL] Entry stub + MSRs configured")
 
-    // Sprint 5.1: Ring 3 ELF execution available via 'ring3' shell command
-    // cmd_ring3() embeds + loads + runs the compiled Ring 3 hello program
-    // VERIFIED: "Hello from Ring 3!" appears on serial via SYSCALL(SYS_WRITE)
+    // Sprint 5.1: Ring 3 ELF via 'ring3' shell command
+    // VERIFIED: "Hello from Ring 3!" + PID=1 + SYS_EXIT on QEMU serial
 
     // Initialize VFS service (Sprint 1.4)
     init_svc_init()

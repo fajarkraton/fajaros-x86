@@ -86,9 +86,9 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
     volatile_write_u8(b + 42, 0x48)
     volatile_write_u8(b + 43, 0x31)
     volatile_write_u8(b + 44, 0xC0) // xor rax, rax (return 0 = success)
-    // jmp sysret_path
+    // jmp sysret_path (offset 82 = 47 + 35)
     volatile_write_u8(b + 45, 0xEB)
-    volatile_write_u8(b + 46, 20)  // skip to sysret
+    volatile_write_u8(b + 46, 35)
 
     // skip_write: (offset 51)
     // cmp rax, 60 (SYS_EXIT)
@@ -96,59 +96,71 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
     volatile_write_u8(b + 52, 0x83)
     volatile_write_u8(b + 53, 0xF8)
     volatile_write_u8(b + 54, 60)
-    // jne unknown_syscall
+    // jne check_getpid (offset 60)
     volatile_write_u8(b + 55, 0x75)
-    volatile_write_u8(b + 56, 10) // skip 10 bytes
+    volatile_write_u8(b + 56, 2)
 
     // SYS_EXIT: halt (user program terminated)
     volatile_write_u8(b + 57, 0xF4) // hlt
     volatile_write_u8(b + 58, 0xEB) // jmp -2
     volatile_write_u8(b + 59, 0xFD)
-    // padding
-    volatile_write_u8(b + 60, 0x90)
-    volatile_write_u8(b + 61, 0x90)
-    volatile_write_u8(b + 62, 0x90)
-    volatile_write_u8(b + 63, 0x90)
-    volatile_write_u8(b + 64, 0x90)
-    volatile_write_u8(b + 65, 0x90)
-    volatile_write_u8(b + 66, 0x90)
 
-    // unknown_syscall: (offset 67)
+    // check_getpid: (offset 60)
+    // cmp rax, 3 (SYS_GETPID)
+    volatile_write_u8(b + 60, 0x48)
+    volatile_write_u8(b + 61, 0x83)
+    volatile_write_u8(b + 62, 0xF8)
+    volatile_write_u8(b + 63, 3)
+    // jne unknown_syscall (offset 76)
+    volatile_write_u8(b + 64, 0x75)
+    volatile_write_u8(b + 65, 10)
+
+    // SYS_GETPID: mov rax, [0x6FE00] (current PID)
+    volatile_write_u8(b + 66, 0x48)
+    volatile_write_u8(b + 67, 0x8B)
+    volatile_write_u8(b + 68, 0x04)
+    volatile_write_u8(b + 69, 0x25)
+    volatile_write_u32(b + 70, 0x6FE00)
+    // jmp sysret_path (offset 82 = 76 + 6)
+    volatile_write_u8(b + 74, 0xEB)
+    volatile_write_u8(b + 75, 6)
+
+    // unknown_syscall: (offset 76)
     // xor rax, rax; dec rax (return -1)
-    volatile_write_u8(b + 67, 0x48)
-    volatile_write_u8(b + 68, 0x31)
-    volatile_write_u8(b + 69, 0xC0)
-    volatile_write_u8(b + 70, 0x48)
-    volatile_write_u8(b + 71, 0xFF)
-    volatile_write_u8(b + 72, 0xC8) // dec rax
+    volatile_write_u8(b + 76, 0x48)
+    volatile_write_u8(b + 77, 0x31)
+    volatile_write_u8(b + 78, 0xC0)
+    volatile_write_u8(b + 79, 0x48)
+    volatile_write_u8(b + 80, 0xFF)
+    volatile_write_u8(b + 81, 0xC8) // dec rax
 
-    // sysret_path: (offset 73)
+    // sysret_path: (offset 82)
     // pop rdx, rsi, rdi
-    volatile_write_u8(b + 73, 0x5A)
-    volatile_write_u8(b + 74, 0x5E)
-    volatile_write_u8(b + 75, 0x5F)
+    volatile_write_u8(b + 82, 0x5A)
+    volatile_write_u8(b + 83, 0x5E)
+    volatile_write_u8(b + 84, 0x5F)
     // pop r11 (user RFLAGS)
-    volatile_write_u8(b + 76, 0x41)
-    volatile_write_u8(b + 77, 0x5B)
+    volatile_write_u8(b + 85, 0x41)
+    volatile_write_u8(b + 86, 0x5B)
     // pop rcx (user RIP)
-    volatile_write_u8(b + 78, 0x59)
+    volatile_write_u8(b + 87, 0x59)
 
     // mov rsp, [USER_RSP_SAVE] (restore user RSP)
-    volatile_write_u8(b + 79, 0x48)
-    volatile_write_u8(b + 80, 0x8B)
-    volatile_write_u8(b + 81, 0x24)
-    volatile_write_u8(b + 82, 0x25)
-    volatile_write_u32(b + 83, USER_RSP_SAVE)
+    volatile_write_u8(b + 88, 0x48)
+    volatile_write_u8(b + 89, 0x8B)
+    volatile_write_u8(b + 90, 0x24)
+    volatile_write_u8(b + 91, 0x25)
+    volatile_write_u32(b + 92, USER_RSP_SAVE)
 
     // swapgs
-    volatile_write_u8(b + 87, 0x0F)
-    volatile_write_u8(b + 88, 0x01)
-    volatile_write_u8(b + 89, 0xF8)
+    volatile_write_u8(b + 96, 0x0F)
+    volatile_write_u8(b + 97, 0x01)
+    volatile_write_u8(b + 98, 0xF8)
 
     // sysretq
-    volatile_write_u8(b + 90, 0x48)
-    volatile_write_u8(b + 91, 0x0F)
-    volatile_write_u8(b + 92, 0x07)
+    volatile_write_u8(b + 99, 0x48)
+    volatile_write_u8(b + 100, 0x0F)
+    volatile_write_u8(b + 101, 0x07)
 }
 
 @kernel fn syscall_configure_msrs() {

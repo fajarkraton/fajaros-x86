@@ -3,6 +3,7 @@
 
 fn main() {
     println("Hello from Ring 3!")
-    println("PID = (getpid not available yet)")
+    let pid = getpid()
+    println(pid)
     println("Exiting cleanly...")
 }
