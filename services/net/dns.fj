@@ -1,0 +1,208 @@
+// FajarOS Nova v2.0 — DNS Client (cache + UDP query)
+// Part of the modular kernel build (concatenated by Makefile)
+// DNS Cache: 16 entries × 64B at DNS_BASE
+// Per entry: +0=valid +8=name_hash +16=ip +24=ttl +32=timestamp +40=name[24]
+const DNS_BASE: i64 = 0x984000
+const DNS_MAX: i64 = 16
+const DNS_ESZ: i64 = 64
+const DNS_QBUF: i64 = 0x984400
+const DNS_RBUF: i64 = 0x984600
+const DNS_FBUF: i64 = 0x984800
+const DNS_PORT: i64 = 53
+const DNS_SRV: i64 = 0x0A000203  // 10.0.2.3
+
+@kernel fn dr(i: i64, o: i64) -> i64 { if i < 0 || i >= DNS_MAX { return 0 }; volatile_read_u64(DNS_BASE + i * DNS_ESZ + o) }
+@kernel fn dw(i: i64, o: i64, v: i64) { if i < 0 || i >= DNS_MAX { return }; volatile_write_u64(DNS_BASE + i * DNS_ESZ + o, v) }
+
+@kernel fn dns_init() {
+    let mut i: i64 = 0
+    while i < DNS_MAX * DNS_ESZ { volatile_write_u64(DNS_BASE + i, 0); i = i + 8 }
+}
+@kernel fn dns_hash(a: i64, n: i64) -> i64 {
+    let mut h: i64 = 0x00000100000001B3
+    let mut i: i64 = 0
+    while i < n {
+        let c = volatile_read_u8(a + i) & 0xFF
+        h = h ^ (if c >= 65 && c <= 90 { c + 32 } else { c })
+        h = (h * 1099511628211) & 0x7FFFFFFFFFFFFFFF
+        i = i + 1
+    }
+    h
+}
+@kernel fn dns_cache_lookup(nh: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < DNS_MAX {
+        if dr(i,0) == 1 && dr(i,8) == nh {
+            if (rdtsc() - dr(i,32)) / 2000000000 < dr(i,24) { return dr(i,16) }
+            dw(i, 0, 0)
+        }
+        i = i + 1
+    }
+    -1
+}
+@kernel fn dns_cache_add(na: i64, nl: i64, ip: i64, ttl: i64) {
+    let nh = dns_hash(na, nl)
+    let mut s: i64 = -1
+    let mut i: i64 = 0
+    while i < DNS_MAX { if dr(i,0)==1 && dr(i,8)==nh { s = i; i = DNS_MAX } else { i = i + 1 } }
+    if s < 0 { i = 0; while i < DNS_MAX { if dr(i,0)==0 { s = i; i = DNS_MAX } else { i = i + 1 } } }
+    if s < 0 { let mut ot: i64 = 0x7FFFFFFFFFFFFFFF; s = 0; i = 0; while i < DNS_MAX { if dr(i,32) < ot { ot = dr(i,32); s = i }; i = i + 1 } }
+    dw(s,0,1); dw(s,8,nh); dw(s,16,ip); dw(s,24,ttl); dw(s,32,rdtsc())
+    let mc = if nl < 23 { nl } else { 23 }
+    let no = DNS_BASE + s * DNS_ESZ + 40
+    i = 0
+    while i < mc { volatile_write_u8(no + i, volatile_read_u8(na + i)); i = i + 1 }
+    volatile_write_u8(no + mc, 0)
+}
+
+// ── Query Builder ──
+@kernel fn dns_build_query(na: i64, nl: i64, buf: i64) -> i64 {
+    let tx = (rdtsc() / 1000) & 0xFFFF
+    volatile_write_u8(buf, (tx>>8)&0xFF); volatile_write_u8(buf+1, tx&0xFF)
+    volatile_write_u8(buf+2, 0x01); volatile_write_u8(buf+3, 0)
+    volatile_write_u8(buf+4, 0); volatile_write_u8(buf+5, 1)
+    let mut k: i64 = 6
+    while k < 12 { volatile_write_u8(buf+k, 0); k = k + 1 }
+    let mut pos: i64 = 12
+    let mut ls: i64 = 0
+    let mut i: i64 = 0
+    while i <= nl {
+        let ch = if i < nl { volatile_read_u8(na+i)&0xFF } else { 0 }
+        if ch == 46 || i == nl {
+            let ll = i - ls
+            if ll > 0 { volatile_write_u8(buf+pos, ll&0xFF); pos = pos + 1; let mut j: i64 = ls; while j < i { volatile_write_u8(buf+pos, volatile_read_u8(na+j)); pos = pos + 1; j = j + 1 } }
+            ls = i + 1
+        }
+        i = i + 1
+    }
+    volatile_write_u8(buf+pos, 0); pos = pos + 1
+    volatile_write_u8(buf+pos, 0); volatile_write_u8(buf+pos+1, 1) // QTYPE=A
+    volatile_write_u8(buf+pos+2, 0); volatile_write_u8(buf+pos+3, 1) // QCLASS=IN
+    pos + 4
+}
+
+// ── Response Parser ──
+@kernel fn dns_parse_response(buf: i64, len: i64) -> i64 {
+    if len < 12 || (volatile_read_u8(buf+2) & 0x80)==0 || (volatile_read_u8(buf+3) & 0x0F)!=0 { return -1 }
+    let ac = ((volatile_read_u8(buf+6)&0xFF)<<8)|(volatile_read_u8(buf+7)&0xFF)
+    if ac == 0 { return -1 }
+    let mut p: i64 = 12
+    while p < len { let l = volatile_read_u8(buf+p)&0xFF; if l==0 { p=p+1; break }; if (l&0xC0)==0xC0 { p=p+2; break }; p=p+1+l }
+    p = p + 4
+    let mut a: i64 = 0
+    while a < ac && p+10 < len {
+        let nb = volatile_read_u8(buf+p)&0xFF
+        if (nb&0xC0)==0xC0 { p=p+2 } else { while p<len { let l=volatile_read_u8(buf+p)&0xFF; if l==0{p=p+1;break}; if (l&0xC0)==0xC0{p=p+2;break}; p=p+1+l } }
+        let rt = ((volatile_read_u8(buf+p)&0xFF)<<8)|(volatile_read_u8(buf+p+1)&0xFF)
+        let ttl = ((volatile_read_u8(buf+p+4)&0xFF)<<24)|((volatile_read_u8(buf+p+5)&0xFF)<<16)|((volatile_read_u8(buf+p+6)&0xFF)<<8)|(volatile_read_u8(buf+p+7)&0xFF)
+        let rdl = ((volatile_read_u8(buf+p+8)&0xFF)<<8)|(volatile_read_u8(buf+p+9)&0xFF)
+        p = p + 10
+        if rt == 1 && rdl == 4 {
+            let ip = ((volatile_read_u8(buf+p)&0xFF)<<24)|((volatile_read_u8(buf+p+1)&0xFF)<<16)|((volatile_read_u8(buf+p+2)&0xFF)<<8)|(volatile_read_u8(buf+p+3)&0xFF)
+            volatile_write_u64(DNS_RBUF, ttl)
+            return ip
+        }
+        p = p + rdl; a = a + 1
+    }
+    -1
+}
+
+// ── Query: build UDP/IP/Eth frame and send ──
+@kernel fn dns_query(na: i64, nl: i64) -> i64 {
+    let ql = dns_build_query(na, nl, DNS_QBUF)
+    if ql <= 0 { return -1 }
+    let b = DNS_FBUF
+    let mut i: i64 = 0
+    while i < 6 { volatile_write_u8(b+i, 0xFF); i = i + 1 }
+    i = 0
+    while i < 6 { volatile_write_u8(b+6+i, volatile_read_u8(0x860000+8+i)); i = i + 1 }
+    volatile_write_u8(b+12, 0x08); volatile_write_u8(b+13, 0x00)
+    let ul: i64 = 8 + ql
+    let ipt = 20 + ul
+    volatile_write_u8(b+14, 0x45); volatile_write_u8(b+15, 0)
+    volatile_write_u8(b+16, (ipt>>8)&0xFF); volatile_write_u8(b+17, ipt&0xFF)
+    volatile_write_u8(b+18, 0); volatile_write_u8(b+19, 2)
+    volatile_write_u8(b+20, 0x40); volatile_write_u8(b+21, 0)
+    volatile_write_u8(b+22, 64); volatile_write_u8(b+23, 17) // TTL=64, UDP
+    volatile_write_u8(b+24, 0); volatile_write_u8(b+25, 0)
+    let sip = volatile_read_u64(0x860000 + 16)
+    volatile_write_u8(b+26, (sip>>24)&0xFF); volatile_write_u8(b+27, (sip>>16)&0xFF)
+    volatile_write_u8(b+28, (sip>>8)&0xFF); volatile_write_u8(b+29, sip&0xFF)
+    volatile_write_u8(b+30, (DNS_SRV>>24)&0xFF); volatile_write_u8(b+31, (DNS_SRV>>16)&0xFF)
+    volatile_write_u8(b+32, (DNS_SRV>>8)&0xFF); volatile_write_u8(b+33, DNS_SRV&0xFF)
+    let ick = tcp_cksum16(b+14, 20)
+    volatile_write_u8(b+24, (ick>>8)&0xFF); volatile_write_u8(b+25, ick&0xFF)
+    let lp: i64 = 50053
+    volatile_write_u8(b+34, (lp>>8)&0xFF); volatile_write_u8(b+35, lp&0xFF)
+    volatile_write_u8(b+36, 0); volatile_write_u8(b+37, DNS_PORT&0xFF)
+    volatile_write_u8(b+38, (ul>>8)&0xFF); volatile_write_u8(b+39, ul&0xFF)
+    volatile_write_u8(b+40, 0); volatile_write_u8(b+41, 0) // UDP cksum=0
+    i = 0
+    while i < ql { volatile_write_u8(b+42+i, volatile_read_u8(DNS_QBUF+i)); i = i + 1 }
+    net_send_frame(b, 14 + ipt)
+    // Poll for DNS response
+    let mut att: i64 = 0
+    while att < 30000000 {
+        let pl = net_rx_poll()
+        if pl > 0 {
+            let rx = NET_RX_BUF + VIRTIO_NET_HDR_SIZE
+            if volatile_read_u8(rx+12)==0x08 && volatile_read_u8(rx+13)==0x00 && (volatile_read_u8(rx+23)&0xFF)==17 {
+                let rihl = (volatile_read_u8(rx+14)&0x0F)*4
+                let ruo = 14 + rihl
+                let rdp = ((volatile_read_u8(rx+ruo+2)&0xFF)<<8)|(volatile_read_u8(rx+ruo+3)&0xFF)
+                if rdp == lp {
+                    let rul = ((volatile_read_u8(rx+ruo+4)&0xFF)<<8)|(volatile_read_u8(rx+ruo+5)&0xFF)
+                    return dns_parse_response(rx + ruo + 8, rul - 8)
+                }
+            }
+        }
+        pause(); att = att + 1
+    }
+    -1
+}
+
+// ── Public Resolve (cache-first) ──
+@kernel fn dns_resolve(na: i64, nl: i64) -> i64 {
+    let c = dns_cache_lookup(dns_hash(na, nl))
+    if c > 0 { return c }
+    let ip = dns_query(na, nl)
+    if ip > 0 { let t = volatile_read_u64(DNS_RBUF); dns_cache_add(na, nl, ip, if t > 0 { t } else { 300 }) }
+    ip
+}
+
+// ── Shell: dns-test ──
+@kernel fn cmd_dns_test() {
+    cprintln("=== DNS Test ===", YELLOW_ON_BLACK)
+    let nb: i64 = DNS_FBUF + 900
+    volatile_write_u8(nb,101); volatile_write_u8(nb+1,120); volatile_write_u8(nb+2,97)
+    volatile_write_u8(nb+3,109); volatile_write_u8(nb+4,112); volatile_write_u8(nb+5,108)
+    volatile_write_u8(nb+6,101); volatile_write_u8(nb+7,46); volatile_write_u8(nb+8,99)
+    volatile_write_u8(nb+9,111); volatile_write_u8(nb+10,109) // "example.com"
+    cprint("Resolve example.com ... ", WHITE_ON_BLACK)
+    let ip = dns_resolve(nb, 11)
+    if ip > 0 { cprint("OK: ", GREEN_ON_BLACK); ip_print(ip); console_putchar(10, WHITE_ON_BLACK) }
+    else { cprintln("FAIL", RED_ON_BLACK) }
+    cprint("Cache lookup ... ", WHITE_ON_BLACK)
+    let ip2 = dns_resolve(nb, 11)
+    if ip2 > 0 { cprint("HIT: ", GREEN_ON_BLACK); ip_print(ip2); console_putchar(10, WHITE_ON_BLACK) }
+    else { cprintln("MISS", YELLOW_ON_BLACK) }
+    cprintln("=== done ===", GREEN_ON_BLACK)
+}
+@kernel fn cmd_dns_cache() {
+    cprintln("DNS Cache:", YELLOW_ON_BLACK)
+    let mut n: i64 = 0
+    let mut i: i64 = 0
+    while i < DNS_MAX {
+        if dr(i,0) == 1 {
+            cprint("  [", WHITE_ON_BLACK); cprint_decimal(i, CYAN_ON_BLACK); cprint("] ", WHITE_ON_BLACK)
+            let no = DNS_BASE + i * DNS_ESZ + 40
+            let mut j: i64 = 0
+            while j < 23 { let c = volatile_read_u8(no+j)&0xFF; if c==0 { j=23 } else { console_putchar(c, CYAN_ON_BLACK); j=j+1 } }
+            cprint(" -> ", WHITE_ON_BLACK); ip_print(dr(i,16))
+            cprint(" ttl=", WHITE_ON_BLACK); cprint_decimal(dr(i,24), WHITE_ON_BLACK); cprintln("s", WHITE_ON_BLACK)
+            n = n + 1
+        }
+        i = i + 1
+    }
+    if n == 0 { cprintln("  (empty)", WHITE_ON_BLACK) }
+}

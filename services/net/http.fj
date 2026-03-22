@@ -1,0 +1,223 @@
+// FajarOS Nova v2.0 — HTTP/1.1 Client (Sprint 4.2)
+// @kernel — minimal HTTP client over TCP sockets
+// Part of the modular kernel build (concatenated by Makefile)
+
+// HTTP State — 0x986000
+const HTTP_REQ_BUF: i64 = 0x986000   // Request buffer (2KB)
+const HTTP_REQ_MAX: i64 = 2048
+const HTTP_RSP_BUF: i64 = 0x986800   // Response buffer (4KB)
+const HTTP_RSP_MAX: i64 = 4096
+const HTTP_HDR_END: i64 = 0x987800   // Offset where headers end
+const HTTP_CONTENT_LEN: i64 = 0x987808
+const HTTP_STATUS: i64 = 0x987810    // HTTP status code
+const HTTP_RSP_LEN: i64 = 0x987818   // Total bytes received
+const HTTP_SCRATCH: i64 = 0x987900   // Scratch buffer for paths
+
+@kernel fn http_init() {
+    let mut i: i64 = 0
+    while i < HTTP_REQ_MAX + HTTP_RSP_MAX { volatile_write_u8(HTTP_REQ_BUF + i, 0); i = i + 1 }
+    volatile_write_u64(HTTP_HDR_END, 0); volatile_write_u64(HTTP_CONTENT_LEN, -1)
+    volatile_write_u64(HTTP_STATUS, 0); volatile_write_u64(HTTP_RSP_LEN, 0)
+}
+
+// Write byte to request buffer at offset, return next offset
+@kernel fn http_put(off: i64, ch: i64) -> i64 {
+    if off < HTTP_REQ_MAX - 1 { volatile_write_u8(HTTP_REQ_BUF + off, ch & 0xFF) }
+    off + 1
+}
+
+// Write decimal octet (0-255) as ASCII digits
+@kernel fn http_put_octet(pos: i64, val: i64) -> i64 {
+    let mut p: i64 = pos
+    if val >= 100 { p = http_put(p, 48 + val / 100); p = http_put(p, 48 + (val / 10) % 10); p = http_put(p, 48 + val % 10) }
+    else if val >= 10 { p = http_put(p, 48 + val / 10); p = http_put(p, 48 + val % 10) }
+    else { p = http_put(p, 48 + val) }
+    p
+}
+
+// Write packed IP as "a.b.c.d"
+@kernel fn http_put_ip(pos: i64, ip: i64) -> i64 {
+    let mut p: i64 = http_put_octet(pos, (ip >> 24) & 0xFF)
+    p = http_put(p, 46)
+    p = http_put_octet(p, (ip >> 16) & 0xFF)
+    p = http_put(p, 46)
+    p = http_put_octet(p, (ip >> 8) & 0xFF)
+    p = http_put(p, 46)
+    http_put_octet(p, ip & 0xFF)
+}
+
+// Build "GET /path HTTP/1.1\r\nHost: ip\r\nConnection: close\r\n\r\n"
+// Returns total request length in HTTP_REQ_BUF
+@kernel fn http_build_request(host_ip: i64, path_addr: i64, path_len: i64) -> i64 {
+    let mut p: i64 = 0
+    // "GET "
+    p = http_put(p, 71); p = http_put(p, 69); p = http_put(p, 84); p = http_put(p, 32)
+    // Path
+    if path_len == 0 { p = http_put(p, 47) }
+    else { let mut i: i64 = 0; while i < path_len { p = http_put(p, volatile_read_u8(path_addr + i)); i = i + 1 } }
+    // " HTTP/1.1\r\n"
+    p = http_put(p, 32); p = http_put(p, 72); p = http_put(p, 84); p = http_put(p, 84)
+    p = http_put(p, 80); p = http_put(p, 47); p = http_put(p, 49); p = http_put(p, 46)
+    p = http_put(p, 49); p = http_put(p, 13); p = http_put(p, 10)
+    // "Host: a.b.c.d\r\n"
+    p = http_put(p, 72); p = http_put(p, 111); p = http_put(p, 115); p = http_put(p, 116)
+    p = http_put(p, 58); p = http_put(p, 32)
+    p = http_put_ip(p, host_ip)
+    p = http_put(p, 13); p = http_put(p, 10)
+    // "Connection: close\r\n"
+    p = http_put(p, 67); p = http_put(p, 111); p = http_put(p, 110); p = http_put(p, 110)
+    p = http_put(p, 101); p = http_put(p, 99); p = http_put(p, 116); p = http_put(p, 105)
+    p = http_put(p, 111); p = http_put(p, 110); p = http_put(p, 58); p = http_put(p, 32)
+    p = http_put(p, 99); p = http_put(p, 108); p = http_put(p, 111); p = http_put(p, 115)
+    p = http_put(p, 101); p = http_put(p, 13); p = http_put(p, 10)
+    // Final "\r\n"
+    p = http_put(p, 13); p = http_put(p, 10)
+    p
+}
+
+// Parse "HTTP/1.x NNN" — extract 3-digit status code
+@kernel fn http_parse_status(buf: i64, len: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < len && volatile_read_u8(buf + i) != 32 { i = i + 1 }
+    i = i + 1
+    if i + 3 > len { return -1 }
+    let d1 = volatile_read_u8(buf + i) - 48
+    let d2 = volatile_read_u8(buf + i + 1) - 48
+    let d3 = volatile_read_u8(buf + i + 2) - 48
+    if d1 < 0 || d1 > 9 || d2 < 0 || d2 > 9 || d3 < 0 || d3 > 9 { return -1 }
+    d1 * 100 + d2 * 10 + d3
+}
+
+// Find "\r\n\r\n" — returns offset past boundary, or -1
+@kernel fn http_find_header_end(buf: i64, len: i64) -> i64 {
+    let mut i: i64 = 0
+    while i + 3 < len {
+        if volatile_read_u8(buf + i) == 13 && volatile_read_u8(buf + i + 1) == 10 && volatile_read_u8(buf + i + 2) == 13 && volatile_read_u8(buf + i + 3) == 10 { return i + 4 }
+        i = i + 1
+    }
+    -1
+}
+
+// Parse response: status, header end, content length
+@kernel fn http_parse_response(buf: i64, len: i64) {
+    volatile_write_u64(HTTP_STATUS, http_parse_status(buf, len))
+    let hdr_end = http_find_header_end(buf, len)
+    volatile_write_u64(HTTP_HDR_END, hdr_end)
+    volatile_write_u64(HTTP_CONTENT_LEN, if hdr_end > 0 { len - hdr_end } else { -1 })
+    volatile_write_u64(HTTP_RSP_LEN, len)
+}
+
+// Extract body after headers into dest buffer, returns bytes copied
+@kernel fn http_get_body(dest: i64, max: i64) -> i64 {
+    let hdr_end = volatile_read_u64(HTTP_HDR_END)
+    let total = volatile_read_u64(HTTP_RSP_LEN)
+    if hdr_end <= 0 || hdr_end >= total { return 0 }
+    let body_len = total - hdr_end
+    let copy_len = if body_len < max { body_len } else { max }
+    let mut i: i64 = 0
+    while i < copy_len { volatile_write_u8(dest + i, volatile_read_u8(HTTP_RSP_BUF + hdr_end + i)); i = i + 1 }
+    copy_len
+}
+
+// Parse URL "http://a.b.c.d/path" — returns packed IP, path written to HTTP_SCRATCH
+@kernel fn http_parse_url(url_addr: i64, url_len: i64) -> i64 {
+    let mut pos: i64 = if url_len > 7 && volatile_read_u8(url_addr) == 104 { 7 } else { 0 }
+    let mut octets: i64 = 0
+    let mut cur: i64 = 0
+    let mut ip: i64 = 0
+    while pos < url_len && octets < 4 {
+        let ch = volatile_read_u8(url_addr + pos)
+        if ch == 46 || ch == 47 || pos == url_len - 1 {
+            if pos == url_len - 1 && ch != 47 { cur = cur * 10 + ch - 48 }
+            ip = (ip << 8) | (cur & 0xFF); cur = 0; octets = octets + 1
+            if ch == 47 { pos = pos - 1; octets = 4 }
+        } else { cur = cur * 10 + ch - 48 }
+        pos = pos + 1
+    }
+    while octets < 4 { ip = (ip << 8); octets = octets + 1 }
+    let mut plen: i64 = 0
+    while pos < url_len { volatile_write_u8(HTTP_SCRATCH + plen, volatile_read_u8(url_addr + pos)); plen = plen + 1; pos = pos + 1 }
+    if plen == 0 { volatile_write_u8(HTTP_SCRATCH, 47); plen = 1 }
+    volatile_write_u64(HTTP_SCRATCH + 256, plen)
+    ip
+}
+
+// HTTP GET — returns status code or -1
+@kernel fn http_get(ip: i64, port: i64, path_addr: i64, path_len: i64) -> i64 {
+    http_init()
+    let req_len = http_build_request(ip, path_addr, path_len)
+    if req_len <= 0 || req_len >= HTTP_REQ_MAX { return -1 }
+    // Allocate socket
+    let sid = sock_alloc()
+    if sid < 0 { return -1 }
+    sock_write(sid, 0, SOCK_CONNECTED)
+    sock_write(sid, 8, PROTO_TCP)
+    sock_write(sid, 16, 49200 + sid)
+    sock_write(sid, 24, ip)
+    sock_write(sid, 32, port)
+    // Send request
+    let mut i: i64 = 0
+    while i < req_len { volatile_write_u8(NET_TX_BUF + i, volatile_read_u8(HTTP_REQ_BUF + i)); i = i + 1 }
+    net_send_frame(NET_TX_BUF, req_len)
+    // Poll for response
+    let mut total_rx: i64 = 0
+    let mut timeout: i64 = 0
+    while timeout < 10000000 && total_rx < HTTP_RSP_MAX {
+        let rx = net_rx_poll()
+        if rx > 0 {
+            let cp = if rx + total_rx > HTTP_RSP_MAX { HTTP_RSP_MAX - total_rx } else { rx }
+            i = 0
+            while i < cp { volatile_write_u8(HTTP_RSP_BUF + total_rx + i, volatile_read_u8(NET_RX_BUF + i)); i = i + 1 }
+            total_rx = total_rx + cp
+        }
+        pause()
+        timeout = timeout + 1
+    }
+    sock_close(sid)
+    if total_rx == 0 { return -1 }
+    http_parse_response(HTTP_RSP_BUF, total_rx)
+    volatile_read_u64(HTTP_STATUS)
+}
+
+// Shell: "wget" — fetch http://10.0.2.2/ and print first 200 bytes
+@kernel fn cmd_wget() {
+    cprintln("wget: fetching http://10.0.2.2/", YELLOW_ON_BLACK)
+    volatile_write_u8(HTTP_SCRATCH, 47); volatile_write_u8(HTTP_SCRATCH + 1, 0)
+    let status = http_get(ip_pack(10, 0, 2, 2), 80, HTTP_SCRATCH, 1)
+    if status < 0 { cprintln("wget: connection failed", RED_ON_BLACK); return }
+    cprint("HTTP ", WHITE_ON_BLACK)
+    cprint_decimal(status, if status == 200 { GREEN_ON_BLACK } else { YELLOW_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+    let body_buf: i64 = HTTP_SCRATCH + 512
+    let blen = http_get_body(body_buf, 200)
+    if blen > 0 {
+        cprint("Body (", WHITE_ON_BLACK); cprint_decimal(blen, CYAN_ON_BLACK); cprintln(" bytes):", WHITE_ON_BLACK)
+        let mut i: i64 = 0
+        while i < blen {
+            let ch = volatile_read_u8(body_buf + i)
+            if ch >= 32 && ch < 127 { console_putchar(ch, WHITE_ON_BLACK) }
+            else if ch == 10 { console_putchar(10, WHITE_ON_BLACK) }
+            else { console_putchar(46, WHITE_ON_BLACK) }
+            i = i + 1
+        }
+        console_putchar(10, WHITE_ON_BLACK)
+    } else { cprintln("wget: empty body", YELLOW_ON_BLACK) }
+}
+
+// Shell: "http-test" — build GET request and display formatted
+@kernel fn cmd_http_test() {
+    cprintln("=== HTTP Client Test ===", YELLOW_ON_BLACK)
+    http_init()
+    volatile_write_u8(HTTP_SCRATCH, 47); volatile_write_u8(HTTP_SCRATCH + 1, 0)
+    let rlen = http_build_request(ip_pack(10, 0, 2, 2), HTTP_SCRATCH, 1)
+    cprint("Request (", WHITE_ON_BLACK); cprint_decimal(rlen, CYAN_ON_BLACK); cprintln(" bytes):", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < rlen {
+        let ch = volatile_read_u8(HTTP_REQ_BUF + i)
+        if ch == 13 { cprint("\\r", YELLOW_ON_BLACK) }
+        else if ch == 10 { cprintln("\\n", YELLOW_ON_BLACK) }
+        else { console_putchar(ch, WHITE_ON_BLACK) }
+        i = i + 1
+    }
+    cprintln("=== HTTP test complete ===", GREEN_ON_BLACK)
+}

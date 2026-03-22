@@ -67,6 +67,10 @@ SOURCES := \
 	services/blk/main.fj \
 	services/blk/journal.fj \
 	services/net/main.fj \
+	services/net/tcp.fj \
+	services/net/dns.fj \
+	services/net/http.fj \
+	services/net/tls.fj \
 	kernel/stubs/framebuffer.fj \
 	services/display/main.fj \
 	services/input/main.fj \

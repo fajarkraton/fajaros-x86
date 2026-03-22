@@ -3221,6 +3221,23 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 100 { cmd_hw_detect(); handled = 1 }
     // hw-test (104,119,45,116)
     if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 116 { cmd_hw_test(); handled = 1 }
+    // === Sprint 4.2: TCP/TLS commands ===
+    // tcp-test (116,99,112,45,116)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 99 && volatile_read_u8(0x6F802) == 112 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_tcp_test(); handled = 1 }
+    // tcp-info (116,99,112,45,105)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 99 && volatile_read_u8(0x6F802) == 112 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 105 { cmd_tcp_info(); handled = 1 }
+    // dns-test (100,110,115,45,116)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 100 && volatile_read_u8(0x6F801) == 110 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_dns_test(); handled = 1 }
+    // dns-cache (100,110,115,45,99)
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 100 && volatile_read_u8(0x6F801) == 110 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 99 { cmd_dns_cache(); handled = 1 }
+    // wget (119,103,101,116)
+    if handled == 0 && len >= 4 && volatile_read_u8(0x6F800) == 119 && volatile_read_u8(0x6F801) == 103 && volatile_read_u8(0x6F802) == 101 && volatile_read_u8(0x6F803) == 116 { cmd_wget(); handled = 1 }
+    // http-test (104,116,116,112,45,116)
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 116 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 112 && volatile_read_u8(0x6F804) == 45 { cmd_http_test(); handled = 1 }
+    // tls-test (116,108,115,45,116)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 108 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_tls_test(); handled = 1 }
+    // tls-info (116,108,115,45,105)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 108 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 105 { cmd_tls_info(); handled = 1 }
     // svc-elf — show loaded service ELFs
     if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 118 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 101 { cmd_svc_elf(); handled = 1 }
     // elf-test — ELF loader test

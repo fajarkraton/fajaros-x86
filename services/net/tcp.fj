@@ -1,0 +1,338 @@
+// FajarOS Nova v2.0 — TCP Protocol (16 connections, full state machine)
+// Part of the modular kernel build (concatenated by Makefile)
+// Per conn (128B at TCP_BASE): +0=state +8=local_port +16=remote_ip +24=remote_port
+//   +32=seq +40=ack +48=window +56=rtx_timer +64=rtx_count +72=send_buf
+//   +80=send_len +88=recv_buf +96=recv_len +104=flags +112=pid +120=activity
+const TCP_BASE: i64 = 0x980000
+const TCP_MAX: i64 = 16
+const TCP_CSZ: i64 = 128
+const TCP_CLOSED: i64 = 0
+const TCP_LISTEN: i64 = 1
+const TCP_SYN_SENT: i64 = 2
+const TCP_SYN_RCVD: i64 = 3
+const TCP_ESTABLISHED: i64 = 4
+const TCP_FIN_WAIT1: i64 = 5
+const TCP_FIN_WAIT2: i64 = 6
+const TCP_CLOSE_WAIT: i64 = 7
+const TCP_LAST_ACK: i64 = 8
+const TCP_TIME_WAIT: i64 = 9
+const TCP_FIN: i64 = 1
+const TCP_SYN: i64 = 2
+const TCP_RST: i64 = 4
+const TCP_PSH: i64 = 8
+const TCP_ACK: i64 = 16
+const TCP_RTX_CYC: i64 = 400000000
+const TCP_RTX_MAX: i64 = 3
+const TCP_BBUF: i64 = 0x982000
+const TCP_BSIZ: i64 = 2048
+const TCP_PKT: i64 = 0x983000
+
+@kernel fn tr(c: i64, o: i64) -> i64 { if c < 0 || c >= TCP_MAX { return 0 }; volatile_read_u64(TCP_BASE + c * TCP_CSZ + o) }
+@kernel fn tw(c: i64, o: i64, v: i64) { if c < 0 || c >= TCP_MAX { return }; volatile_write_u64(TCP_BASE + c * TCP_CSZ + o, v) }
+
+@kernel fn tcp_init() {
+    let mut i: i64 = 0
+    while i < TCP_MAX * TCP_CSZ { volatile_write_u64(TCP_BASE + i, 0); i = i + 8 }
+    i = 0
+    while i < TCP_MAX * TCP_BSIZ * 2 { volatile_write_u64(TCP_BBUF + i, 0); i = i + 8 }
+}
+@kernel fn tcp_alloc() -> i64 {
+    let mut i: i64 = 0
+    while i < TCP_MAX {
+        if tr(i, 0) == TCP_CLOSED {
+            let b = TCP_BBUF + i * TCP_BSIZ * 2
+            tw(i, 72, b); tw(i, 80, 0); tw(i, 88, b + TCP_BSIZ); tw(i, 96, 0)
+            tw(i, 48, 8192); tw(i, 64, 0); tw(i, 104, 0); tw(i, 120, rdtsc())
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+@kernel fn tcp_connect(ip: i64, port: i64) -> i64 {
+    let c = tcp_alloc()
+    if c < 0 { return -1 }
+    tw(c, 0, TCP_SYN_SENT); tw(c, 8, 49152 + c); tw(c, 16, ip); tw(c, 24, port)
+    tw(c, 32, 0x10000 + rdtsc() / 1000); tw(c, 40, 0); tw(c, 112, volatile_read_u64(0x6FE00))
+    let p = tcp_build_pkt(c, TCP_SYN, 0, 0)
+    if p > 0 { net_send_frame(TCP_PKT, p); tw(c, 56, rdtsc()) }
+    c
+}
+@kernel fn tcp_listen(port: i64) -> i64 {
+    let c = tcp_alloc()
+    if c < 0 { return -1 }
+    tw(c, 0, TCP_LISTEN); tw(c, 8, port); tw(c, 112, volatile_read_u64(0x6FE00))
+    c
+}
+@kernel fn tcp_send(c: i64, data: i64, len: i64) -> i64 {
+    if c < 0 || c >= TCP_MAX || tr(c, 0) != TCP_ESTABLISHED { return -1 }
+    let ba = tr(c, 72)
+    let bl = tr(c, 80)
+    let tc = if len < TCP_BSIZ - bl { len } else { TCP_BSIZ - bl }
+    if tc <= 0 { return 0 }
+    let mut i: i64 = 0
+    while i < tc { volatile_write_u8(ba + bl + i, volatile_read_u8(data + i)); i = i + 1 }
+    tw(c, 80, bl + tc)
+    let p = tcp_build_pkt(c, TCP_PSH | TCP_ACK, ba, tc)
+    if p > 0 { net_send_frame(TCP_PKT, p); tw(c, 32, tr(c, 32) + tc); tw(c, 56, rdtsc()); tw(c, 64, 0) }
+    tw(c, 120, rdtsc())
+    tc
+}
+@kernel fn tcp_recv(c: i64, buf: i64, max: i64) -> i64 {
+    if c < 0 || c >= TCP_MAX { return -1 }
+    let st = tr(c, 0)
+    if st != TCP_ESTABLISHED && st != TCP_CLOSE_WAIT { return -1 }
+    let ra = tr(c, 88)
+    let rl = tr(c, 96)
+    if rl == 0 { return 0 }
+    let tc = if rl < max { rl } else { max }
+    let mut i: i64 = 0
+    while i < tc { volatile_write_u8(buf + i, volatile_read_u8(ra + i)); i = i + 1 }
+    i = 0
+    while i < rl - tc { volatile_write_u8(ra + i, volatile_read_u8(ra + tc + i)); i = i + 1 }
+    tw(c, 96, rl - tc); tw(c, 120, rdtsc())
+    tc
+}
+@kernel fn tcp_close(c: i64) {
+    if c < 0 || c >= TCP_MAX { return }
+    let st = tr(c, 0)
+    if st == TCP_ESTABLISHED || st == TCP_CLOSE_WAIT {
+        let p = tcp_build_pkt(c, TCP_FIN | TCP_ACK, 0, 0)
+        if p > 0 { net_send_frame(TCP_PKT, p) }
+        tw(c, 0, if st == TCP_ESTABLISHED { TCP_FIN_WAIT1 } else { TCP_LAST_ACK })
+        tw(c, 56, rdtsc())
+    } else if st == TCP_LISTEN || st == TCP_SYN_SENT { tw(c, 0, TCP_CLOSED) }
+}
+
+// ── Packet Build: Eth(14)+IP(20)+TCP(20)+data ──
+@kernel fn tcp_build_pkt(c: i64, flags: i64, data: i64, len: i64) -> i64 {
+    let b = TCP_PKT
+    let mut i: i64 = 0
+    // Eth dst=broadcast
+    while i < 6 { volatile_write_u8(b + i, 0xFF); i = i + 1 }
+    i = 0
+    while i < 6 { volatile_write_u8(b + 6 + i, volatile_read_u8(0x860000 + 8 + i)); i = i + 1 }
+    volatile_write_u8(b + 12, 0x08); volatile_write_u8(b + 13, 0x00)
+    // IP header
+    let ipt = 40 + len
+    volatile_write_u8(b+14, 0x45); volatile_write_u8(b+15, 0)
+    volatile_write_u8(b+16, (ipt >> 8) & 0xFF); volatile_write_u8(b+17, ipt & 0xFF)
+    volatile_write_u8(b+18, 0); volatile_write_u8(b+19, 1)
+    volatile_write_u8(b+20, 0x40); volatile_write_u8(b+21, 0)
+    volatile_write_u8(b+22, 64); volatile_write_u8(b+23, 6) // TTL=64, proto=TCP
+    volatile_write_u8(b+24, 0); volatile_write_u8(b+25, 0) // checksum placeholder
+    let sip = volatile_read_u64(0x860000 + 16)
+    let rip = tr(c, 16)
+    volatile_write_u8(b+26, (sip>>24)&0xFF); volatile_write_u8(b+27, (sip>>16)&0xFF)
+    volatile_write_u8(b+28, (sip>>8)&0xFF); volatile_write_u8(b+29, sip&0xFF)
+    volatile_write_u8(b+30, (rip>>24)&0xFF); volatile_write_u8(b+31, (rip>>16)&0xFF)
+    volatile_write_u8(b+32, (rip>>8)&0xFF); volatile_write_u8(b+33, rip&0xFF)
+    let ick = tcp_cksum16(b + 14, 20)
+    volatile_write_u8(b+24, (ick>>8)&0xFF); volatile_write_u8(b+25, ick&0xFF)
+    // TCP header at +34
+    let lp = tr(c, 8); let rp = tr(c, 24); let seq = tr(c, 32); let ack = tr(c, 40); let win = tr(c, 48)
+    volatile_write_u8(b+34, (lp>>8)&0xFF); volatile_write_u8(b+35, lp&0xFF)
+    volatile_write_u8(b+36, (rp>>8)&0xFF); volatile_write_u8(b+37, rp&0xFF)
+    volatile_write_u8(b+38, (seq>>24)&0xFF); volatile_write_u8(b+39, (seq>>16)&0xFF)
+    volatile_write_u8(b+40, (seq>>8)&0xFF); volatile_write_u8(b+41, seq&0xFF)
+    volatile_write_u8(b+42, (ack>>24)&0xFF); volatile_write_u8(b+43, (ack>>16)&0xFF)
+    volatile_write_u8(b+44, (ack>>8)&0xFF); volatile_write_u8(b+45, ack&0xFF)
+    volatile_write_u8(b+46, 0x50); volatile_write_u8(b+47, flags&0xFF) // doff=5, flags
+    volatile_write_u8(b+48, (win>>8)&0xFF); volatile_write_u8(b+49, win&0xFF)
+    volatile_write_u8(b+50, 0); volatile_write_u8(b+51, 0) // cksum placeholder
+    volatile_write_u8(b+52, 0); volatile_write_u8(b+53, 0) // urgent=0
+    i = 0
+    while i < len { volatile_write_u8(b + 54 + i, volatile_read_u8(data + i)); i = i + 1 }
+    let tck = tcp_pseudo_cksum(b + 26, b + 34, 20 + len)
+    volatile_write_u8(b+50, (tck>>8)&0xFF); volatile_write_u8(b+51, tck&0xFF)
+    14 + ipt
+}
+@kernel fn tcp_cksum16(h: i64, len: i64) -> i64 {
+    let mut s: i64 = 0
+    let mut k: i64 = 0
+    while k < len { s = s + ((volatile_read_u8(h+k)&0xFF)<<8) + (volatile_read_u8(h+k+1)&0xFF); k = k + 2 }
+    while s > 0xFFFF { s = (s & 0xFFFF) + (s >> 16) }
+    (s ^ 0xFFFF) & 0xFFFF
+}
+@kernel fn tcp_pseudo_cksum(ips: i64, th: i64, tl: i64) -> i64 {
+    let mut s: i64 = 0
+    s = s + ((volatile_read_u8(ips)&0xFF)<<8) + (volatile_read_u8(ips+1)&0xFF)
+    s = s + ((volatile_read_u8(ips+2)&0xFF)<<8) + (volatile_read_u8(ips+3)&0xFF)
+    s = s + ((volatile_read_u8(ips+4)&0xFF)<<8) + (volatile_read_u8(ips+5)&0xFF)
+    s = s + ((volatile_read_u8(ips+6)&0xFF)<<8) + (volatile_read_u8(ips+7)&0xFF)
+    s = s + 6 + tl
+    let mut k: i64 = 0
+    while k < tl {
+        let lo = if k+1 < tl { volatile_read_u8(th+k+1) & 0xFF } else { 0 }
+        s = s + ((volatile_read_u8(th+k)&0xFF)<<8) + lo; k = k + 2
+    }
+    while s > 0xFFFF { s = (s & 0xFFFF) + (s >> 16) }
+    (s ^ 0xFFFF) & 0xFFFF
+}
+@kernel fn tcp_parse_hdr(p: i64, o: i64) -> i64 {
+    let r: i64 = TCP_PKT + 3200 // 7 fields × 8B
+    volatile_write_u64(r, ((volatile_read_u8(p+o)&0xFF)<<8)|(volatile_read_u8(p+o+1)&0xFF))
+    volatile_write_u64(r+8, ((volatile_read_u8(p+o+2)&0xFF)<<8)|(volatile_read_u8(p+o+3)&0xFF))
+    volatile_write_u64(r+16, ((volatile_read_u8(p+o+4)&0xFF)<<24)|((volatile_read_u8(p+o+5)&0xFF)<<16)|((volatile_read_u8(p+o+6)&0xFF)<<8)|(volatile_read_u8(p+o+7)&0xFF))
+    volatile_write_u64(r+24, ((volatile_read_u8(p+o+8)&0xFF)<<24)|((volatile_read_u8(p+o+9)&0xFF)<<16)|((volatile_read_u8(p+o+10)&0xFF)<<8)|(volatile_read_u8(p+o+11)&0xFF))
+    volatile_write_u64(r+32, volatile_read_u8(p+o+13) & 0x3F)
+    volatile_write_u64(r+40, ((volatile_read_u8(p+o+14)&0xFF)<<8)|(volatile_read_u8(p+o+15)&0xFF))
+    volatile_write_u64(r+48, ((volatile_read_u8(p+o+12)>>4)&0xF)*4)
+    r
+}
+
+// ── Incoming Packet Handler ──
+@kernel fn tcp_handle_incoming(pk: i64, pl: i64) {
+    if volatile_read_u8(pk+12) != 0x08 || volatile_read_u8(pk+13) != 0x00 { return }
+    if (volatile_read_u8(pk+23) & 0xFF) != 6 { return } // IP proto at 14+9=23
+    let sip = ((volatile_read_u8(pk+26)&0xFF)<<24)|((volatile_read_u8(pk+27)&0xFF)<<16)|((volatile_read_u8(pk+28)&0xFF)<<8)|(volatile_read_u8(pk+29)&0xFF)
+    let ihl = (volatile_read_u8(pk+14) & 0x0F) * 4
+    let to = 14 + ihl
+    let h = tcp_parse_hdr(pk, to)
+    let sp = volatile_read_u64(h); let dp = volatile_read_u64(h+8)
+    let seq = volatile_read_u64(h+16); let flags = volatile_read_u64(h+32)
+    let win = volatile_read_u64(h+40); let thl = volatile_read_u64(h+48)
+    let ipt = ((volatile_read_u8(pk+16)&0xFF)<<8)|(volatile_read_u8(pk+17)&0xFF)
+    let dl = ipt - ihl - thl
+    let doff = to + thl
+    let c = tcp_find(dp, sip, sp)
+    if c < 0 {
+        if (flags & TCP_SYN) != 0 { let lc = tcp_find_l(dp); if lc >= 0 { tcp_do_syn(lc, sip, sp, seq, win) } }
+        return
+    }
+    let st = tr(c, 0); tw(c, 120, rdtsc())
+    if (flags & TCP_RST) != 0 { tw(c, 0, TCP_CLOSED); return }
+    if st == TCP_SYN_SENT && (flags & (TCP_SYN|TCP_ACK)) == (TCP_SYN|TCP_ACK) {
+        tw(c, 40, seq+1); tw(c, 48, win); tw(c, 0, TCP_ESTABLISHED)
+        let p = tcp_build_pkt(c, TCP_ACK, 0, 0); if p > 0 { net_send_frame(TCP_PKT, p) }
+    } else if st == TCP_SYN_RCVD && (flags & TCP_ACK) != 0 {
+        tw(c, 0, TCP_ESTABLISHED)
+    } else if st == TCP_ESTABLISHED {
+        if dl > 0 {
+            let ra = tr(c, 88); let rl = tr(c, 96)
+            let tc = if dl < TCP_BSIZ - rl { dl } else { TCP_BSIZ - rl }
+            let mut i: i64 = 0
+            while i < tc { volatile_write_u8(ra+rl+i, volatile_read_u8(pk+doff+i)); i = i + 1 }
+            tw(c, 96, rl + tc); tw(c, 40, seq + dl)
+            let p = tcp_build_pkt(c, TCP_ACK, 0, 0); if p > 0 { net_send_frame(TCP_PKT, p) }
+        }
+        if (flags & TCP_FIN) != 0 {
+            tw(c, 40, seq+dl+1); tw(c, 0, TCP_CLOSE_WAIT)
+            let p = tcp_build_pkt(c, TCP_ACK, 0, 0); if p > 0 { net_send_frame(TCP_PKT, p) }
+        }
+    } else if st == TCP_FIN_WAIT1 && (flags & TCP_ACK) != 0 {
+        if (flags & TCP_FIN) != 0 { tw(c, 40, seq+1); tw(c, 0, TCP_TIME_WAIT); let p = tcp_build_pkt(c, TCP_ACK, 0, 0); if p > 0 { net_send_frame(TCP_PKT, p) } }
+        else { tw(c, 0, TCP_FIN_WAIT2) }
+    } else if st == TCP_FIN_WAIT2 && (flags & TCP_FIN) != 0 {
+        tw(c, 40, seq+1); tw(c, 0, TCP_TIME_WAIT)
+        let p = tcp_build_pkt(c, TCP_ACK, 0, 0); if p > 0 { net_send_frame(TCP_PKT, p) }
+    } else if st == TCP_LAST_ACK && (flags & TCP_ACK) != 0 { tw(c, 0, TCP_CLOSED) }
+}
+@kernel fn tcp_find(lp: i64, ri: i64, rp: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < TCP_MAX { let s = tr(i,0); if s != TCP_CLOSED && s != TCP_LISTEN && tr(i,8)==lp && tr(i,16)==ri && tr(i,24)==rp { return i }; i = i + 1 }
+    -1
+}
+@kernel fn tcp_find_l(lp: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < TCP_MAX { if tr(i,0)==TCP_LISTEN && tr(i,8)==lp { return i }; i = i + 1 }
+    -1
+}
+@kernel fn tcp_do_syn(c: i64, ri: i64, rp: i64, ps: i64, pw: i64) {
+    tw(c,0,TCP_SYN_RCVD); tw(c,16,ri); tw(c,24,rp); tw(c,32,0x10000+rdtsc()/1000)
+    tw(c,40,ps+1); tw(c,48,pw); tw(c,120,rdtsc())
+    let p = tcp_build_pkt(c, TCP_SYN|TCP_ACK, 0, 0)
+    if p > 0 { net_send_frame(TCP_PKT, p); tw(c, 56, rdtsc()) }
+}
+@kernel fn tcp_retransmit_check() {
+    let now = rdtsc()
+    let mut i: i64 = 0
+    while i < TCP_MAX {
+        let st = tr(i, 0)
+        if st==TCP_SYN_SENT || st==TCP_SYN_RCVD || st==TCP_FIN_WAIT1 || st==TCP_LAST_ACK {
+            if tr(i,56) > 0 && (now - tr(i,56)) > TCP_RTX_CYC {
+                if tr(i,64) >= TCP_RTX_MAX { tw(i, 0, TCP_CLOSED) }
+                else {
+                    let fl = if st==TCP_SYN_SENT { TCP_SYN } else if st==TCP_SYN_RCVD { TCP_SYN|TCP_ACK } else { TCP_FIN|TCP_ACK }
+                    let p = tcp_build_pkt(i, fl, 0, 0); if p > 0 { net_send_frame(TCP_PKT, p) }
+                    tw(i, 56, now); tw(i, 64, tr(i,64)+1)
+                }
+            }
+        }
+        if st == TCP_TIME_WAIT && tr(i,120) > 0 && (now - tr(i,120)) > TCP_RTX_CYC * 2 { tw(i, 0, TCP_CLOSED) }
+        i = i + 1
+    }
+}
+
+// ── Shell: tcp-test ──
+@kernel fn tcp_sn(s: i64) {
+    if s==TCP_CLOSED { cprint("CLOSED",WHITE_ON_BLACK) } else if s==TCP_LISTEN { cprint("LISTEN",CYAN_ON_BLACK) }
+    else if s==TCP_SYN_SENT { cprint("SYN_SENT",YELLOW_ON_BLACK) } else if s==TCP_SYN_RCVD { cprint("SYN_RCVD",YELLOW_ON_BLACK) }
+    else if s==TCP_ESTABLISHED { cprint("ESTAB",GREEN_ON_BLACK) } else if s==TCP_FIN_WAIT1 { cprint("FIN_W1",YELLOW_ON_BLACK) }
+    else if s==TCP_FIN_WAIT2 { cprint("FIN_W2",YELLOW_ON_BLACK) } else if s==TCP_CLOSE_WAIT { cprint("CLOSE_W",RED_ON_BLACK) }
+    else if s==TCP_LAST_ACK { cprint("LAST_ACK",RED_ON_BLACK) } else if s==TCP_TIME_WAIT { cprint("TIME_W",YELLOW_ON_BLACK) }
+}
+@kernel fn cmd_tcp_test() {
+    cprintln("=== TCP Test ===", YELLOW_ON_BLACK)
+    let tip = ip_pack(10, 0, 2, 2)
+    cprint("Connect ", WHITE_ON_BLACK); ip_print(tip); cprintln(":80", WHITE_ON_BLACK)
+    let c = tcp_connect(tip, 80)
+    if c < 0 { cprintln("  no slots", RED_ON_BLACK); return }
+    // Wait SYN-ACK
+    let mut a: i64 = 0
+    while a < 10000000 && tr(c,0) == TCP_SYN_SENT {
+        let pl = net_rx_poll()
+        if pl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl - VIRTIO_NET_HDR_SIZE) }
+        pause(); a = a + 1
+    }
+    cprint("  state=", WHITE_ON_BLACK); tcp_sn(tr(c,0)); console_putchar(10, WHITE_ON_BLACK)
+    if tr(c, 0) == TCP_ESTABLISHED {
+        let rb: i64 = TCP_PKT + 3600
+        // "GET / HTTP/1.0\r\n\r\n"
+        volatile_write_u8(rb,71); volatile_write_u8(rb+1,69); volatile_write_u8(rb+2,84); volatile_write_u8(rb+3,32)
+        volatile_write_u8(rb+4,47); volatile_write_u8(rb+5,32); volatile_write_u8(rb+6,72); volatile_write_u8(rb+7,84)
+        volatile_write_u8(rb+8,84); volatile_write_u8(rb+9,80); volatile_write_u8(rb+10,47); volatile_write_u8(rb+11,49)
+        volatile_write_u8(rb+12,46); volatile_write_u8(rb+13,48); volatile_write_u8(rb+14,13); volatile_write_u8(rb+15,10)
+        volatile_write_u8(rb+16,13); volatile_write_u8(rb+17,10)
+        let sent = tcp_send(c, rb, 18)
+        cprint("  sent=", WHITE_ON_BLACK); cprint_decimal(sent, CYAN_ON_BLACK); cprintln("B", WHITE_ON_BLACK)
+        let resp: i64 = TCP_PKT + 3800
+        let mut got: i64 = 0
+        a = 0
+        while a < 20000000 && got == 0 {
+            let pl = net_rx_poll()
+            if pl > 0 { tcp_handle_incoming(NET_RX_BUF + VIRTIO_NET_HDR_SIZE, pl - VIRTIO_NET_HDR_SIZE) }
+            got = tcp_recv(c, resp, 512); pause(); a = a + 1
+        }
+        if got > 0 {
+            cprint("  recv=", GREEN_ON_BLACK); cprint_decimal(got, CYAN_ON_BLACK); cprintln("B", GREEN_ON_BLACK)
+            let sh = if got < 64 { got } else { 64 }
+            cprint("  ", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < sh { let ch = volatile_read_u8(resp+j) & 0xFF; console_putchar(if ch>=32 && ch<127 { ch } else { 46 }, CYAN_ON_BLACK); j = j + 1 }
+            console_putchar(10, WHITE_ON_BLACK)
+        } else { cprintln("  timeout", YELLOW_ON_BLACK) }
+    }
+    tcp_close(c)
+    cprint("  final=", WHITE_ON_BLACK); tcp_sn(tr(c,0)); console_putchar(10, WHITE_ON_BLACK)
+    cprintln("=== done ===", GREEN_ON_BLACK)
+}
+@kernel fn cmd_tcp_info() {
+    cprintln("TCP Connections:", YELLOW_ON_BLACK)
+    let mut n: i64 = 0
+    let mut i: i64 = 0
+    while i < TCP_MAX {
+        let s = tr(i,0)
+        if s != TCP_CLOSED {
+            cprint("  [", WHITE_ON_BLACK); cprint_decimal(i, CYAN_ON_BLACK); cprint("] ", WHITE_ON_BLACK)
+            tcp_sn(s); cprint(" :", WHITE_ON_BLACK); cprint_decimal(tr(i,8), WHITE_ON_BLACK)
+            cprint("->", WHITE_ON_BLACK); ip_print(tr(i,16)); cprint(":", WHITE_ON_BLACK); cprint_decimal(tr(i,24), WHITE_ON_BLACK)
+            cprint(" seq=", WHITE_ON_BLACK); cprint_decimal(tr(i,32), CYAN_ON_BLACK)
+            cprint(" ack=", WHITE_ON_BLACK); cprint_decimal(tr(i,40), CYAN_ON_BLACK)
+            cprint(" rx=", WHITE_ON_BLACK); cprint_decimal(tr(i,96), GREEN_ON_BLACK)
+            cprintln("B", WHITE_ON_BLACK); n = n + 1
+        }
+        i = i + 1
+    }
+    if n == 0 { cprintln("  (none)", WHITE_ON_BLACK) }
+}
