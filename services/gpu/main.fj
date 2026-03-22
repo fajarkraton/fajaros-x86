@@ -1,0 +1,757 @@
+// FajarOS Nova v2.0 — GPU Compute Service (Sprint 4.5)
+// @kernel process — PID 9, GPU compute dispatch + VirtIO-GPU 2D
+// Backends: VirtIO-GPU (QEMU), CPU fallback (always available)
+// Part of the modular kernel build (concatenated by Makefile)
+
+// =================================================================
+// GPU IPC Protocol — message types 0x0A00-0x0AFF
+// =================================================================
+
+const MSG_GPU_INFO: i64 = 0x0A00
+const MSG_GPU_ALLOC: i64 = 0x0A01
+const MSG_GPU_FREE: i64 = 0x0A02
+const MSG_GPU_UPLOAD: i64 = 0x0A03
+const MSG_GPU_DOWNLOAD: i64 = 0x0A04
+const MSG_GPU_DISPATCH: i64 = 0x0A05
+const MSG_GPU_MATMUL: i64 = 0x0A06
+const MSG_GPU_REPLY: i64 = 0x0AFF
+
+const GPU_SVC_PID: i64 = 9
+
+// Status codes
+const GPU_OK: i64 = 0
+const GPU_ENOMEM: i64 = -1       // Out of GPU memory
+const GPU_EINVAL: i64 = -2       // Invalid argument
+const GPU_ENODEV: i64 = -3       // No GPU device
+const GPU_EBUSY: i64 = -4        // Device busy
+const GPU_EIO: i64 = -5          // I/O error
+
+// =================================================================
+// GPU State — at GPU_BASE (0x9B0000), 128 bytes
+// =================================================================
+
+const GPU_BASE: i64 = 0x9B0000
+
+// GPU state field offsets
+const GPU_AVAILABLE: i64 = 0      // 0=unavailable, 1=available
+const GPU_TYPE: i64 = 8           // 0=none, 1=virtio, 2=nvidia, 3=cpu_fallback
+const GPU_VRAM_TOTAL: i64 = 16    // Total VRAM in bytes
+const GPU_VRAM_USED: i64 = 24     // Used VRAM in bytes
+const GPU_COMPUTE_UNITS: i64 = 32 // Number of compute units
+const GPU_CLOCK_MHZ: i64 = 40     // Clock speed in MHz
+const GPU_DISPATCH_COUNT: i64 = 48 // Total dispatches executed
+const GPU_TOTAL_FLOPS: i64 = 56   // Total floating-point ops performed
+
+// GPU type constants
+const GPU_TYPE_NONE: i64 = 0
+const GPU_TYPE_VIRTIO: i64 = 1
+const GPU_TYPE_NVIDIA: i64 = 2
+const GPU_TYPE_CPU_FALLBACK: i64 = 3
+
+@kernel fn gpu_state_read(off: i64) -> i64 {
+    volatile_read_u64(GPU_BASE + off)
+}
+
+@kernel fn gpu_state_write(off: i64, val: i64) {
+    volatile_write_u64(GPU_BASE + off, val)
+}
+
+// =================================================================
+// GPU Memory Manager — at GPU_MEM (0x9B0200)
+// 32 allocations x 32 bytes = 1024 bytes
+// Per alloc: +0=active, +8=size, +16=gpu_addr, +24=owner_pid
+// =================================================================
+
+const GPU_MEM: i64 = 0x9B0200
+const GPU_MEM_MAX: i64 = 32
+const GPU_MEM_ENTRY: i64 = 32
+
+// Simulated GPU address space starts at 0x1000_0000
+const GPU_ADDR_BASE: i64 = 0x10000000
+
+@kernel fn gpu_mem_entry_addr(idx: i64) -> i64 {
+    GPU_MEM + idx * GPU_MEM_ENTRY
+}
+
+@kernel fn gpu_mem_init() {
+    let mut i: i64 = 0
+    while i < GPU_MEM_MAX * GPU_MEM_ENTRY {
+        volatile_write_u8(GPU_MEM + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn gpu_mem_alloc(size: i64, pid: i64) -> i64 {
+    if size <= 0 { return GPU_EINVAL }
+
+    // Find next available GPU address
+    let mut next_addr: i64 = GPU_ADDR_BASE
+    let mut i: i64 = 0
+    while i < GPU_MEM_MAX {
+        let base = gpu_mem_entry_addr(i)
+        let active = volatile_read_u64(base)
+        if active == 1 {
+            let addr = volatile_read_u64(base + 16)
+            let sz = volatile_read_u64(base + 8)
+            let end = addr + sz
+            if end > next_addr { next_addr = end }
+        }
+        i = i + 1
+    }
+    // Align to 256-byte boundary
+    next_addr = (next_addr + 255) & (-256)
+
+    // Check VRAM capacity
+    let vram_total = gpu_state_read(GPU_VRAM_TOTAL)
+    let vram_used = gpu_state_read(GPU_VRAM_USED)
+    if vram_used + size > vram_total { return GPU_ENOMEM }
+
+    // Find free slot
+    i = 0
+    while i < GPU_MEM_MAX {
+        let base = gpu_mem_entry_addr(i)
+        let active = volatile_read_u64(base)
+        if active == 0 {
+            volatile_write_u64(base, 1)              // active
+            volatile_write_u64(base + 8, size)       // size
+            volatile_write_u64(base + 16, next_addr) // gpu_addr
+            volatile_write_u64(base + 24, pid)       // owner_pid
+            gpu_state_write(GPU_VRAM_USED, vram_used + size)
+            return next_addr
+        }
+        i = i + 1
+    }
+    GPU_ENOMEM  // No free allocation slots
+}
+
+@kernel fn gpu_mem_free(gpu_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < GPU_MEM_MAX {
+        let base = gpu_mem_entry_addr(i)
+        let active = volatile_read_u64(base)
+        if active == 1 {
+            let addr = volatile_read_u64(base + 16)
+            if addr == gpu_addr {
+                let size = volatile_read_u64(base + 8)
+                volatile_write_u64(base, 0)  // deactivate
+                volatile_write_u64(base + 8, 0)
+                volatile_write_u64(base + 16, 0)
+                volatile_write_u64(base + 24, 0)
+                let used = gpu_state_read(GPU_VRAM_USED)
+                if used >= size { gpu_state_write(GPU_VRAM_USED, used - size) }
+                else { gpu_state_write(GPU_VRAM_USED, 0) }
+                return GPU_OK
+            }
+        }
+        i = i + 1
+    }
+    GPU_EINVAL  // Not found
+}
+
+@kernel fn gpu_mem_stats() -> i64 {
+    // Returns: total in high 32, used in low 32 (packed)
+    let total = gpu_state_read(GPU_VRAM_TOTAL)
+    let used = gpu_state_read(GPU_VRAM_USED)
+    (total << 32) | (used & 0xFFFFFFFF)
+}
+
+@kernel fn gpu_mem_count_active() -> i64 {
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < GPU_MEM_MAX {
+        let base = gpu_mem_entry_addr(i)
+        if volatile_read_u64(base) == 1 { count = count + 1 }
+        i = i + 1
+    }
+    count
+}
+
+// =================================================================
+// VirtIO-GPU 2D Stub
+// PCI vendor 0x1AF4, device 0x1050 (virtio-gpu)
+// =================================================================
+
+const VIRTIO_GPU_VENDOR: i64 = 0x1AF4
+const VIRTIO_GPU_DEVICE: i64 = 0x1050
+
+// VirtIO-GPU resource formats
+const VIRTIO_GPU_FORMAT_B8G8R8A8: i64 = 1
+const VIRTIO_GPU_FORMAT_R8G8B8A8: i64 = 67
+
+// VirtIO-GPU BAR0 state at GPU_BASE + 0x80
+const VIRTIO_GPU_STATE: i64 = 0x9B0080
+const VGPU_BAR0: i64 = 0         // BAR0 address
+const VGPU_PCI_DEV: i64 = 8      // PCI device number
+const VGPU_WIDTH: i64 = 16       // Display width
+const VGPU_HEIGHT: i64 = 24      // Display height
+const VGPU_RESOURCE_ID: i64 = 32 // Next resource ID counter
+
+@kernel fn vgpu_read(off: i64) -> i64 {
+    volatile_read_u64(VIRTIO_GPU_STATE + off)
+}
+
+@kernel fn vgpu_write(off: i64, val: i64) {
+    volatile_write_u64(VIRTIO_GPU_STATE + off, val)
+}
+
+@kernel fn virtio_gpu_detect() -> i64 {
+    // Scan PCI bus for VirtIO GPU (vendor 0x1AF4, device 0x1050)
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let vendor = id & 0xFFFF
+            let device = (id >> 16) & 0xFFFF
+            if vendor == VIRTIO_GPU_VENDOR && device == VIRTIO_GPU_DEVICE {
+                vgpu_write(VGPU_PCI_DEV, dev)
+                // Read BAR0
+                let bar0 = pci_read32(0, dev, 0, 0x10)
+                let bar_addr = bar0 & 0xFFFFF000
+                vgpu_write(VGPU_BAR0, bar_addr)
+                // Map BAR0 page for MMIO access
+                if bar_addr > 0 {
+                    map_page(bar_addr, bar_addr, PAGE_PRESENT | PAGE_WRITABLE)
+                }
+                return 1
+            }
+        }
+        dev = dev + 1
+    }
+    0
+}
+
+@kernel fn virtio_gpu_get_display_info() -> i64 {
+    // Returns packed (width << 32 | height)
+    // Default 1024x768 if not probed
+    let bar0 = vgpu_read(VGPU_BAR0)
+    if bar0 == 0 {
+        vgpu_write(VGPU_WIDTH, 1024)
+        vgpu_write(VGPU_HEIGHT, 768)
+        return (1024 << 32) | 768
+    }
+    // VirtIO-GPU: VIRTIO_GPU_CMD_GET_DISPLAY_INFO via control virtqueue
+    // For now, use default resolution (actual probing requires virtqueue setup)
+    let w: i64 = 1024
+    let h: i64 = 768
+    vgpu_write(VGPU_WIDTH, w)
+    vgpu_write(VGPU_HEIGHT, h)
+    (w << 32) | h
+}
+
+@kernel fn virtio_gpu_create_resource(id: i64, width: i64, height: i64, format: i64) -> i64 {
+    // VIRTIO_GPU_CMD_RESOURCE_CREATE_2D
+    // In a full implementation this writes to the control virtqueue.
+    // Stub: record resource metadata at GPU_BASE + 0x100 + id * 32
+    let res_base: i64 = 0x9B0100
+    if id < 0 || id >= 16 { return GPU_EINVAL }
+    let addr = res_base + id * 32
+    volatile_write_u64(addr, 1)           // active
+    volatile_write_u64(addr + 8, width)
+    volatile_write_u64(addr + 16, height)
+    volatile_write_u64(addr + 24, format)
+    // Advance resource counter
+    let next = vgpu_read(VGPU_RESOURCE_ID)
+    if id >= next { vgpu_write(VGPU_RESOURCE_ID, id + 1) }
+    GPU_OK
+}
+
+@kernel fn virtio_gpu_transfer(resource_id: i64, data_addr: i64, len: i64) -> i64 {
+    // VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D
+    // Stub: validate resource exists
+    let res_base: i64 = 0x9B0100
+    if resource_id < 0 || resource_id >= 16 { return GPU_EINVAL }
+    let addr = res_base + resource_id * 32
+    let active = volatile_read_u64(addr)
+    if active != 1 { return GPU_EINVAL }
+    if data_addr == 0 || len <= 0 { return GPU_EINVAL }
+    // In a full implementation, data would be written to the GPU via virtqueue.
+    // For now, increment dispatch counter to track usage.
+    let count = gpu_state_read(GPU_DISPATCH_COUNT)
+    gpu_state_write(GPU_DISPATCH_COUNT, count + 1)
+    GPU_OK
+}
+
+// =================================================================
+// CPU Fallback Compute
+// Used when no hardware GPU is available.
+// Matrices stored row-major as i64-encoded f64 values.
+// =================================================================
+
+// Scratch buffer for CPU compute at 0x9B0600 (16KB)
+const GPU_SCRATCH: i64 = 0x9B0600
+const GPU_SCRATCH_SIZE: i64 = 16384
+
+@kernel fn cpu_matmul(a_addr: i64, b_addr: i64, c_addr: i64, m: i64, n: i64, k: i64) {
+    // C[m x n] = A[m x k] * B[k x n]
+    // All values stored as i64 (integer arithmetic for bare-metal)
+    let mut row: i64 = 0
+    while row < m {
+        let mut col: i64 = 0
+        while col < n {
+            let mut sum: i64 = 0
+            let mut idx: i64 = 0
+            while idx < k {
+                let a_val = volatile_read_u64(a_addr + (row * k + idx) * 8)
+                let b_val = volatile_read_u64(b_addr + (idx * n + col) * 8)
+                sum = sum + a_val * b_val
+                idx = idx + 1
+            }
+            volatile_write_u64(c_addr + (row * n + col) * 8, sum)
+            col = col + 1
+        }
+        row = row + 1
+    }
+    // Track FLOPS: matmul does 2*m*n*k operations
+    let flops = gpu_state_read(GPU_TOTAL_FLOPS)
+    gpu_state_write(GPU_TOTAL_FLOPS, flops + 2 * m * n * k)
+    let count = gpu_state_read(GPU_DISPATCH_COUNT)
+    gpu_state_write(GPU_DISPATCH_COUNT, count + 1)
+}
+
+@kernel fn cpu_relu(data_addr: i64, len: i64) {
+    // ReLU: val = max(0, val) — in-place
+    let mut i: i64 = 0
+    while i < len {
+        let val = volatile_read_u64(data_addr + i * 8)
+        if val < 0 { volatile_write_u64(data_addr + i * 8, 0) }
+        i = i + 1
+    }
+    let flops = gpu_state_read(GPU_TOTAL_FLOPS)
+    gpu_state_write(GPU_TOTAL_FLOPS, flops + len)
+    let count = gpu_state_read(GPU_DISPATCH_COUNT)
+    gpu_state_write(GPU_DISPATCH_COUNT, count + 1)
+}
+
+@kernel fn cpu_sigmoid(data_addr: i64, len: i64) {
+    // Sigmoid approximation: piecewise linear
+    //   x <= -4  -> 0
+    //   x >= 4   -> 1000 (scaled by 1000 for integer math)
+    //   else     -> 500 + x * 125 (linear region approx)
+    // Values are in fixed-point: multiply by 1000
+    let mut i: i64 = 0
+    while i < len {
+        let val = volatile_read_u64(data_addr + i * 8)
+        let mut result: i64 = 0
+        if val <= -4000 {
+            result = 0
+        } else if val >= 4000 {
+            result = 1000
+        } else {
+            // Linear approximation in [-4, 4] range
+            // sigmoid(x) ~ 0.5 + 0.125*x (scaled by 1000)
+            result = 500 + (val * 125) / 1000
+            if result < 0 { result = 0 }
+            if result > 1000 { result = 1000 }
+        }
+        volatile_write_u64(data_addr + i * 8, result)
+        i = i + 1
+    }
+    let flops = gpu_state_read(GPU_TOTAL_FLOPS)
+    gpu_state_write(GPU_TOTAL_FLOPS, flops + len * 3)
+    let count = gpu_state_read(GPU_DISPATCH_COUNT)
+    gpu_state_write(GPU_DISPATCH_COUNT, count + 1)
+}
+
+@kernel fn cpu_add(a_addr: i64, b_addr: i64, c_addr: i64, len: i64) {
+    // Element-wise addition: C[i] = A[i] + B[i]
+    let mut i: i64 = 0
+    while i < len {
+        let a_val = volatile_read_u64(a_addr + i * 8)
+        let b_val = volatile_read_u64(b_addr + i * 8)
+        volatile_write_u64(c_addr + i * 8, a_val + b_val)
+        i = i + 1
+    }
+    let flops = gpu_state_read(GPU_TOTAL_FLOPS)
+    gpu_state_write(GPU_TOTAL_FLOPS, flops + len)
+}
+
+@kernel fn cpu_scale(data_addr: i64, len: i64, scalar: i64) {
+    // Element-wise multiply by scalar: data[i] = data[i] * scalar
+    let mut i: i64 = 0
+    while i < len {
+        let val = volatile_read_u64(data_addr + i * 8)
+        volatile_write_u64(data_addr + i * 8, val * scalar)
+        i = i + 1
+    }
+}
+
+// =================================================================
+// GPU IPC Handler
+// Dispatches incoming IPC messages to the correct GPU operation
+// =================================================================
+
+@kernel fn gpu_svc_handle_msg(sender: i64, msg_buf: i64, reply_buf: i64) -> i64 {
+    let msg_type = volatile_read_u32(msg_buf + 8)
+
+    if msg_type == MSG_GPU_INFO {
+        // Reply with GPU info: available, type, vram, compute units, clock, dispatches
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GPU_SVC_PID, MSG_GPU_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, gpu_state_read(GPU_AVAILABLE))
+        volatile_write_u64(reply_buf + 24, gpu_state_read(GPU_TYPE))
+        volatile_write_u64(reply_buf + 32, gpu_state_read(GPU_VRAM_TOTAL))
+        volatile_write_u64(reply_buf + 40, gpu_state_read(GPU_VRAM_USED))
+        volatile_write_u64(reply_buf + 48, gpu_state_read(GPU_COMPUTE_UNITS))
+        return GPU_OK
+    }
+
+    if msg_type == MSG_GPU_ALLOC {
+        // payload +16 = size
+        let size = volatile_read_u64(msg_buf + 16)
+        let addr = gpu_mem_alloc(size, sender)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GPU_SVC_PID, MSG_GPU_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, addr)  // gpu_addr or error code
+        return GPU_OK
+    }
+
+    if msg_type == MSG_GPU_FREE {
+        // payload +16 = gpu_addr
+        let addr = volatile_read_u64(msg_buf + 16)
+        let result = gpu_mem_free(addr)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GPU_SVC_PID, MSG_GPU_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, result)
+        return GPU_OK
+    }
+
+    if msg_type == MSG_GPU_UPLOAD {
+        // payload +16 = resource_id, +24 = data_addr, +32 = len
+        let res_id = volatile_read_u64(msg_buf + 16)
+        let data_addr = volatile_read_u64(msg_buf + 24)
+        let len = volatile_read_u64(msg_buf + 32)
+        let result = virtio_gpu_transfer(res_id, data_addr, len)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GPU_SVC_PID, MSG_GPU_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, result)
+        return GPU_OK
+    }
+
+    if msg_type == MSG_GPU_DOWNLOAD {
+        // payload +16 = gpu_addr, +24 = dst_addr, +32 = len
+        // For CPU fallback: direct memcpy from scratch to destination
+        let src = volatile_read_u64(msg_buf + 16)
+        let dst = volatile_read_u64(msg_buf + 24)
+        let len = volatile_read_u64(msg_buf + 32)
+        let mut i: i64 = 0
+        while i < len {
+            volatile_write_u8(dst + i, volatile_read_u8(src + i))
+            i = i + 1
+        }
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GPU_SVC_PID, MSG_GPU_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, GPU_OK)
+        return GPU_OK
+    }
+
+    if msg_type == MSG_GPU_DISPATCH {
+        // Generic compute dispatch
+        // payload +16 = op_type (0=relu, 1=sigmoid), +24 = data_addr, +32 = len
+        let op = volatile_read_u64(msg_buf + 16)
+        let data_addr = volatile_read_u64(msg_buf + 24)
+        let len = volatile_read_u64(msg_buf + 32)
+        if op == 0 { cpu_relu(data_addr, len) }
+        else if op == 1 { cpu_sigmoid(data_addr, len) }
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GPU_SVC_PID, MSG_GPU_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, GPU_OK)
+        return GPU_OK
+    }
+
+    if msg_type == MSG_GPU_MATMUL {
+        // payload +16 = a_addr, +24 = b_addr, +32 = c_addr
+        // payload +40 = m | (n << 16) | (k << 32)  (packed dimensions)
+        let a_addr = volatile_read_u64(msg_buf + 16)
+        let b_addr = volatile_read_u64(msg_buf + 24)
+        let c_addr = volatile_read_u64(msg_buf + 32)
+        let dims = volatile_read_u64(msg_buf + 40)
+        let m = dims & 0xFFFF
+        let n = (dims >> 16) & 0xFFFF
+        let k = (dims >> 32) & 0xFFFF
+        cpu_matmul(a_addr, b_addr, c_addr, m, n, k)
+        ipc_msg_clear(reply_buf)
+        ipc_msg_set_header(reply_buf, GPU_SVC_PID, MSG_GPU_REPLY, 0)
+        volatile_write_u64(reply_buf + 16, GPU_OK)
+        return GPU_OK
+    }
+
+    // Unknown message type
+    ipc_msg_clear(reply_buf)
+    ipc_msg_set_header(reply_buf, GPU_SVC_PID, MSG_GPU_REPLY, 0)
+    volatile_write_u64(reply_buf + 16, GPU_EINVAL)
+    GPU_EINVAL
+}
+
+// =================================================================
+// GPU Service Initialization
+// =================================================================
+
+@kernel fn gpu_svc_init() {
+    // Clear GPU state
+    let mut i: i64 = 0
+    while i < 128 {
+        volatile_write_u8(GPU_BASE + i, 0)
+        i = i + 1
+    }
+
+    // Initialize GPU memory manager
+    gpu_mem_init()
+
+    // Clear VirtIO-GPU state
+    i = 0
+    while i < 64 {
+        volatile_write_u8(VIRTIO_GPU_STATE + i, 0)
+        i = i + 1
+    }
+
+    // Try to detect VirtIO-GPU on PCI bus
+    let found = virtio_gpu_detect()
+    if found == 1 {
+        gpu_state_write(GPU_AVAILABLE, 1)
+        gpu_state_write(GPU_TYPE, GPU_TYPE_VIRTIO)
+        gpu_state_write(GPU_VRAM_TOTAL, 16 * 1024 * 1024) // 16MB VRAM
+        gpu_state_write(GPU_COMPUTE_UNITS, 1)
+        gpu_state_write(GPU_CLOCK_MHZ, 100)
+        virtio_gpu_get_display_info()
+        return
+    }
+
+    // No hardware GPU — use CPU fallback
+    gpu_state_write(GPU_AVAILABLE, 1)
+    gpu_state_write(GPU_TYPE, GPU_TYPE_CPU_FALLBACK)
+    gpu_state_write(GPU_VRAM_TOTAL, GPU_SCRATCH_SIZE) // Scratch memory as "VRAM"
+    gpu_state_write(GPU_COMPUTE_UNITS, 1)
+    gpu_state_write(GPU_CLOCK_MHZ, 0) // N/A for CPU fallback
+}
+
+// =================================================================
+// Shell Commands
+// =================================================================
+
+@kernel fn gpu_type_name(gpu_type: i64) {
+    if gpu_type == GPU_TYPE_NONE { cprint("none", WHITE_ON_BLACK) }
+    else if gpu_type == GPU_TYPE_VIRTIO { cprint("VirtIO-GPU", CYAN_ON_BLACK) }
+    else if gpu_type == GPU_TYPE_NVIDIA { cprint("NVIDIA", GREEN_ON_BLACK) }
+    else if gpu_type == GPU_TYPE_CPU_FALLBACK { cprint("CPU fallback", YELLOW_ON_BLACK) }
+    else { cprint("unknown", RED_ON_BLACK) }
+}
+
+@kernel fn cmd_gpu_info() {
+    cprintln("=== GPU Compute Service ===", YELLOW_ON_BLACK)
+
+    let avail = gpu_state_read(GPU_AVAILABLE)
+    cprint("  Status:     ", WHITE_ON_BLACK)
+    if avail == 1 { cprintln("AVAILABLE", GREEN_ON_BLACK) }
+    else { cprintln("NOT AVAILABLE", RED_ON_BLACK); return }
+
+    cprint("  Type:       ", WHITE_ON_BLACK)
+    gpu_type_name(gpu_state_read(GPU_TYPE))
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  VRAM total: ", WHITE_ON_BLACK)
+    cprint_decimal(gpu_state_read(GPU_VRAM_TOTAL) / 1024, CYAN_ON_BLACK)
+    cprintln(" KB", WHITE_ON_BLACK)
+
+    cprint("  VRAM used:  ", WHITE_ON_BLACK)
+    cprint_decimal(gpu_state_read(GPU_VRAM_USED) / 1024, CYAN_ON_BLACK)
+    cprintln(" KB", WHITE_ON_BLACK)
+
+    cprint("  Compute:    ", WHITE_ON_BLACK)
+    cprint_decimal(gpu_state_read(GPU_COMPUTE_UNITS), CYAN_ON_BLACK)
+    cprintln(" units", WHITE_ON_BLACK)
+
+    let clock = gpu_state_read(GPU_CLOCK_MHZ)
+    if clock > 0 {
+        cprint("  Clock:      ", WHITE_ON_BLACK)
+        cprint_decimal(clock, CYAN_ON_BLACK)
+        cprintln(" MHz", WHITE_ON_BLACK)
+    }
+
+    cprint("  Dispatches: ", WHITE_ON_BLACK)
+    cprint_decimal(gpu_state_read(GPU_DISPATCH_COUNT), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Total FLOP: ", WHITE_ON_BLACK)
+    cprint_decimal(gpu_state_read(GPU_TOTAL_FLOPS), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Allocs:     ", WHITE_ON_BLACK)
+    cprint_decimal(gpu_mem_count_active(), CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(GPU_MEM_MAX, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // VirtIO-GPU specific info
+    let gpu_type = gpu_state_read(GPU_TYPE)
+    if gpu_type == GPU_TYPE_VIRTIO {
+        cprint("  VirtIO dev: PCI #", WHITE_ON_BLACK)
+        cprint_decimal(vgpu_read(VGPU_PCI_DEV), CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  BAR0:       0x", WHITE_ON_BLACK)
+        cprint_hex(vgpu_read(VGPU_BAR0), 8, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  Display:    ", WHITE_ON_BLACK)
+        cprint_decimal(vgpu_read(VGPU_WIDTH), CYAN_ON_BLACK)
+        cprint("x", WHITE_ON_BLACK)
+        cprint_decimal(vgpu_read(VGPU_HEIGHT), CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_gpu_bench() {
+    cprintln("=== GPU Compute Benchmark (CPU fallback) ===", YELLOW_ON_BLACK)
+
+    let avail = gpu_state_read(GPU_AVAILABLE)
+    if avail != 1 {
+        cprintln("  GPU service not initialized", RED_ON_BLACK)
+        return
+    }
+
+    // Use scratch buffer for matrices
+    // Layout: A at +0, B at +2048, C at +4096 (enough for 16x16 i64)
+    let a_buf: i64 = GPU_SCRATCH
+    let b_buf: i64 = GPU_SCRATCH + 2048
+    let c_buf: i64 = GPU_SCRATCH + 4096
+
+    // --- 16x16 matmul ---
+    let m16: i64 = 16
+    gpu_bench_fill_matrix(a_buf, m16, m16, 1)
+    gpu_bench_fill_matrix(b_buf, m16, m16, 2)
+
+    let t0_16 = rdtsc()
+    cpu_matmul(a_buf, b_buf, c_buf, m16, m16, m16)
+    let t1_16 = rdtsc()
+    let cycles_16 = t1_16 - t0_16
+
+    cprint("  16x16 matmul: ", WHITE_ON_BLACK)
+    cprint_decimal(cycles_16, CYAN_ON_BLACK)
+    cprintln(" cycles", WHITE_ON_BLACK)
+
+    // Verify corner: C[0][0] should be 16*1*2 = 32
+    let c00 = volatile_read_u64(c_buf)
+    cprint("    C[0][0] = ", WHITE_ON_BLACK)
+    cprint_decimal(c00, CYAN_ON_BLACK)
+    if c00 == m16 * 1 * 2 { cprintln(" (OK)", GREEN_ON_BLACK) }
+    else { cprintln(" (MISMATCH)", RED_ON_BLACK) }
+
+    // --- 32x32 matmul ---
+    let m32: i64 = 32
+    // Reuse scratch (32*32*8 = 8192 per matrix, fits in 16KB with overlap)
+    // Use a_buf, b_buf offset for 32x32
+    let a32: i64 = GPU_SCRATCH
+    let b32: i64 = GPU_SCRATCH + 8192
+    // c32 would overflow scratch, use a secondary region at GPU_BASE + 0x500
+    let c32: i64 = 0x9B4600
+    gpu_bench_fill_matrix(a32, m32, m32, 1)
+    gpu_bench_fill_matrix(b32, m32, m32, 1)
+
+    let t0_32 = rdtsc()
+    cpu_matmul(a32, b32, c32, m32, m32, m32)
+    let t1_32 = rdtsc()
+    let cycles_32 = t1_32 - t0_32
+
+    cprint("  32x32 matmul: ", WHITE_ON_BLACK)
+    cprint_decimal(cycles_32, CYAN_ON_BLACK)
+    cprintln(" cycles", WHITE_ON_BLACK)
+
+    // --- GFLOPS estimate ---
+    // Assume ~3 GHz CPU. FLOPS = 2*M*N*K. GFLOPS = FLOPS / (cycles / freq)
+    // For 32x32: FLOPS = 2*32*32*32 = 65536
+    let flops_32: i64 = 2 * m32 * m32 * m32
+    cprint("  32x32 FLOP:   ", WHITE_ON_BLACK)
+    cprint_decimal(flops_32, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    if cycles_32 > 0 {
+        // MFLOPS = FLOPS * freq_mhz / cycles (avoid overflow)
+        // Approximate: cycles_per_flop = cycles / FLOPS
+        let cpf = cycles_32 / flops_32
+        cprint("  Cycles/FLOP:  ", WHITE_ON_BLACK)
+        cprint_decimal(cpf, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+
+    cprintln("  Benchmark complete", GREEN_ON_BLACK)
+}
+
+@kernel fn gpu_bench_fill_matrix(addr: i64, rows: i64, cols: i64, fill_val: i64) {
+    // Fill matrix with constant value
+    let mut i: i64 = 0
+    let total = rows * cols
+    while i < total {
+        volatile_write_u64(addr + i * 8, fill_val)
+        i = i + 1
+    }
+}
+
+@kernel fn cmd_gpu_matmul() {
+    cprintln("=== GPU MatMul Demo (4x4) ===", YELLOW_ON_BLACK)
+
+    let avail = gpu_state_read(GPU_AVAILABLE)
+    if avail != 1 {
+        cprintln("  GPU service not initialized", RED_ON_BLACK)
+        return
+    }
+
+    // 4x4 matrices in scratch buffer
+    let a_addr: i64 = GPU_SCRATCH
+    let b_addr: i64 = GPU_SCRATCH + 128   // 4*4*8 = 128
+    let c_addr: i64 = GPU_SCRATCH + 256
+
+    // A = identity matrix
+    let mut i: i64 = 0
+    while i < 128 { volatile_write_u64(a_addr + i, 0); i = i + 8 }
+    volatile_write_u64(a_addr + 0 * 8, 1)    // A[0][0]
+    volatile_write_u64(a_addr + 5 * 8, 1)    // A[1][1]
+    volatile_write_u64(a_addr + 10 * 8, 1)   // A[2][2]
+    volatile_write_u64(a_addr + 15 * 8, 1)   // A[3][3]
+
+    // B = [1,2,3,4; 5,6,7,8; 9,10,11,12; 13,14,15,16]
+    let mut v: i64 = 1
+    i = 0
+    while i < 16 {
+        volatile_write_u64(b_addr + i * 8, v)
+        v = v + 1
+        i = i + 1
+    }
+
+    // C = A * B (should equal B since A is identity)
+    let t0 = rdtsc()
+    cpu_matmul(a_addr, b_addr, c_addr, 4, 4, 4)
+    let t1 = rdtsc()
+
+    cprintln("  A = I (identity 4x4)", WHITE_ON_BLACK)
+    cprintln("  B = [1..16]", WHITE_ON_BLACK)
+    cprintln("  C = A * B:", WHITE_ON_BLACK)
+
+    // Print result matrix
+    let mut row: i64 = 0
+    while row < 4 {
+        cprint("    [", WHITE_ON_BLACK)
+        let mut col: i64 = 0
+        while col < 4 {
+            let val = volatile_read_u64(c_addr + (row * 4 + col) * 8)
+            cprint_decimal(val, CYAN_ON_BLACK)
+            if col < 3 { cprint(", ", WHITE_ON_BLACK) }
+            col = col + 1
+        }
+        cprintln("]", WHITE_ON_BLACK)
+        row = row + 1
+    }
+
+    cprint("  Time: ", WHITE_ON_BLACK)
+    cprint_decimal(t1 - t0, CYAN_ON_BLACK)
+    cprintln(" cycles", WHITE_ON_BLACK)
+
+    // Verify: C should equal B (since A = identity)
+    let mut ok: i64 = 1
+    i = 0
+    while i < 16 {
+        let c_val = volatile_read_u64(c_addr + i * 8)
+        let b_val = volatile_read_u64(b_addr + i * 8)
+        if c_val != b_val { ok = 0 }
+        i = i + 1
+    }
+    if ok == 1 { cprintln("  Verify: PASS (C == B)", GREEN_ON_BLACK) }
+    else { cprintln("  Verify: FAIL (C != B)", RED_ON_BLACK) }
+}

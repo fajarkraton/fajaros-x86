@@ -56,8 +56,9 @@ const SVC_CRASHED: i64 = 2
     // Initialize network service
     net_svc_init()
 
-    // Initialize auth service
+    // Initialize auth + GPU services
     auth_init()
+    gpu_svc_init()
 
     // Initialize display + input + GUI + pkgmgr services
     display_svc_init()

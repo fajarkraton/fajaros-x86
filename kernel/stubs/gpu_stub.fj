@@ -1,0 +1,206 @@
+// FajarOS Nova v2.0 — GPU DMA Kernel Stub (Sprint 4.5)
+// kernel/stubs/gpu_stub.fj — Ring 0 ONLY
+// Minimal kernel-side GPU support: BAR mapping, DMA buffer, IRQ forwarding.
+// All GPU logic lives in the GPU service (PID 9); this stub only provides
+// the privileged operations that cannot run in user space.
+
+// =================================================================
+// GPU Stub State — at 0x9B4000 (64 bytes)
+// =================================================================
+
+const GPU_STUB_STATE: i64 = 0x9B4000
+
+// Field offsets
+const GPU_STUB_BAR0_ADDR: i64 = 0     // Mapped BAR0 base address
+const GPU_STUB_BAR0_SIZE: i64 = 8     // BAR0 region size in bytes
+const GPU_STUB_BAR0_MAPPED: i64 = 16  // 1 if pages are mapped
+const GPU_STUB_IRQ_LINE: i64 = 24     // GPU IRQ number (PCI interrupt line)
+const GPU_STUB_IRQ_COUNT: i64 = 32    // Total IRQs forwarded
+const GPU_STUB_INIT_DONE: i64 = 40    // 1 if initialized
+
+@kernel fn gpu_stub_read(off: i64) -> i64 {
+    volatile_read_u64(GPU_STUB_STATE + off)
+}
+
+@kernel fn gpu_stub_write(off: i64, val: i64) {
+    volatile_write_u64(GPU_STUB_STATE + off, val)
+}
+
+// =================================================================
+// GPU BAR Mapping
+// Identity-map GPU BAR0 for MMIO access by the GPU service.
+// Must be called from kernel context (Ring 0) since map_page
+// manipulates page tables.
+// =================================================================
+
+@kernel fn gpu_stub_init(bar0_addr: i64, bar0_size: i64) {
+    // Clear state
+    let mut i: i64 = 0
+    while i < 64 {
+        volatile_write_u8(GPU_STUB_STATE + i, 0)
+        i = i + 1
+    }
+
+    if bar0_addr == 0 || bar0_size == 0 {
+        // No GPU BAR to map — stub stays inactive
+        return
+    }
+
+    // Store BAR0 info
+    gpu_stub_write(GPU_STUB_BAR0_ADDR, bar0_addr)
+    gpu_stub_write(GPU_STUB_BAR0_SIZE, bar0_size)
+
+    // Identity-map BAR0 pages (uncacheable MMIO region)
+    let aligned_addr = bar0_addr & (-4096)  // Page-align down
+    let end_addr = bar0_addr + bar0_size
+    let pages = (end_addr - aligned_addr + FRAME_SIZE - 1) / FRAME_SIZE
+    let mut pg: i64 = 0
+    while pg < pages {
+        let phys = aligned_addr + pg * FRAME_SIZE
+        map_page(phys, phys, PAGE_PRESENT | PAGE_WRITABLE)
+        // Mark frame as used in the bitmap allocator so it is not reused
+        frame_mark_used(phys / FRAME_SIZE)
+        pg = pg + 1
+    }
+
+    gpu_stub_write(GPU_STUB_BAR0_MAPPED, 1)
+    gpu_stub_write(GPU_STUB_INIT_DONE, 1)
+}
+
+// =================================================================
+// GPU BAR MMIO Access
+// Read/write 32-bit registers at BAR0 + offset.
+// These are thin wrappers used by the GPU service via IPC or
+// directly when running in monolithic kernel mode.
+// =================================================================
+
+@kernel fn gpu_stub_read32(offset: i64) -> i64 {
+    let bar0 = gpu_stub_read(GPU_STUB_BAR0_ADDR)
+    if bar0 == 0 { return 0 }
+    let mapped = gpu_stub_read(GPU_STUB_BAR0_MAPPED)
+    if mapped != 1 { return 0 }
+    volatile_read_u32(bar0 + offset)
+}
+
+@kernel fn gpu_stub_write32(offset: i64, val: i64) {
+    let bar0 = gpu_stub_read(GPU_STUB_BAR0_ADDR)
+    if bar0 == 0 { return }
+    let mapped = gpu_stub_read(GPU_STUB_BAR0_MAPPED)
+    if mapped != 1 { return }
+    volatile_write_u32(bar0 + offset, val)
+}
+
+// =================================================================
+// DMA Buffer Allocation
+// Allocate contiguous physical memory for GPU command buffers
+// and data transfers. Uses the kernel frame allocator.
+//
+// DMA allocation table: 8 entries x 16 bytes at GPU_STUB_STATE + 0x80
+// Per entry: +0 = active (0/1), +8 = phys_addr
+// =================================================================
+
+const GPU_DMA_TABLE: i64 = 0x9B4080
+const GPU_DMA_MAX: i64 = 8
+const GPU_DMA_ENTRY: i64 = 16
+
+@kernel fn gpu_dma_alloc(size: i64) -> i64 {
+    if size <= 0 { return -1 }
+
+    // Calculate number of contiguous frames needed
+    let frames_needed = (size + FRAME_SIZE - 1) / FRAME_SIZE
+
+    // Allocate the first frame
+    let first_frame = frame_alloc()
+    if first_frame == -1 { return -1 }  // Out of memory
+    let phys_addr = first_frame
+
+    // For multi-frame allocations, allocate additional contiguous frames
+    // (Best-effort: allocate sequentially and hope they are contiguous)
+    let mut f: i64 = 1
+    while f < frames_needed {
+        let next = frame_alloc()
+        if next == -1 {
+            // Rollback: free already-allocated frames
+            let mut j: i64 = 0
+            while j < f {
+                frame_mark_free((phys_addr + j * FRAME_SIZE) / FRAME_SIZE)
+                j = j + 1
+            }
+            return -1
+        }
+        f = f + 1
+    }
+
+    // Identity-map the DMA region so GPU can access it
+    let mut pg: i64 = 0
+    while pg < frames_needed {
+        let addr = phys_addr + pg * FRAME_SIZE
+        map_page(addr, addr, PAGE_PRESENT | PAGE_WRITABLE)
+        pg = pg + 1
+    }
+
+    // Record in DMA table
+    let mut i: i64 = 0
+    while i < GPU_DMA_MAX {
+        let entry = GPU_DMA_TABLE + i * GPU_DMA_ENTRY
+        let active = volatile_read_u64(entry)
+        if active == 0 {
+            volatile_write_u64(entry, 1)         // active
+            volatile_write_u64(entry + 8, phys_addr) // phys_addr
+            return phys_addr
+        }
+        i = i + 1
+    }
+
+    // DMA table full — free allocated frames
+    let mut j: i64 = 0
+    while j < frames_needed {
+        frame_mark_free((phys_addr + j * FRAME_SIZE) / FRAME_SIZE)
+        j = j + 1
+    }
+    -1
+}
+
+@kernel fn gpu_dma_free(phys_addr: i64) -> i64 {
+    if phys_addr <= 0 { return -1 }
+
+    // Find entry in DMA table
+    let mut i: i64 = 0
+    while i < GPU_DMA_MAX {
+        let entry = GPU_DMA_TABLE + i * GPU_DMA_ENTRY
+        let active = volatile_read_u64(entry)
+        let addr = volatile_read_u64(entry + 8)
+        if active == 1 && addr == phys_addr {
+            // Free the frame and remove entry
+            frame_mark_free(phys_addr / FRAME_SIZE)
+            volatile_write_u64(entry, 0)
+            volatile_write_u64(entry + 8, 0)
+            return 0
+        }
+        i = i + 1
+    }
+    -1  // Not found
+}
+
+// =================================================================
+// GPU IRQ Forwarding
+// Called from the IDT when the GPU IRQ fires.
+// Notifies the GPU service (PID 9) via async IPC notification
+// so it can process the interrupt in user space.
+// =================================================================
+
+@kernel fn gpu_stub_irq() {
+    // Notify GPU service (PID 9) that a GPU interrupt occurred
+    irq_notify_fire(12)  // GPU typically on IRQ 12
+
+    // Increment forwarded IRQ counter
+    let count = gpu_stub_read(GPU_STUB_IRQ_COUNT)
+    gpu_stub_write(GPU_STUB_IRQ_COUNT, count + 1)
+
+    // Send EOI to interrupt controller
+    lapic_eoi()
+}
+
+@kernel fn gpu_stub_set_irq(irq_line: i64) {
+    gpu_stub_write(GPU_STUB_IRQ_LINE, irq_line)
+}

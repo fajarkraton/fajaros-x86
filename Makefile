@@ -75,8 +75,10 @@ SOURCES := \
 	services/net/http.fj \
 	services/net/tls.fj \
 	kernel/stubs/framebuffer.fj \
+	kernel/stubs/gpu_stub.fj \
 	services/display/main.fj \
 	services/input/main.fj \
+	services/gpu/main.fj \
 	services/gui/main.fj \
 	services/auth/main.fj \
 	services/shell/main.fj \
