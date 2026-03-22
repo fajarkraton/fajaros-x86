@@ -31,9 +31,11 @@ const NET_PKT_BUF: i64 = 0x87C000  // Temp packet build buffer (4KB)
 // Queue sizes — set at runtime from device (typically 256)
 // Memory: each queue needs desc(N*16) + avail(6+2*N) + used(6+8*N) ≈ N*26+12
 // For N=256: ~6672 bytes per queue → 2 pages (8KB) each
-const VQ_RX_BASE: i64 = 0x890000     // RX queue (needs 8KB: desc+avail+used)
-const VQ_TX_BASE: i64 = 0x894000     // TX queue (must not overlap RX used ring at ~0x892000)
-const VQ_RX_BUFS: i64 = 0x898000    // RX packet buffers: 256 × 2KB = 512KB (to 0x918000)
+// VirtIO queue memory — placed at 10MB to avoid conflicts with kernel tables
+// (PROC_TABLE_V2=0x890000, FD_TABLE=0x894000, PIPE_POOL=0x898000)
+const VQ_RX_BASE: i64 = 0xA00000     // RX queue (16KB: desc+avail+used for 256 entries)
+const VQ_TX_BASE: i64 = 0xA04000     // TX queue (16KB)
+const VQ_RX_BUFS: i64 = 0xA08000    // RX packet buffers: 256 × 2KB = 512KB (to 0xA88000)
 const VQ_RXBUF_COUNT: i64 = 256     // Must match vq_num() for 1:1 desc→buffer mapping
 // Actual queue size stored at NET_STATE+96
 const NET_QSIZE_OFF: i64 = 96       // Queue size (from device)
