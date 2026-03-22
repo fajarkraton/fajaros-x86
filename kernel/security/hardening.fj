@@ -26,8 +26,8 @@
     cprintln("  fxrstor: restored OK", GREEN_ON_BLACK)
 }
 
-@kernel fn cmd_ring3() {
-    // Ring 3 demo — show Ring 3 infrastructure status
+@kernel fn cmd_ring3_info() {
+    // Ring 3 info — show Ring 3 infrastructure status
     cprintln("Ring 3 User Mode:", YELLOW_ON_BLACK)
     cprintln("  GDT User CS: 0x23 (0x20 | RPL=3)", WHITE_ON_BLACK)
     cprintln("  GDT User SS: 0x1B (0x18 | RPL=3)", WHITE_ON_BLACK)

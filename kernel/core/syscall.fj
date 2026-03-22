@@ -111,9 +111,9 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
     volatile_write_u8(b + 42, 0x48)
     volatile_write_u8(b + 43, 0x31)
     volatile_write_u8(b + 44, 0xC0)
-    // jmp sysret_path
+    // jmp sysret_path (offset 73 = 47 + 26)
     volatile_write_u8(b + 45, 0xEB)
-    volatile_write_u8(b + 46, 20)  // skip to sysret
+    volatile_write_u8(b + 46, 26)  // skip to sysret at offset 73
 
     // skip_write: (offset 51)
     // cmp rax, 60 (SYS_EXIT)

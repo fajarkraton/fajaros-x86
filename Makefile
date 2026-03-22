@@ -68,6 +68,7 @@ SOURCES := \
 	kernel/hw/pcie.fj \
 	kernel/hw/uefi_boot.fj \
 	kernel/core/elf_loader.fj \
+	kernel/ring3_embed.fj \
 	services/blk/main.fj \
 	services/blk/journal.fj \
 	services/net/main.fj \

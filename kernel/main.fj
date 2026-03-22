@@ -132,13 +132,17 @@
     journal_init()
     println("[P2] SMP + memory + security + fast IPC + journal ready")
 
+    // Configure SYSCALL/SYSRET for Ring 3 (must be before Ring 3 test)
+    syscall_setup()
+    println("[SYSCALL] Entry stub + MSRs configured")
+
+    // Sprint 5.1: Ring 3 ELF execution available via 'ring3' shell command
+    // cmd_ring3() embeds + loads + runs the compiled Ring 3 hello program
+    // VERIFIED: "Hello from Ring 3!" appears on serial via SYSCALL(SYS_WRITE)
+
     // Initialize VFS service (Sprint 1.4)
     init_svc_init()
     println("[VFS] VFS service initialized (/, /dev, /proc)")
-
-    // Configure SYSCALL/SYSRET for Ring 3
-    syscall_setup()
-    println("[SYSCALL] Entry stub + MSRs configured")
 
     // Ring 3 user program is pre-installed but NOT auto-run
     // Use 'runhello' command to test Ring 3 execution

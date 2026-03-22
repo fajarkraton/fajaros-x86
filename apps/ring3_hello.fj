@@ -1,0 +1,8 @@
+// FajarOS Ring 3 Test — minimal user-mode program
+// Compile: fj build --target x86_64-user apps/ring3_hello.fj -o build/ring3_hello.elf
+
+fn main() {
+    println("Hello from Ring 3!")
+    println("PID = (getpid not available yet)")
+    println("Exiting cleanly...")
+}

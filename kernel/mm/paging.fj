@@ -86,7 +86,7 @@ const PAGE_NX: i64 = 0  // Would be bit 63, needs EFER.NXE
         if pt_addr == -1 { return }
         let mut i: i64 = 0
         while i < 4096 { volatile_write_u8(pt_addr + i, 0); i = i + 1 }
-        page_table_set(pd_addr, pd_idx, pt_addr | PAGE_PRESENT | PAGE_WRITABLE)
+        page_table_set(pd_addr, pd_idx, pt_addr | PAGE_PRESENT | PAGE_WRITABLE | user_flag)
     }
 
     // Set the PT entry
