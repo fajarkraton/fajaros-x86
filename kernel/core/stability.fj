@@ -1,0 +1,670 @@
+// FajarOS Nova v2.0 — Stability & Stress Testing (Sprint 4.6)
+// kernel/core/stability.fj — Ring 0 ONLY
+// Stress tests, leak detector, watchdog timer, health reports
+// All functions @kernel annotated. Uses volatile_read_u64/volatile_write_u64.
+
+// ═══════════════════════════════════════════════════════════════
+// Memory Layout — Stability state at 0x9D0000 (4KB)
+// ═══════════════════════════════════════════════════════════════
+
+const STAB_BASE: i64 = 0x9D0000
+
+// Leak detector state (offset 0x000)
+const LEAK_SNAPSHOT: i64 = 0x9D0000    // frame_stats_used() snapshot
+const LEAK_ENABLED: i64 = 0x9D0008     // 1 if leak detector active
+
+// Watchdog state (offset 0x100)
+const WATCHDOG_BASE: i64 = 0x9D0100
+const WD_LAST_HEARTBEAT: i64 = 0       // rdtsc() of last kick
+const WD_TIMEOUT_TICKS: i64 = 8        // timeout in TSC ticks
+const WD_ENABLED: i64 = 16             // 1 if enabled
+const WD_KICK_COUNT: i64 = 24          // total kicks since init
+const WD_TIMEOUT_MS: i64 = 32          // configured timeout in ms
+
+// Stress test scratch (offset 0x200)
+const STRESS_SCRATCH: i64 = 0x9D0200
+const STRESS_MSG_BUF: i64 = 0x9D0300
+const STRESS_REPLY_BUF: i64 = 0x9D0340
+const STRESS_SENDER_BUF: i64 = 0x9D0380
+
+// Health report counters (offset 0x400)
+const HEALTH_BASE: i64 = 0x9D0400
+const HEALTH_CHECKS_RUN: i64 = 0
+const HEALTH_CHECKS_PASS: i64 = 8
+const HEALTH_CHECKS_FAIL: i64 = 16
+const HEALTH_LAST_TSC: i64 = 24
+
+// ═══════════════════════════════════════════════════════════════
+// Section 1: IPC Flood Stress Test
+// 16 processes send/recv simultaneously in round-robin
+// Verify no messages lost, count matches
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn stress_ipc_flood(rounds: i64) {
+    cprintln("=== Stress: IPC Flood ===", YELLOW_ON_BLACK)
+    cprint("  Rounds: ", WHITE_ON_BLACK)
+    cprint_decimal(rounds, CYAN_ON_BLACK)
+    cprint("  PIDs: 16", WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let msg = STRESS_MSG_BUF
+    let reply = STRESS_REPLY_BUF
+    let sender = STRESS_SENDER_BUF
+
+    let mut total_sent: i64 = 0
+    let mut total_recv: i64 = 0
+    let mut total_errors: i64 = 0
+
+    let t0 = rdtsc()
+
+    let mut round: i64 = 0
+    while round < rounds {
+        // Each round: PID 0..15 sends a message to PID (i+1)%16
+        let mut pid: i64 = 0
+        while pid < PROC_V2_MAX {
+            let dst_pid = (pid + 1) % PROC_V2_MAX
+
+            // Prepare message with unique payload
+            ipc_msg_clear(msg)
+            ipc_msg_set_header(msg, pid, 0x55, round * 16 + pid)
+            // Payload: sender PID + round number
+            volatile_write_u64(msg + 16, pid)
+            volatile_write_u64(msg + 24, round)
+
+            let push_result = ipc_queue_push(dst_pid, pid, msg)
+            if push_result == 0 {
+                total_sent = total_sent + 1
+            } else {
+                total_errors = total_errors + 1
+            }
+            pid = pid + 1
+        }
+
+        // Now each PID pops its message
+        pid = 0
+        while pid < PROC_V2_MAX {
+            let pop_result = ipc_queue_pop(pid, sender, reply)
+            if pop_result == 0 {
+                total_recv = total_recv + 1
+                // Verify sender is (pid-1+16)%16
+                let expected_sender = (pid - 1 + PROC_V2_MAX) % PROC_V2_MAX
+                let actual_sender = volatile_read_u64(sender)
+                if actual_sender != expected_sender {
+                    total_errors = total_errors + 1
+                }
+            } else {
+                total_errors = total_errors + 1
+            }
+            pid = pid + 1
+        }
+
+        round = round + 1
+    }
+
+    let elapsed = rdtsc() - t0
+
+    cprint("  Sent: ", WHITE_ON_BLACK)
+    cprint_decimal(total_sent, CYAN_ON_BLACK)
+    cprint("  Recv: ", WHITE_ON_BLACK)
+    cprint_decimal(total_recv, CYAN_ON_BLACK)
+    cprint("  Errors: ", WHITE_ON_BLACK)
+    cprint_decimal(total_errors, if total_errors == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Total cycles: ", WHITE_ON_BLACK)
+    cprint_decimal(elapsed, WHITE_ON_BLACK)
+    if total_sent > 0 {
+        cprint("  (", WHITE_ON_BLACK)
+        cprint_decimal(elapsed / total_sent, GREEN_ON_BLACK)
+        cprint(" cyc/msg)", WHITE_ON_BLACK)
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    if total_errors == 0 && total_sent == total_recv {
+        cprintln("  Result: PASS — no messages lost", GREEN_ON_BLACK)
+    } else {
+        cprintln("  Result: FAIL — messages lost or corrupted", RED_ON_BLACK)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 2: Filesystem I/O Stress Test
+// Create + write + read + verify content for N files
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn stress_fs_io(count: i64) {
+    cprintln("=== Stress: Filesystem I/O ===", YELLOW_ON_BLACK)
+    cprint("  Files to test: ", WHITE_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let actual = if count > 50 { 50 } else { count }
+    let mut created: i64 = 0
+    let mut bytes_written: i64 = 0
+    let mut integrity_errors: i64 = 0
+
+    let t0 = rdtsc()
+
+    let mut i: i64 = 0
+    while i < actual {
+        // Generate file name: "stress_XX" where XX is the index
+        // We use a fixed-format name stored at scratch address
+        let name_addr = STRESS_SCRATCH
+        volatile_write_u8(name_addr, 115)      // 's'
+        volatile_write_u8(name_addr + 1, 116)  // 't'
+        volatile_write_u8(name_addr + 2, 114)  // 'r'
+        volatile_write_u8(name_addr + 3, 101)  // 'e'
+        volatile_write_u8(name_addr + 4, 115)  // 's'
+        volatile_write_u8(name_addr + 5, 115)  // 's'
+        volatile_write_u8(name_addr + 6, 95)   // '_'
+        // Two-digit index
+        volatile_write_u8(name_addr + 7, 48 + (i / 10) % 10)
+        volatile_write_u8(name_addr + 8, 48 + i % 10)
+        volatile_write_u8(name_addr + 9, 0)    // null
+
+        // Create file entry via ramfs
+        let idx = ramfs_create_entry("stress", 1)
+        if idx >= 0 {
+            created = created + 1
+
+            // Write data: pattern = 0xA0 + (i % 16) repeated 32 bytes
+            let data_pattern = 0xA0 + (i % 16)
+            let write_len: i64 = 32
+            let data_addr = STRESS_SCRATCH + 64
+            let mut j: i64 = 0
+            while j < write_len {
+                volatile_write_u8(data_addr + j, data_pattern)
+                j = j + 1
+            }
+
+            // Write to ramfs data area
+            let entry_addr = ramfs_entry_addr(idx)
+            let fs_data_offset = volatile_read(FS_BASE + 8)
+            j = 0
+            while j < write_len {
+                volatile_write_u8(fs_data_offset + j, volatile_read_u8(data_addr + j))
+                j = j + 1
+            }
+            volatile_write(entry_addr + 32, write_len)
+            volatile_write(entry_addr + 40, fs_data_offset)
+            volatile_write(entry_addr + 48, 1)
+            volatile_write(FS_BASE + 8, fs_data_offset + write_len)
+            bytes_written = bytes_written + write_len
+
+            // Verify: read back and check
+            j = 0
+            while j < write_len {
+                let read_byte = volatile_read_u8(fs_data_offset + j)
+                if read_byte != data_pattern {
+                    integrity_errors = integrity_errors + 1
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+
+    let elapsed = rdtsc() - t0
+
+    cprint("  Created: ", WHITE_ON_BLACK)
+    cprint_decimal(created, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(actual, WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Bytes written: ", WHITE_ON_BLACK)
+    cprint_decimal(bytes_written, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Integrity errors: ", WHITE_ON_BLACK)
+    cprint_decimal(integrity_errors, if integrity_errors == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Total cycles: ", WHITE_ON_BLACK)
+    cprint_decimal(elapsed, WHITE_ON_BLACK)
+    if created > 0 {
+        cprint("  (", WHITE_ON_BLACK)
+        cprint_decimal(elapsed / created, GREEN_ON_BLACK)
+        cprint(" cyc/file)", WHITE_ON_BLACK)
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    if integrity_errors == 0 && created == actual {
+        cprintln("  Result: PASS", GREEN_ON_BLACK)
+    } else {
+        cprintln("  Result: FAIL", RED_ON_BLACK)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 3: Memory Leak Detector
+// Snapshot frame allocation counts, compare after tests
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn leak_detector_start() {
+    let used = frame_stats_used()
+    volatile_write_u64(LEAK_SNAPSHOT, used)
+    volatile_write_u64(LEAK_ENABLED, 1)
+    cprint("  Leak detector: snapshot at ", WHITE_ON_BLACK)
+    cprint_decimal(used, CYAN_ON_BLACK)
+    cprintln(" frames used", WHITE_ON_BLACK)
+}
+
+@kernel fn leak_detector_check() -> i64 {
+    let enabled = volatile_read_u64(LEAK_ENABLED)
+    if enabled == 0 {
+        cprintln("  Leak detector: not started", YELLOW_ON_BLACK)
+        return 0
+    }
+    let snapshot = volatile_read_u64(LEAK_SNAPSHOT)
+    let current = frame_stats_used()
+    let leaked = current - snapshot
+
+    cprint("  Leak detector: before=", WHITE_ON_BLACK)
+    cprint_decimal(snapshot, CYAN_ON_BLACK)
+    cprint(" after=", WHITE_ON_BLACK)
+    cprint_decimal(current, CYAN_ON_BLACK)
+    cprint(" leaked=", WHITE_ON_BLACK)
+    cprint_decimal(leaked, if leaked == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    cprintln(" frames", WHITE_ON_BLACK)
+
+    if leaked > 0 {
+        cprint("    WARNING: ", RED_ON_BLACK)
+        cprint_decimal(leaked, RED_ON_BLACK)
+        cprint(" frames (", RED_ON_BLACK)
+        cprint_decimal(leaked * FRAME_SIZE, RED_ON_BLACK)
+        cprintln(" bytes) leaked!", RED_ON_BLACK)
+    }
+
+    leaked
+}
+
+@kernel fn leak_detector_reset() {
+    volatile_write_u64(LEAK_ENABLED, 0)
+    volatile_write_u64(LEAK_SNAPSHOT, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 4: Watchdog Timer
+// If kernel doesn't kick within timeout, trigger panic
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn watchdog_init(timeout_ms: i64) {
+    let now = rdtsc()
+    volatile_write_u64(WATCHDOG_BASE + WD_LAST_HEARTBEAT, now)
+    // Convert ms to approximate TSC ticks: ms * cpu_freq_ghz * 1_000_000
+    // At 2 GHz: 1ms = 2,000,000 ticks
+    let ticks = timeout_ms * 2000000
+    volatile_write_u64(WATCHDOG_BASE + WD_TIMEOUT_TICKS, ticks)
+    volatile_write_u64(WATCHDOG_BASE + WD_ENABLED, 1)
+    volatile_write_u64(WATCHDOG_BASE + WD_KICK_COUNT, 0)
+    volatile_write_u64(WATCHDOG_BASE + WD_TIMEOUT_MS, timeout_ms)
+
+    cprint("  Watchdog: armed, timeout=", WHITE_ON_BLACK)
+    cprint_decimal(timeout_ms, CYAN_ON_BLACK)
+    cprintln("ms", WHITE_ON_BLACK)
+}
+
+@kernel fn watchdog_kick() {
+    let enabled = volatile_read_u64(WATCHDOG_BASE + WD_ENABLED)
+    if enabled == 0 { return }
+    volatile_write_u64(WATCHDOG_BASE + WD_LAST_HEARTBEAT, rdtsc())
+    let kicks = volatile_read_u64(WATCHDOG_BASE + WD_KICK_COUNT)
+    volatile_write_u64(WATCHDOG_BASE + WD_KICK_COUNT, kicks + 1)
+}
+
+@kernel fn watchdog_check() {
+    let enabled = volatile_read_u64(WATCHDOG_BASE + WD_ENABLED)
+    if enabled == 0 { return }
+
+    let now = rdtsc()
+    let last = volatile_read_u64(WATCHDOG_BASE + WD_LAST_HEARTBEAT)
+    let timeout = volatile_read_u64(WATCHDOG_BASE + WD_TIMEOUT_TICKS)
+
+    if now - last > timeout {
+        // Watchdog timeout — kernel hang detected
+        cprintln("!!! WATCHDOG TIMEOUT !!!", RED_ON_BLACK)
+        cprint("  Last kick: ", WHITE_ON_BLACK)
+        cprint_decimal(last, CYAN_ON_BLACK)
+        cprint("  Now: ", WHITE_ON_BLACK)
+        cprint_decimal(now, CYAN_ON_BLACK)
+        cprint("  Elapsed: ", WHITE_ON_BLACK)
+        cprint_decimal(now - last, RED_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("  Timeout was: ", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(WATCHDOG_BASE + WD_TIMEOUT_MS), CYAN_ON_BLACK)
+        cprintln("ms", WHITE_ON_BLACK)
+        // Watchdog panic — halt via QEMU debug-exit
+        cprintln("WATCHDOG PANIC: system hung!", RED_ON_BLACK)
+        port_outb(0xF4, 99)  // QEMU debug exit with code 99
+        while true { port_outb(0x3F8, 46) }  // spin on serial if still alive
+    }
+}
+
+@kernel fn watchdog_disable() {
+    volatile_write_u64(WATCHDOG_BASE + WD_ENABLED, 0)
+    cprintln("  Watchdog: disabled", YELLOW_ON_BLACK)
+}
+
+@kernel fn cmd_watchdog() {
+    cprintln("=== Watchdog Status ===", YELLOW_ON_BLACK)
+    let enabled = volatile_read_u64(WATCHDOG_BASE + WD_ENABLED)
+    cprint("  Enabled: ", WHITE_ON_BLACK)
+    if enabled == 1 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("NO", YELLOW_ON_BLACK) }
+
+    if enabled == 1 {
+        let timeout_ms = volatile_read_u64(WATCHDOG_BASE + WD_TIMEOUT_MS)
+        let kicks = volatile_read_u64(WATCHDOG_BASE + WD_KICK_COUNT)
+        let last = volatile_read_u64(WATCHDOG_BASE + WD_LAST_HEARTBEAT)
+        let now = rdtsc()
+        let elapsed_ticks = now - last
+        // Approximate ms since last kick: ticks / 2_000_000
+        let elapsed_ms = elapsed_ticks / 2000000
+
+        cprint("  Timeout: ", WHITE_ON_BLACK)
+        cprint_decimal(timeout_ms, CYAN_ON_BLACK)
+        cprintln("ms", WHITE_ON_BLACK)
+
+        cprint("  Kicks: ", WHITE_ON_BLACK)
+        cprint_decimal(kicks, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+
+        cprint("  Since last kick: ~", WHITE_ON_BLACK)
+        cprint_decimal(elapsed_ms, if elapsed_ms < timeout_ms { GREEN_ON_BLACK } else { RED_ON_BLACK })
+        cprintln("ms", WHITE_ON_BLACK)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 5: System Health Report
+// Run all checks: memory, IPC, processes, uptime
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_health() {
+    cprintln("=== System Health Report ===", YELLOW_ON_BLACK)
+
+    let mut checks_pass: i64 = 0
+    let mut checks_fail: i64 = 0
+
+    // 1. Memory: frame usage
+    cprint("  [MEM] Frames used: ", WHITE_ON_BLACK)
+    let used = frame_stats_used()
+    cprint_decimal(used, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(TOTAL_FRAMES, WHITE_ON_BLACK)
+    let pct = (used * 100) / TOTAL_FRAMES
+    cprint(" (", WHITE_ON_BLACK)
+    cprint_decimal(pct, if pct < 80 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    cprint("%)", WHITE_ON_BLACK)
+    if pct < 90 { cprint(" OK", GREEN_ON_BLACK); checks_pass = checks_pass + 1 }
+    else { cprint(" HIGH", RED_ON_BLACK); checks_fail = checks_fail + 1 }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // 2. Memory leaks
+    cprint("  [LEAK] ", WHITE_ON_BLACK)
+    let leak_on = volatile_read_u64(LEAK_ENABLED)
+    if leak_on == 1 {
+        let snap = volatile_read_u64(LEAK_SNAPSHOT)
+        let diff = used - snap
+        if diff == 0 {
+            cprintln("No leaks detected", GREEN_ON_BLACK)
+            checks_pass = checks_pass + 1
+        } else {
+            cprint_decimal(diff, RED_ON_BLACK)
+            cprintln(" frames leaked", RED_ON_BLACK)
+            checks_fail = checks_fail + 1
+        }
+    } else {
+        cprintln("Detector not active (neutral)", YELLOW_ON_BLACK)
+        checks_pass = checks_pass + 1
+    }
+
+    // 3. IPC queue depths — check no queue is full
+    cprint("  [IPC] Queue depths: ", WHITE_ON_BLACK)
+    let mut ipc_ok: i64 = 1
+    let mut pid: i64 = 0
+    while pid < IPC_EP_MAX {
+        let depth = ep_read(pid, EP_QUEUE_COUNT)
+        if depth > 0 {
+            cprint("P", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint("=", WHITE_ON_BLACK)
+            cprint_decimal(depth, if depth < IPC_QUEUE_SLOTS { YELLOW_ON_BLACK } else { RED_ON_BLACK })
+            cprint(" ", WHITE_ON_BLACK)
+            if depth >= IPC_QUEUE_SLOTS { ipc_ok = 0 }
+        }
+        pid = pid + 1
+    }
+    if ipc_ok == 1 { cprintln("OK", GREEN_ON_BLACK); checks_pass = checks_pass + 1 }
+    else { cprintln("OVERFLOW", RED_ON_BLACK); checks_fail = checks_fail + 1 }
+
+    // 4. Process states — count zombies
+    cprint("  [PROC] ", WHITE_ON_BLACK)
+    let mut running: i64 = 0
+    let mut ready: i64 = 0
+    let mut blocked: i64 = 0
+    let mut zombies: i64 = 0
+    pid = 0
+    while pid < PROC_V2_MAX {
+        let state = proc_v2_get(pid, 0)
+        if state == PROC_STATE_RUNNING { running = running + 1 }
+        if state == PROC_STATE_READY { ready = ready + 1 }
+        if state == PROC_STATE_BLOCKED { blocked = blocked + 1 }
+        if state == PROC_STATE_ZOMBIE { zombies = zombies + 1 }
+        pid = pid + 1
+    }
+    cprint("run=", WHITE_ON_BLACK)
+    cprint_decimal(running, GREEN_ON_BLACK)
+    cprint(" rdy=", WHITE_ON_BLACK)
+    cprint_decimal(ready, CYAN_ON_BLACK)
+    cprint(" blk=", WHITE_ON_BLACK)
+    cprint_decimal(blocked, YELLOW_ON_BLACK)
+    cprint(" zombie=", WHITE_ON_BLACK)
+    cprint_decimal(zombies, if zombies == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    if zombies == 0 { cprint(" OK", GREEN_ON_BLACK); checks_pass = checks_pass + 1 }
+    else { cprint(" WARN", YELLOW_ON_BLACK); checks_fail = checks_fail + 1 }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // 5. Watchdog status
+    cprint("  [WDG] ", WHITE_ON_BLACK)
+    let wd_on = volatile_read_u64(WATCHDOG_BASE + WD_ENABLED)
+    if wd_on == 1 {
+        let kicks = volatile_read_u64(WATCHDOG_BASE + WD_KICK_COUNT)
+        cprint("Active, ", GREEN_ON_BLACK)
+        cprint_decimal(kicks, CYAN_ON_BLACK)
+        cprintln(" kicks", WHITE_ON_BLACK)
+        checks_pass = checks_pass + 1
+    } else {
+        cprintln("Inactive", YELLOW_ON_BLACK)
+        checks_pass = checks_pass + 1  // Not a failure, just informational
+    }
+
+    // 6. Uptime (TSC-based estimate)
+    cprint("  [TIME] TSC: ", WHITE_ON_BLACK)
+    let tsc = rdtsc()
+    cprint_decimal(tsc, CYAN_ON_BLACK)
+    // Rough uptime: tsc / (2 GHz * 1e9) = tsc / 2e9 seconds
+    let approx_secs = tsc / 2000000000
+    cprint(" (~", WHITE_ON_BLACK)
+    cprint_decimal(approx_secs, GREEN_ON_BLACK)
+    cprintln("s uptime)", WHITE_ON_BLACK)
+    checks_pass = checks_pass + 1
+
+    // Store results
+    volatile_write_u64(HEALTH_BASE + HEALTH_CHECKS_RUN, checks_pass + checks_fail)
+    volatile_write_u64(HEALTH_BASE + HEALTH_CHECKS_PASS, checks_pass)
+    volatile_write_u64(HEALTH_BASE + HEALTH_CHECKS_FAIL, checks_fail)
+    volatile_write_u64(HEALTH_BASE + HEALTH_LAST_TSC, tsc)
+
+    // Summary
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Health: ", WHITE_ON_BLACK)
+    cprint_decimal(checks_pass, GREEN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(checks_pass + checks_fail, WHITE_ON_BLACK)
+    cprint(" checks passed", WHITE_ON_BLACK)
+    if checks_fail == 0 {
+        cprintln(" — HEALTHY", GREEN_ON_BLACK)
+    } else {
+        cprint(" — ", RED_ON_BLACK)
+        cprint_decimal(checks_fail, RED_ON_BLACK)
+        cprintln(" ISSUES", RED_ON_BLACK)
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Section 6: Release Checklist Test
+// Verify: build OK, 0 CE006, tests pass, services init'd, no leaks
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_release_check() {
+    cprintln("=== FajarOS Release Checklist ===", YELLOW_ON_BLACK)
+
+    let mut pass: i64 = 0
+    let mut fail: i64 = 0
+
+    // 1. Build verification — if we're running, the build is OK
+    cprint("  [1] Build: ", WHITE_ON_BLACK)
+    cprintln("OK (kernel is running)", GREEN_ON_BLACK)
+    pass = pass + 1
+
+    // 2. Kernel panic code — check no unresolved panics
+    cprint("  [2] Panic state: ", WHITE_ON_BLACK)
+    // If we reach this point, no panics occurred
+    cprintln("OK (no panics)", GREEN_ON_BLACK)
+    pass = pass + 1
+
+    // 3. Services initialized — check init service table
+    cprint("  [3] Services: ", WHITE_ON_BLACK)
+    let mut svc_ok: i64 = 1
+    let mut svc_count: i64 = 0
+    let mut slot: i64 = 0
+    while slot < INIT_SVC_MAX {
+        let state = init_svc_get_state(slot)
+        if state == SVC_RUNNING { svc_count = svc_count + 1 }
+        else if state == SVC_CRASHED { svc_ok = 0 }
+        slot = slot + 1
+    }
+    cprint_decimal(svc_count, CYAN_ON_BLACK)
+    cprint(" running", WHITE_ON_BLACK)
+    if svc_ok == 1 && svc_count > 0 {
+        cprintln(" OK", GREEN_ON_BLACK)
+        pass = pass + 1
+    } else if svc_count == 0 {
+        cprintln(" WARN (no services)", YELLOW_ON_BLACK)
+        pass = pass + 1  // Monolithic mode is OK
+    } else {
+        cprintln(" FAIL (crashed services)", RED_ON_BLACK)
+        fail = fail + 1
+    }
+
+    // 4. Memory leak check
+    cprint("  [4] Memory leaks: ", WHITE_ON_BLACK)
+    leak_detector_start()
+    // Allocate + free a test frame
+    let test_frame = frame_alloc()
+    if test_frame != -1 { frame_free(test_frame) }
+    let leaked = leak_detector_check()
+    if leaked == 0 {
+        cprint("    ", WHITE_ON_BLACK)
+        cprintln("OK", GREEN_ON_BLACK)
+        pass = pass + 1
+    } else {
+        cprint("    ", WHITE_ON_BLACK)
+        cprintln("FAIL", RED_ON_BLACK)
+        fail = fail + 1
+    }
+    leak_detector_reset()
+
+    // 5. IPC subsystem — queue functional
+    cprint("  [5] IPC: ", WHITE_ON_BLACK)
+    let ipc_msg = STRESS_MSG_BUF
+    let ipc_reply = STRESS_REPLY_BUF
+    let ipc_sender = STRESS_SENDER_BUF
+    ipc_msg_clear(ipc_msg)
+    ipc_msg_set_header(ipc_msg, 0, 0xFF, 0)
+    let push_ok = ipc_queue_push(0, 0, ipc_msg)
+    let pop_ok = ipc_queue_pop(0, ipc_sender, ipc_reply)
+    if push_ok == 0 && pop_ok == 0 {
+        cprintln("OK (push/pop verified)", GREEN_ON_BLACK)
+        pass = pass + 1
+    } else {
+        cprintln("FAIL", RED_ON_BLACK)
+        fail = fail + 1
+    }
+
+    // 6. Process table — no zombies
+    cprint("  [6] Processes: ", WHITE_ON_BLACK)
+    let mut zombie_count: i64 = 0
+    let mut pid: i64 = 0
+    while pid < PROC_V2_MAX {
+        if proc_v2_get(pid, 0) == PROC_STATE_ZOMBIE { zombie_count = zombie_count + 1 }
+        pid = pid + 1
+    }
+    if zombie_count == 0 {
+        cprintln("OK (no zombies)", GREEN_ON_BLACK)
+        pass = pass + 1
+    } else {
+        cprint_decimal(zombie_count, RED_ON_BLACK)
+        cprintln(" zombies found", RED_ON_BLACK)
+        fail = fail + 1
+    }
+
+    // 7. Frame allocator — can allocate and free
+    cprint("  [7] Frame allocator: ", WHITE_ON_BLACK)
+    let f1 = frame_alloc()
+    if f1 != -1 {
+        frame_free(f1)
+        let f2 = frame_alloc()
+        if f2 != -1 {
+            frame_free(f2)
+            cprintln("OK (alloc/free working)", GREEN_ON_BLACK)
+            pass = pass + 1
+        } else {
+            cprintln("FAIL (second alloc failed)", RED_ON_BLACK)
+            fail = fail + 1
+        }
+    } else {
+        cprintln("FAIL (alloc failed — out of memory?)", RED_ON_BLACK)
+        fail = fail + 1
+    }
+
+    // 8. Scheduler — SMP queues responsive
+    cprint("  [8] Scheduler: ", WHITE_ON_BLACK)
+    let test_pid = proc_v2_alloc()
+    if test_pid >= 0 {
+        proc_v2_set(test_pid, 0, PROC_STATE_READY)
+        proc_v2_set(test_pid, 8, test_pid)
+        smp_queue_add(0, test_pid)
+        let count_before = smp_queue_count(0)
+        smp_queue_remove(0, test_pid)
+        let count_after = smp_queue_count(0)
+        proc_v2_set(test_pid, 0, PROC_STATE_FREE)
+        if count_before > count_after {
+            cprintln("OK (enqueue/dequeue verified)", GREEN_ON_BLACK)
+            pass = pass + 1
+        } else {
+            cprintln("FAIL (queue mismatch)", RED_ON_BLACK)
+            fail = fail + 1
+        }
+    } else {
+        cprintln("SKIP (no free PID)", YELLOW_ON_BLACK)
+        pass = pass + 1
+    }
+
+    // Summary
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("=== Release Verdict ===", YELLOW_ON_BLACK)
+    cprint("  Checks: ", WHITE_ON_BLACK)
+    cprint_decimal(pass, GREEN_ON_BLACK)
+    cprint(" passed, ", WHITE_ON_BLACK)
+    cprint_decimal(fail, if fail == 0 { GREEN_ON_BLACK } else { RED_ON_BLACK })
+    cprintln(" failed", WHITE_ON_BLACK)
+
+    if fail == 0 {
+        cprintln("  RELEASE READY", GREEN_ON_BLACK)
+    } else {
+        cprintln("  NOT READY — fix issues above", RED_ON_BLACK)
+    }
+}

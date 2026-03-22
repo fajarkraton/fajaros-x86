@@ -62,6 +62,7 @@ SOURCES := \
 	kernel/core/mm_advanced.fj \
 	kernel/core/security.fj \
 	kernel/core/fast_ipc.fj \
+	kernel/core/stability.fj \
 	kernel/hw/detect.fj \
 	kernel/hw/acpi.fj \
 	kernel/hw/pcie.fj \
@@ -90,6 +91,7 @@ SOURCES := \
 	apps/user_programs.fj \
 	apps/mnist.fj \
 	tests/kernel_tests.fj \
+	tests/benchmarks.fj \
 	kernel/main.fj
 
 # QEMU settings
