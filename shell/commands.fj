@@ -668,9 +668,7 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 // New Shell Commands (Phase 2 expansion)
 // ═══════════════════════════════════════════════
 
-@kernel fn cmd_whoami() {
-    cprintln("root", WHITE_ON_BLACK)
-}
+// cmd_whoami moved to services/auth/main.fj (Sprint 4.3)
 
 @kernel fn cmd_hostname() {
     cprintln("fajaros-nova", CYAN_ON_BLACK)
@@ -3221,6 +3219,13 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 100 { cmd_hw_detect(); handled = 1 }
     // hw-test (104,119,45,116)
     if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 116 { cmd_hw_test(); handled = 1 }
+    // === Sprint 4.3: Auth/Multi-user commands ===
+    // auth-test (97,117,116,104,45,116)
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 117 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 104 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 116 { cmd_auth_login_test(); handled = 1 }
+    // users (117,115,101,114,115)
+    if handled == 0 && len == 5 && volatile_read_u8(0x6F800) == 117 && volatile_read_u8(0x6F801) == 115 && volatile_read_u8(0x6F802) == 101 && volatile_read_u8(0x6F803) == 114 && volatile_read_u8(0x6F804) == 115 { cmd_users(); handled = 1 }
+    // auth-id (97,117,116,104,45,105,100)
+    if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 117 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 104 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 105 { cmd_auth_id(); handled = 1 }
     // === Sprint 4.2: TCP/TLS commands ===
     // tcp-test (116,99,112,45,116)
     if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 99 && volatile_read_u8(0x6F802) == 112 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 116 { cmd_tcp_test(); handled = 1 }

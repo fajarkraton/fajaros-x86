@@ -1,0 +1,372 @@
+// FajarOS Nova v2.0 — Auth Service + Multi-User (Sprint 4.3)
+// @kernel process — user database, login, permissions, home directories
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// User Database — 16 users × 128 bytes at 0x990000
+// ═══════════════════════════════════════════════════════════════
+
+const USER_DB: i64 = 0x990000
+const USER_MAX: i64 = 16
+const USER_SIZE: i64 = 128
+
+// Per user: +0=active, +8=uid, +16=gid, +24=name[32], +56=hash, +64=home[32], +96=shell, +104=flags, +112=login_count, +120=last_login
+const USR_ACTIVE: i64 = 0
+const USR_UID: i64 = 8
+const USR_GID: i64 = 16
+const USR_NAME: i64 = 24
+const USR_HASH: i64 = 56
+const USR_HOME: i64 = 64
+const USR_SHELL: i64 = 96
+const USR_FLAGS: i64 = 104
+const USR_LOGIN_COUNT: i64 = 112
+const USR_LAST_LOGIN: i64 = 120
+
+// Flags
+const USR_FLAG_ADMIN: i64 = 1
+const USR_FLAG_LOCKED: i64 = 2
+const USR_FLAG_NOLOGIN: i64 = 4
+
+// Current session
+const AUTH_SESSION: i64 = 0x992000
+const AUTH_CURRENT_UID: i64 = 0
+const AUTH_CURRENT_GID: i64 = 8
+const AUTH_CURRENT_NAME: i64 = 16  // 32 bytes
+const AUTH_LOGIN_TIME: i64 = 48
+const AUTH_FAILED_ATTEMPTS: i64 = 56
+
+// ═══════════════════════════════════════════════════════════════
+// Password Hashing — FNV-1a (simple, not cryptographic)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn auth_hash(data_addr: i64, len: i64) -> i64 {
+    let mut hash: i64 = 0x811C9DC5  // FNV offset basis (32-bit)
+    let mut i: i64 = 0
+    while i < len {
+        let byte = volatile_read_u8(data_addr + i)
+        hash = hash ^ byte
+        hash = hash * 0x01000193  // FNV prime
+        // Keep in positive range
+        hash = hash & 0x7FFFFFFF
+        i = i + 1
+    }
+    hash
+}
+
+// ═══════════════════════════════════════════════════════════════
+// User Database Operations
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn user_addr(uid: i64) -> i64 { USER_DB + uid * USER_SIZE }
+
+@kernel fn user_read(uid: i64, off: i64) -> i64 {
+    if uid < 0 || uid >= USER_MAX { return 0 }
+    volatile_read_u64(user_addr(uid) + off)
+}
+
+@kernel fn user_write(uid: i64, off: i64, val: i64) {
+    if uid < 0 || uid >= USER_MAX { return }
+    volatile_write_u64(user_addr(uid) + off, val)
+}
+
+@kernel fn user_set_name(uid: i64, name_addr: i64) {
+    let base = user_addr(uid) + USR_NAME
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(name_addr + i)
+        volatile_write_u8(base + i, ch)
+        if ch == 0 { return }
+        i = i + 1
+    }
+    volatile_write_u8(base + 31, 0)
+}
+
+@kernel fn user_name_match(uid: i64, name_addr: i64) -> i64 {
+    let base = user_addr(uid) + USR_NAME
+    let mut i: i64 = 0
+    while i < 31 {
+        let a = volatile_read_u8(base + i)
+        let b = volatile_read_u8(name_addr + i)
+        if a != b { return 0 }
+        if a == 0 { return 1 }
+        i = i + 1
+    }
+    1
+}
+
+@kernel fn user_find(name_addr: i64) -> i64 {
+    let mut uid: i64 = 0
+    while uid < USER_MAX {
+        if user_read(uid, USR_ACTIVE) == 1 {
+            if user_name_match(uid, name_addr) == 1 { return uid }
+        }
+        uid = uid + 1
+    }
+    -1
+}
+
+@kernel fn user_create(name_addr: i64, password_addr: i64, pass_len: i64, is_admin: i64) -> i64 {
+    // Find free UID
+    let mut uid: i64 = 0
+    while uid < USER_MAX {
+        if user_read(uid, USR_ACTIVE) == 0 {
+            user_write(uid, USR_ACTIVE, 1)
+            user_write(uid, USR_UID, uid)
+            user_write(uid, USR_GID, uid)
+            user_set_name(uid, name_addr)
+            user_write(uid, USR_HASH, auth_hash(password_addr, pass_len))
+            user_write(uid, USR_FLAGS, if is_admin == 1 { USR_FLAG_ADMIN } else { 0 })
+            user_write(uid, USR_LOGIN_COUNT, 0)
+            return uid
+        }
+        uid = uid + 1
+    }
+    -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Login / Authentication
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn auth_login(name_addr: i64, pass_addr: i64, pass_len: i64) -> i64 {
+    let uid = user_find(name_addr)
+    if uid < 0 { return -1 }  // User not found
+
+    // Check locked
+    let flags = user_read(uid, USR_FLAGS)
+    if (flags & USR_FLAG_LOCKED) != 0 { return -3 }
+
+    // Verify password
+    let stored_hash = user_read(uid, USR_HASH)
+    let attempt_hash = auth_hash(pass_addr, pass_len)
+    if stored_hash != attempt_hash {
+        let fails = volatile_read_u64(AUTH_SESSION + AUTH_FAILED_ATTEMPTS) + 1
+        volatile_write_u64(AUTH_SESSION + AUTH_FAILED_ATTEMPTS, fails)
+        // Lock after 5 failed attempts
+        if fails >= 5 {
+            user_write(uid, USR_FLAGS, flags | USR_FLAG_LOCKED)
+        }
+        return -2  // Wrong password
+    }
+
+    // Success — set session
+    volatile_write_u64(AUTH_SESSION + AUTH_CURRENT_UID, uid)
+    volatile_write_u64(AUTH_SESSION + AUTH_CURRENT_GID, user_read(uid, USR_GID))
+    // Copy name to session
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(user_addr(uid) + USR_NAME + i)
+        volatile_write_u8(AUTH_SESSION + AUTH_CURRENT_NAME + i, ch)
+        if ch == 0 { i = 31 } else { i = i + 1 }
+    }
+    volatile_write_u64(AUTH_SESSION + AUTH_LOGIN_TIME, read_timer_ticks())
+    volatile_write_u64(AUTH_SESSION + AUTH_FAILED_ATTEMPTS, 0)
+
+    // Update user stats
+    user_write(uid, USR_LOGIN_COUNT, user_read(uid, USR_LOGIN_COUNT) + 1)
+    user_write(uid, USR_LAST_LOGIN, read_timer_ticks())
+
+    // Set process UID
+    proc_v2_set(volatile_read_u64(0x6FE00), 96, uid)  // field 96 = UID in proc table
+
+    uid
+}
+
+@kernel fn auth_get_uid() -> i64 {
+    volatile_read_u64(AUTH_SESSION + AUTH_CURRENT_UID)
+}
+
+@kernel fn auth_is_admin() -> i64 {
+    let uid = auth_get_uid()
+    let flags = user_read(uid, USR_FLAGS)
+    if (flags & USR_FLAG_ADMIN) != 0 { 1 } else { 0 }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// VFS Permission Integration
+// ═══════════════════════════════════════════════════════════════
+
+// Permission model: simple owner-based
+// Each file has owner_uid. Non-owner non-admin gets read-only.
+// Admin (uid 0 or USR_FLAG_ADMIN) gets full access.
+
+@kernel fn auth_check_perm(file_owner_uid: i64, operation: i64) -> i64 {
+    // operation: 0=read, 1=write, 2=execute
+    let current_uid = auth_get_uid()
+    // Root or admin always allowed
+    if current_uid == 0 || auth_is_admin() == 1 { return 1 }
+    // Owner can do anything
+    if current_uid == file_owner_uid { return 1 }
+    // Others: read-only
+    if operation == 0 { return 1 }
+    0  // Denied
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization — create default users
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn auth_init() {
+    // Clear database
+    let mut i: i64 = 0
+    while i < USER_MAX * USER_SIZE { volatile_write_u8(USER_DB + i, 0); i = i + 1 }
+    // Clear session
+    i = 0
+    while i < 64 { volatile_write_u8(AUTH_SESSION + i, 0); i = i + 1 }
+
+    // Create root user (uid 0, admin)
+    let name_buf: i64 = 0x992100
+    volatile_write_u8(name_buf, 114)    // r
+    volatile_write_u8(name_buf+1, 111)  // o
+    volatile_write_u8(name_buf+2, 111)  // o
+    volatile_write_u8(name_buf+3, 116)  // t
+    volatile_write_u8(name_buf+4, 0)
+    let pass_buf: i64 = 0x992140
+    volatile_write_u8(pass_buf, 114)    // r
+    volatile_write_u8(pass_buf+1, 111)  // o
+    volatile_write_u8(pass_buf+2, 111)  // o
+    volatile_write_u8(pass_buf+3, 116)  // t
+    volatile_write_u8(pass_buf+4, 0)
+    user_create(name_buf, pass_buf, 4, 1)
+
+    // Create fajar user (uid 1, normal)
+    volatile_write_u8(name_buf, 102)    // f
+    volatile_write_u8(name_buf+1, 97)   // a
+    volatile_write_u8(name_buf+2, 106)  // j
+    volatile_write_u8(name_buf+3, 97)   // a
+    volatile_write_u8(name_buf+4, 114)  // r
+    volatile_write_u8(name_buf+5, 0)
+    volatile_write_u8(pass_buf, 102)    // f
+    volatile_write_u8(pass_buf+1, 97)   // a
+    volatile_write_u8(pass_buf+2, 106)  // j
+    volatile_write_u8(pass_buf+3, 97)   // a
+    volatile_write_u8(pass_buf+4, 114)  // r
+    volatile_write_u8(pass_buf+5, 0)
+    user_create(name_buf, pass_buf, 5, 0)
+
+    // Create guest user (uid 2, normal)
+    volatile_write_u8(name_buf, 103)    // g
+    volatile_write_u8(name_buf+1, 117)  // u
+    volatile_write_u8(name_buf+2, 101)  // e
+    volatile_write_u8(name_buf+3, 115)  // s
+    volatile_write_u8(name_buf+4, 116)  // t
+    volatile_write_u8(name_buf+5, 0)
+    volatile_write_u8(pass_buf, 103)    // g
+    volatile_write_u8(pass_buf+1, 117)  // u
+    volatile_write_u8(pass_buf+2, 101)  // e
+    volatile_write_u8(pass_buf+3, 115)  // s
+    volatile_write_u8(pass_buf+4, 116)  // t
+    volatile_write_u8(pass_buf+5, 0)
+    user_create(name_buf, pass_buf, 5, 0)
+
+    // Auto-login as root
+    volatile_write_u8(name_buf, 114)
+    volatile_write_u8(name_buf+1, 111)
+    volatile_write_u8(name_buf+2, 111)
+    volatile_write_u8(name_buf+3, 116)
+    volatile_write_u8(name_buf+4, 0)
+    auth_login(name_buf, pass_buf, 4)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_whoami() {
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(AUTH_SESSION + AUTH_CURRENT_NAME + i)
+        if ch == 0 { i = 31 } else { console_putchar(ch, CYAN_ON_BLACK); i = i + 1 }
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_auth_id() {
+    cprint("uid=", WHITE_ON_BLACK)
+    cprint_decimal(auth_get_uid(), CYAN_ON_BLACK)
+    cprint(" gid=", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(AUTH_SESSION + AUTH_CURRENT_GID), CYAN_ON_BLACK)
+    cprint(" name=", WHITE_ON_BLACK)
+    cmd_whoami()
+}
+
+@kernel fn cmd_users() {
+    cprintln("Users:", YELLOW_ON_BLACK)
+    let mut uid: i64 = 0
+    while uid < USER_MAX {
+        if user_read(uid, USR_ACTIVE) == 1 {
+            cprint("  uid=", WHITE_ON_BLACK)
+            cprint_decimal(uid, CYAN_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            let base = user_addr(uid) + USR_NAME
+            let mut j: i64 = 0
+            while j < 31 {
+                let ch = volatile_read_u8(base + j)
+                if ch == 0 { j = 31 } else { console_putchar(ch, GREEN_ON_BLACK); j = j + 1 }
+            }
+            let flags = user_read(uid, USR_FLAGS)
+            if (flags & USR_FLAG_ADMIN) != 0 { cprint(" [admin]", YELLOW_ON_BLACK) }
+            if (flags & USR_FLAG_LOCKED) != 0 { cprint(" [LOCKED]", RED_ON_BLACK) }
+            cprint(" logins=", WHITE_ON_BLACK)
+            cprint_decimal(user_read(uid, USR_LOGIN_COUNT), WHITE_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        uid = uid + 1
+    }
+}
+
+@kernel fn cmd_auth_login_test() {
+    cprintln("=== Auth Test ===", YELLOW_ON_BLACK)
+
+    // Test 1: whoami
+    cprint("[1] Current user: ", WHITE_ON_BLACK)
+    cmd_whoami()
+
+    // Test 2: List users
+    cprintln("[2] User list:", WHITE_ON_BLACK)
+    cmd_users()
+
+    // Test 3: Login as fajar
+    cprintln("[3] Login as fajar:", WHITE_ON_BLACK)
+    let name_buf: i64 = 0x992200
+    volatile_write_u8(name_buf, 102); volatile_write_u8(name_buf+1, 97)
+    volatile_write_u8(name_buf+2, 106); volatile_write_u8(name_buf+3, 97)
+    volatile_write_u8(name_buf+4, 114); volatile_write_u8(name_buf+5, 0)
+    let pass_buf: i64 = 0x992240
+    volatile_write_u8(pass_buf, 102); volatile_write_u8(pass_buf+1, 97)
+    volatile_write_u8(pass_buf+2, 106); volatile_write_u8(pass_buf+3, 97)
+    volatile_write_u8(pass_buf+4, 114); volatile_write_u8(pass_buf+5, 0)
+    let result = auth_login(name_buf, pass_buf, 5)
+    cprint("  result=", WHITE_ON_BLACK)
+    if result >= 0 {
+        cprint_decimal(result, GREEN_ON_BLACK)
+        cprint(" now: ", WHITE_ON_BLACK)
+        cmd_whoami()
+    } else {
+        cprint_decimal(result, RED_ON_BLACK)
+        cprintln(" FAILED", RED_ON_BLACK)
+    }
+
+    // Test 4: Permission check
+    cprintln("[4] Permission check:", WHITE_ON_BLACK)
+    cprint("  Read /root (owner=0): ", WHITE_ON_BLACK)
+    if auth_check_perm(0, 0) == 1 { cprintln("ALLOWED", GREEN_ON_BLACK) }
+    else { cprintln("DENIED", RED_ON_BLACK) }
+    cprint("  Write /root (owner=0): ", WHITE_ON_BLACK)
+    if auth_check_perm(0, 1) == 1 { cprintln("ALLOWED", YELLOW_ON_BLACK) }
+    else { cprintln("DENIED", RED_ON_BLACK) }
+
+    // Test 5: Switch back to root
+    cprintln("[5] Switch to root:", WHITE_ON_BLACK)
+    volatile_write_u8(name_buf, 114); volatile_write_u8(name_buf+1, 111)
+    volatile_write_u8(name_buf+2, 111); volatile_write_u8(name_buf+3, 116)
+    volatile_write_u8(name_buf+4, 0)
+    volatile_write_u8(pass_buf, 114); volatile_write_u8(pass_buf+1, 111)
+    volatile_write_u8(pass_buf+2, 111); volatile_write_u8(pass_buf+3, 116)
+    volatile_write_u8(pass_buf+4, 0)
+    auth_login(name_buf, pass_buf, 4)
+    cprint("  Now: ", WHITE_ON_BLACK)
+    cmd_whoami()
+
+    cprintln("=== Auth test complete ===", GREEN_ON_BLACK)
+}
