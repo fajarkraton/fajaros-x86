@@ -220,7 +220,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
             let et_hi = volatile_read_u8(NET_RX_BUF + eth_off + 12)
             let et_lo = volatile_read_u8(NET_RX_BUF + eth_off + 13)
             if et_hi == 0x08 && et_lo == 0x00 {
-                // IPv4 — check protocol at IP offset 9
+                // IPv4 — check ip_proto at IP offset 9
                 let ip_off = eth_off + 14
                 let proto = volatile_read_u8(NET_RX_BUF + ip_off + 9)
                 if proto == 1 {
@@ -432,7 +432,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 
 // ── IPv4 ──
 
-@kernel fn ip_build_header(dst_ip: i64, protocol: i64, payload_len: i64) -> i64 {
+@kernel fn ip_build_header(dst_ip: i64, ip_proto: i64, payload_len: i64) -> i64 {
     let buf = NET_PKT_BUF + 512 // Use offset 512 for IP header build
     let total_len = 20 + payload_len
     // Version(4) + IHL(5) = 0x45
@@ -448,7 +448,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     // TTL
     volatile_write_u8(buf + 8, 64)
     // Protocol (1=ICMP, 6=TCP, 17=UDP)
-    volatile_write_u8(buf + 9, protocol)
+    volatile_write_u8(buf + 9, ip_proto)
     // Checksum (set to 0, compute later)
     buffer_write_u16_be(buf + 10, 0)
     // Source IP
