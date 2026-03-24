@@ -27,6 +27,7 @@ SOURCES := \
 	kernel/mm/slab.fj \
 	kernel/ipc/message.fj \
 	kernel/ipc/pipe.fj \
+	kernel/ipc/pipe_v2.fj \
 	kernel/ipc/ipc.fj \
 	kernel/ipc/channel.fj \
 	kernel/ipc/notify.fj \
@@ -46,6 +47,8 @@ SOURCES := \
 	kernel/process/exec.fj \
 	kernel/process/wait.fj \
 	kernel/process/exit.fj \
+	kernel/signal/signal.fj \
+	kernel/signal/jobs.fj \
 	kernel/security/capability.fj \
 	kernel/security/limits.fj \
 	kernel/security/hardening.fj \

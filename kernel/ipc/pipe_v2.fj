@@ -1,0 +1,99 @@
+// FajarOS Nova v1.2.0 "Nexus" — Pipe V2 (Circular + Refcounting)
+// kernel/ipc/pipe_v2.fj — SYS_PIPE, circular buffer, EOF detection
+
+const PIPE_REFCOUNT: i64 = 0x8D4000  // 8 pipes x 16B: reader_count + writer_count
+const PIPE_BUF_OFFSET: i64 = 32
+const PIPE_BUF_SIZE: i64 = 4064     // 4096 - 32
+
+// SYS_PIPE(23): create pipe, return read/write FDs
+@kernel fn sys_pipe(fds_addr: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let slot = pipe_create()
+    if slot < 0 { return -1 }
+
+    let read_fd = fd_v2_alloc(pid)
+    if read_fd < 0 { return -1 }
+    fd_v2_set(pid, read_fd, FD_PIPE_READ, slot)
+
+    let write_fd = fd_v2_alloc(pid)
+    if write_fd < 0 { fd_v2_set(pid, read_fd, FD_CLOSED, 0); return -1 }
+    fd_v2_set(pid, write_fd, FD_PIPE_WRITE, slot)
+
+    let ref_base = PIPE_REFCOUNT + slot * 16
+    volatile_write_u64(ref_base, 1)      // reader_count
+    volatile_write_u64(ref_base + 8, 1)  // writer_count
+
+    if fds_addr != 0 {
+        volatile_write_u64(fds_addr, read_fd)
+        volatile_write_u64(fds_addr + 8, write_fd)
+    }
+    0
+}
+
+// Refcount operations
+@kernel fn pipe_incref(slot: i64, is_writer: i64) {
+    let ref_base = PIPE_REFCOUNT + slot * 16
+    let off = if is_writer != 0 { 8 } else { 0 }
+    let count = volatile_read_u64(ref_base + off)
+    volatile_write_u64(ref_base + off, count + 1)
+}
+
+@kernel fn pipe_decref(slot: i64, is_writer: i64) -> i64 {
+    let ref_base = PIPE_REFCOUNT + slot * 16
+    let off = if is_writer != 0 { 8 } else { 0 }
+    let count = volatile_read_u64(ref_base + off)
+    let nc = if count > 0 { count - 1 } else { 0 }
+    volatile_write_u64(ref_base + off, nc)
+    let rc = volatile_read_u64(ref_base)
+    let wc = volatile_read_u64(ref_base + 8)
+    if rc == 0 && wc == 0 { 1 } else { 0 }
+}
+
+@kernel fn pipe_has_writers(slot: i64) -> i64 { volatile_read_u64(PIPE_REFCOUNT + slot * 16 + 8) }
+@kernel fn pipe_has_readers(slot: i64) -> i64 { volatile_read_u64(PIPE_REFCOUNT + slot * 16) }
+
+// Circular pipe read
+@kernel fn pipe_read_circular(slot: i64, buf: i64, len: i64) -> i64 {
+    let pb = PIPE_POOL + slot * 4096
+    let rp = volatile_read_u64(pb + 8)
+    let wp = volatile_read_u64(pb + 16)
+    if wp == rp {
+        if pipe_has_writers(slot) == 0 { return 0 } // EOF
+        return -2 // would block
+    }
+    let avail = (wp - rp + PIPE_BUF_SIZE) % PIPE_BUF_SIZE
+    let to_read = if len < avail { len } else { avail }
+    let mut i: i64 = 0
+    while i < to_read {
+        volatile_write_u8(buf + i, volatile_read_u8(pb + PIPE_BUF_OFFSET + ((rp + i) % PIPE_BUF_SIZE)))
+        i = i + 1
+    }
+    volatile_write_u64(pb + 8, (rp + to_read) % PIPE_BUF_SIZE)
+    to_read
+}
+
+// Circular pipe write
+@kernel fn pipe_write_circular(slot: i64, data: i64, len: i64) -> i64 {
+    let pb = PIPE_POOL + slot * 4096
+    let rp = volatile_read_u64(pb + 8)
+    let wp = volatile_read_u64(pb + 16)
+    if pipe_has_readers(slot) == 0 { return -1 } // broken pipe
+    let used = (wp - rp + PIPE_BUF_SIZE) % PIPE_BUF_SIZE
+    let free = PIPE_BUF_SIZE - 1 - used
+    if free <= 0 { return -2 } // full
+    let to_write = if len < free { len } else { free }
+    let mut i: i64 = 0
+    while i < to_write {
+        volatile_write_u8(pb + PIPE_BUF_OFFSET + ((wp + i) % PIPE_BUF_SIZE), volatile_read_u8(data + i))
+        i = i + 1
+    }
+    volatile_write_u64(pb + 16, (wp + to_write) % PIPE_BUF_SIZE)
+    to_write
+}
+
+@kernel fn pipe_free(slot: i64) {
+    let pb = PIPE_POOL + slot * 4096
+    volatile_write_u64(pb, 0)
+    volatile_write_u64(pb + 8, 0)
+    volatile_write_u64(pb + 16, 0)
+}

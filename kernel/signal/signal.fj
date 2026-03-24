@@ -1,0 +1,139 @@
+// FajarOS Nova v1.2.0 "Nexus" — Signal Infrastructure
+// kernel/signal/signal.fj — signal table, send, check, deliver
+
+const SIGNAL_TABLE: i64 = 0x8D1000  // 16 procs x 64B
+const SIG_ENTRY_SIZE: i64 = 64
+const SIG_OFF_PENDING: i64 = 0
+const SIG_OFF_MASK: i64 = 8
+const SIG_OFF_HANDLERS: i64 = 16
+const SIG_MAX_SLOTS: i64 = 8
+
+// Signal numbers (POSIX)
+const SIGHUP: i64 = 1
+const SIGINT: i64 = 2
+const SIGKILL: i64 = 9
+const SIGSEGV: i64 = 11
+const SIGTERM: i64 = 15
+const SIGCHLD: i64 = 17
+const SIGCONT: i64 = 18
+const SIGSTOP: i64 = 19
+const SIGTSTP: i64 = 20
+
+const SIG_DFL: i64 = 0
+const SIG_IGN: i64 = 1
+
+@kernel fn sig_to_slot(signum: i64) -> i64 {
+    if signum == SIGHUP { 0 }
+    else if signum == SIGINT { 1 }
+    else if signum == SIGKILL { 2 }
+    else if signum == SIGSEGV { 3 }
+    else if signum == SIGTERM { 4 }
+    else if signum == SIGCHLD { 5 }
+    else if signum == SIGSTOP { 6 }
+    else if signum == SIGCONT { 7 }
+    else { -1 }
+}
+
+@kernel fn slot_to_signum(slot: i64) -> i64 {
+    if slot == 0 { SIGHUP }
+    else if slot == 1 { SIGINT }
+    else if slot == 2 { SIGKILL }
+    else if slot == 3 { SIGSEGV }
+    else if slot == 4 { SIGTERM }
+    else if slot == 5 { SIGCHLD }
+    else if slot == 6 { SIGSTOP }
+    else if slot == 7 { SIGCONT }
+    else { 0 }
+}
+
+@kernel fn sig_entry_addr(pid: i64) -> i64 { SIGNAL_TABLE + pid * SIG_ENTRY_SIZE }
+
+@kernel fn sig_init(pid: i64) {
+    let base = sig_entry_addr(pid)
+    volatile_write_u64(base + SIG_OFF_PENDING, 0)
+    volatile_write_u64(base + SIG_OFF_MASK, 0)
+    let mut i: i64 = 0
+    while i < SIG_MAX_SLOTS { volatile_write_u64(base + SIG_OFF_HANDLERS + i * 8, SIG_DFL); i = i + 1 }
+}
+
+@kernel fn signal_send(pid: i64, signum: i64) -> i64 {
+    if pid < 0 || pid >= PROC_MAX { return -1 }
+    let slot = sig_to_slot(signum)
+    if slot < 0 { return -1 }
+    let base = sig_entry_addr(pid)
+    let pending = volatile_read_u64(base + SIG_OFF_PENDING)
+    volatile_write_u64(base + SIG_OFF_PENDING, pending | (1 << slot))
+    if signum == SIGKILL { signal_deliver_default(pid, signum) }
+    if signum == SIGCONT {
+        let state = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+        if state == PROC_STATE_BLOCKED {
+            volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE, PROC_STATE_READY)
+        }
+    }
+    0
+}
+
+@kernel fn signal_deliver_default(pid: i64, signum: i64) {
+    if signum == SIGKILL || signum == SIGTERM || signum == SIGINT || signum == SIGHUP || signum == SIGSEGV {
+        let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+        volatile_write(base + PROC_OFF_STATE, PROC_STATE_ZOMBIE)
+        volatile_write(base + PROC_OFF_EXIT, 128 + signum)
+        reparent_children(pid)
+        wake_waiting_parent(pid, 128 + signum)
+        let mut fd: i64 = 0
+        while fd < FD_MAX { fd_v2_set(pid, fd, FD_CLOSED, 0); fd = fd + 1 }
+    }
+    if signum == SIGSTOP || signum == SIGTSTP {
+        volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE, PROC_STATE_BLOCKED)
+    }
+}
+
+@kernel fn signal_check_pending(pid: i64) -> i64 {
+    let base = sig_entry_addr(pid)
+    let pending = volatile_read_u64(base + SIG_OFF_PENDING)
+    let xor_mask = volatile_read_u64(base + SIG_OFF_MASK) ^ 0xFF
+    let deliverable = pending & xor_mask
+    if deliverable == 0 { 0 }
+    else { signal_deliver_first(pid, base, pending, deliverable) }
+}
+
+@kernel fn signal_deliver_first(pid: i64, base: i64, pending: i64, deliverable: i64) -> i64 {
+    let slot = signal_find_first_bit(deliverable)
+    if slot < 0 { 0 }
+    else {
+        let clear_mask = 0xFF ^ (1 << slot)
+        volatile_write_u64(base + SIG_OFF_PENDING, pending & clear_mask)
+        let handler = volatile_read_u64(base + SIG_OFF_HANDLERS + slot * 8)
+        if handler == SIG_DFL { signal_deliver_default(pid, slot_to_signum(slot)) }
+        slot + 1
+    }
+}
+
+@kernel fn signal_find_first_bit(bitmap: i64) -> i64 {
+    if (bitmap & 1) != 0 { 0 }
+    else if (bitmap & 2) != 0 { 1 }
+    else if (bitmap & 4) != 0 { 2 }
+    else if (bitmap & 8) != 0 { 3 }
+    else if (bitmap & 16) != 0 { 4 }
+    else if (bitmap & 32) != 0 { 5 }
+    else if (bitmap & 64) != 0 { 6 }
+    else if (bitmap & 128) != 0 { 7 }
+    else { -1 }
+}
+
+@kernel fn sys_kill(pid: i64, signum: i64) -> i64 {
+    if pid < 0 || pid >= PROC_MAX { return -1 }
+    if volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE) == PROC_STATE_FREE { return -1 }
+    signal_send(pid, signum)
+}
+
+@kernel fn sys_signal(signum: i64, handler: i64) -> i64 {
+    if signum == SIGKILL || signum == SIGSTOP { return -1 }
+    let slot = sig_to_slot(signum)
+    if slot < 0 { return -1 }
+    let pid = volatile_read_u64(0x6FE00)
+    let base = sig_entry_addr(pid)
+    let old = volatile_read_u64(base + SIG_OFF_HANDLERS + slot * 8)
+    volatile_write_u64(base + SIG_OFF_HANDLERS + slot * 8, handler)
+    old
+}

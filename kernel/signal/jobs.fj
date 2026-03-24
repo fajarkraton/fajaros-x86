@@ -1,0 +1,175 @@
+// FajarOS Nova v1.2.0 "Nexus" — Job Control
+// kernel/signal/jobs.fj — job table, jobs/fg/bg, Ctrl+C/Z, background &
+
+const JOB_TABLE: i64 = 0x8D8000
+const JOB_MAX: i64 = 16
+const JOB_ENTRY_SIZE: i64 = 64
+const JOB_OFF_PID: i64 = 0
+const JOB_OFF_STATE: i64 = 8
+const JOB_OFF_CMD: i64 = 16
+
+const JOB_FREE: i64 = 0
+const JOB_RUNNING: i64 = 1
+const JOB_STOPPED: i64 = 2
+const JOB_DONE: i64 = 3
+
+const FG_PGID_ADDR: i64 = 0x652068
+const CTRL_STATE_ADDR: i64 = 0x6FBE4
+
+@kernel fn set_fg_pgid(pgid: i64) { volatile_write_u64(FG_PGID_ADDR, pgid) }
+@kernel fn get_fg_pgid() -> i64 { volatile_read_u64(FG_PGID_ADDR) }
+
+@kernel fn signal_fg_group(signum: i64) {
+    let fg = get_fg_pgid()
+    if fg == 0 { return }
+    let mut pid: i64 = 1
+    while pid < PROC_MAX {
+        let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+        let state = volatile_read(base + PROC_OFF_STATE)
+        if state != PROC_STATE_FREE && state != PROC_STATE_ZOMBIE {
+            if volatile_read(base + PROC_OFF_PGID) == fg { signal_send(pid, signum) }
+        }
+        pid = pid + 1
+    }
+}
+
+@kernel fn shell_has_background() -> i64 {
+    let len = cmdbuf_len()
+    if len < 2 { return 0 }
+    let mut pos = len - 1
+    while pos > 0 && volatile_read_u8(0x6F800 + pos) == 32 { pos = pos - 1 }
+    if volatile_read_u8(0x6F800 + pos) == 38 { pos } else { 0 }
+}
+
+@kernel fn job_add(pid: i64, cmd_addr: i64, cmd_len: i64) -> i64 {
+    let mut slot: i64 = 0
+    while slot < JOB_MAX {
+        let base = JOB_TABLE + slot * JOB_ENTRY_SIZE
+        if volatile_read_u64(base + JOB_OFF_STATE) == JOB_FREE {
+            volatile_write_u64(base + JOB_OFF_PID, pid)
+            volatile_write_u64(base + JOB_OFF_STATE, JOB_RUNNING)
+            let copy_len = if cmd_len < 47 { cmd_len } else { 47 }
+            let mut i: i64 = 0
+            while i < copy_len {
+                volatile_write_u8(base + JOB_OFF_CMD + i, volatile_read_u8(cmd_addr + i))
+                i = i + 1
+            }
+            volatile_write_u8(base + JOB_OFF_CMD + copy_len, 0)
+            return slot
+        }
+        slot = slot + 1
+    }
+    -1
+}
+
+@kernel fn job_check_notifications() {
+    let mut slot: i64 = 0
+    while slot < JOB_MAX {
+        let base = JOB_TABLE + slot * JOB_ENTRY_SIZE
+        if volatile_read_u64(base + JOB_OFF_STATE) == JOB_RUNNING {
+            let pid = volatile_read_u64(base + JOB_OFF_PID)
+            let ps = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+            if ps == PROC_STATE_ZOMBIE || ps == PROC_STATE_FREE {
+                volatile_write_u64(base + JOB_OFF_STATE, JOB_DONE)
+                cprint("[", WHITE_ON_BLACK)
+                cprint_decimal(slot + 1, CYAN_ON_BLACK)
+                cprint("]+  Done                    ", WHITE_ON_BLACK)
+                let mut ci: i64 = 0
+                while ci < 47 {
+                    let ch = volatile_read_u8(base + JOB_OFF_CMD + ci)
+                    if ch == 0 { ci = 47 } else { console_putchar(ch, WHITE_ON_BLACK); ci = ci + 1 }
+                }
+                console_putchar(10, WHITE_ON_BLACK)
+                if ps == PROC_STATE_ZOMBIE { process_reap(pid) }
+                volatile_write_u64(base + JOB_OFF_STATE, JOB_FREE)
+            }
+        }
+        slot = slot + 1
+    }
+}
+
+@kernel fn cmd_jobs() {
+    let mut slot: i64 = 0
+    let mut count: i64 = 0
+    while slot < JOB_MAX {
+        let base = JOB_TABLE + slot * JOB_ENTRY_SIZE
+        let state = volatile_read_u64(base + JOB_OFF_STATE)
+        if state != JOB_FREE {
+            cprint("[", WHITE_ON_BLACK)
+            cprint_decimal(slot + 1, CYAN_ON_BLACK)
+            cprint("]  ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(base + JOB_OFF_PID), CYAN_ON_BLACK)
+            cprint("  ", WHITE_ON_BLACK)
+            if state == JOB_RUNNING { cprint("Running   ", GREEN_ON_BLACK) }
+            else if state == JOB_STOPPED { cprint("Stopped   ", YELLOW_ON_BLACK) }
+            else if state == JOB_DONE { cprint("Done      ", WHITE_ON_BLACK) }
+            let mut ci: i64 = 0
+            while ci < 47 {
+                let ch = volatile_read_u8(base + JOB_OFF_CMD + ci)
+                if ch == 0 { ci = 47 } else { console_putchar(ch, WHITE_ON_BLACK); ci = ci + 1 }
+            }
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        slot = slot + 1
+    }
+    if count == 0 { cprintln("No background jobs", WHITE_ON_BLACK) }
+}
+
+@kernel fn cmd_fg() {
+    let mut target: i64 = -1
+    let len = cmdbuf_len()
+    if len > 3 {
+        let ch = volatile_read_u8(0x6F800 + 3)
+        if ch == 37 { target = volatile_read_u8(0x6F800 + 4) - 48 - 1 }
+        else { target = ch - 48 - 1 }
+    }
+    if target < 0 || target >= JOB_MAX {
+        let mut slot = JOB_MAX - 1
+        while slot >= 0 && target < 0 {
+            if volatile_read_u64(JOB_TABLE + slot * JOB_ENTRY_SIZE + JOB_OFF_STATE) != JOB_FREE { target = slot }
+            slot = slot - 1
+        }
+    }
+    if target < 0 { cprintln("No current job", RED_ON_BLACK); return }
+    let base = JOB_TABLE + target * JOB_ENTRY_SIZE
+    let pid = volatile_read_u64(base + JOB_OFF_PID)
+    if volatile_read_u64(base + JOB_OFF_STATE) == JOB_STOPPED {
+        signal_send(pid, SIGCONT)
+        volatile_write_u64(base + JOB_OFF_STATE, JOB_RUNNING)
+    }
+    set_fg_pgid(pid)
+    cprint("Foreground: PID ", WHITE_ON_BLACK)
+    cprint_decimal(pid, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    sys_waitpid(pid, 0, 0)
+    set_fg_pgid(0)
+    volatile_write_u64(base + JOB_OFF_STATE, JOB_FREE)
+}
+
+@kernel fn cmd_bg() {
+    let mut target: i64 = -1
+    let len = cmdbuf_len()
+    if len > 3 {
+        let ch = volatile_read_u8(0x6F800 + 3)
+        if ch == 37 { target = volatile_read_u8(0x6F800 + 4) - 48 - 1 }
+        else { target = ch - 48 - 1 }
+    }
+    if target < 0 || target >= JOB_MAX {
+        let mut slot = JOB_MAX - 1
+        while slot >= 0 && target < 0 {
+            if volatile_read_u64(JOB_TABLE + slot * JOB_ENTRY_SIZE + JOB_OFF_STATE) == JOB_STOPPED { target = slot }
+            slot = slot - 1
+        }
+    }
+    if target < 0 { cprintln("No stopped job", RED_ON_BLACK); return }
+    let base = JOB_TABLE + target * JOB_ENTRY_SIZE
+    let pid = volatile_read_u64(base + JOB_OFF_PID)
+    signal_send(pid, SIGCONT)
+    volatile_write_u64(base + JOB_OFF_STATE, JOB_RUNNING)
+    cprint("[", WHITE_ON_BLACK)
+    cprint_decimal(target + 1, CYAN_ON_BLACK)
+    cprint("]  ", WHITE_ON_BLACK)
+    cprint_decimal(pid, CYAN_ON_BLACK)
+    cprintln(" &", WHITE_ON_BLACK)
+}
