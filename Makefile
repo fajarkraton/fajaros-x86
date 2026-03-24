@@ -91,6 +91,8 @@ SOURCES := \
 	kernel/ring3_embed.fj \
 	services/blk/main.fj \
 	services/blk/journal.fj \
+	services/net/socket.fj \
+	services/net/httpd.fj \
 	services/net/main.fj \
 	services/net/tcp.fj \
 	services/net/dns.fj \

@@ -1,0 +1,194 @@
+// FajarOS Nova v1.3.0 "Bastion" — Socket API
+// services/net/socket.fj — socket table, bind, listen, accept, connect, netstat
+
+const SOCKET_TABLE: i64 = 0x980000
+const SOCKET_MAX: i64 = 16
+const SOCKET_ENTRY_SIZE: i64 = 64
+const SOCK_OFF_STATE: i64 = 0
+const SOCK_OFF_TYPE: i64 = 8
+const SOCK_OFF_LOCAL_PORT: i64 = 16
+const SOCK_OFF_REMOTE_IP: i64 = 24
+const SOCK_OFF_REMOTE_PORT: i64 = 32
+const SOCK_OFF_RX_BUF: i64 = 40
+const SOCK_OFF_TX_BUF: i64 = 48
+const SOCK_OFF_BACKLOG: i64 = 56
+
+const SOCK_FREE: i64 = 0
+const SOCK_CREATED: i64 = 1
+const SOCK_BOUND: i64 = 2
+const SOCK_LISTEN: i64 = 3
+const SOCK_CONNECTING: i64 = 4
+const SOCK_ESTABLISHED: i64 = 5
+const SOCK_CLOSE_WAIT: i64 = 6
+const SOCK_CLOSED: i64 = 7
+const SOCK_STREAM: i64 = 1
+const SOCK_DGRAM: i64 = 2
+const FD_SOCKET: i64 = 6
+const SOCKET_BUF_BASE: i64 = 0x982000
+const SOCKET_BUF_SIZE: i64 = 2048
+
+const SYS_SOCKET: i64 = 27
+const SYS_BIND: i64 = 28
+const SYS_LISTEN: i64 = 29
+const SYS_ACCEPT: i64 = 30
+const SYS_CONNECT_SOCK: i64 = 31
+
+@kernel fn socket_init() {
+    let mut i: i64 = 0
+    while i < SOCKET_MAX * SOCKET_ENTRY_SIZE { volatile_write_u8(SOCKET_TABLE + i, 0); i = i + 1 }
+}
+
+@kernel fn sys_socket(sock_type: i64) -> i64 {
+    let mut slot: i64 = -1
+    let mut i: i64 = 0
+    while i < SOCKET_MAX && slot == -1 {
+        if volatile_read_u64(SOCKET_TABLE + i * SOCKET_ENTRY_SIZE) == SOCK_FREE { slot = i }
+        i = i + 1
+    }
+    if slot == -1 { return -1 }
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    volatile_write_u64(entry + SOCK_OFF_STATE, SOCK_CREATED)
+    volatile_write_u64(entry + SOCK_OFF_TYPE, sock_type)
+    volatile_write_u64(entry + SOCK_OFF_LOCAL_PORT, 0)
+    volatile_write_u64(entry + SOCK_OFF_REMOTE_IP, 0)
+    volatile_write_u64(entry + SOCK_OFF_REMOTE_PORT, 0)
+    volatile_write_u64(entry + SOCK_OFF_RX_BUF, SOCKET_BUF_BASE + slot * SOCKET_BUF_SIZE * 2)
+    volatile_write_u64(entry + SOCK_OFF_TX_BUF, SOCKET_BUF_BASE + slot * SOCKET_BUF_SIZE * 2 + SOCKET_BUF_SIZE)
+    volatile_write_u64(entry + SOCK_OFF_BACKLOG, 0)
+    let pid = volatile_read_u64(0x6FE00)
+    let fd = fd_v2_alloc(pid)
+    if fd == -1 { volatile_write_u64(entry + SOCK_OFF_STATE, SOCK_FREE); return -1 }
+    fd_v2_set(pid, fd, FD_SOCKET, slot)
+    fd
+}
+
+@kernel fn sys_bind(fd: i64, port: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    if fd_v2_get_type(pid, fd) != FD_SOCKET { return -1 }
+    let slot = fd_v2_get_data(pid, fd)
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    if volatile_read_u64(entry + SOCK_OFF_STATE) != SOCK_CREATED { return -1 }
+    let mut i: i64 = 0
+    while i < SOCKET_MAX {
+        let e = SOCKET_TABLE + i * SOCKET_ENTRY_SIZE
+        if volatile_read_u64(e + SOCK_OFF_STATE) != SOCK_FREE && volatile_read_u64(e + SOCK_OFF_LOCAL_PORT) == port { return -2 }
+        i = i + 1
+    }
+    volatile_write_u64(entry + SOCK_OFF_LOCAL_PORT, port)
+    volatile_write_u64(entry + SOCK_OFF_STATE, SOCK_BOUND)
+    0
+}
+
+@kernel fn sys_listen(fd: i64, backlog: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    if fd_v2_get_type(pid, fd) != FD_SOCKET { return -1 }
+    let slot = fd_v2_get_data(pid, fd)
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    if volatile_read_u64(entry + SOCK_OFF_STATE) != SOCK_BOUND { return -1 }
+    volatile_write_u64(entry + SOCK_OFF_BACKLOG, backlog)
+    volatile_write_u64(entry + SOCK_OFF_STATE, SOCK_LISTEN)
+    0
+}
+
+@kernel fn sys_accept(fd: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    if fd_v2_get_type(pid, fd) != FD_SOCKET { return -1 }
+    let slot = fd_v2_get_data(pid, fd)
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    if volatile_read_u64(entry + SOCK_OFF_STATE) != SOCK_LISTEN { return -1 }
+    let new_fd = sys_socket(SOCK_STREAM)
+    if new_fd < 0 { return -1 }
+    let new_slot = fd_v2_get_data(pid, new_fd)
+    let ne = SOCKET_TABLE + new_slot * SOCKET_ENTRY_SIZE
+    volatile_write_u64(ne + SOCK_OFF_STATE, SOCK_ESTABLISHED)
+    volatile_write_u64(ne + SOCK_OFF_LOCAL_PORT, volatile_read_u64(entry + SOCK_OFF_LOCAL_PORT))
+    new_fd
+}
+
+@kernel fn sys_connect_sock(fd: i64, remote_ip: i64, remote_port: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    if fd_v2_get_type(pid, fd) != FD_SOCKET { return -1 }
+    let slot = fd_v2_get_data(pid, fd)
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    let state = volatile_read_u64(entry + SOCK_OFF_STATE)
+    if state != SOCK_CREATED && state != SOCK_BOUND { return -1 }
+    volatile_write_u64(entry + SOCK_OFF_REMOTE_IP, remote_ip)
+    volatile_write_u64(entry + SOCK_OFF_REMOTE_PORT, remote_port)
+    volatile_write_u64(entry + SOCK_OFF_STATE, SOCK_ESTABLISHED)
+    if volatile_read_u64(entry + SOCK_OFF_LOCAL_PORT) == 0 {
+        volatile_write_u64(entry + SOCK_OFF_LOCAL_PORT, 49152 + slot)
+    }
+    0
+}
+
+@kernel fn socket_read(slot: i64, buf: i64, len: i64) -> i64 {
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    if volatile_read_u64(entry + SOCK_OFF_STATE) != SOCK_ESTABLISHED { return -1 }
+    let rx = volatile_read_u64(entry + SOCK_OFF_RX_BUF)
+    let rl = volatile_read_u64(rx)
+    if rl == 0 { return 0 }
+    let tr = if len < rl { len } else { rl }
+    let mut i: i64 = 0
+    while i < tr { volatile_write_u8(buf + i, volatile_read_u8(rx + 8 + i)); i = i + 1 }
+    let rem = rl - tr
+    i = 0
+    while i < rem { volatile_write_u8(rx + 8 + i, volatile_read_u8(rx + 8 + tr + i)); i = i + 1 }
+    volatile_write_u64(rx, rem)
+    tr
+}
+
+@kernel fn socket_write(slot: i64, buf: i64, len: i64) -> i64 {
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    if volatile_read_u64(entry + SOCK_OFF_STATE) != SOCK_ESTABLISHED { return -1 }
+    let tx = volatile_read_u64(entry + SOCK_OFF_TX_BUF)
+    let tl = volatile_read_u64(tx)
+    let avail = SOCKET_BUF_SIZE - 8 - tl
+    if avail <= 0 { return 0 }
+    let tw = if len < avail { len } else { avail }
+    let mut i: i64 = 0
+    while i < tw { volatile_write_u8(tx + 8 + tl + i, volatile_read_u8(buf + i)); i = i + 1 }
+    volatile_write_u64(tx, tl + tw)
+    tw
+}
+
+@kernel fn socket_reset(slot: i64) {
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    volatile_write_u64(entry + SOCK_OFF_STATE, SOCK_CLOSED)
+    let rx = volatile_read_u64(entry + SOCK_OFF_RX_BUF)
+    let tx = volatile_read_u64(entry + SOCK_OFF_TX_BUF)
+    if rx != 0 { volatile_write_u64(rx, 0) }
+    if tx != 0 { volatile_write_u64(tx, 0) }
+}
+
+@kernel fn socket_close(slot: i64) {
+    let entry = SOCKET_TABLE + slot * SOCKET_ENTRY_SIZE
+    volatile_write_u64(entry + SOCK_OFF_STATE, SOCK_FREE)
+    volatile_write_u64(entry + SOCK_OFF_LOCAL_PORT, 0)
+    volatile_write_u64(entry + SOCK_OFF_REMOTE_IP, 0)
+    volatile_write_u64(entry + SOCK_OFF_REMOTE_PORT, 0)
+}
+
+@kernel fn cmd_netstat() {
+    cprintln("Active sockets:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    let mut count: i64 = 0
+    while i < SOCKET_MAX {
+        let entry = SOCKET_TABLE + i * SOCKET_ENTRY_SIZE
+        let state = volatile_read_u64(entry + SOCK_OFF_STATE)
+        if state != SOCK_FREE {
+            cprint("  [", WHITE_ON_BLACK); cprint_decimal(i, CYAN_ON_BLACK); cprint("] ", WHITE_ON_BLACK)
+            if volatile_read_u64(entry + SOCK_OFF_TYPE) == SOCK_STREAM { cprint("TCP", WHITE_ON_BLACK) }
+            else { cprint("UDP", WHITE_ON_BLACK) }
+            cprint(" :", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(entry + SOCK_OFF_LOCAL_PORT), CYAN_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            if state == SOCK_LISTEN { cprint("LISTEN", GREEN_ON_BLACK) }
+            else if state == SOCK_ESTABLISHED { cprint("ESTABLISHED", GREEN_ON_BLACK) }
+            else if state == SOCK_CLOSED { cprint("CLOSED", RED_ON_BLACK) }
+            else { cprint_decimal(state, WHITE_ON_BLACK) }
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (none)", WHITE_ON_BLACK) }
+}
