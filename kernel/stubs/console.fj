@@ -90,7 +90,18 @@ const LSR_TX_EMPTY: i64 = 0x20
     }
 }
 
+// Non-blocking serial mirror — sends char to COM1 if TX buffer ready
+@kernel fn serial_mirror(ch: i64) {
+    // LSR at 0x3FD, bit 5 (0x20) = TX Holding Register Empty
+    // Use simple comparison: if LSR >= 0x20, TX is likely ready
+    let lsr = port_inb(0x3FD)
+    if lsr >= 0x20 {
+        port_outb(0x3F8, ch)
+    }
+}
+
 @kernel fn console_putchar(ch: i64, color: i64) {
+    serial_mirror(ch)
     let row = volatile_read(0x6FA00)
     let col = volatile_read(0x6FA08)
     if ch == 10 {

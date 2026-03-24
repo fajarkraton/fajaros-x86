@@ -33,7 +33,17 @@
     }
 }
 
+// Mirror console output to serial (COM1) for automated QEMU testing
+@kernel fn serial_putchar(ch: i64) {
+    // Non-blocking: send only if TX ready (LSR bit 5 at 0x3FD)
+    let lsr = port_inb(0x3FD)
+    if lsr >= 32 {
+        port_outb(0x3F8, ch)
+    }
+}
+
 @kernel fn console_putchar(ch: i64, color: i64) {
+    serial_putchar(ch)
     let row = volatile_read(0x6FA00)
     let col = volatile_read(0x6FA08)
     if ch == 10 {
