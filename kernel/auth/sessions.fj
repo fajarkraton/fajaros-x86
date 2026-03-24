@@ -1,0 +1,83 @@
+// FajarOS Nova v1.3.0 "Bastion" — User Sessions
+// kernel/auth/sessions.fj — login history, session timeout, logout
+
+const LOGIN_HISTORY: i64 = 0x962000
+const LOGIN_HIST_MAX: i64 = 16
+const LOGIN_HIST_SIZE: i64 = 32
+const LOGIN_HIST_IDX: i64 = 0x962200
+const SESSION_TIMEOUT: i64 = 0x652078
+const SESSION_LAST_INPUT: i64 = 0x652080
+
+@kernel fn login_history_record(uid: i64, action: i64) {
+    let idx = volatile_read_u64(LOGIN_HIST_IDX)
+    let entry = LOGIN_HISTORY + idx * LOGIN_HIST_SIZE
+    volatile_write_u64(entry, uid)
+    volatile_write_u64(entry + 8, volatile_read_u64(0x6FE08))
+    volatile_write_u64(entry + 16, action)
+    volatile_write_u64(LOGIN_HIST_IDX, (idx + 1) % LOGIN_HIST_MAX)
+}
+
+@kernel fn session_login(uid: i64) {
+    volatile_write_u64(CURRENT_UID_ADDR, uid)
+    let pid = volatile_read_u64(0x6FE00)
+    volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_UID, uid)
+    let entry = USER_TABLE + uid * USER_ENTRY_SIZE
+    volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_GID, volatile_read_u64(entry + USER_OFF_GID))
+    login_history_record(uid, 1)
+    volatile_write_u64(SESSION_LAST_INPUT, volatile_read_u64(0x6FE08))
+}
+
+@kernel fn cmd_logout() {
+    let uid = volatile_read_u64(CURRENT_UID_ADDR)
+    if uid == 0 { cprintln("Cannot logout root", YELLOW_ON_BLACK); return }
+    login_history_record(uid, 2)
+    volatile_write_u64(CURRENT_UID_ADDR, 0)
+    let pid = volatile_read_u64(0x6FE00)
+    volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_UID, 0)
+    volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_GID, 0)
+    cprintln("Logged out", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_last() {
+    cprintln("Login history:", YELLOW_ON_BLACK)
+    let idx = volatile_read_u64(LOGIN_HIST_IDX)
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < LOGIN_HIST_MAX {
+        let slot = (idx - 1 - i + LOGIN_HIST_MAX) % LOGIN_HIST_MAX
+        let entry = LOGIN_HISTORY + slot * LOGIN_HIST_SIZE
+        let action = volatile_read_u64(entry + 16)
+        if action != 0 {
+            cprint("  uid=", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(entry), CYAN_ON_BLACK)
+            cprint(" tick=", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(entry + 8), WHITE_ON_BLACK)
+            if action == 1 { cprintln(" login", GREEN_ON_BLACK) }
+            else { cprintln(" logout", YELLOW_ON_BLACK) }
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (empty)", WHITE_ON_BLACK) }
+}
+
+@kernel fn session_check_timeout() {
+    let timeout = volatile_read_u64(SESSION_TIMEOUT)
+    if timeout == 0 { return }
+    let uid = volatile_read_u64(CURRENT_UID_ADDR)
+    if uid == 0 { return }
+    let last = volatile_read_u64(SESSION_LAST_INPUT)
+    let now = volatile_read_u64(0x6FE08)
+    if now - last > timeout { cprintln("Session timed out", YELLOW_ON_BLACK); cmd_logout() }
+}
+
+@kernel fn session_touch() {
+    volatile_write_u64(SESSION_LAST_INPUT, volatile_read_u64(0x6FE08))
+}
+
+@kernel fn cmd_groups() {
+    let uid = volatile_read_u64(CURRENT_UID_ADDR)
+    cprint("Groups: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(USER_TABLE + uid * USER_ENTRY_SIZE + USER_OFF_GID), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}

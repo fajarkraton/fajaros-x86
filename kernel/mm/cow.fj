@@ -1,0 +1,126 @@
+// FajarOS Nova v1.3.0 "Bastion" — Copy-on-Write
+// kernel/mm/cow.fj — CoW page tables, refcounting, page fault handler
+
+const PAGE_COW: i64 = 0x200
+const PAGE_REFCOUNT: i64 = 0x950000
+const PAGE_REFCOUNT_MAX: i64 = 32768
+const COW_FAULT_COUNT: i64 = 0x950048
+
+@kernel fn cow_init() {
+    let mut i: i64 = 0
+    while i < PAGE_REFCOUNT_MAX * 2 { volatile_write_u8(PAGE_REFCOUNT + i, 0); i = i + 1 }
+}
+
+@kernel fn cow_refcount_get(frame_idx: i64) -> i64 {
+    if frame_idx < 0 || frame_idx >= PAGE_REFCOUNT_MAX { return 0 }
+    let addr = PAGE_REFCOUNT + frame_idx * 2
+    volatile_read_u8(addr) + volatile_read_u8(addr + 1) * 256
+}
+
+@kernel fn cow_refcount_set(frame_idx: i64, count: i64) {
+    if frame_idx >= 0 && frame_idx < PAGE_REFCOUNT_MAX {
+        let addr = PAGE_REFCOUNT + frame_idx * 2
+        volatile_write_u8(addr, count & 0xFF)
+        volatile_write_u8(addr + 1, (count >> 8) & 0xFF)
+    }
+}
+
+@kernel fn cow_refcount_inc(frame_idx: i64) {
+    cow_refcount_set(frame_idx, cow_refcount_get(frame_idx) + 1)
+}
+
+@kernel fn cow_refcount_dec(frame_idx: i64) -> i64 {
+    let c = cow_refcount_get(frame_idx)
+    let nc = if c > 0 { c - 1 } else { 0 }
+    cow_refcount_set(frame_idx, nc)
+    nc
+}
+
+@kernel fn cow_mark_readonly(table: i64, idx: i64) {
+    let entry = page_table_entry(table, idx)
+    if entry != 0 && (entry & PAGE_PRESENT) != 0 && (entry & PAGE_WRITABLE) != 0 {
+        page_table_set(table, idx, (entry & (0xFFFFFFFFFFFF ^ PAGE_WRITABLE)) | PAGE_COW)
+    }
+}
+
+@kernel fn cow_handle_fault(fault_addr: i64) -> i64 {
+    let pml4_idx = (fault_addr >> 39) & 0x1FF
+    let pdpt_idx = (fault_addr >> 30) & 0x1FF
+    let pd_idx = (fault_addr >> 21) & 0x1FF
+    let pt_idx = (fault_addr >> 12) & 0x1FF
+    let pml4_entry = page_table_entry(PML4_BASE, pml4_idx)
+    if (pml4_entry & PAGE_PRESENT) == 0 { return -1 }
+    let pdpt_entry = page_table_entry(pml4_entry & 0xFFFFFFFFF000, pdpt_idx)
+    if (pdpt_entry & PAGE_PRESENT) == 0 { return -1 }
+    let pd_entry = page_table_entry(pdpt_entry & 0xFFFFFFFFF000, pd_idx)
+    if (pd_entry & PAGE_PRESENT) == 0 { return -1 }
+    let pt_addr = pd_entry & 0xFFFFFFFFF000
+    let pt_entry = page_table_entry(pt_addr, pt_idx)
+    if (pt_entry & PAGE_PRESENT) == 0 { return -1 }
+    if (pt_entry & PAGE_COW) == 0 { return -1 }
+    let old_phys = pt_entry & 0xFFFFFFFFF000
+    let old_frame = old_phys / FRAME_SIZE
+    let old_flags = pt_entry & 0xFFF
+    let refcount = cow_refcount_get(old_frame)
+    if refcount <= 1 {
+        page_table_set(pt_addr, pt_idx, old_phys | (old_flags | PAGE_WRITABLE) & (0xFFF ^ PAGE_COW))
+    } else {
+        let new_phys = frame_alloc()
+        if new_phys == -1 { return -1 }
+        let new_frame = new_phys / FRAME_SIZE
+        let mut i: i64 = 0
+        while i < FRAME_SIZE { volatile_write_u8(new_phys + i, volatile_read_u8(old_phys + i)); i = i + 1 }
+        page_table_set(pt_addr, pt_idx, new_phys | (old_flags | PAGE_WRITABLE) & (0xFFF ^ PAGE_COW))
+        cow_refcount_dec(old_frame)
+        cow_refcount_set(new_frame, 1)
+    }
+    write_cr3(read_cr3())
+    let faults = volatile_read_u64(COW_FAULT_COUNT)
+    volatile_write_u64(COW_FAULT_COUNT, faults + 1)
+    0
+}
+
+@kernel fn cow_release_pages(pml4: i64) {
+    let mut idx: i64 = 0
+    while idx < 512 {
+        let entry = page_table_entry(pml4, idx)
+        if entry != 0 && (entry & PAGE_USER) != 0 { cow_release_level(entry & 0xFFFFFFFFF000, 3) }
+        idx = idx + 1
+    }
+}
+
+@kernel fn cow_release_level(table: i64, level: i64) {
+    let mut idx: i64 = 0
+    while idx < 512 {
+        let entry = page_table_entry(table, idx)
+        if entry != 0 && (entry & PAGE_PRESENT) != 0 {
+            if level == 1 {
+                let remaining = cow_refcount_dec((entry & 0xFFFFFFFFF000) / FRAME_SIZE)
+                if remaining == 0 { frame_mark_free((entry & 0xFFFFFFFFF000) / FRAME_SIZE) }
+            } else {
+                if (entry & PAGE_USER) != 0 { cow_release_level(entry & 0xFFFFFFFFF000, level - 1) }
+            }
+        }
+        idx = idx + 1
+    }
+}
+
+@kernel fn cmd_cowstat() {
+    cprintln("CoW Statistics:", YELLOW_ON_BLACK)
+    let mut shared: i64 = 0
+    let mut total: i64 = 0
+    let mut i: i64 = 0
+    while i < PAGE_REFCOUNT_MAX {
+        let rc = cow_refcount_get(i)
+        if rc > 0 { total = total + 1 }
+        if rc > 1 { shared = shared + 1 }
+        i = i + 1
+    }
+    cprint("  Tracked: ", WHITE_ON_BLACK)
+    cprint_decimal(total, CYAN_ON_BLACK)
+    cprint("  Shared: ", WHITE_ON_BLACK)
+    cprint_decimal(shared, GREEN_ON_BLACK)
+    cprint("  Faults: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(COW_FAULT_COUNT), YELLOW_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}

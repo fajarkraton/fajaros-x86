@@ -1,0 +1,152 @@
+// FajarOS Nova v1.3.0 "Bastion" — User Account System
+// kernel/auth/users.fj — user table, login, passwd, adduser, su, id
+
+const USER_TABLE: i64 = 0x960000
+const USER_MAX: i64 = 16
+const USER_ENTRY_SIZE: i64 = 64
+const USER_OFF_UID: i64 = 0
+const USER_OFF_NAME: i64 = 8
+const USER_OFF_PASS: i64 = 24
+const USER_OFF_GID: i64 = 32
+const USER_OFF_HOME: i64 = 40
+const USER_OFF_ACTIVE: i64 = 56
+const PROC_OFF_UID: i64 = 168
+const PROC_OFF_GID: i64 = 176
+const CURRENT_UID_ADDR: i64 = 0x652070
+
+@kernel fn simple_hash(addr: i64) -> i64 {
+    let mut hash: i64 = 0x811C9DC5
+    let mut i: i64 = 0
+    while i < 16 {
+        let ch = volatile_read_u8(addr + i)
+        if ch == 0 { i = 16 }
+        else { hash = hash ^ ch; hash = (hash * 16777619) & 0x7FFFFFFF; i = i + 1 }
+    }
+    hash
+}
+
+@kernel fn user_init() {
+    let mut i: i64 = 0
+    while i < USER_MAX * USER_ENTRY_SIZE { volatile_write_u8(USER_TABLE + i, 0); i = i + 1 }
+    let root = USER_TABLE
+    volatile_write_u64(root + USER_OFF_UID, 0)
+    volatile_write_u8(root + USER_OFF_NAME, 114)
+    volatile_write_u8(root + USER_OFF_NAME + 1, 111)
+    volatile_write_u8(root + USER_OFF_NAME + 2, 111)
+    volatile_write_u8(root + USER_OFF_NAME + 3, 116)
+    volatile_write_u8(root + USER_OFF_NAME + 4, 0)
+    let pb: i64 = 0x843E80
+    volatile_write_u8(pb, 114)
+    volatile_write_u8(pb + 1, 111)
+    volatile_write_u8(pb + 2, 111)
+    volatile_write_u8(pb + 3, 116)
+    volatile_write_u8(pb + 4, 0)
+    volatile_write_u64(root + USER_OFF_PASS, simple_hash(pb))
+    volatile_write_u64(root + USER_OFF_GID, 0)
+    volatile_write_u8(root + USER_OFF_HOME, 47)
+    volatile_write_u8(root + USER_OFF_HOME + 1, 0)
+    volatile_write_u64(root + USER_OFF_ACTIVE, 1)
+    volatile_write_u64(CURRENT_UID_ADDR, 0)
+}
+
+@kernel fn user_find(name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < USER_MAX {
+        let entry = USER_TABLE + i * USER_ENTRY_SIZE
+        if volatile_read_u64(entry + USER_OFF_ACTIVE) == 1 {
+            let mut ok: i64 = 1
+            let mut j: i64 = 0
+            while j < 16 && ok == 1 {
+                let a = volatile_read_u8(entry + USER_OFF_NAME + j)
+                let b = volatile_read_u8(name_addr + j)
+                if a != b { ok = 0 }
+                if a == 0 && b == 0 { j = 16 } else { j = j + 1 }
+            }
+            if ok == 1 { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn cmd_adduser() {
+    let len = cmdbuf_len()
+    if len <= 8 { cprintln("Usage: adduser <name> <pass>", YELLOW_ON_BLACK); return }
+    if volatile_read_u64(CURRENT_UID_ADDR) != 0 { cprintln("Permission denied", RED_ON_BLACK); return }
+    let nb: i64 = 0x843E00
+    let ppb: i64 = 0x843E40
+    let mut pos: i64 = 8
+    let mut ni: i64 = 0
+    while pos < len && volatile_read_u8(0x6F800 + pos) != 32 && ni < 15 {
+        volatile_write_u8(nb + ni, volatile_read_u8(0x6F800 + pos)); ni = ni + 1; pos = pos + 1
+    }
+    volatile_write_u8(nb + ni, 0); pos = pos + 1
+    let mut pi: i64 = 0
+    while pos < len && pi < 15 { volatile_write_u8(ppb + pi, volatile_read_u8(0x6F800 + pos)); pi = pi + 1; pos = pos + 1 }
+    volatile_write_u8(ppb + pi, 0)
+    if user_find(nb) >= 0 { cprintln("User exists", RED_ON_BLACK); return }
+    let mut slot: i64 = -1
+    let mut si: i64 = 0
+    while si < USER_MAX && slot == -1 { if volatile_read_u64(USER_TABLE + si * USER_ENTRY_SIZE + USER_OFF_ACTIVE) == 0 { slot = si }; si = si + 1 }
+    if slot == -1 { cprintln("Table full", RED_ON_BLACK); return }
+    let entry = USER_TABLE + slot * USER_ENTRY_SIZE
+    volatile_write_u64(entry + USER_OFF_UID, slot)
+    let mut ci: i64 = 0
+    while ci <= ni { volatile_write_u8(entry + USER_OFF_NAME + ci, volatile_read_u8(nb + ci)); ci = ci + 1 }
+    volatile_write_u64(entry + USER_OFF_PASS, simple_hash(ppb))
+    volatile_write_u64(entry + USER_OFF_GID, slot)
+    volatile_write_u8(entry + USER_OFF_HOME, 47)
+    ci = 0
+    while ci < ni { volatile_write_u8(entry + USER_OFF_HOME + 1 + ci, volatile_read_u8(nb + ci)); ci = ci + 1 }
+    volatile_write_u8(entry + USER_OFF_HOME + 1 + ni, 0)
+    volatile_write_u64(entry + USER_OFF_ACTIVE, 1)
+    cprint("Created uid=", WHITE_ON_BLACK); cprint_decimal(slot, GREEN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_login() {
+    let len = cmdbuf_len()
+    if len <= 6 { cprintln("Usage: login <name> <pass>", YELLOW_ON_BLACK); return }
+    let nb: i64 = 0x843E00
+    let ppb: i64 = 0x843E40
+    let mut pos: i64 = 6
+    let mut ni: i64 = 0
+    while pos < len && volatile_read_u8(0x6F800 + pos) != 32 && ni < 15 {
+        volatile_write_u8(nb + ni, volatile_read_u8(0x6F800 + pos)); ni = ni + 1; pos = pos + 1
+    }
+    volatile_write_u8(nb + ni, 0); pos = pos + 1
+    let mut pi: i64 = 0
+    while pos < len && pi < 15 { volatile_write_u8(ppb + pi, volatile_read_u8(0x6F800 + pos)); pi = pi + 1; pos = pos + 1 }
+    volatile_write_u8(ppb + pi, 0)
+    let slot = user_find(nb)
+    if slot < 0 { cprintln("User not found", RED_ON_BLACK); return }
+    let entry = USER_TABLE + slot * USER_ENTRY_SIZE
+    if volatile_read_u64(entry + USER_OFF_PASS) != simple_hash(ppb) { cprintln("Wrong password", RED_ON_BLACK); return }
+    volatile_write_u64(CURRENT_UID_ADDR, slot)
+    let pid = volatile_read_u64(0x6FE00)
+    volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_UID, slot)
+    volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_GID, volatile_read_u64(entry + USER_OFF_GID))
+    cprintln("Logged in", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_id() {
+    let uid = volatile_read_u64(CURRENT_UID_ADDR)
+    let entry = USER_TABLE + uid * USER_ENTRY_SIZE
+    cprint("uid=", WHITE_ON_BLACK); cprint_decimal(uid, CYAN_ON_BLACK)
+    cprint(" gid=", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(entry + USER_OFF_GID), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_whoami_user() {
+    let uid = volatile_read_u64(CURRENT_UID_ADDR)
+    let entry = USER_TABLE + uid * USER_ENTRY_SIZE
+    let mut i: i64 = 0
+    while i < 16 { let ch = volatile_read_u8(entry + USER_OFF_NAME + i); if ch == 0 { i = 16 } else { console_putchar(ch, WHITE_ON_BLACK); i = i + 1 } }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn fork_copy_uid(parent_pid: i64, child_pid: i64) {
+    let pb = PROC_TABLE + parent_pid * PROC_ENTRY_SIZE
+    let cb = PROC_TABLE + child_pid * PROC_ENTRY_SIZE
+    volatile_write(cb + PROC_OFF_UID, volatile_read(pb + PROC_OFF_UID))
+    volatile_write(cb + PROC_OFF_GID, volatile_read(pb + PROC_OFF_GID))
+}

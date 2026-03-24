@@ -1,0 +1,108 @@
+// FajarOS Nova v1.3.0 "Bastion" — File Permissions
+// kernel/auth/permissions.fj — rwxrwxrwx, chmod, chown, permission checks
+
+const FS_OFF_OWNER_UID: i64 = 56
+const FS_OFF_OWNER_GID: i64 = 64
+const FS_OFF_MODE: i64 = 72
+const PERM_FILE_DEFAULT: i64 = 0x1A4  // 0644
+const PERM_DIR_DEFAULT: i64 = 0x1ED   // 0755
+const PERM_SETUID: i64 = 0x800
+const PERM_SETGID: i64 = 0x400
+
+@kernel fn fs_set_default_perms(entry_addr: i64, ftype: i64) {
+    let uid = volatile_read_u64(CURRENT_UID_ADDR)
+    volatile_write(entry_addr + FS_OFF_OWNER_UID, uid)
+    volatile_write(entry_addr + FS_OFF_OWNER_GID, uid)
+    volatile_write(entry_addr + FS_OFF_MODE, if ftype == 2 { PERM_DIR_DEFAULT } else { PERM_FILE_DEFAULT })
+}
+
+@kernel fn fs_check_perm(entry_addr: i64, access: i64) -> i64 {
+    let uid = volatile_read_u64(CURRENT_UID_ADDR)
+    if uid == 0 { return 0 }
+    let owner = volatile_read(entry_addr + FS_OFF_OWNER_UID)
+    let mode = volatile_read(entry_addr + FS_OFF_MODE)
+    if uid == owner {
+        if (((mode >> 6) & 7) & access) == access { return 0 }
+        return -1
+    }
+    let gid = volatile_read(entry_addr + FS_OFF_OWNER_GID)
+    let pgid = volatile_read(PROC_TABLE + volatile_read_u64(0x6FE00) * PROC_ENTRY_SIZE + PROC_OFF_GID)
+    if pgid == gid {
+        if (((mode >> 3) & 7) & access) == access { return 0 }
+        return -1
+    }
+    if ((mode & 7) & access) == access { 0 } else { -1 }
+}
+
+@kernel fn cmd_chmod() {
+    let len = cmdbuf_len()
+    if len <= 10 { cprintln("Usage: chmod <mode> <file>", YELLOW_ON_BLACK); return }
+    let d0 = volatile_read_u8(0x6F800 + 6) - 48
+    let d1 = volatile_read_u8(0x6F800 + 7) - 48
+    let d2 = volatile_read_u8(0x6F800 + 8) - 48
+    let mode = d0 * 64 + d1 * 8 + d2
+    let fname: i64 = 0x843D00
+    let mut fi: i64 = 0
+    let mut pos: i64 = 10
+    while pos < len && fi < 31 { volatile_write_u8(fname + fi, volatile_read_u8(0x6F800 + pos)); fi = fi + 1; pos = pos + 1 }
+    volatile_write_u8(fname + fi, 0)
+    let idx = ramfs_find_by_addr(fname)
+    if idx < 0 { cprintln("Not found", RED_ON_BLACK); return }
+    let entry = ramfs_entry_addr(idx)
+    let uid = volatile_read_u64(CURRENT_UID_ADDR)
+    if uid != 0 && uid != volatile_read(entry + FS_OFF_OWNER_UID) { cprintln("Permission denied", RED_ON_BLACK); return }
+    volatile_write(entry + FS_OFF_MODE, mode)
+    cprintln("Mode changed", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_chown() {
+    let len = cmdbuf_len()
+    if len <= 8 { cprintln("Usage: chown <uid> <file>", YELLOW_ON_BLACK); return }
+    if volatile_read_u64(CURRENT_UID_ADDR) != 0 { cprintln("Root only", RED_ON_BLACK); return }
+    let new_uid = volatile_read_u8(0x6F800 + 6) - 48
+    let fname: i64 = 0x843D00
+    let mut fi: i64 = 0
+    let mut pos: i64 = 8
+    while pos < len && fi < 31 { volatile_write_u8(fname + fi, volatile_read_u8(0x6F800 + pos)); fi = fi + 1; pos = pos + 1 }
+    volatile_write_u8(fname + fi, 0)
+    let idx = ramfs_find_by_addr(fname)
+    if idx < 0 { cprintln("Not found", RED_ON_BLACK); return }
+    volatile_write(ramfs_entry_addr(idx) + FS_OFF_OWNER_UID, new_uid)
+    cprintln("Owner changed", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_ls_long() {
+    let count = volatile_read(FS_BASE)
+    let mut i: i64 = 0
+    while i < count {
+        let addr = ramfs_entry_addr(i)
+        let ftype = volatile_read(addr + 48)
+        if ftype != 0 {
+            if ftype == 2 { cprint("d", CYAN_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+            let mode = volatile_read(addr + FS_OFF_MODE)
+            if mode == 0 { cprint("rw-r--r--", WHITE_ON_BLACK) }
+            else { fs_print_mode(mode) }
+            cprint(" ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read(addr + FS_OFF_OWNER_UID), CYAN_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read(addr + 32), WHITE_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < 32 { let ch = volatile_read_u8(addr + j); if ch == 0 { j = 32 } else { console_putchar(ch, GREEN_ON_BLACK); j = j + 1 } }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        i = i + 1
+    }
+}
+
+@kernel fn fs_print_mode(mode: i64) {
+    fs_print_rwx((mode >> 6) & 7)
+    fs_print_rwx((mode >> 3) & 7)
+    fs_print_rwx(mode & 7)
+}
+
+@kernel fn fs_print_rwx(bits: i64) {
+    if (bits & 4) != 0 { cprint("r", WHITE_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+    if (bits & 2) != 0 { cprint("w", WHITE_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+    if (bits & 1) != 0 { cprint("x", WHITE_ON_BLACK) } else { cprint("-", WHITE_ON_BLACK) }
+}

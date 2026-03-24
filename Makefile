@@ -25,6 +25,10 @@ SOURCES := \
 	kernel/mm/paging.fj \
 	kernel/mm/heap.fj \
 	kernel/mm/slab.fj \
+	kernel/mm/cow.fj \
+	kernel/auth/users.fj \
+	kernel/auth/permissions.fj \
+	kernel/auth/sessions.fj \
 	kernel/ipc/message.fj \
 	kernel/ipc/pipe.fj \
 	kernel/ipc/pipe_v2.fj \
