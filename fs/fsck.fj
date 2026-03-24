@@ -1,0 +1,63 @@
+// FajarOS Nova v1.3.0 "Bastion" — Filesystem Check
+// fs/fsck.fj — consistency verification, atomic rename
+
+@kernel fn cmd_fsck() {
+    cprintln("Filesystem check:", YELLOW_ON_BLACK)
+    let count = volatile_read(FS_BASE)
+    let mut errors: i64 = 0
+    let mut files: i64 = 0
+    let mut dirs: i64 = 0
+    let mut links: i64 = 0
+    let mut i: i64 = 0
+    while i < count {
+        let addr = ramfs_entry_addr(i)
+        let ftype = volatile_read(addr + 48)
+        if ftype == 1 { files = files + 1 }
+        if ftype == 2 { dirs = dirs + 1 }
+        let lt = volatile_read(addr + FS_OFF_LINK_TYPE)
+        if lt == LINK_SYMLINK || lt == LINK_HARDLINK {
+            links = links + 1
+            let target = volatile_read(addr + FS_OFF_LINK_TARGET)
+            if target >= count || target < 0 { errors = errors + 1 }
+        }
+        let size = volatile_read(addr + 32)
+        if size < 0 { errors = errors + 1 }
+        i = i + 1
+    }
+    cprint("  Files: ", WHITE_ON_BLACK); cprint_decimal(files, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Dirs: ", WHITE_ON_BLACK); cprint_decimal(dirs, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Links: ", WHITE_ON_BLACK); cprint_decimal(links, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    let jcount = volatile_read_u64(JOURNAL_BASE)
+    let jcommit = volatile_read_u64(JOURNAL_BASE + 8)
+    cprint("  Journal: ", WHITE_ON_BLACK); cprint_decimal(jcount, CYAN_ON_BLACK)
+    cprint(" entries, ", WHITE_ON_BLACK)
+    if jcommit == 1 { cprintln("committed", GREEN_ON_BLACK) }
+    else { cprintln("UNCOMMITTED", RED_ON_BLACK); errors = errors + 1 }
+    if errors == 0 { cprintln("  No errors", GREEN_ON_BLACK) }
+    else { cprint("  ", WHITE_ON_BLACK); cprint_decimal(errors, RED_ON_BLACK); cprintln(" errors!", RED_ON_BLACK) }
+}
+
+@kernel fn cmd_rename() {
+    let len = cmdbuf_len()
+    if len <= 7 { cprintln("Usage: mv <old> <new>", YELLOW_ON_BLACK); return }
+    let ob: i64 = 0x847500
+    let nb: i64 = 0x847580
+    let mut pos: i64 = 3
+    let mut oi: i64 = 0
+    while pos < len && volatile_read_u8(0x6F800 + pos) != 32 && oi < 31 {
+        volatile_write_u8(ob + oi, volatile_read_u8(0x6F800 + pos)); oi = oi + 1; pos = pos + 1
+    }
+    volatile_write_u8(ob + oi, 0); pos = pos + 1
+    let mut ni: i64 = 0
+    while pos < len && ni < 31 { volatile_write_u8(nb + ni, volatile_read_u8(0x6F800 + pos)); ni = ni + 1; pos = pos + 1 }
+    volatile_write_u8(nb + ni, 0)
+    let idx = ramfs_find_by_addr(ob)
+    if idx < 0 { cprintln("Not found", RED_ON_BLACK); return }
+    journal_add(JTYPE_RENAME, idx, 0, ni, nb)
+    let addr = ramfs_entry_addr(idx)
+    let mut ri: i64 = 0
+    while ri < ni { volatile_write_u8(addr + ri, volatile_read_u8(nb + ri)); ri = ri + 1 }
+    volatile_write_u8(addr + ni, 0)
+    journal_commit()
+    cprintln("Renamed", GREEN_ON_BLACK)
+}

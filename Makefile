@@ -66,6 +66,10 @@ SOURCES := \
 	drivers/xhci.fj \
 	drivers/gpu.fj \
 	fs/ramfs.fj \
+	fs/directory.fj \
+	fs/links.fj \
+	fs/journal.fj \
+	fs/fsck.fj \
 	fs/fat32.fj \
 	fs/vfs.fj \
 	shell/pipes.fj \

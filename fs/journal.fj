@@ -1,0 +1,102 @@
+// FajarOS Nova v1.3.0 "Bastion" — Filesystem Journal
+// fs/journal.fj — WAL, commit, replay, crash recovery, disk usage
+
+const JOURNAL_BASE: i64 = 0x970000
+const JOURNAL_ENTRIES: i64 = 0x970100
+const JOURNAL_ENTRY_SIZE: i64 = 64
+const JOURNAL_MAX_ENTRIES: i64 = 1000
+const JTYPE_NONE: i64 = 0
+const JTYPE_CREATE: i64 = 1
+const JTYPE_WRITE: i64 = 2
+const JTYPE_DELETE: i64 = 3
+const JTYPE_RENAME: i64 = 4
+const JTYPE_CHMOD: i64 = 5
+const INODE_GEN_TABLE: i64 = 0x97FC00
+const FS_USED_BYTES: i64 = 0x97FE00
+const FS_TOTAL_BYTES: i64 = 0x97FE08
+const FS_DISK_FULL_THRESHOLD: i64 = 90
+
+@kernel fn journal_init() {
+    volatile_write_u64(JOURNAL_BASE, 0)
+    volatile_write_u64(JOURNAL_BASE + 8, 1)
+    volatile_write_u64(JOURNAL_BASE + 16, 0)
+    volatile_write_u64(FS_USED_BYTES, 0)
+    volatile_write_u64(FS_TOTAL_BYTES, 832 * 1024)
+}
+
+@kernel fn journal_add(jtype: i64, inode: i64, offset: i64, jlen: i64, data_addr: i64) -> i64 {
+    let count = volatile_read_u64(JOURNAL_BASE)
+    if count >= JOURNAL_MAX_ENTRIES { return -1 }
+    let entry = JOURNAL_ENTRIES + count * JOURNAL_ENTRY_SIZE
+    volatile_write_u64(entry, jtype)
+    volatile_write_u64(entry + 8, inode)
+    volatile_write_u64(entry + 16, offset)
+    volatile_write_u64(entry + 24, jlen)
+    let cl = if jlen < 32 { jlen } else { 32 }
+    let mut i: i64 = 0
+    while i < cl { volatile_write_u8(entry + 32 + i, volatile_read_u8(data_addr + i)); i = i + 1 }
+    volatile_write_u64(JOURNAL_BASE + 8, 0)
+    volatile_write_u64(JOURNAL_BASE, count + 1)
+    let seq = volatile_read_u64(JOURNAL_BASE + 16)
+    volatile_write_u64(JOURNAL_BASE + 16, seq + 1)
+    count
+}
+
+@kernel fn journal_commit() {
+    let count = volatile_read_u64(JOURNAL_BASE)
+    if count == 0 { return }
+    volatile_write_u64(JOURNAL_BASE + 8, 1)
+    volatile_write_u64(JOURNAL_BASE, 0)
+}
+
+@kernel fn journal_replay() -> i64 {
+    let committed = volatile_read_u64(JOURNAL_BASE + 8)
+    if committed == 1 { return 0 }
+    let count = volatile_read_u64(JOURNAL_BASE)
+    cprint("[JOURNAL] Replaying ", YELLOW_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprintln(" entries", YELLOW_ON_BLACK)
+    journal_commit()
+    count
+}
+
+@kernel fn cmd_sync_journal() { journal_commit(); cprintln("Synced", GREEN_ON_BLACK) }
+
+@kernel fn fs_check_disk_space(needed: i64) -> i64 {
+    let used = volatile_read_u64(FS_USED_BYTES)
+    let total = volatile_read_u64(FS_TOTAL_BYTES)
+    if total == 0 { return 0 }
+    if (used * 100) / total >= FS_DISK_FULL_THRESHOLD && needed > 0 { -1 } else { 0 }
+}
+
+@kernel fn fs_update_usage(delta: i64) {
+    let used = volatile_read_u64(FS_USED_BYTES)
+    let nu = used + delta
+    if nu >= 0 { volatile_write_u64(FS_USED_BYTES, nu) }
+}
+
+@kernel fn inode_get_gen(inode: i64) -> i64 {
+    if inode < 0 || inode >= 64 { return 0 }
+    let addr = INODE_GEN_TABLE + inode * 4
+    volatile_read_u8(addr) + volatile_read_u8(addr + 1) * 256 + volatile_read_u8(addr + 2) * 65536 + volatile_read_u8(addr + 3) * 16777216
+}
+
+@kernel fn inode_inc_gen(inode: i64) {
+    if inode >= 0 && inode < 64 {
+        let gen = inode_get_gen(inode) + 1
+        let addr = INODE_GEN_TABLE + inode * 4
+        volatile_write_u8(addr, gen & 0xFF)
+        volatile_write_u8(addr + 1, (gen >> 8) & 0xFF)
+        volatile_write_u8(addr + 2, (gen >> 16) & 0xFF)
+        volatile_write_u8(addr + 3, (gen >> 24) & 0xFF)
+    }
+}
+
+@kernel fn cmd_df_journal() {
+    cprintln("Filesystem usage:", YELLOW_ON_BLACK)
+    let used = volatile_read_u64(FS_USED_BYTES)
+    let total = volatile_read_u64(FS_TOTAL_BYTES)
+    cprint("  Used: ", WHITE_ON_BLACK); cprint_decimal(used / 1024, CYAN_ON_BLACK); cprintln(" KB", WHITE_ON_BLACK)
+    cprint("  Total: ", WHITE_ON_BLACK); cprint_decimal(total / 1024, CYAN_ON_BLACK); cprintln(" KB", WHITE_ON_BLACK)
+    if total > 0 { cprint("  Usage: ", WHITE_ON_BLACK); cprint_decimal((used * 100) / total, CYAN_ON_BLACK); cprintln("%", WHITE_ON_BLACK) }
+}

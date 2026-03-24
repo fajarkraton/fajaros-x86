@@ -1,0 +1,67 @@
+// FajarOS Nova v1.3.0 "Bastion" — Symbolic + Hard Links
+// fs/links.fj — ln, ln -s, readlink
+
+@kernel fn cmd_ln() {
+    let len = cmdbuf_len()
+    let is_sym = len > 5 && volatile_read_u8(0x6F800 + 3) == 45 && volatile_read_u8(0x6F800 + 4) == 115
+    let prefix = if is_sym { 6 } else { 3 }
+    if len <= prefix + 2 { cprintln("Usage: ln [-s] <target> <link>", YELLOW_ON_BLACK); return }
+    let tb: i64 = 0x847300
+    let lb: i64 = 0x847380
+    let mut pos: i64 = prefix
+    let mut ti: i64 = 0
+    while pos < len && volatile_read_u8(0x6F800 + pos) != 32 && ti < 31 {
+        volatile_write_u8(tb + ti, volatile_read_u8(0x6F800 + pos)); ti = ti + 1; pos = pos + 1
+    }
+    volatile_write_u8(tb + ti, 0); pos = pos + 1
+    let mut li: i64 = 0
+    while pos < len && li < 31 { volatile_write_u8(lb + li, volatile_read_u8(0x6F800 + pos)); li = li + 1; pos = pos + 1 }
+    volatile_write_u8(lb + li, 0)
+    let target_idx = ramfs_find_by_addr(tb)
+    if target_idx < 0 && is_sym == false { cprintln("Target not found", RED_ON_BLACK); return }
+    let link_idx = ramfs_create_by_addr(lb)
+    if link_idx < 0 { cprintln("Cannot create", RED_ON_BLACK); return }
+    let le = ramfs_entry_addr(link_idx)
+    if is_sym {
+        volatile_write(le + FS_OFF_LINK_TYPE, LINK_SYMLINK)
+        volatile_write(le + FS_OFF_LINK_TARGET, target_idx)
+        volatile_write(le + 48, 1)
+        cprint("Symlink: ", WHITE_ON_BLACK)
+    } else {
+        volatile_write(le + FS_OFF_LINK_TYPE, LINK_HARDLINK)
+        volatile_write(le + FS_OFF_LINK_TARGET, target_idx)
+        let te = ramfs_entry_addr(target_idx)
+        volatile_write(le + 32, volatile_read(te + 32))
+        volatile_write(le + 40, volatile_read(te + 40))
+        volatile_write(le + 48, volatile_read(te + 48))
+        cprint("Hardlink: ", WHITE_ON_BLACK)
+    }
+    let mut pi: i64 = 0
+    while pi < li { console_putchar(volatile_read_u8(lb + pi), GREEN_ON_BLACK); pi = pi + 1 }
+    cprint(" -> ", WHITE_ON_BLACK)
+    pi = 0
+    while pi < ti { console_putchar(volatile_read_u8(tb + pi), CYAN_ON_BLACK); pi = pi + 1 }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_readlink() {
+    let len = cmdbuf_len()
+    if len <= 9 { cprintln("Usage: readlink <link>", YELLOW_ON_BLACK); return }
+    let nb: i64 = 0x847400
+    let mut ni: i64 = 0
+    let mut pos: i64 = 9
+    while pos < len && ni < 31 { volatile_write_u8(nb + ni, volatile_read_u8(0x6F800 + pos)); ni = ni + 1; pos = pos + 1 }
+    volatile_write_u8(nb + ni, 0)
+    let idx = ramfs_find_by_addr(nb)
+    if idx < 0 { cprintln("Not found", RED_ON_BLACK); return }
+    let entry = ramfs_entry_addr(idx)
+    let lt = volatile_read(entry + FS_OFF_LINK_TYPE)
+    if lt == LINK_NONE { cprintln("Not a link", WHITE_ON_BLACK); return }
+    let target = volatile_read(entry + FS_OFF_LINK_TARGET)
+    if target >= 0 {
+        let te = ramfs_entry_addr(target)
+        let mut i: i64 = 0
+        while i < 32 { let ch = volatile_read_u8(te + i); if ch == 0 { i = 32 } else { console_putchar(ch, CYAN_ON_BLACK); i = i + 1 } }
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+}

@@ -1,0 +1,139 @@
+// FajarOS Nova v1.3.0 "Bastion" — Directory Tree
+// fs/directory.fj — hierarchical path resolution, mkdir -p, rmdir
+
+const FS_OFF_PARENT: i64 = 80
+const FS_OFF_LINK_TARGET: i64 = 88
+const FS_OFF_LINK_TYPE: i64 = 96
+const LINK_NONE: i64 = 0
+const LINK_SYMLINK: i64 = 1
+const LINK_HARDLINK: i64 = 2
+
+@kernel fn fs_resolve_path(path_addr: i64) -> i64 {
+    let mut current_dir: i64 = 0
+    let cb: i64 = 0x847000
+    let mut pos: i64 = 0
+    if volatile_read_u8(path_addr) == 47 { pos = 1 }
+    if volatile_read_u8(path_addr + pos) == 0 { return 0 }
+    while volatile_read_u8(path_addr + pos) != 0 {
+        let mut ci: i64 = 0
+        while ci < 31 {
+            let ch = volatile_read_u8(path_addr + pos)
+            if ch == 47 || ch == 0 { ci = 31 }
+            else { volatile_write_u8(cb + ci, ch); ci = ci + 1; pos = pos + 1 }
+        }
+        volatile_write_u8(cb + (if ci > 31 { 0 } else { ci }), 0)
+        if volatile_read_u8(path_addr + pos) == 47 { pos = pos + 1 }
+        let idx = fs_find_in_dir(current_dir, cb)
+        if idx < 0 { return -1 }
+        let entry = ramfs_entry_addr(idx)
+        let lt = volatile_read(entry + FS_OFF_LINK_TYPE)
+        if lt == LINK_SYMLINK {
+            let target = volatile_read(entry + FS_OFF_LINK_TARGET)
+            if target < 0 { return -1 }
+            current_dir = target
+        } else { current_dir = idx }
+    }
+    current_dir
+}
+
+@kernel fn fs_find_in_dir(parent_idx: i64, name_addr: i64) -> i64 {
+    let count = volatile_read(FS_BASE)
+    let mut i: i64 = 0
+    while i < count {
+        let addr = ramfs_entry_addr(i)
+        let p = volatile_read(addr + FS_OFF_PARENT)
+        if p == parent_idx || (parent_idx == 0 && p == 0) {
+            let mut ok: i64 = 1
+            let mut j: i64 = 0
+            let mut nlen: i64 = 0
+            while nlen < 31 && volatile_read_u8(name_addr + nlen) != 0 { nlen = nlen + 1 }
+            while j < nlen && ok == 1 {
+                if volatile_read_u8(addr + j) != volatile_read_u8(name_addr + j) { ok = 0 }
+                j = j + 1
+            }
+            if ok == 1 && volatile_read_u8(addr + nlen) == 0 { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn cmd_mkdir_p() {
+    let len = cmdbuf_len()
+    let prefix = if len > 8 && volatile_read_u8(0x6F800 + 6) == 45 { 9 } else { 6 }
+    if len <= prefix { cprintln("Usage: mkdir [-p] <path>", YELLOW_ON_BLACK); return }
+    let pb: i64 = 0x847100
+    let mut fi: i64 = 0
+    let mut pos: i64 = prefix
+    while pos < len && fi < 63 { volatile_write_u8(pb + fi, volatile_read_u8(0x6F800 + pos)); fi = fi + 1; pos = pos + 1 }
+    volatile_write_u8(pb + fi, 0)
+    fs_mkdir_recursive(pb)
+}
+
+@kernel fn fs_mkdir_recursive(path_addr: i64) {
+    let cb: i64 = 0x847200
+    let mut pos: i64 = 0
+    let mut parent: i64 = 0
+    if volatile_read_u8(path_addr) == 47 { pos = 1 }
+    while volatile_read_u8(path_addr + pos) != 0 {
+        let mut ci: i64 = 0
+        while ci < 31 {
+            let ch = volatile_read_u8(path_addr + pos)
+            if ch == 47 || ch == 0 { ci = 31 }
+            else { volatile_write_u8(cb + ci, ch); ci = ci + 1; pos = pos + 1 }
+        }
+        volatile_write_u8(cb + (if ci > 31 { 0 } else { ci }), 0)
+        if volatile_read_u8(path_addr + pos) == 47 { pos = pos + 1 }
+        let existing = fs_find_in_dir(parent, cb)
+        if existing >= 0 { parent = existing }
+        else {
+            let idx = ramfs_create_by_addr(cb)
+            if idx >= 0 {
+                let entry = ramfs_entry_addr(idx)
+                volatile_write(entry + 48, 2)
+                volatile_write(entry + FS_OFF_PARENT, parent)
+                fs_set_default_perms(entry, 2)
+                parent = idx
+            }
+        }
+    }
+    cprintln("Directory created", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_pwd_full() {
+    let pid = volatile_read_u64(0x6FE00)
+    let cwd = PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_CWD
+    let mut i: i64 = 0
+    let mut has: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(cwd + i)
+        if ch == 0 { i = 31 } else { console_putchar(ch, WHITE_ON_BLACK); has = 1; i = i + 1 }
+    }
+    if has == 0 { cprint("/", WHITE_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_rmdir() {
+    let len = cmdbuf_len()
+    if len <= 6 { cprintln("Usage: rmdir <dir>", YELLOW_ON_BLACK); return }
+    let nb: i64 = 0x847400
+    let mut ni: i64 = 0
+    let mut pos: i64 = 6
+    while pos < len && ni < 31 { volatile_write_u8(nb + ni, volatile_read_u8(0x6F800 + pos)); ni = ni + 1; pos = pos + 1 }
+    volatile_write_u8(nb + ni, 0)
+    let idx = ramfs_find_by_addr(nb)
+    if idx < 0 { cprintln("Not found", RED_ON_BLACK); return }
+    let entry = ramfs_entry_addr(idx)
+    if volatile_read(entry + 48) != 2 { cprintln("Not a directory", RED_ON_BLACK); return }
+    let count = volatile_read(FS_BASE)
+    let mut i: i64 = 0
+    let mut children: i64 = 0
+    while i < count {
+        if volatile_read(ramfs_entry_addr(i) + FS_OFF_PARENT) == idx && volatile_read(ramfs_entry_addr(i) + 48) != 0 { children = 1 }
+        i = i + 1
+    }
+    if children == 1 { cprintln("Not empty", RED_ON_BLACK); return }
+    volatile_write_u8(entry, 0)
+    volatile_write(entry + 48, 0)
+    cprintln("Removed", GREEN_ON_BLACK)
+}
