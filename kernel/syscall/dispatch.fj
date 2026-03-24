@@ -1,304 +1,431 @@
-// FajarOS Nova v0.5.0 — Syscall Dispatch Table
+// FajarOS Nova v1.2.0 "Nexus" — Syscall Dispatch Table
 // Part of the modular kernel build (concatenated by Makefile)
+// Updated: v0.7 "Nexus" — 26 unified syscalls via table dispatch
 
-// ── Syscall Dispatch Table ──
+// ═══════════════════════════════════════════════════
+// Syscall Numbers (v0.7 — 27 syscalls: 0-26)
+// ═══════════════════════════════════════════════════
 
-const SYSCALL_TABLE: i64 = 0x884000  // 64 entries × 8 bytes (fn pointers)
-const SYS_EXIT: i64 = 0
-const SYS_WRITE: i64 = 1
-const SYS_READ: i64 = 2
-const SYS_GETPID: i64 = 3
-const SYS_YIELD: i64 = 4
-const SYS_SLEEP: i64 = 5
-const SYS_MMAP: i64 = 6
-const SYS_BRK: i64 = 7
+const SYSCALL_TABLE: i64 = 0x884000      // 32 entries x 8 bytes
+const SYSCALL_DISPATCH_FN: i64 = 0x884008 // fn pointer for linker indirect call
 
-// IPC syscalls (Sprint 1.2)
-const SYS_SEND: i64 = 10
-const SYS_RECV: i64 = 11
-const SYS_CALL: i64 = 12
-const SYS_REPLY: i64 = 13
-const SYS_NOTIFY: i64 = 14
+// Core syscalls (Phase F1)
+const SYS_EXIT: i64 = 0       // EXIT handled in linker asm (never returns)
+const SYS_WRITE: i64 = 1      // write(fd, buf, len) -> bytes_written
+const SYS_READ: i64 = 2       // read(fd, buf, len) -> bytes_read
+const SYS_GETPID: i64 = 3     // getpid() -> pid
+const SYS_YIELD: i64 = 4      // yield() -> 0
+const SYS_BRK: i64 = 5        // brk(increment) -> new_brk
+const SYS_MMAP: i64 = 6       // mmap(addr, len, prot) -> va
+const SYS_CLOCK: i64 = 7      // clock() -> ticks
+const SYS_SLEEP: i64 = 8      // sleep(ms) -> 0
+const SYS_SBRK: i64 = 9       // sbrk(increment) -> old_brk
 
-// Memory syscalls
-const SYS_MUNMAP: i64 = 21
-const SYS_SHARE: i64 = 22
+// File I/O syscalls (Phase F2)
+const SYS_OPEN: i64 = 10      // open(path, flags) -> fd
+const SYS_CLOSE: i64 = 11     // close(fd) -> 0
+const SYS_STAT: i64 = 12      // stat(path, buf) -> 0
+const SYS_FSTAT: i64 = 13     // fstat(fd, buf) -> 0
+const SYS_LSEEK: i64 = 14     // lseek(fd, offset, whence) -> new_offset
+const SYS_DUP: i64 = 15       // dup(old_fd) -> new_fd
+const SYS_DUP2: i64 = 16      // dup2(old_fd, new_fd) -> new_fd
+const SYS_GETCWD: i64 = 17    // getcwd(buf, size) -> len
+const SYS_CHDIR: i64 = 18     // chdir(path) -> 0
+const SYS_UNLINK: i64 = 19    // unlink(path) -> 0
 
-// Process lifecycle (Sprint 5.4)
-const SYS_SPAWN: i64 = 40
-const SYS_KILL_SIG: i64 = 41
-const SYS_WAITPID: i64 = 42
+// Process syscalls (Phase G)
+const SYS_FORK: i64 = 20      // fork() -> pid/0
+const SYS_EXEC: i64 = 21      // exec(path, argv) -> (no return)
+const SYS_WAITPID: i64 = 22   // waitpid(pid, status, opts) -> child_pid
 
-// I/O syscalls (for drivers)
-const SYS_IRQ_WAIT: i64 = 30
-const SYS_PORT_IO: i64 = 31
-const SYS_DMA_ALLOC: i64 = 32
+// Pipe + Signal syscalls (Phase H, I)
+const SYS_PIPE: i64 = 23      // pipe(fds_buf) -> 0
+const SYS_KILL: i64 = 24      // kill(pid, signum) -> 0
+const SYS_SIGNAL: i64 = 25    // signal(signum, handler) -> old_handler
+const SYS_SETPGID: i64 = 26   // setpgid(pid, pgid) -> 0
+
+// IPC syscalls (microkernel — kept for compatibility)
+const SYS_SEND: i64 = 30
+const SYS_RECV: i64 = 31
+const SYS_CALL_IPC: i64 = 32
+const SYS_REPLY: i64 = 33
+const SYS_NOTIFY: i64 = 34
+
+// ═══════════════════════════════════════════════════
+// FD Table V2 (relocated to 0x8D0000, 16 procs x 16 FDs x 16B)
+// ═══════════════════════════════════════════════════
+
+const FD_TABLE_V2: i64 = 0x8D0000
+const FD_MAX: i64 = 16
+const FD_ENTRY_SIZE: i64 = 16
+const FD_CLOSED: i64 = 0
+const FD_CONSOLE: i64 = 1
+const FD_RAMFS: i64 = 2
+const FD_PIPE_READ: i64 = 3
+const FD_PIPE_WRITE: i64 = 4
+const FD_FAT32: i64 = 5
+
+// LSEEK whence
+const SEEK_SET: i64 = 0
+const SEEK_CUR: i64 = 1
+const SEEK_END: i64 = 2
+
+// Process table extensions
+const PROC_OFF_BRK: i64 = 96
+const PROC_OFF_CWD: i64 = 128
+const PROC_OFF_PGID: i64 = 120
+const USER_HEAP_BASE: i64 = 0x2800000
+
+// ═══════════════════════════════════════════════════
+// Syscall Init + Dispatch
+// ═══════════════════════════════════════════════════
 
 @kernel fn syscall_init() {
-    // Clear syscall table
     let mut i: i64 = 0
     while i < 32 * 8 { volatile_write_u8(SYSCALL_TABLE + i, 0); i = i + 1 }
     frame_mark_used(SYSCALL_TABLE / FRAME_SIZE)
 }
 
-@kernel fn syscall_handle(num: i64, arg0: i64, arg1: i64, arg2: i64) -> i64 {
-    if num == SYS_EXIT { return arg0 }
-    if num == SYS_WRITE {
-        // arg0=fd, arg1=buf_addr, arg2=len
-        if arg0 == 1 { // stdout
-            let mut i: i64 = 0
-            while i < arg2 {
-                let ch = volatile_read_u8(arg1 + i)
-                console_putchar(ch, WHITE_ON_BLACK)
-                i = i + 1
-            }
-            return arg2
-        }
-        return -1
-    }
-    if num == SYS_READ {
-        // arg0=fd — stdin not implemented yet
-        return 0
-    }
-    if num == SYS_GETPID {
-        return 0 // TODO: return actual PID
-    }
-    if num == SYS_YIELD {
-        return 0
-    }
-    if num == SYS_SLEEP {
-        sleep_ms(arg0)
-        return 0
-    }
-    if num == SYS_MMAP {
-        // Simple: allocate arg0 bytes, return address
-        let pages = (arg0 + FRAME_SIZE - 1) / FRAME_SIZE
-        let base = ELF_LOAD_BASE + 0x800000 // heap starts at 40MB
-        let mut pg: i64 = 0
-        while pg < pages {
-            let frame = frame_alloc()
-            if frame != -1 {
-                map_page(base + pg * FRAME_SIZE, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
-            }
-            pg = pg + 1
-        }
-        return base
-    }
-
-    // ── IPC v2 Syscalls (Sprint 1.2) ──
-    if num == SYS_SEND {
-        // arg0=dst_pid, arg1=msg_ptr
-        return ipc2_send_checked(arg0, arg1)
-    }
-    if num == SYS_RECV {
-        // arg0=from_pid (-1=any), arg1=buf_ptr
-        return ipc2_recv_checked(arg0, arg1)
-    }
-    if num == SYS_CALL {
-        // arg0=dst_pid, arg1=msg_ptr, arg2=reply_ptr
-        return ipc2_call_checked(arg0, arg1, arg2)
-    }
-    if num == SYS_REPLY {
-        // arg0=caller_pid, arg1=reply_ptr
-        return ipc2_reply_checked(arg0, arg1)
-    }
-    if num == SYS_NOTIFY {
-        // arg0=dst_pid, arg1=bits
-        return ipc2_notify_checked(arg0, arg1)
-    }
-    if num == SYS_SHARE {
-        // arg0=region_id, arg1=guest_pid
-        return shm_share(arg0, arg1)
-    }
-    if num == SYS_IRQ_WAIT {
-        // arg0=irq — block until IRQ fires (driver use)
-        return ipc2_wait_notify(1 << (arg0 & 63))
-    }
-    if num == SYS_DMA_ALLOC {
-        // arg0=size — allocate DMA-safe memory
-        return shm_create(arg0)
-    }
-
-    // Process lifecycle (Sprint 5.4)
-    if num == SYS_SPAWN { return sc_spawn(arg0, arg1) }
-    if num == SYS_KILL_SIG { return sc_kill(arg0, arg1) }
-    if num == SYS_WAITPID { return sc_wait(arg0) }
-
-    -1 // Unknown syscall
+@kernel fn syscall_register_dispatch() {
+    volatile_write_u64(SYSCALL_DISPATCH_FN, fn_addr("syscall_dispatch"))
 }
 
-// ── Shell Commands ──
+// Main dispatcher — called from linker __syscall_entry via indirect call
+@kernel fn syscall_dispatch(num: i64, arg0: i64, arg1: i64, arg2: i64) -> i64 {
+    // Core (F1)
+    if num == SYS_WRITE { return sys_write(arg0, arg1, arg2) }
+    if num == SYS_READ { return sys_read(arg0, arg1, arg2) }
+    if num == SYS_GETPID { return sys_getpid() }
+    if num == SYS_YIELD { return sys_yield() }
+    if num == SYS_BRK { return sys_brk(arg0) }
+    if num == SYS_MMAP { return sys_mmap(arg0, arg1, arg2) }
+    if num == SYS_CLOCK { return sys_clock() }
+    if num == SYS_SLEEP { return sys_sleep(arg0) }
+    if num == SYS_SBRK { return sys_sbrk(arg0) }
+    // File I/O (F2)
+    if num == SYS_OPEN { return sys_open(arg0, arg1) }
+    if num == SYS_CLOSE { return sys_close(arg0) }
+    if num == SYS_STAT { return sys_stat(arg0, arg1) }
+    if num == SYS_FSTAT { return sys_fstat(arg0, arg1) }
+    if num == SYS_LSEEK { return sys_lseek(arg0, arg1, arg2) }
+    if num == SYS_DUP { return sys_dup(arg0) }
+    if num == SYS_DUP2 { return sys_dup2(arg0, arg1) }
+    if num == SYS_GETCWD { return sys_getcwd(arg0, arg1) }
+    if num == SYS_CHDIR { return sys_chdir(arg0) }
+    if num == SYS_UNLINK { return sys_unlink(arg0) }
+    // Process (G)
+    if num == SYS_FORK { return sys_fork() }
+    if num == SYS_EXEC { return sys_exec(arg0, arg1) }
+    if num == SYS_WAITPID { return sys_waitpid(arg0, arg1, arg2) }
+    // Pipe + Signal (H, I)
+    if num == SYS_PIPE { return sys_pipe(arg0) }
+    if num == SYS_KILL { return sys_kill(arg0, arg1) }
+    if num == SYS_SIGNAL { return sys_signal(arg0, arg1) }
+    if num == SYS_SETPGID { return sys_setpgid(arg0, arg1) }
+    // IPC (microkernel compat)
+    if num == SYS_SEND { return ipc2_send_checked(arg0, arg1) }
+    if num == SYS_RECV { return ipc2_recv_checked(arg0, arg1) }
+    if num == SYS_REPLY { return ipc2_reply_checked(arg0, arg1) }
+    if num == SYS_NOTIFY { return ipc2_notify_checked(arg0, arg1) }
+    -1
+}
 
-@kernel fn cmd_readelf() {
-    // "readelf <filename>" — parse ELF from FAT32
-    if fat32_state_read(0) != 1 { cprintln("FAT32 not mounted", RED_ON_BLACK); return }
+// ═══════════════════════════════════════════════════
+// FD Table V2 Helpers
+// ═══════════════════════════════════════════════════
 
-    // Get filename from cmdbuf offset 8 ("readelf ")
-    let mut fname_len: i64 = 0
-    let mut i: i64 = 8
-    while i < 64 {
-        let ch = volatile_read_u8(0x6F800 + i)
-        if ch == 0 { i = 64 }
-        else { volatile_write_u8(FAT32_NAME_BUF + 256 + fname_len, ch); fname_len = fname_len + 1; i = i + 1 }
+@kernel fn fd_v2_addr(pid: i64, fd: i64) -> i64 {
+    FD_TABLE_V2 + pid * FD_MAX * FD_ENTRY_SIZE + fd * FD_ENTRY_SIZE
+}
+
+@kernel fn fd_v2_get_type(pid: i64, fd: i64) -> i64 {
+    volatile_read_u64(fd_v2_addr(pid, fd))
+}
+
+@kernel fn fd_v2_get_data(pid: i64, fd: i64) -> i64 {
+    volatile_read_u64(fd_v2_addr(pid, fd) + 8)
+}
+
+@kernel fn fd_v2_set(pid: i64, fd: i64, ftype: i64, data: i64) {
+    let addr = fd_v2_addr(pid, fd)
+    volatile_write_u64(addr, ftype)
+    volatile_write_u64(addr + 8, data)
+}
+
+@kernel fn fd_v2_init(pid: i64) {
+    fd_v2_set(pid, 0, FD_CONSOLE, 0)
+    fd_v2_set(pid, 1, FD_CONSOLE, 0)
+    fd_v2_set(pid, 2, FD_CONSOLE, 0)
+    let mut fd: i64 = 3
+    while fd < FD_MAX { fd_v2_set(pid, fd, FD_CLOSED, 0); fd = fd + 1 }
+}
+
+@kernel fn fd_v2_alloc(pid: i64) -> i64 {
+    let mut fd: i64 = 0
+    while fd < FD_MAX {
+        if fd_v2_get_type(pid, fd) == FD_CLOSED { return fd }
+        fd = fd + 1
     }
-    volatile_write_u8(FAT32_NAME_BUF + 256 + fname_len, 0)
+    -1
+}
 
-    if fname_len == 0 { cprintln("Usage: readelf <filename>", YELLOW_ON_BLACK); return }
+// ═══════════════════════════════════════════════════
+// Core Syscall Implementations (sys_write, sys_read, etc.)
+// ═══════════════════════════════════════════════════
 
-    // Find file
-    let root = fat32_state_read(48)
-    let result = fat32_find_in_dir(root, FAT32_NAME_BUF + 256)
-    if result == -1 { cprintln("File not found", RED_ON_BLACK); return }
-
-    let shifted = result >> 32
-    let file_cluster = shifted & 0x7FFFFFFF
-    let file_size = result & 0xFFFFFFFF
-
-    // Read file
-    let bytes = fat32_read_file(file_cluster, file_size, ELF_BUF)
-    if bytes <= 0 { cprintln("Read error", RED_ON_BLACK); return }
-
-    // Validate ELF
-    let valid = elf_validate(ELF_BUF)
-    if valid != 0 {
-        cprint("Not a valid ELF64: error ", RED_ON_BLACK)
-        cprint_decimal(valid, RED_ON_BLACK)
-        console_putchar(10, WHITE_ON_BLACK)
-        return
+@kernel fn sys_write(fd: i64, buf_addr: i64, len: i64) -> i64 {
+    if fd < 0 || fd >= FD_MAX { return -1 }
+    let pid = volatile_read_u64(0x6FE00)
+    let ftype = fd_v2_get_type(pid, fd)
+    if ftype == FD_CONSOLE {
+        let mut i: i64 = 0
+        while i < len { console_putchar(volatile_read_u8(buf_addr + i), WHITE_ON_BLACK); i = i + 1 }
+        return len
     }
+    if ftype == FD_PIPE_WRITE {
+        let slot = fd_v2_get_data(pid, fd)
+        return pipe_write_circular(slot, buf_addr, len)
+    }
+    if ftype == FD_RAMFS {
+        let data = fd_v2_get_data(pid, fd)
+        let idx = data & 0xFFFFFFFF
+        let offset = (data >> 32) & 0xFFFFFFFF
+        let entry_addr = ramfs_entry_addr(idx)
+        let data_ptr = volatile_read(entry_addr + 40)
+        if data_ptr == 0 { return -1 }
+        let mut i: i64 = 0
+        while i < len { volatile_write_u8(data_ptr + offset + i, volatile_read_u8(buf_addr + i)); i = i + 1 }
+        let new_offset = offset + len
+        fd_v2_set(pid, fd, ftype, (new_offset << 32) | idx)
+        let old_size = volatile_read(entry_addr + 32)
+        if new_offset > old_size { volatile_write(entry_addr + 32, new_offset) }
+        return len
+    }
+    -1
+}
 
-    cprintln("ELF64 Header:", YELLOW_ON_BLACK)
-    let entry = elf_get_entry(ELF_BUF)
-    cprint("  Entry point: 0x", WHITE_ON_BLACK)
-    cprint_hex(entry, 16, CYAN_ON_BLACK)
-    console_putchar(10, WHITE_ON_BLACK)
+@kernel fn sys_read(fd: i64, buf_addr: i64, len: i64) -> i64 {
+    if fd < 0 || fd >= FD_MAX { return -1 }
+    let pid = volatile_read_u64(0x6FE00)
+    let ftype = fd_v2_get_type(pid, fd)
+    if ftype == FD_CONSOLE {
+        let read_idx = volatile_read_u8(0x6FBF8)
+        let write_idx = volatile_read_u8(0x6FBF0)
+        if read_idx == write_idx { return 0 }
+        volatile_write_u8(buf_addr, volatile_read_u8(0x6FB00 + read_idx))
+        volatile_write_u8(0x6FBF8, (read_idx + 1) % 256)
+        return 1
+    }
+    if ftype == FD_PIPE_READ {
+        let slot = fd_v2_get_data(pid, fd)
+        return pipe_read_circular(slot, buf_addr, len)
+    }
+    if ftype == FD_RAMFS {
+        let data = fd_v2_get_data(pid, fd)
+        let idx = data & 0xFFFFFFFF
+        let offset = (data >> 32) & 0xFFFFFFFF
+        let entry_addr = ramfs_entry_addr(idx)
+        let size = volatile_read(entry_addr + 32)
+        let data_ptr = volatile_read(entry_addr + 40)
+        if data_ptr == 0 { return 0 }
+        let available = size - offset
+        if available <= 0 { return 0 }
+        let to_read = if len < available { len } else { available }
+        let mut i: i64 = 0
+        while i < to_read { volatile_write_u8(buf_addr + i, volatile_read_u8(data_ptr + offset + i)); i = i + 1 }
+        fd_v2_set(pid, fd, ftype, ((offset + to_read) << 32) | idx)
+        return to_read
+    }
+    -1
+}
 
-    let phnum = elf_get_phnum(ELF_BUF)
-    cprint("  Program headers: ", WHITE_ON_BLACK)
-    cprint_decimal(phnum, CYAN_ON_BLACK)
-    console_putchar(10, WHITE_ON_BLACK)
+@kernel fn sys_getpid() -> i64 { volatile_read_u64(0x6FE00) }
 
-    let phoff = elf_get_phoff(ELF_BUF)
-    let phentsize = elf_get_phentsize(ELF_BUF)
-    i = 0
-    while i < phnum {
-        let ph = ELF_BUF + phoff + i * phentsize
-        let ph_type = buffer_read_u32_le(ph + PH_OFF_TYPE)
-        let vaddr = buffer_read_u64_le(ph + PH_OFF_VADDR)
-        let filesz = buffer_read_u64_le(ph + PH_OFF_FILESZ)
-        let memsz = buffer_read_u64_le(ph + PH_OFF_MEMSZ)
-        let flags = buffer_read_u32_le(ph + PH_OFF_FLAGS)
-        cprint("  [", WHITE_ON_BLACK)
-        cprint_decimal(i, CYAN_ON_BLACK)
-        cprint("] type=", WHITE_ON_BLACK)
-        if ph_type == 1 { cprint("LOAD", GREEN_ON_BLACK) }
-        else { cprint_decimal(ph_type, WHITE_ON_BLACK) }
-        cprint(" vaddr=0x", WHITE_ON_BLACK)
-        cprint_hex(vaddr, 8, CYAN_ON_BLACK)
-        cprint(" filesz=", WHITE_ON_BLACK)
-        cprint_decimal(filesz, CYAN_ON_BLACK)
-        cprint(" memsz=", WHITE_ON_BLACK)
-        cprint_decimal(memsz, CYAN_ON_BLACK)
-        cprint(" flags=", WHITE_ON_BLACK)
-        if flags & 4 != 0 { cprint("R", GREEN_ON_BLACK) }
-        if flags & 2 != 0 { cprint("W", YELLOW_ON_BLACK) }
-        if flags & 1 != 0 { cprint("X", RED_ON_BLACK) }
-        console_putchar(10, WHITE_ON_BLACK)
+@kernel fn sys_yield() -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    if pid > 0 { volatile_write_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE, PROC_STATE_READY) }
+    0
+}
+
+@kernel fn sys_clock() -> i64 { volatile_read_u64(0x6FE08) }
+
+@kernel fn sys_sleep(ms: i64) -> i64 {
+    let target = volatile_read_u64(0x6FE08) + (ms + 9) / 10
+    let pid = volatile_read_u64(0x6FE00)
+    if pid > 0 {
+        volatile_write_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + 104, target)
+        volatile_write_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE, PROC_STATE_BLOCKED)
+    }
+    while volatile_read_u64(0x6FE08) < target { }
+    0
+}
+
+@kernel fn sys_brk(new_brk: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let brk_addr = PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_BRK
+    let current_brk = volatile_read_u64(brk_addr)
+    if new_brk == 0 {
+        if current_brk == 0 { volatile_write_u64(brk_addr, USER_HEAP_BASE); return USER_HEAP_BASE }
+        return current_brk
+    }
+    if new_brk >= USER_HEAP_BASE && new_brk < ELF_STACK_TOP - 0x10000 {
+        let old = if current_brk == 0 { USER_HEAP_BASE } else { current_brk }
+        let mut page = (old + FRAME_SIZE - 1) / FRAME_SIZE * FRAME_SIZE
+        while page < new_brk {
+            let frame = frame_alloc()
+            if frame != -1 { map_page(page, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) }
+            page = page + FRAME_SIZE
+        }
+        volatile_write_u64(brk_addr, new_brk)
+        return new_brk
+    }
+    -1
+}
+
+@kernel fn sys_sbrk(increment: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let current_brk = volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_BRK)
+    let old = if current_brk == 0 { USER_HEAP_BASE } else { current_brk }
+    if increment == 0 { return old }
+    let result = sys_brk(old + increment)
+    if result == -1 { -1 } else { old }
+}
+
+@kernel fn sys_mmap(addr: i64, len: i64, prot: i64) -> i64 {
+    let pages = (len + FRAME_SIZE - 1) / FRAME_SIZE
+    let base = if addr != 0 { addr } else { USER_HEAP_BASE + 0x100000 }
+    let mut pg: i64 = 0
+    while pg < pages {
+        let frame = frame_alloc()
+        if frame != -1 { map_page(base + pg * FRAME_SIZE, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) }
+        pg = pg + 1
+    }
+    base
+}
+
+@kernel fn sys_open(path_addr: i64, flags: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let fd = fd_v2_alloc(pid)
+    if fd == -1 { return -1 }
+    let idx = ramfs_find_by_addr(path_addr)
+    if idx >= 0 {
+        let entry_addr = ramfs_entry_addr(idx)
+        if volatile_read(entry_addr + 48) != 1 { return -1 }
+        fd_v2_set(pid, fd, FD_RAMFS, idx)
+        return fd
+    }
+    -1
+}
+
+@kernel fn sys_close(fd: i64) -> i64 {
+    if fd < 0 || fd >= FD_MAX { return -1 }
+    let pid = volatile_read_u64(0x6FE00)
+    let ftype = fd_v2_get_type(pid, fd)
+    if ftype == FD_CLOSED { return -1 }
+    if ftype == FD_PIPE_READ { let freed = pipe_decref(fd_v2_get_data(pid, fd), 0); if freed == 1 { pipe_free(fd_v2_get_data(pid, fd)) } }
+    if ftype == FD_PIPE_WRITE { let freed = pipe_decref(fd_v2_get_data(pid, fd), 1); if freed == 1 { pipe_free(fd_v2_get_data(pid, fd)) } }
+    fd_v2_set(pid, fd, FD_CLOSED, 0)
+    0
+}
+
+@kernel fn sys_stat(path_addr: i64, buf_addr: i64) -> i64 {
+    let idx = ramfs_find_by_addr(path_addr)
+    if idx >= 0 {
+        let ea = ramfs_entry_addr(idx)
+        volatile_write_u64(buf_addr, volatile_read(ea + 32))
+        volatile_write_u64(buf_addr + 8, volatile_read(ea + 48))
+        return 0
+    }
+    -1
+}
+
+@kernel fn sys_fstat(fd: i64, buf_addr: i64) -> i64 {
+    if fd < 0 || fd >= FD_MAX { return -1 }
+    let pid = volatile_read_u64(0x6FE00)
+    let ftype = fd_v2_get_type(pid, fd)
+    if ftype == FD_CONSOLE { volatile_write_u64(buf_addr, 0); volatile_write_u64(buf_addr + 8, 0); return 0 }
+    if ftype == FD_RAMFS {
+        let idx = fd_v2_get_data(pid, fd) & 0xFFFFFFFF
+        let ea = ramfs_entry_addr(idx)
+        volatile_write_u64(buf_addr, volatile_read(ea + 32))
+        volatile_write_u64(buf_addr + 8, volatile_read(ea + 48))
+        return 0
+    }
+    -1
+}
+
+@kernel fn sys_lseek(fd: i64, offset: i64, whence: i64) -> i64 {
+    if fd < 0 || fd >= FD_MAX { return -1 }
+    let pid = volatile_read_u64(0x6FE00)
+    let ftype = fd_v2_get_type(pid, fd)
+    if ftype != FD_RAMFS && ftype != FD_FAT32 { return -1 }
+    let data = fd_v2_get_data(pid, fd)
+    let idx = data & 0xFFFFFFFF
+    let cur = (data >> 32) & 0xFFFFFFFF
+    let new_off = if whence == SEEK_SET { offset }
+        else if whence == SEEK_CUR { cur + offset }
+        else if whence == SEEK_END { volatile_read(ramfs_entry_addr(idx) + 32) + offset }
+        else { -1 }
+    if new_off < 0 { return -1 }
+    fd_v2_set(pid, fd, ftype, (new_off << 32) | idx)
+    new_off
+}
+
+@kernel fn sys_dup(old_fd: i64) -> i64 {
+    if old_fd < 0 || old_fd >= FD_MAX { return -1 }
+    let pid = volatile_read_u64(0x6FE00)
+    let ftype = fd_v2_get_type(pid, old_fd)
+    if ftype == FD_CLOSED { return -1 }
+    let new_fd = fd_v2_alloc(pid)
+    if new_fd == -1 { return -1 }
+    fd_v2_set(pid, new_fd, ftype, fd_v2_get_data(pid, old_fd))
+    new_fd
+}
+
+@kernel fn sys_dup2(old_fd: i64, new_fd: i64) -> i64 {
+    if old_fd < 0 || old_fd >= FD_MAX || new_fd < 0 || new_fd >= FD_MAX { return -1 }
+    let pid = volatile_read_u64(0x6FE00)
+    if fd_v2_get_type(pid, old_fd) == FD_CLOSED { return -1 }
+    if old_fd == new_fd { return new_fd }
+    if fd_v2_get_type(pid, new_fd) != FD_CLOSED { sys_close(new_fd) }
+    fd_v2_set(pid, new_fd, fd_v2_get_type(pid, old_fd), fd_v2_get_data(pid, old_fd))
+    new_fd
+}
+
+@kernel fn sys_getcwd(buf_addr: i64, size: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let cwd = PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_CWD
+    let mut len: i64 = 0
+    while len < 31 && len < size - 1 {
+        let ch = volatile_read_u8(cwd + len)
+        if ch == 0 { len = size } else { volatile_write_u8(buf_addr + len, ch); len = len + 1 }
+    }
+    if len == 0 || len >= size { volatile_write_u8(buf_addr, 47); volatile_write_u8(buf_addr + 1, 0); return 1 }
+    volatile_write_u8(buf_addr + len, 0)
+    len
+}
+
+@kernel fn sys_chdir(path_addr: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let cwd = PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_CWD
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(path_addr + i)
+        volatile_write_u8(cwd + i, ch)
+        if ch == 0 { return 0 }
         i = i + 1
     }
-
-    cprint("  File size: ", WHITE_ON_BLACK)
-    cprint_decimal(bytes, CYAN_ON_BLACK)
-    cprintln(" bytes", WHITE_ON_BLACK)
+    volatile_write_u8(cwd + 31, 0)
+    0
 }
 
-@kernel fn cmd_exec() {
-    // "exec <filename>" — load and execute ELF from FAT32
-    if fat32_state_read(0) != 1 { cprintln("FAT32 not mounted", RED_ON_BLACK); return }
-
-    let mut fname_len: i64 = 0
-    let mut i: i64 = 5
-    while i < 64 {
-        let ch = volatile_read_u8(0x6F800 + i)
-        if ch == 0 { i = 64 }
-        else { volatile_write_u8(FAT32_NAME_BUF + 256 + fname_len, ch); fname_len = fname_len + 1; i = i + 1 }
-    }
-    volatile_write_u8(FAT32_NAME_BUF + 256 + fname_len, 0)
-
-    if fname_len == 0 { cprintln("Usage: exec <filename>", YELLOW_ON_BLACK); return }
-
-    let root = fat32_state_read(48)
-    let result = fat32_find_in_dir(root, FAT32_NAME_BUF + 256)
-    if result == -1 { cprintln("File not found", RED_ON_BLACK); return }
-
-    let shifted = result >> 32
-    let file_cluster = shifted & 0x7FFFFFFF
-    let file_size = result & 0xFFFFFFFF
-
-    cprint("Loading ", WHITE_ON_BLACK)
-    let mut k: i64 = 0
-    while k < fname_len {
-        console_putchar(volatile_read_u8(FAT32_NAME_BUF + 256 + k), CYAN_ON_BLACK)
-        k = k + 1
-    }
-    cprint(" (", WHITE_ON_BLACK)
-    cprint_decimal(file_size, CYAN_ON_BLACK)
-    cprintln(" bytes)...", WHITE_ON_BLACK)
-
-    let bytes = fat32_read_file(file_cluster, file_size, ELF_BUF)
-    if bytes <= 0 { cprintln("Read error", RED_ON_BLACK); return }
-
-    let valid = elf_validate(ELF_BUF)
-    if valid != 0 {
-        cprintln("Not a valid ELF64", RED_ON_BLACK)
-        return
-    }
-
-    // Load PT_LOAD segments into memory
-    let loaded = elf_load_segments(ELF_BUF, bytes)
-    cprint("  Loaded ", WHITE_ON_BLACK)
-    cprint_decimal(loaded, CYAN_ON_BLACK)
-    cprintln(" segments", WHITE_ON_BLACK)
-
-    let entry = elf_get_entry(ELF_BUF)
-    cprint("  Entry: 0x", WHITE_ON_BLACK)
-    cprint_hex(entry, 16, CYAN_ON_BLACK)
-    console_putchar(10, WHITE_ON_BLACK)
-
-    // Setup user stack (64KB at ELF_STACK_TOP - 0x10000)
-    let user_stack_base = ELF_STACK_TOP - 0x10000
-    let mut pg: i64 = user_stack_base
-    while pg < ELF_STACK_TOP {
-        let frame = frame_alloc()
-        if frame != -1 {
-            map_page(pg, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
-        }
-        pg = pg + FRAME_SIZE
-    }
-
-    let user_rsp = ELF_STACK_TOP - 8 // Stack grows down, leave room
-    cprintln("  Transitioning to Ring 3...", YELLOW_ON_BLACK)
-
-    // Setup SYSCALL/SYSRET MSRs for return path
-    // IA32_STAR (0xC0000081): SYSRET CS/SS in bits 63:48, SYSCALL CS/SS in 47:32
-    // Kernel CS=0x08, Kernel SS=0x10, User CS=0x20|3=0x23, User SS=0x18|3=0x1B
-    // STAR: (user_cs_base << 48) | (kernel_cs << 32)
-    // SYSRET loads CS from STAR[63:48]+16, SS from STAR[63:48]+8
-    // So user_cs_base = 0x18 (SYSRET adds 16 → 0x28? No...)
-    // Actually: SYSRET 64-bit loads CS = STAR[63:48]+16, SS = STAR[63:48]+8
-    // We want CS=0x23 (0x20|RPL3). STAR[63:48] = 0x13 → CS = 0x13+16 = 0x23. SS = 0x13+8 = 0x1B.
-    let star_val = (0x13 << 48) | (0x08 << 32)
-    wrmsr(0xC0000081, star_val)
-
-    // IA32_LSTAR (0xC0000082): SYSCALL entry point
-    // For now, set to a simple handler that writes to VGA and halts
-    // We'll use a fixed kernel address for the syscall handler
-    // Actually, without a real SYSCALL handler in the kernel binary,
-    // we can't safely transition. Use IRETQ instead (which we have).
-
-    // IRETQ to Ring 3: push SS, RSP, RFLAGS, CS, RIP on stack
-    // iretq_to_user(rip, rsp, rflags) does this for us
-    iretq_to_user(entry, user_rsp, 0x202) // IF=1 (interrupts enabled)
-    // Note: we only reach here if user program returns via exception/syscall
-    cprintln("  User program returned", GREEN_ON_BLACK)
+@kernel fn sys_unlink(path_addr: i64) -> i64 {
+    let idx = ramfs_find_by_addr(path_addr)
+    if idx < 0 { return -1 }
+    let ea = ramfs_entry_addr(idx)
+    if volatile_read(ea + 48) == 2 { return -1 }
+    volatile_write_u8(ea, 0)
+    volatile_write(ea + 32, 0)
+    volatile_write(ea + 48, 0)
+    0
 }
