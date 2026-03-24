@@ -1,0 +1,141 @@
+// FajarOS Nova v1.2.0 "Nexus" — Process Fork
+// kernel/process/fork.fj — sys_fork() with deep page table copy
+
+// Context frame: 15 GPRs + 5 IRETQ = 20 x 8 = 160 bytes
+const CTX_FRAME_SIZE: i64 = 160
+const CTX_OFF_RAX: i64 = 112
+
+@kernel fn sys_fork() -> i64 {
+    let parent_pid = volatile_read_u64(0x6FE00)
+    let parent_base = PROC_TABLE + parent_pid * PROC_ENTRY_SIZE
+
+    // Find free PID
+    let mut child_pid: i64 = -1
+    let mut i: i64 = 1
+    while i < PROC_MAX && child_pid == -1 {
+        if volatile_read(PROC_TABLE + i * PROC_ENTRY_SIZE + PROC_OFF_STATE) == PROC_STATE_FREE {
+            child_pid = i
+        }
+        i = i + 1
+    }
+    if child_pid == -1 { return -1 }
+
+    // Clone page tables
+    let parent_cr3 = volatile_read(parent_base + PROC_OFF_CR3)
+    let child_pml4 = fork_clone_page_tables(parent_cr3)
+    if child_pml4 == -1 { return -1 }
+
+    // Copy FD table
+    fork_copy_fd_table(parent_pid, child_pid)
+
+    // Copy proc fields (brk, wake, cwd, pgid)
+    let child_base = PROC_TABLE + child_pid * PROC_ENTRY_SIZE
+    let mut off: i64 = PROC_OFF_BRK
+    while off < PROC_OFF_CWD + 32 {
+        volatile_write_u8(child_base + off, volatile_read_u8(parent_base + off))
+        off = off + 1
+    }
+
+    // Build child kernel stack
+    let child_kstack_base = KSTACK_BASE + child_pid * KSTACK_SIZE
+    let child_kstack_top = child_kstack_base + KSTACK_SIZE - 16
+    let mut pg: i64 = child_kstack_base
+    while pg < child_kstack_base + KSTACK_SIZE {
+        map_page(pg, pg, PAGE_PRESENT | PAGE_WRITABLE)
+        frame_mark_used(pg / FRAME_SIZE)
+        pg = pg + FRAME_SIZE
+    }
+
+    // Copy parent context frame, set child RAX=0
+    let parent_rsp = volatile_read(parent_base + PROC_OFF_RSP)
+    let child_sp = child_kstack_top - CTX_FRAME_SIZE
+    let mut ci: i64 = 0
+    while ci < CTX_FRAME_SIZE {
+        volatile_write_u8(child_sp + ci, volatile_read_u8(parent_rsp + ci))
+        ci = ci + 1
+    }
+    volatile_write_u64(child_sp + CTX_OFF_RAX, 0)
+
+    // Set child process entry
+    volatile_write(child_base + PROC_OFF_STATE, PROC_STATE_READY)
+    volatile_write(child_base + PROC_OFF_RSP, child_sp)
+    volatile_write(child_base + PROC_OFF_ENTRY, volatile_read(parent_base + PROC_OFF_ENTRY))
+    volatile_write(child_base + PROC_OFF_TICKS, 0)
+    volatile_write(child_base + PROC_OFF_CR3, child_pml4)
+    volatile_write(child_base + PROC_OFF_EXIT, 0)
+    volatile_write(child_base + PROC_OFF_PPID, parent_pid)
+
+    // Copy name
+    let mut ni: i64 = 0
+    while ni < 16 {
+        volatile_write_u8(child_base + PROC_OFF_NAME + ni, volatile_read_u8(parent_base + PROC_OFF_NAME + ni))
+        ni = ni + 1
+    }
+
+    child_pid
+}
+
+@kernel fn fork_clone_page_tables(parent_pml4: i64) -> i64 {
+    let child_pml4 = clone_kernel_pml4()
+    if child_pml4 == -1 { return -1 }
+    let mut idx: i64 = 0
+    while idx < 512 {
+        let entry = page_table_entry(parent_pml4, idx)
+        if entry != 0 && (entry & PAGE_USER) != 0 {
+            let subtable = entry & 0xFFFFFFFFF000
+            let child_sub = fork_copy_page_level(subtable, 3)
+            if child_sub != -1 {
+                page_table_set(child_pml4, idx, child_sub | (entry & 0xFFF))
+            }
+        }
+        idx = idx + 1
+    }
+    child_pml4
+}
+
+@kernel fn fork_copy_page_level(parent_table: i64, level: i64) -> i64 {
+    let child_frame = frame_alloc()
+    if child_frame == -1 { return -1 }
+    let child_table = child_frame * FRAME_SIZE
+    let mut z: i64 = 0
+    while z < 4096 { volatile_write_u8(child_table + z, 0); z = z + 1 }
+    let mut idx: i64 = 0
+    while idx < 512 {
+        let entry = page_table_entry(parent_table, idx)
+        if entry != 0 && (entry & PAGE_PRESENT) != 0 {
+            if level == 1 {
+                let parent_phys = entry & 0xFFFFFFFFF000
+                let flags = entry & 0xFFF
+                let new_frame = frame_alloc()
+                if new_frame != -1 {
+                    let new_phys = new_frame * FRAME_SIZE
+                    let mut b: i64 = 0
+                    while b < 4096 { volatile_write_u8(new_phys + b, volatile_read_u8(parent_phys + b)); b = b + 1 }
+                    page_table_set(child_table, idx, new_phys | flags)
+                }
+            } else {
+                if (entry & PAGE_USER) != 0 {
+                    let subtable = entry & 0xFFFFFFFFF000
+                    let child_sub = fork_copy_page_level(subtable, level - 1)
+                    if child_sub != -1 { page_table_set(child_table, idx, child_sub | (entry & 0xFFF)) }
+                } else {
+                    page_table_set(child_table, idx, entry)
+                }
+            }
+        }
+        idx = idx + 1
+    }
+    child_table
+}
+
+@kernel fn fork_copy_fd_table(parent_pid: i64, child_pid: i64) {
+    let mut fd: i64 = 0
+    while fd < FD_MAX {
+        let ftype = fd_v2_get_type(parent_pid, fd)
+        let data = fd_v2_get_data(parent_pid, fd)
+        fd_v2_set(child_pid, fd, ftype, data)
+        if ftype == FD_PIPE_READ { pipe_incref(data, 0) }
+        if ftype == FD_PIPE_WRITE { pipe_incref(data, 1) }
+        fd = fd + 1
+    }
+}

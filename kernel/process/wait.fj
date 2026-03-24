@@ -1,0 +1,101 @@
+// FajarOS Nova v1.2.0 "Nexus" — Process Wait
+// kernel/process/wait.fj — sys_waitpid, zombie reaping, orphan reparenting
+
+const PROC_WAIT_TABLE: i64 = 0x8D2000
+const WAIT_ENTRY_SIZE: i64 = 16
+const WNOHANG: i64 = 1
+
+@kernel fn wait_pack_status(exit_code: i64, signal: i64) -> i64 {
+    ((exit_code & 0xFF) << 8) | (signal & 0xFF)
+}
+
+@kernel fn sys_waitpid(pid: i64, status_addr: i64, options: i64) -> i64 {
+    let parent_pid = volatile_read_u64(0x6FE00)
+    if pid == -1 { return waitpid_any(parent_pid, status_addr, options) }
+    if pid < 1 || pid >= PROC_MAX { return -1 }
+    let child_base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+    if volatile_read(child_base + PROC_OFF_PPID) != parent_pid { return -1 }
+    let state = volatile_read(child_base + PROC_OFF_STATE)
+    if state == PROC_STATE_ZOMBIE {
+        let status = wait_pack_status(volatile_read(child_base + PROC_OFF_EXIT), 0)
+        waitpid_write_status(status_addr, status)
+        volatile_write(child_base + PROC_OFF_STATE, PROC_STATE_FREE)
+        volatile_write(child_base + PROC_OFF_TICKS, 0)
+        volatile_write(child_base + PROC_OFF_ENTRY, 0)
+        return pid
+    }
+    if (options & WNOHANG) != 0 { return 0 }
+    // Block
+    volatile_write_u64(PROC_WAIT_TABLE + parent_pid * WAIT_ENTRY_SIZE, pid)
+    volatile_write(PROC_TABLE + parent_pid * PROC_ENTRY_SIZE + PROC_OFF_STATE, PROC_STATE_BLOCKED)
+    if parent_pid == 0 {
+        waitpid_spin(child_base)
+        let status = wait_pack_status(volatile_read(child_base + PROC_OFF_EXIT), 0)
+        waitpid_write_status(status_addr, status)
+        waitpid_reap_child(child_base, parent_pid)
+        return pid
+    }
+    0
+}
+
+@kernel fn waitpid_any(parent_pid: i64, status_addr: i64, options: i64) -> i64 {
+    let mut i: i64 = 1
+    while i < PROC_MAX {
+        let cb = PROC_TABLE + i * PROC_ENTRY_SIZE
+        if volatile_read(cb + PROC_OFF_PPID) == parent_pid && volatile_read(cb + PROC_OFF_STATE) == PROC_STATE_ZOMBIE {
+            let status = wait_pack_status(volatile_read(cb + PROC_OFF_EXIT), 0)
+            waitpid_write_status(status_addr, status)
+            volatile_write(cb + PROC_OFF_STATE, PROC_STATE_FREE)
+            volatile_write(cb + PROC_OFF_TICKS, 0)
+            volatile_write(cb + PROC_OFF_ENTRY, 0)
+            return i
+        }
+        i = i + 1
+    }
+    if (options & WNOHANG) != 0 { return 0 }
+    -1
+}
+
+@kernel fn waitpid_spin(child_base: i64) {
+    while volatile_read(child_base + PROC_OFF_STATE) != PROC_STATE_ZOMBIE { hlt() }
+}
+
+@kernel fn waitpid_reap_child(child_base: i64, parent_pid: i64) {
+    volatile_write(child_base + PROC_OFF_STATE, PROC_STATE_FREE)
+    volatile_write(child_base + PROC_OFF_TICKS, 0)
+    volatile_write(child_base + PROC_OFF_ENTRY, 0)
+    volatile_write(PROC_TABLE + parent_pid * PROC_ENTRY_SIZE + PROC_OFF_STATE, PROC_STATE_RUNNING)
+}
+
+@kernel fn waitpid_write_status(addr: i64, status: i64) {
+    if addr != 0 { volatile_write_u64(addr, status) }
+}
+
+@kernel fn reparent_children(exiting_pid: i64) {
+    let mut i: i64 = 1
+    while i < PROC_MAX {
+        let cb = PROC_TABLE + i * PROC_ENTRY_SIZE
+        let ppid = volatile_read(cb + PROC_OFF_PPID)
+        let state = volatile_read(cb + PROC_OFF_STATE)
+        if ppid == exiting_pid && state != PROC_STATE_FREE {
+            volatile_write(cb + PROC_OFF_PPID, 1) // reparent to init
+            if state == PROC_STATE_ZOMBIE {
+                volatile_write(cb + PROC_OFF_STATE, PROC_STATE_FREE)
+                volatile_write(cb + PROC_OFF_TICKS, 0)
+            }
+        }
+        i = i + 1
+    }
+}
+
+@kernel fn wake_waiting_parent(child_pid: i64, exit_code: i64) {
+    let ppid = volatile_read(PROC_TABLE + child_pid * PROC_ENTRY_SIZE + PROC_OFF_PPID)
+    if ppid < 0 || ppid >= PROC_MAX { return }
+    let pb = PROC_TABLE + ppid * PROC_ENTRY_SIZE
+    if volatile_read(pb + PROC_OFF_STATE) == PROC_STATE_BLOCKED {
+        let wait_pid = volatile_read_u64(PROC_WAIT_TABLE + ppid * WAIT_ENTRY_SIZE)
+        if wait_pid == child_pid || wait_pid == -1 {
+            volatile_write(pb + PROC_OFF_STATE, PROC_STATE_READY)
+        }
+    }
+}

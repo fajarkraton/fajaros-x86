@@ -42,6 +42,10 @@ SOURCES := \
 	kernel/syscall/entry.fj \
 	kernel/syscall/dispatch.fj \
 	kernel/syscall/elf.fj \
+	kernel/process/fork.fj \
+	kernel/process/exec.fj \
+	kernel/process/wait.fj \
+	kernel/process/exit.fj \
 	kernel/security/capability.fj \
 	kernel/security/limits.fj \
 	kernel/security/hardening.fj \

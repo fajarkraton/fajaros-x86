@@ -1,0 +1,137 @@
+// FajarOS Nova v1.2.0 "Nexus" — Process Exec
+// kernel/process/exec.fj — sys_exec() loads ELF, replaces process image
+
+const ARGV_BUF: i64 = 0x8D6000
+const ARGV_MAX: i64 = 16
+const ARGV_STR_SIZE: i64 = 256
+
+@kernel fn sys_exec(path_addr: i64, argv_addr: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+
+    // Load ELF from ramfs or FAT32
+    let mut elf_loaded: i64 = 0
+
+    // Try ramfs
+    let idx = ramfs_find_by_addr(path_addr)
+    if idx >= 0 {
+        let entry_addr = ramfs_entry_addr(idx)
+        let file_size = volatile_read(entry_addr + 32)
+        let data_ptr = volatile_read(entry_addr + 40)
+        if data_ptr != 0 && file_size > 0 {
+            let mut ci: i64 = 0
+            while ci < file_size && ci < 0x10000 {
+                volatile_write_u8(ELF_BUF + ci, volatile_read_u8(data_ptr + ci))
+                ci = ci + 1
+            }
+            elf_loaded = file_size
+        }
+    }
+
+    // Try FAT32
+    if elf_loaded == 0 && fat32_state_read(0) == 1 {
+        let mut ni: i64 = 0
+        while ni < 64 {
+            let ch = volatile_read_u8(path_addr + ni)
+            volatile_write_u8(FAT32_NAME_BUF + 256 + ni, ch)
+            if ch == 0 { ni = 64 } else { ni = ni + 1 }
+        }
+        let root = fat32_state_read(48)
+        let result = fat32_find_in_dir(root, FAT32_NAME_BUF + 256)
+        if result != -1 {
+            let shifted = result >> 32
+            let cluster = shifted & 0x7FFFFFFF
+            let fsize = result & 0xFFFFFFFF
+            let bytes = fat32_read_file(cluster, fsize, ELF_BUF)
+            if bytes > 0 { elf_loaded = bytes }
+        }
+    }
+
+    if elf_loaded == 0 { return -1 }
+    let valid = elf_validate(ELF_BUF)
+    if valid != 0 { return -1 }
+
+    // Load ELF segments
+    let loaded = elf_load_segments(ELF_BUF, elf_loaded)
+    if loaded == 0 { return -1 }
+    let entry = elf_get_entry(ELF_BUF)
+
+    // Setup user stack
+    let user_stack_base = ELF_STACK_TOP - 0x10000
+    let mut pg: i64 = user_stack_base
+    while pg < ELF_STACK_TOP {
+        let frame = frame_alloc()
+        if frame != -1 { map_page(pg, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) }
+        pg = pg + FRAME_SIZE
+    }
+
+    let user_rsp = exec_setup_argv(argv_addr)
+
+    // Reset non-stdio FDs
+    exec_reset_fds(pid)
+
+    // Rebuild context frame for Ring 3
+    let kstack_top = KSTACK_BASE + pid * KSTACK_SIZE + KSTACK_SIZE - 16
+    let mut sp = kstack_top
+    sp = sp - 8; volatile_write_u64(sp, 0x1B)       // SS
+    sp = sp - 8; volatile_write_u64(sp, user_rsp)    // RSP
+    sp = sp - 8; volatile_write_u64(sp, 0x202)       // RFLAGS
+    sp = sp - 8; volatile_write_u64(sp, 0x23)        // CS
+    sp = sp - 8; volatile_write_u64(sp, entry)        // RIP
+    let mut r: i64 = 0
+    while r < 15 { sp = sp - 8; volatile_write_u64(sp, 0); r = r + 1 }
+
+    volatile_write(base + PROC_OFF_RSP, sp)
+    volatile_write(base + PROC_OFF_ENTRY, entry)
+    volatile_write(base + PROC_OFF_TICKS, 0)
+    volatile_write(base + PROC_OFF_STATE, PROC_STATE_READY)
+    volatile_write_u64(base + PROC_OFF_BRK, 0)
+    0
+}
+
+@kernel fn exec_setup_argv(argv_addr: i64) -> i64 {
+    let mut user_rsp = ELF_STACK_TOP - 8
+    if argv_addr == 0 {
+        user_rsp = user_rsp - 8; volatile_write_u64(user_rsp, 0)
+        user_rsp = user_rsp - 8; volatile_write_u64(user_rsp, 0)
+        return (user_rsp / 16) * 16
+    }
+    // Parse space-separated args
+    let mut argc: i64 = 0
+    let mut pos: i64 = 0
+    let mut arg_start: i64 = 0
+    let mut in_arg: i64 = 0
+    let mut ch = volatile_read_u8(argv_addr + pos)
+    while ch != 0 && argc < ARGV_MAX {
+        if ch == 32 {
+            if in_arg == 1 {
+                volatile_write_u8(ARGV_BUF + argc * ARGV_STR_SIZE + (pos - arg_start), 0)
+                argc = argc + 1
+                in_arg = 0
+            }
+        } else {
+            if in_arg == 0 { arg_start = pos; in_arg = 1 }
+            let offset = pos - arg_start
+            if offset < ARGV_STR_SIZE - 1 {
+                volatile_write_u8(ARGV_BUF + argc * ARGV_STR_SIZE + offset, ch)
+            }
+        }
+        pos = pos + 1
+        ch = volatile_read_u8(argv_addr + pos)
+    }
+    if in_arg == 1 {
+        volatile_write_u8(ARGV_BUF + argc * ARGV_STR_SIZE + (pos - arg_start), 0)
+        argc = argc + 1
+    }
+    user_rsp = user_rsp - 8; volatile_write_u64(user_rsp, 0)
+    user_rsp = user_rsp - 8; volatile_write_u64(user_rsp, argc)
+    (user_rsp / 16) * 16
+}
+
+@kernel fn exec_reset_fds(pid: i64) {
+    let mut fd: i64 = 3
+    while fd < FD_MAX {
+        if fd_v2_get_type(pid, fd) != FD_CLOSED { fd_v2_set(pid, fd, FD_CLOSED, 0) }
+        fd = fd + 1
+    }
+}

@@ -1,0 +1,31 @@
+// FajarOS Nova v1.2.0 "Nexus" — Process Exit
+// kernel/process/exit.fj — enhanced exit with signals + cleanup
+
+@kernel fn process_exit_with_signal(exit_code: i64) {
+    let pid = volatile_read(0x6FE00)
+    let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+    volatile_write(base + PROC_OFF_STATE, PROC_STATE_ZOMBIE)
+    volatile_write(base + PROC_OFF_EXIT, exit_code)
+    reparent_children(pid)
+    // Send SIGCHLD to parent
+    let ppid = volatile_read(base + PROC_OFF_PPID)
+    if ppid >= 0 && ppid < PROC_MAX { signal_send(ppid, SIGCHLD) }
+    wake_waiting_parent(pid, exit_code)
+    // Close all FDs
+    let mut fd: i64 = 0
+    while fd < FD_MAX { fd_v2_set(pid, fd, FD_CLOSED, 0); fd = fd + 1 }
+    cprint("[PROC] PID ", WHITE_ON_BLACK)
+    cprint_decimal(pid, CYAN_ON_BLACK)
+    cprint(" exited (code ", WHITE_ON_BLACK)
+    cprint_decimal(exit_code, CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+    while 1 == 1 { hlt() }
+}
+
+@kernel fn sys_setpgid(pid: i64, pgid: i64) -> i64 {
+    let target = if pid == 0 { volatile_read_u64(0x6FE00) } else { pid }
+    if target < 0 || target >= PROC_MAX { return -1 }
+    let tpgid = if pgid == 0 { target } else { pgid }
+    volatile_write(PROC_TABLE + target * PROC_ENTRY_SIZE + PROC_OFF_PGID, tpgid)
+    0
+}
