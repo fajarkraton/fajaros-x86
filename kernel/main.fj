@@ -2,6 +2,39 @@
 // Part of the modular kernel build (concatenated by Makefile)
 // This file MUST be last in the concatenation order.
 
+// Poll serial port for input (COM1: 0x3F8)
+// Called from shell loop to enable automated QEMU testing via -serial stdio
+@kernel fn shell_poll_serial() {
+    // Only poll if shell is ready (flag at 0x6FC00)
+    let ready = volatile_read(0x6FC00)
+    if ready == 0 { return }
+    // LSR (Line Status Register) at base+5: bit 0 = data ready
+    let lsr = port_inb(0x3FD)
+    let has_data = lsr & 1
+    if has_data == 0 {
+        return
+    }
+    let ch = port_inb(0x3F8)
+    if ch == 10 || ch == 13 {
+        // Enter — execute command
+        console_putchar(10, WHITE_ON_BLACK)
+        history_push()
+        dispatch_command()
+        cmdbuf_clear()
+        cprint("nova> ", GREEN_ON_BLACK)
+    } else if ch == 8 || ch == 127 {
+        // Backspace
+        if cmdbuf_len() > 0 {
+            cmdbuf_pop()
+            console_putchar(8, WHITE_ON_BLACK)
+        }
+    } else if ch >= 32 && ch < 127 {
+        // Printable ASCII
+        cmdbuf_push(ch)
+        console_putchar(ch, WHITE_ON_BLACK)
+    }
+}
+
 @kernel fn kernel_main() {
     x86_serial_init(0, 115200)
 
@@ -207,15 +240,28 @@
     cmdbuf_clear()
     cprint("nova> ", GREEN_ON_BLACK)
 
+    // Flush any stale serial input before enabling serial shell
+    let mut flush_count: i64 = 0
+    while flush_count < 256 {
+        let fl = port_inb(0x3FD)
+        if (fl & 1) == 0 { flush_count = 256 }
+        else { let _ = port_inb(0x3F8); flush_count = flush_count + 1 }
+    }
+    // Enable serial shell input
+    volatile_write(0x6FC00, 1)
+
     // Init shift/caps/ctrl state
     volatile_write(0x6FBE0, 0)  // shift = 0
     volatile_write(0x6FBE8, 0)  // caps = 0
     volatile_write(0x6FBF0, 0)  // ctrl = 0 (Sprint 5.4.7)
 
     // Main shell loop — shift, caps lock, ctrl, arrow history
+    // Also polls serial port (COM1) for automated testing
     let mut running: i64 = 1
     let mut ext_prefix: i64 = 0
     while running == 1 {
+        // Check serial input (COM1) — enables automated QEMU testing
+        shell_poll_serial()
         if kb_has_data() == 1 {
             let sc = kb_read_scancode()
 
