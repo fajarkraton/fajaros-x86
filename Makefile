@@ -53,6 +53,8 @@ SOURCES := \
 	kernel/process/exit.fj \
 	kernel/signal/signal.fj \
 	kernel/signal/jobs.fj \
+	kernel/debug/gdb_stub.fj \
+	kernel/debug/gdb_ext.fj \
 	kernel/security/capability.fj \
 	kernel/security/limits.fj \
 	kernel/security/hardening.fj \

@@ -1,0 +1,159 @@
+// FajarOS Nova v1.3.0 "Bastion" — GDB Extensions
+// kernel/debug/gdb_ext.fj — watchpoints, thread query, memory map, rcmd
+
+const GDB_WP_MAX: i64 = 4
+const GDB_WP_TABLE: i64 = 0x996300
+
+@kernel fn gdb_insert_watchpoint(pkt: i64, len: i64) {
+    let wp_type = volatile_read_u8(pkt + 1) - 48
+    let mut addr: i64 = 0
+    let mut pos: i64 = 3
+    while pos < len && volatile_read_u8(pkt + pos) != 44 { addr = addr * 16 + gdb_hex_digit(volatile_read_u8(pkt + pos)); pos = pos + 1 }
+    let mut dr: i64 = 0
+    let mut found: i64 = -1
+    while dr < GDB_WP_MAX && found == -1 { if volatile_read_u64(GDB_WP_TABLE + dr * 16) == 0 { found = dr }; dr = dr + 1 }
+    if found == -1 { gdb_send_packet(GDB_RESP_BUF, 0); return }
+    volatile_write_u64(GDB_WP_TABLE + found * 16, addr)
+    volatile_write_u64(GDB_WP_TABLE + found * 16 + 8, wp_type)
+    let r = GDB_RESP_BUF
+    volatile_write_u8(r, 79); volatile_write_u8(r + 1, 75)
+    gdb_send_packet(r, 2)
+}
+
+@kernel fn gdb_remove_watchpoint(pkt: i64, len: i64) {
+    let mut addr: i64 = 0
+    let mut pos: i64 = 3
+    while pos < len && volatile_read_u8(pkt + pos) != 44 { addr = addr * 16 + gdb_hex_digit(volatile_read_u8(pkt + pos)); pos = pos + 1 }
+    let mut i: i64 = 0
+    while i < GDB_WP_MAX {
+        if volatile_read_u64(GDB_WP_TABLE + i * 16) == addr {
+            volatile_write_u64(GDB_WP_TABLE + i * 16, 0)
+            volatile_write_u64(GDB_WP_TABLE + i * 16 + 8, 0)
+            let r = GDB_RESP_BUF
+            volatile_write_u8(r, 79); volatile_write_u8(r + 1, 75)
+            gdb_send_packet(r, 2)
+            return
+        }
+        i = i + 1
+    }
+    gdb_send_packet(GDB_RESP_BUF, 0)
+}
+
+@kernel fn gdb_handle_thread_info() {
+    let r = GDB_RESP_BUF
+    let mut pos: i64 = 0
+    volatile_write_u8(r + pos, 109); pos = pos + 1
+    let mut first: i64 = 1
+    let mut pid: i64 = 0
+    while pid < PROC_MAX {
+        if volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE) != PROC_STATE_FREE {
+            if first == 0 { volatile_write_u8(r + pos, 44); pos = pos + 1 }
+            pos = gdb_write_hex_small(r, pos, pid + 1)
+            first = 0
+        }
+        pid = pid + 1
+    }
+    gdb_send_packet(r, pos)
+}
+
+@kernel fn gdb_write_hex_small(buf: i64, pos: i64, val: i64) -> i64 {
+    if val < 16 { volatile_write_u8(buf + pos, gdb_hex_char(val)); pos + 1 }
+    else {
+        volatile_write_u8(buf + pos, gdb_hex_char((val >> 4) & 0xF))
+        volatile_write_u8(buf + pos + 1, gdb_hex_char(val & 0xF))
+        pos + 2
+    }
+}
+
+@kernel fn gdb_encode_hex_byte(buf: i64, pos: i64, byte: i64) -> i64 {
+    volatile_write_u8(buf + pos, gdb_hex_char((byte >> 4) & 0xF))
+    volatile_write_u8(buf + pos + 1, gdb_hex_char(byte & 0xF))
+    pos + 2
+}
+
+@kernel fn gdb_handle_rcmd(pkt: i64, len: i64) {
+    let cb: i64 = 0x996200
+    let mut pos: i64 = 6
+    let mut ci: i64 = 0
+    while pos + 1 < len && ci < 63 {
+        volatile_write_u8(cb + ci, gdb_hex_digit(volatile_read_u8(pkt + pos)) * 16 + gdb_hex_digit(volatile_read_u8(pkt + pos + 1)))
+        ci = ci + 1; pos = pos + 2
+    }
+    volatile_write_u8(cb + ci, 0)
+    if volatile_read_u8(cb) == 105 {
+        let r = GDB_RESP_BUF
+        let mut rp: i64 = 0
+        let mut pid: i64 = 0
+        while pid < PROC_MAX {
+            if volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE) != PROC_STATE_FREE {
+                rp = gdb_encode_hex_byte(r, rp, 80)
+                rp = gdb_encode_hex_byte(r, rp, 48 + pid)
+                rp = gdb_encode_hex_byte(r, rp, 10)
+            }
+            pid = pid + 1
+        }
+        gdb_send_packet(r, rp)
+        return
+    }
+    let r = GDB_RESP_BUF
+    volatile_write_u8(r, 79); volatile_write_u8(r + 1, 75)
+    gdb_send_packet(r, 2)
+}
+
+@kernel fn gdb_handle_memory_map() {
+    let r = GDB_RESP_BUF
+    let mut pos: i64 = 0
+    volatile_write_u8(r, 108); pos = 1
+    pos = http_write_str(r, pos, "<memory-map>")
+    pos = http_write_str(r, pos, "<memory type=\"ram\" start=\"0x100000\" length=\"0x7F00000\"/>")
+    pos = http_write_str(r, pos, "<memory type=\"ram\" start=\"0x2000000\" length=\"0x1000000\"/>")
+    pos = http_write_str(r, pos, "</memory-map>")
+    gdb_send_packet(r, pos)
+}
+
+@kernel fn gdb_on_breakpoint() {
+    if volatile_read_u64(GDB_STATE) == 1 { gdb_handle_halt_reason() }
+}
+
+@kernel fn gdb_on_debug_trap() {
+    if volatile_read_u64(GDB_STATE) == 1 { volatile_write_u64(GDB_STATE + 8, 0); gdb_handle_halt_reason() }
+}
+
+@kernel fn gdb_dispatch_v2(pkt: i64, len: i64) {
+    let cmd = volatile_read_u8(pkt)
+    if cmd == 63 { gdb_handle_halt_reason() }
+    else if cmd == 103 { gdb_handle_read_regs() }
+    else if cmd == 109 { gdb_handle_read_mem(pkt, len) }
+    else if cmd == 115 { gdb_handle_step() }
+    else if cmd == 99 { gdb_handle_continue() }
+    else if cmd == 90 {
+        let sc = volatile_read_u8(pkt + 1)
+        if sc == 48 { gdb_insert_breakpoint(pkt, len) }
+        else if sc == 50 || sc == 51 { gdb_insert_watchpoint(pkt, len) }
+        else { gdb_send_packet(GDB_RESP_BUF, 0) }
+    }
+    else if cmd == 122 {
+        let sc = volatile_read_u8(pkt + 1)
+        if sc == 48 { gdb_remove_breakpoint(pkt, len) }
+        else if sc == 50 || sc == 51 { gdb_remove_watchpoint(pkt, len) }
+        else { gdb_send_packet(GDB_RESP_BUF, 0) }
+    }
+    else if cmd == 113 {
+        if volatile_read_u8(pkt + 1) == 102 { gdb_handle_thread_info() }
+        else if volatile_read_u8(pkt + 1) == 82 { gdb_handle_rcmd(pkt, len) }
+        else if volatile_read_u8(pkt + 1) == 88 { gdb_handle_memory_map() }
+        else { gdb_send_packet(GDB_RESP_BUF, 0) }
+    }
+    else { gdb_send_packet(GDB_RESP_BUF, 0) }
+}
+
+@kernel fn cmd_gdb_info() {
+    cprintln("GDB Debug Info:", YELLOW_ON_BLACK)
+    cprintln("  QEMU: -s -S (port 1234)", WHITE_ON_BLACK)
+    cprintln("  Stub: COM2, RSP protocol", WHITE_ON_BLACK)
+    cprint("  Breakpoints: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(GDB_STATE + 16), CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(GDB_BP_MAX, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}
