@@ -1,0 +1,201 @@
+// FajarOS Nova v1.2.0 "Nexus" — Shell Control Flow + Script Loading
+// shell/control.fj — if/for/while, test, exit, script execution, shell_execute_v2
+
+const SCRIPT_STATE: i64 = 0x8D5000
+const SCRIPT_BODY_BUF: i64 = 0x8D5100
+
+const SMODE_NONE: i64 = 0
+const SMODE_IF: i64 = 1
+const SMODE_FOR: i64 = 2
+const SMODE_WHILE: i64 = 3
+
+@kernel fn script_state_init() {
+    volatile_write_u64(SCRIPT_STATE, SMODE_NONE)
+    volatile_write_u64(SCRIPT_STATE + 8, 0)
+    volatile_write_u64(SCRIPT_STATE + 16, 0)
+    volatile_write_u64(SCRIPT_STATE + 24, 0)
+    volatile_write_u64(SCRIPT_STATE + 72, 0)
+    volatile_write_u64(SCRIPT_STATE + 88, 0)
+}
+
+@kernel fn cmd_test() {
+    let len = cmdbuf_len()
+    if len > 8 && volatile_read_u8(0x6F800 + 5) == 45 && volatile_read_u8(0x6F800 + 6) == 102 {
+        let fa: i64 = 0x843D00
+        let mut fi: i64 = 0
+        let mut pos: i64 = 8
+        while pos < len && fi < 31 { volatile_write_u8(fa + fi, volatile_read_u8(0x6F800 + pos)); fi = fi + 1; pos = pos + 1 }
+        volatile_write_u8(fa + fi, 0)
+        let idx = ramfs_find_by_addr(fa)
+        if idx >= 0 { volatile_write_u64(LAST_EXIT_CODE, 0) }
+        else { volatile_write_u64(LAST_EXIT_CODE, 1) }
+        return
+    }
+    if len > 8 && volatile_read_u8(0x6F800 + 5) == 45 && volatile_read_u8(0x6F800 + 6) == 100 {
+        let fa: i64 = 0x843D00
+        let mut fi: i64 = 0
+        let mut pos: i64 = 8
+        while pos < len && fi < 31 { volatile_write_u8(fa + fi, volatile_read_u8(0x6F800 + pos)); fi = fi + 1; pos = pos + 1 }
+        volatile_write_u8(fa + fi, 0)
+        let idx = ramfs_find_by_addr(fa)
+        if idx >= 0 {
+            if volatile_read(ramfs_entry_addr(idx) + 48) == 2 { volatile_write_u64(LAST_EXIT_CODE, 0) }
+            else { volatile_write_u64(LAST_EXIT_CODE, 1) }
+        } else { volatile_write_u64(LAST_EXIT_CODE, 1) }
+        return
+    }
+    volatile_write_u64(LAST_EXIT_CODE, 0)
+}
+
+@kernel fn cmd_if_start() {
+    let len = cmdbuf_len()
+    let cond_buf: i64 = 0x843E00
+    let mut ci: i64 = 0
+    let mut pos: i64 = 3
+    while pos < len && ci < 62 {
+        let ch = volatile_read_u8(0x6F800 + pos)
+        if ch == 59 { pos = len } else { volatile_write_u8(cond_buf + ci, ch); ci = ci + 1; pos = pos + 1 }
+    }
+    volatile_write_u8(cond_buf + ci, 0)
+    shell_exec_from_buf(cond_buf, ci)
+    let cr = volatile_read_u64(LAST_EXIT_CODE)
+    volatile_write_u64(SCRIPT_STATE, SMODE_IF)
+    volatile_write_u64(SCRIPT_STATE + 16, if cr == 0 { 1 } else { 0 })
+    volatile_write_u64(SCRIPT_STATE + 24, 0)
+    volatile_write_u64(SCRIPT_STATE + 72, 1)
+    volatile_write_u64(SCRIPT_STATE + 88, 0)
+}
+
+@kernel fn cmd_for_start() {
+    let len = cmdbuf_len()
+    let var_buf: i64 = 0x843F00
+    let mut vi: i64 = 0
+    let mut pos: i64 = 4
+    while pos < len && volatile_read_u8(0x6F800 + pos) != 32 && vi < 15 {
+        volatile_write_u8(var_buf + vi, volatile_read_u8(0x6F800 + pos))
+        vi = vi + 1; pos = pos + 1
+    }
+    volatile_write_u8(var_buf + vi, 0)
+    while pos < len && volatile_read_u8(0x6F800 + pos) == 32 { pos = pos + 1 }
+    if pos + 2 < len && volatile_read_u8(0x6F800 + pos) == 105 { pos = pos + 3 }
+    let items_buf: i64 = 0x844800
+    let mut ii: i64 = 0
+    while pos < len && ii < 255 {
+        let ch = volatile_read_u8(0x6F800 + pos)
+        if ch == 59 { pos = len } else { volatile_write_u8(items_buf + ii, ch); ii = ii + 1; pos = pos + 1 }
+    }
+    volatile_write_u8(items_buf + ii, 0)
+    volatile_write_u64(SCRIPT_STATE, SMODE_FOR)
+    volatile_write_u64(SCRIPT_STATE + 32, var_buf)
+    volatile_write_u64(SCRIPT_STATE + 40, items_buf)
+    volatile_write_u64(SCRIPT_STATE + 48, 0)
+    volatile_write_u64(SCRIPT_STATE + 72, 1)
+    volatile_write_u64(SCRIPT_STATE + 88, 0)
+}
+
+@kernel fn cmd_while_start() {
+    let len = cmdbuf_len()
+    let cond_buf: i64 = 0x844A00
+    let mut ci: i64 = 0
+    let mut pos: i64 = 6
+    while pos < len && ci < 62 {
+        let ch = volatile_read_u8(0x6F800 + pos)
+        if ch == 59 { pos = len } else { volatile_write_u8(cond_buf + ci, ch); ci = ci + 1; pos = pos + 1 }
+    }
+    volatile_write_u8(cond_buf + ci, 0)
+    shell_exec_from_buf(cond_buf, ci)
+    let cr = volatile_read_u64(LAST_EXIT_CODE)
+    volatile_write_u64(SCRIPT_STATE, SMODE_WHILE)
+    volatile_write_u64(SCRIPT_STATE + 16, if cr == 0 { 1 } else { 0 })
+    volatile_write_u64(SCRIPT_STATE + 72, 1)
+    volatile_write_u64(SCRIPT_STATE + 88, 0)
+}
+
+@kernel fn script_process_line(line: i64, line_len: i64) {
+    let mode = volatile_read_u64(SCRIPT_STATE)
+    if mode == SMODE_IF {
+        if line_len == 4 && volatile_read_u8(line) == 101 && volatile_read_u8(line + 1) == 108 &&
+           volatile_read_u8(line + 2) == 115 && volatile_read_u8(line + 3) == 101 {
+            volatile_write_u64(SCRIPT_STATE + 24, 1); return
+        }
+        if line_len == 2 && volatile_read_u8(line) == 102 && volatile_read_u8(line + 1) == 105 {
+            script_state_init(); return
+        }
+        let ct = volatile_read_u64(SCRIPT_STATE + 16)
+        let ie = volatile_read_u64(SCRIPT_STATE + 24)
+        let should = (ct == 1 && ie == 0) || (ct == 0 && ie == 1)
+        if should == 1 { shell_exec_from_buf(line, line_len) }
+        return
+    }
+    if mode == SMODE_FOR || mode == SMODE_WHILE {
+        if line_len == 4 && volatile_read_u8(line) == 100 && volatile_read_u8(line + 1) == 111 &&
+           volatile_read_u8(line + 2) == 110 && volatile_read_u8(line + 3) == 101 {
+            script_state_init(); return
+        }
+        shell_exec_from_buf(line, line_len)
+    }
+}
+
+@kernel fn cmd_sh() {
+    let len = cmdbuf_len()
+    let prefix = if volatile_read_u8(0x6F800 + 1) == 104 { 3 } else { 7 }
+    if len <= prefix { cprintln("Usage: sh <script>", YELLOW_ON_BLACK); return }
+    let fa: i64 = 0x843C00
+    let mut fi: i64 = 0
+    let mut pos: i64 = prefix
+    while pos < len && fi < 31 { volatile_write_u8(fa + fi, volatile_read_u8(0x6F800 + pos)); fi = fi + 1; pos = pos + 1 }
+    volatile_write_u8(fa + fi, 0)
+    let idx = ramfs_find_by_addr(fa)
+    let script_buf: i64 = 0x845000
+    let mut script_len: i64 = 0
+    if idx >= 0 {
+        let entry = ramfs_entry_addr(idx)
+        let size = volatile_read(entry + 32)
+        let data_ptr = volatile_read(entry + 40)
+        if data_ptr != 0 && size > 0 {
+            let mut si: i64 = 0
+            while si < size && si < 4096 { volatile_write_u8(script_buf + si, volatile_read_u8(data_ptr + si)); si = si + 1 }
+            script_len = size
+        }
+    }
+    if script_len == 0 { cprintln("Script not found", RED_ON_BLACK); return }
+    let line_buf: i64 = 0x846000
+    let mut lpos: i64 = 0
+    let mut line_len: i64 = 0
+    while lpos < script_len {
+        let ch = volatile_read_u8(script_buf + lpos)
+        if ch == 10 || lpos == script_len - 1 {
+            if ch != 10 && line_len < 63 { volatile_write_u8(line_buf + line_len, ch); line_len = line_len + 1 }
+            volatile_write_u8(line_buf + line_len, 0)
+            let first = volatile_read_u8(line_buf)
+            if line_len > 0 && first != 35 { shell_exec_from_buf(line_buf, line_len) }
+            line_len = 0
+        } else {
+            if line_len < 63 { volatile_write_u8(line_buf + line_len, ch); line_len = line_len + 1 }
+        }
+        lpos = lpos + 1
+    }
+}
+
+@kernel fn cmd_exit_shell() {
+    let len = cmdbuf_len()
+    let mut code: i64 = 0
+    if len > 5 { code = volatile_read_u8(0x6F800 + 5) - 48 }
+    cprint("Exiting with code ", WHITE_ON_BLACK)
+    cprint_decimal(code, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    volatile_write_u64(LAST_EXIT_CODE, code)
+    if volatile_read_u64(SCRIPT_STATE) == SMODE_NONE { shutdown_clean() }
+}
+
+// Main shell entry point (v0.7)
+@kernel fn shell_execute_v2() {
+    let len = cmdbuf_len()
+    if len == 0 { return }
+    shell_expand_vars()
+    let pipe_pos = shell_find_pipe()
+    if pipe_pos > 0 { shell_exec_pipe(pipe_pos); return }
+    let redir = shell_find_redirect()
+    if redir > 0 { shell_exec_redirect(redir); return }
+    dispatch_command()
+}

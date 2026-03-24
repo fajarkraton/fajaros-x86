@@ -64,6 +64,10 @@ SOURCES := \
 	fs/ramfs.fj \
 	fs/fat32.fj \
 	fs/vfs.fj \
+	shell/pipes.fj \
+	shell/redirect.fj \
+	shell/vars.fj \
+	shell/control.fj \
 	shell/commands.fj \
 	shell/scripting.fj \
 	kernel/core/smp_sched.fj \

@@ -1,0 +1,83 @@
+// FajarOS Nova v1.2.0 "Nexus" — Shell Pipe Support
+// shell/pipes.fj — pipe operator |, shell_exec_pipe, shell_exec_from_buf
+
+const SHELL_SPLIT_BUF: i64 = 0x842000
+const SHELL_SPLIT_BUF2: i64 = 0x842400
+
+@kernel fn shell_find_pipe() -> i64 {
+    let len = cmdbuf_len()
+    let mut i: i64 = 0
+    while i < len {
+        if volatile_read_u8(0x6F800 + i) == 124 { return i }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn shell_copy_segment(src_start: i64, src_end: i64, dst: i64) -> i64 {
+    let mut start = src_start
+    while start < src_end && volatile_read_u8(0x6F800 + start) == 32 { start = start + 1 }
+    let mut end = src_end
+    while end > start && volatile_read_u8(0x6F800 + end - 1) == 32 { end = end - 1 }
+    let len = end - start
+    let mut i: i64 = 0
+    while i < len {
+        volatile_write_u8(dst + i, volatile_read_u8(0x6F800 + start + i))
+        i = i + 1
+    }
+    volatile_write_u8(dst + len, 0)
+    len
+}
+
+@kernel fn shell_exec_from_buf(buf: i64, len: i64) {
+    let saved_len = cmdbuf_len()
+    let saved_buf: i64 = 0x843000
+    let mut si: i64 = 0
+    while si < saved_len { volatile_write_u8(saved_buf + si, volatile_read_u8(0x6F800 + si)); si = si + 1 }
+    volatile_write_u8(saved_buf + saved_len, 0)
+
+    cmdbuf_clear()
+    let mut ci: i64 = 0
+    while ci < len { volatile_write_u8(0x6F800 + ci, volatile_read_u8(buf + ci)); ci = ci + 1 }
+    volatile_write_u8(0x6F800 + len, 0)
+    volatile_write(0x6F880, len)
+
+    dispatch_command()
+
+    cmdbuf_clear()
+    let mut ri: i64 = 0
+    while ri < saved_len { volatile_write_u8(0x6F800 + ri, volatile_read_u8(saved_buf + ri)); ri = ri + 1 }
+    volatile_write_u8(0x6F800 + saved_len, 0)
+    volatile_write(0x6F880, saved_len)
+}
+
+@kernel fn shell_exec_pipe(pipe_pos: i64) {
+    let len = cmdbuf_len()
+    let len1 = shell_copy_segment(0, pipe_pos, SHELL_SPLIT_BUF)
+    let len2 = shell_copy_segment(pipe_pos + 1, len, SHELL_SPLIT_BUF2)
+    if len1 == 0 || len2 == 0 { cprintln("Syntax error: empty pipe segment", RED_ON_BLACK); return }
+
+    let slot = pipe_create()
+    if slot < 0 { cprintln("No free pipes", RED_ON_BLACK); return }
+
+    let ref_base = PIPE_REFCOUNT + slot * 16
+    volatile_write_u64(ref_base, 1)
+    volatile_write_u64(ref_base + 8, 1)
+
+    let pid = volatile_read_u64(0x6FE00)
+    let saved_fd1_type = fd_v2_get_type(pid, 1)
+    let saved_fd1_data = fd_v2_get_data(pid, 1)
+    fd_v2_set(pid, 1, FD_PIPE_WRITE, slot)
+    shell_exec_from_buf(SHELL_SPLIT_BUF, len1)
+    fd_v2_set(pid, 1, saved_fd1_type, saved_fd1_data)
+    volatile_write_u64(ref_base + 8, 0)
+
+    let saved_fd0_type = fd_v2_get_type(pid, 0)
+    let saved_fd0_data = fd_v2_get_data(pid, 0)
+    fd_v2_set(pid, 0, FD_PIPE_READ, slot)
+    shell_exec_from_buf(SHELL_SPLIT_BUF2, len2)
+    fd_v2_set(pid, 0, saved_fd0_type, saved_fd0_data)
+
+    pipe_free(slot)
+    volatile_write_u64(ref_base, 0)
+}

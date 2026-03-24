@@ -1,0 +1,91 @@
+// FajarOS Nova v1.2.0 "Nexus" — Shell I/O Redirection
+// shell/redirect.fj — >, >>, < operators
+
+@kernel fn shell_find_redirect() -> i64 {
+    let len = cmdbuf_len()
+    let mut i: i64 = 0
+    while i < len {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch == 62 {
+            if i + 1 < len && volatile_read_u8(0x6F800 + i + 1) == 62 { return 200 + i }
+            return 100 + i
+        }
+        if ch == 60 { return 300 + i }
+        i = i + 1
+    }
+    0
+}
+
+@kernel fn shell_exec_redirect(redirect_info: i64) {
+    let len = cmdbuf_len()
+    let pid = volatile_read_u64(0x6FE00)
+
+    if redirect_info >= 300 {
+        let pos = redirect_info - 300
+        let cmd_len = shell_copy_segment(0, pos, SHELL_SPLIT_BUF)
+        let file_len = shell_copy_segment(pos + 1, len, SHELL_SPLIT_BUF2)
+        if cmd_len == 0 || file_len == 0 { cprintln("Syntax error", RED_ON_BLACK); return }
+        let fd = sys_open(SHELL_SPLIT_BUF2, 0)
+        if fd < 0 { cprintln("File not found", RED_ON_BLACK); return }
+        let st = fd_v2_get_type(pid, 0)
+        let sd = fd_v2_get_data(pid, 0)
+        fd_v2_set(pid, 0, fd_v2_get_type(pid, fd), fd_v2_get_data(pid, fd))
+        shell_exec_from_buf(SHELL_SPLIT_BUF, cmd_len)
+        fd_v2_set(pid, 0, st, sd)
+        sys_close(fd)
+    } else if redirect_info >= 200 {
+        let pos = redirect_info - 200
+        let cmd_len = shell_copy_segment(0, pos, SHELL_SPLIT_BUF)
+        let file_len = shell_copy_segment(pos + 2, len, SHELL_SPLIT_BUF2)
+        if cmd_len == 0 || file_len == 0 { cprintln("Syntax error", RED_ON_BLACK); return }
+        shell_exec_redirect_output(cmd_len, file_len, 1)
+    } else if redirect_info >= 100 {
+        let pos = redirect_info - 100
+        let cmd_len = shell_copy_segment(0, pos, SHELL_SPLIT_BUF)
+        let file_len = shell_copy_segment(pos + 1, len, SHELL_SPLIT_BUF2)
+        if cmd_len == 0 || file_len == 0 { cprintln("Syntax error", RED_ON_BLACK); return }
+        shell_exec_redirect_output(cmd_len, file_len, 0)
+    }
+}
+
+@kernel fn shell_exec_redirect_output(cmd_len: i64, file_len: i64, append: i64) {
+    let pid = volatile_read_u64(0x6FE00)
+    let idx = ramfs_find_by_addr(SHELL_SPLIT_BUF2)
+    let mut target_idx = idx
+    if target_idx < 0 {
+        target_idx = ramfs_create_by_addr(SHELL_SPLIT_BUF2)
+        if target_idx < 0 { cprintln("Cannot create file", RED_ON_BLACK); return }
+    }
+    if append == 0 { volatile_write(ramfs_entry_addr(target_idx) + 32, 0) }
+    let fd = fd_v2_alloc(pid)
+    if fd < 0 { cprintln("No free FDs", RED_ON_BLACK); return }
+    let offset = if append == 1 { volatile_read(ramfs_entry_addr(target_idx) + 32) } else { 0 }
+    let packed = (offset << 32) | target_idx
+    fd_v2_set(pid, fd, FD_RAMFS, packed)
+    let st = fd_v2_get_type(pid, 1)
+    let sd = fd_v2_get_data(pid, 1)
+    fd_v2_set(pid, 1, FD_RAMFS, packed)
+    shell_exec_from_buf(SHELL_SPLIT_BUF, cmd_len)
+    fd_v2_set(pid, 1, st, sd)
+    fd_v2_set(pid, fd, FD_CLOSED, 0)
+}
+
+@kernel fn ramfs_create_by_addr(name_addr: i64) -> i64 {
+    let count = volatile_read(FS_BASE)
+    if count >= FS_MAX_FILES { return -1 }
+    let addr = ramfs_entry_addr(count)
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(name_addr + i)
+        volatile_write_u8(addr + i, ch)
+        if ch == 0 { i = 31 } else { i = i + 1 }
+    }
+    volatile_write_u8(addr + i, 0)
+    volatile_write(addr + 48, 1)
+    volatile_write(addr + 32, 0)
+    let data_offset = volatile_read(FS_BASE + 8)
+    volatile_write(addr + 40, data_offset)
+    volatile_write(FS_BASE + 8, data_offset + 4096)
+    volatile_write(FS_BASE, count + 1)
+    count
+}
