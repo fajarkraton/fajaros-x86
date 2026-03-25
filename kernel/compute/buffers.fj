@@ -1,0 +1,63 @@
+// FajarOS Nova v1.4.0 "Zenith" — Compute Buffer Pool
+// Synced from Nova kernel v0.9 Sprint R2
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Compute Buffer Pool
+// 16 buffers x 4KB each at 0x9F0000 (64KB total)
+// ═══════════════════════════════════════════════
+
+const COMPUTE_BUF_BASE: i64 = 0x9F0000
+const COMPUTE_BUF_MAX: i64 = 16
+const COMPUTE_BUF_SIZE: i64 = 4096
+
+// Compute buffer metadata at 0x9EF000 (16 buffers x 32B)
+// Per buffer: +0=active(i64), +8=rows(i64), +16=cols(i64), +24=dtype(i64: 0=f64, 1=i64)
+const COMPUTE_META: i64 = 0x9EF000
+const COMPUTE_META_SIZE: i64 = 32
+
+// ═══════════════════════════════════════════════
+// Buffer Allocation / Free
+// ═══════════════════════════════════════════════
+
+// Allocate a compute buffer with given dimensions
+@kernel fn compute_buf_alloc(rows: i64, cols: i64, dtype: i64) -> i64 {
+    let needed = rows * cols * 8
+    if needed > COMPUTE_BUF_SIZE { return -1 }
+    let mut slot: i64 = 0
+    while slot < COMPUTE_BUF_MAX {
+        let meta = COMPUTE_META + slot * COMPUTE_META_SIZE
+        if volatile_read_u64(meta) == 0 {
+            volatile_write_u64(meta, 1)
+            volatile_write_u64(meta + 8, rows)
+            volatile_write_u64(meta + 16, cols)
+            volatile_write_u64(meta + 24, dtype)
+            // Zero the buffer
+            let buf = COMPUTE_BUF_BASE + slot * COMPUTE_BUF_SIZE
+            let mut i: i64 = 0
+            while i < needed { volatile_write_u8(buf + i, 0); i = i + 1 }
+            return slot
+        }
+        slot = slot + 1
+    }
+    -1
+}
+
+// Free a compute buffer
+@kernel fn compute_buf_free(slot: i64) {
+    if slot >= 0 && slot < COMPUTE_BUF_MAX {
+        volatile_write_u64(COMPUTE_META + slot * COMPUTE_META_SIZE, 0)
+    }
+}
+
+// Get buffer base address
+@kernel fn compute_buf_addr(slot: i64) -> i64 {
+    COMPUTE_BUF_BASE + slot * COMPUTE_BUF_SIZE
+}
+
+// Get buffer shape dimension (0=rows, 1=cols)
+@kernel fn compute_get_shape(slot: i64, dim: i64) -> i64 {
+    let meta = COMPUTE_META + slot * COMPUTE_META_SIZE
+    if dim == 0 { volatile_read_u64(meta + 8) }
+    else { volatile_read_u64(meta + 16) }
+}

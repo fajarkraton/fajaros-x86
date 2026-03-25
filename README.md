@@ -1,20 +1,22 @@
-# FajarOS Nova v2.0 "Sovereignty" — Microkernel OS in Fajar Lang
+# FajarOS Nova v1.4.0 "Zenith" — Microkernel OS in Fajar Lang
 
 > The world's first **microkernel OS with compiler-enforced safety** — written 100% in
 > [Fajar Lang](https://github.com/fajarkraton/fajar-lang). `@kernel/@device/@safe` annotations
 > prevent privilege violations at compile time. No other OS has this.
 
-**Codename:** "Sovereignty" (Indonesian: Kedaulatan — sovereign control)
+**Codename:** "Zenith" (Puncak — peak)
 
 ## Highlights
 
 | Metric | Value |
 |--------|-------|
-| **LOC** | 20,416 lines of Fajar Lang |
+| **LOC** | 34,000+ lines of Fajar Lang |
+| **Files** | 115 modular .fj files |
 | **ELF** | 405 KB monolithic / 22 KB microkernel core |
-| **Services** | 9 IPC-based (init, blk, vfs, net, shell, display, input, gui, compiler) |
-| **Commands** | 200+ shell commands |
-| **Sprints** | 21 complete (Phase 1: Core, Phase 2: Hardening, Phase 3: GUI+Self-hosting) |
+| **Services** | 9 IPC-based (init, blk, vfs, net, shell, display, input, gpu, compiler) |
+| **Commands** | 240+ shell commands |
+| **GPU** | VirtIO-GPU driver + compute dispatch (matmul, vecadd) |
+| **Sprints** | 21 complete + Y1 GPU/Compute sync |
 | **Safety** | 8 error codes, 12 capability bits, 3 context annotations |
 | **Hardware** | x86_64 (QEMU) + ARM64 (Radxa Dragon Q6A — 10/10 tests passed) |
 | **Bugs Found** | 19 critical bugs found & fixed during systematic review |
@@ -161,7 +163,7 @@ fajaros-x86/
 |   |   +-- spinlock.fj        Test-and-set spinlock
 |   +-- syscall/
 |   |   +-- entry.fj           SYSCALL stub at 0x8200, MSR config
-|   |   +-- dispatch.fj        Syscall table (8 syscalls)
+|   |   +-- dispatch.fj        Syscall table (29 syscalls)
 |   |   +-- elf.fj             ELF64 parser + loader
 |   +-- ipc/
 |   |   +-- message.fj         IPC message queue
@@ -179,6 +181,10 @@ fajaros-x86/
 |   +-- virtio_net.fj          Network stack (Ethernet/ARP/IPv4/ICMP)
 |   +-- xhci.fj                USB 3.0 XHCI detection
 |   +-- gpu.fj                 GPU detection (NVIDIA/Intel/AMD)
+|   +-- virtio_gpu.fj          VirtIO-GPU driver (framebuffer, draw)
++-- kernel/compute/            GPU compute dispatch
+|   +-- buffers.fj             Compute buffer pool (16 x 4KB)
+|   +-- kernels.fj             matmul, vecadd kernels + syscalls
 +-- fs/                        Filesystem
 |   +-- ramfs.fj               RAM filesystem (64 entries)
 |   +-- fat32.fj               FAT32 driver (read/write/delete)

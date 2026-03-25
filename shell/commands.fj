@@ -173,7 +173,8 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  tail wc grep sort uniq nl cut", WHITE_ON_BLACK)
     cprintln("  stat xxd strings df du count md5", WHITE_ON_BLACK)
     cprintln("AI/Compute:", WHITE_ON_BLUE)
-    cprintln("  tensor mnist bench fib", WHITE_ON_BLACK)
+    cprintln("  tensor mnist bench fib compute cbench", WHITE_ON_BLACK)
+    cprintln("  virtio-gpu gpu gpu-info gpu-bench", WHITE_ON_BLACK)
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
     cprintln("  echo rev upcase downcase tr", WHITE_ON_BLACK)
@@ -3080,6 +3081,14 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 5 && volatile_read_u8(0x6F800) == 108 && volatile_read_u8(0x6F801) == 115 && volatile_read_u8(0x6F802) == 117 && volatile_read_u8(0x6F803) == 115 && volatile_read_u8(0x6F804) == 98 { cmd_lsusb(); handled = 1 }
     // xhci — "xhci" (120,104,99,105)
     if handled == 0 && len == 4 && buf_eq4(120, 104, 99, 105) == 1 { cmd_xhci_info(); handled = 1 }
+    // usbinit — "usbinit" (117,115,98,105,110,105,116)
+    if handled == 0 && len == 7 && buf_eq4(117, 115, 98, 105) == 1 && volatile_read_u8(0x6F804) == 110 && volatile_read_u8(0x6F805) == 105 && volatile_read_u8(0x6F806) == 116 { cmd_usb_init(); handled = 1 }
+    // usbread — "usbread" (117,115,98,114,101,97,100)
+    if handled == 0 && len >= 7 && buf_eq4(117, 115, 98, 114) == 1 && volatile_read_u8(0x6F804) == 101 && volatile_read_u8(0x6F805) == 97 && volatile_read_u8(0x6F806) == 100 { cmd_usbread(); handled = 1 }
+    // usbls — "usbls" (117,115,98,108,115)
+    if handled == 0 && len == 5 && buf_eq4(117, 115, 98, 108) == 1 && volatile_read_u8(0x6F804) == 115 { cmd_usbls(); handled = 1 }
+    // usbcat — "usbcat" (117,115,98,99,97,116)
+    if handled == 0 && len >= 6 && buf_eq4(117, 115, 98, 99) == 1 && volatile_read_u8(0x6F804) == 97 && volatile_read_u8(0x6F805) == 116 { cmd_usbcat(); handled = 1 }
     // virtioblk — "virtioblk" (118,105,114,116)
     if handled == 0 && len == 9 && buf_eq4(118, 105, 114, 116) == 1 { cmd_virtio_blk(); handled = 1 }
     // source — "source ..." (115,111,117,114,99,101)
@@ -3224,6 +3233,13 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 103 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 117 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 98 { cmd_gpu_bench(); handled = 1 }
     // gpu-matmul (103,112,117,45,109)
     if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 103 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 117 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 109 { cmd_gpu_matmul(); handled = 1 }
+    // === Sprint Y1: VirtIO-GPU + Compute commands (v1.4.0 Zenith sync) ===
+    // virtio-gpu (118,105,114,116,105,111,45,103,112,117)
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 118 && volatile_read_u8(0x6F801) == 105 && volatile_read_u8(0x6F802) == 114 && volatile_read_u8(0x6F803) == 116 && volatile_read_u8(0x6F804) == 105 && volatile_read_u8(0x6F805) == 111 && volatile_read_u8(0x6F806) == 45 && volatile_read_u8(0x6F807) == 103 { cmd_virtio_gpu(); handled = 1 }
+    // compute (99,111,109,112,117,116,101)
+    if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 99 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 109 && volatile_read_u8(0x6F803) == 112 && volatile_read_u8(0x6F804) == 117 && volatile_read_u8(0x6F805) == 116 && volatile_read_u8(0x6F806) == 101 { cmd_tensor_compute(); handled = 1 }
+    // cbench (99,98,101,110,99,104)
+    if handled == 0 && len == 6 && volatile_read_u8(0x6F800) == 99 && volatile_read_u8(0x6F801) == 98 && volatile_read_u8(0x6F802) == 101 && volatile_read_u8(0x6F803) == 110 && volatile_read_u8(0x6F804) == 99 && volatile_read_u8(0x6F805) == 104 { cmd_gpubench_compute(); handled = 1 }
     // === Sprint 4.4: Real hardware commands ===
     // acpi-info (97,99,112,105,45,105)
     if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 99 && volatile_read_u8(0x6F802) == 112 && volatile_read_u8(0x6F803) == 105 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 105 { cmd_acpi_info(); handled = 1 }

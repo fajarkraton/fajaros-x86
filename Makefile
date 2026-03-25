@@ -67,6 +67,9 @@ SOURCES := \
 	drivers/virtio_net.fj \
 	drivers/xhci.fj \
 	drivers/gpu.fj \
+	drivers/virtio_gpu.fj \
+	kernel/compute/buffers.fj \
+	kernel/compute/kernels.fj \
 	fs/ramfs.fj \
 	fs/directory.fj \
 	fs/links.fj \

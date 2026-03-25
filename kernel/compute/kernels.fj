@@ -1,0 +1,161 @@
+// FajarOS Nova v1.4.0 "Zenith" — Compute Kernels + Dispatch
+// Synced from Nova kernel v0.9 Sprint R2
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Compute Kernel IDs
+// ═══════════════════════════════════════════════
+
+const KERNEL_MATMUL: i64 = 1
+const KERNEL_VECADD: i64 = 2
+const KERNEL_SCALE: i64 = 3
+const KERNEL_RELU: i64 = 4
+
+// GPU compute syscall numbers (after IPC syscalls 30-34)
+const SYS_GPU_ALLOC: i64 = 35
+const SYS_GPU_DISPATCH: i64 = 36
+
+// ═══════════════════════════════════════════════
+// Matrix Multiply Kernel (CPU fallback)
+// C[m x p] = A[m x n] x B[n x p]
+// ═══════════════════════════════════════════════
+
+@kernel fn compute_matmul(a_slot: i64, b_slot: i64, c_slot: i64) -> i64 {
+    let a_meta = COMPUTE_META + a_slot * COMPUTE_META_SIZE
+    let b_meta = COMPUTE_META + b_slot * COMPUTE_META_SIZE
+    let m = volatile_read_u64(a_meta + 8)
+    let n = volatile_read_u64(a_meta + 16)
+    let bn = volatile_read_u64(b_meta + 8)
+    let p = volatile_read_u64(b_meta + 16)
+    if n != bn { return -1 }  // dimension mismatch
+    let a = compute_buf_addr(a_slot)
+    let b = compute_buf_addr(b_slot)
+    let c = compute_buf_addr(c_slot)
+    // Set C metadata
+    let c_meta = COMPUTE_META + c_slot * COMPUTE_META_SIZE
+    volatile_write_u64(c_meta + 8, m)
+    volatile_write_u64(c_meta + 16, p)
+    // Naive O(n^3) matmul
+    let mut i: i64 = 0
+    while i < m {
+        let mut j: i64 = 0
+        while j < p {
+            let mut sum: i64 = 0
+            let mut k: i64 = 0
+            while k < n {
+                let av = volatile_read_u64(a + (i * n + k) * 8)
+                let bv = volatile_read_u64(b + (k * p + j) * 8)
+                sum = sum + av * bv
+                k = k + 1
+            }
+            volatile_write_u64(c + (i * p + j) * 8, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════
+// Vector Add Kernel
+// C = A + B (element-wise)
+// ═══════════════════════════════════════════════
+
+@kernel fn compute_vecadd(a_slot: i64, b_slot: i64, c_slot: i64) -> i64 {
+    let a_meta = COMPUTE_META + a_slot * COMPUTE_META_SIZE
+    let rows = volatile_read_u64(a_meta + 8)
+    let cols = volatile_read_u64(a_meta + 16)
+    let total = rows * cols
+    let a = compute_buf_addr(a_slot)
+    let b = compute_buf_addr(b_slot)
+    let c = compute_buf_addr(c_slot)
+    let c_meta = COMPUTE_META + c_slot * COMPUTE_META_SIZE
+    volatile_write_u64(c_meta + 8, rows)
+    volatile_write_u64(c_meta + 16, cols)
+    let mut i: i64 = 0
+    while i < total {
+        volatile_write_u64(c + i * 8, volatile_read_u64(a + i * 8) + volatile_read_u64(b + i * 8))
+        i = i + 1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════
+// Syscall Wrappers
+// ═══════════════════════════════════════════════
+
+@kernel fn sys_gpu_alloc(rows: i64, cols: i64, dtype: i64) -> i64 {
+    compute_buf_alloc(rows, cols, dtype)
+}
+
+@kernel fn sys_gpu_dispatch(kernel_id: i64, a: i64, b: i64, c: i64) -> i64 {
+    if kernel_id == KERNEL_MATMUL { return compute_matmul(a, b, c) }
+    if kernel_id == KERNEL_VECADD { return compute_vecadd(a, b, c) }
+    -1
+}
+
+// ═══════════════════════════════════════════════
+// Shell Commands: tensor, gpubench
+// ═══════════════════════════════════════════════
+
+// `tensor` command — create, fill, display compute buffer
+@kernel fn cmd_tensor_compute() {
+    cprintln("Compute tensors:", YELLOW_ON_BLACK)
+    // Create 4x4 identity matrix
+    let a = compute_buf_alloc(4, 4, 1)
+    if a < 0 { cprintln("  Alloc failed", RED_ON_BLACK); return }
+    let buf = compute_buf_addr(a)
+    // Set identity
+    let mut i: i64 = 0
+    while i < 4 { volatile_write_u64(buf + (i * 4 + i) * 8, 1); i = i + 1 }
+    cprint("  Buffer ", WHITE_ON_BLACK)
+    cprint_decimal(a, CYAN_ON_BLACK)
+    cprintln(": 4x4 identity", WHITE_ON_BLACK)
+    // Display first row
+    cprint("  [", WHITE_ON_BLACK)
+    i = 0
+    while i < 4 {
+        cprint_decimal(volatile_read_u64(buf + i * 8), CYAN_ON_BLACK)
+        if i < 3 { cprint(", ", WHITE_ON_BLACK) }
+        i = i + 1
+    }
+    cprintln(", ...]", WHITE_ON_BLACK)
+    compute_buf_free(a)
+}
+
+// `gpubench` command — benchmark matmul
+@kernel fn cmd_gpubench_compute() {
+    cprintln("GPU Compute Benchmark:", YELLOW_ON_BLACK)
+    let n: i64 = 8
+    let a = compute_buf_alloc(n, n, 1)
+    let b = compute_buf_alloc(n, n, 1)
+    let c = compute_buf_alloc(n, n, 1)
+    if a < 0 || b < 0 || c < 0 { cprintln("  Alloc failed", RED_ON_BLACK); return }
+    // Fill A and B with simple values
+    let mut i: i64 = 0
+    while i < n * n {
+        volatile_write_u64(compute_buf_addr(a) + i * 8, i + 1)
+        volatile_write_u64(compute_buf_addr(b) + i * 8, 1)
+        i = i + 1
+    }
+    let start = volatile_read_u64(0x6FE08)
+    compute_matmul(a, b, c)
+    let end = volatile_read_u64(0x6FE08)
+    cprint("  ", WHITE_ON_BLACK)
+    cprint_decimal(n, CYAN_ON_BLACK)
+    cprint("x", WHITE_ON_BLACK)
+    cprint_decimal(n, CYAN_ON_BLACK)
+    cprint(" matmul: ", WHITE_ON_BLACK)
+    cprint_decimal((end - start) * 10, CYAN_ON_BLACK)
+    cprintln(" ms", WHITE_ON_BLACK)
+    // Verify: C[0,0] = sum of first row of A = 1+2+...+n = n*(n+1)/2
+    let c0 = volatile_read_u64(compute_buf_addr(c))
+    cprint("  C[0,0] = ", WHITE_ON_BLACK)
+    cprint_decimal(c0, CYAN_ON_BLACK)
+    cprint(" (expected ", WHITE_ON_BLACK)
+    cprint_decimal(n * (n + 1) / 2, CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+    compute_buf_free(a)
+    compute_buf_free(b)
+    compute_buf_free(c)
+}

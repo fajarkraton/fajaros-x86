@@ -1,0 +1,236 @@
+// FajarOS Nova v1.4.0 "Zenith" — VirtIO-GPU Driver
+// Synced from Nova kernel v0.9 Sprint R1
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// VirtIO-GPU Driver Constants
+// ═══════════════════════════════════════════════
+
+// VirtIO-GPU PCI: vendor 0x1AF4, device 0x1050
+const VIRTIO_GPU_VENDOR: i64 = 0x1AF4
+const VIRTIO_GPU_DEVICE: i64 = 0x1050
+
+// GPU state at 0x9A0000 (4KB)
+const GPU_STATE: i64 = 0x9A0000
+const GPU_OFF_BAR0: i64 = 0
+const GPU_OFF_WIDTH: i64 = 8
+const GPU_OFF_HEIGHT: i64 = 16
+const GPU_OFF_ACTIVE: i64 = 24
+const GPU_OFF_RESOURCE_ID: i64 = 32
+const GPU_OFF_SCANOUT_ID: i64 = 40
+
+// GPU framebuffer at 0x9A1000 (256KB — 320x200x4 = 256KB)
+const GPU_FB_BASE: i64 = 0x9A1000
+const GPU_FB_WIDTH: i64 = 320
+const GPU_FB_HEIGHT: i64 = 200
+const GPU_FB_BPP: i64 = 4
+const GPU_FB_SIZE: i64 = 256000
+
+// VirtIO-GPU command types
+const VIRTIO_GPU_CMD_GET_DISPLAY_INFO: i64 = 0x0100
+const VIRTIO_GPU_CMD_RESOURCE_CREATE_2D: i64 = 0x0101
+const VIRTIO_GPU_CMD_RESOURCE_UNREF: i64 = 0x0102
+const VIRTIO_GPU_CMD_SET_SCANOUT: i64 = 0x0103
+const VIRTIO_GPU_CMD_RESOURCE_FLUSH: i64 = 0x0104
+const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: i64 = 0x0105
+const VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING: i64 = 0x0106
+const VIRTIO_GPU_RESP_OK_NODATA: i64 = 0x1100
+
+// VirtIO-GPU control virtqueue at 0x9E0000 (16KB)
+const GPU_CTRL_QUEUE: i64 = 0x9E0000
+const GPU_CMD_BUF: i64 = 0x9E4000
+const GPU_RESP_BUFADDR: i64 = 0x9E5000
+
+// ═══════════════════════════════════════════════
+// Helper: write u32 little-endian to address
+// ═══════════════════════════════════════════════
+
+@kernel fn volatile_write_u32_le(addr: i64, val: i64) {
+    volatile_write_u8(addr, val & 0xFF)
+    volatile_write_u8(addr + 1, (val >> 8) & 0xFF)
+    volatile_write_u8(addr + 2, (val >> 16) & 0xFF)
+    volatile_write_u8(addr + 3, (val >> 24) & 0xFF)
+}
+
+// ═══════════════════════════════════════════════
+// VirtIO-GPU PCI Discovery + Init
+// ═══════════════════════════════════════════════
+
+// Find VirtIO-GPU device on PCI bus
+@kernel fn gpu_find_virtio_device() -> i64 {
+    let mut dev: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let vendor = id & 0xFFFF
+            let device_id = (id >> 16) & 0xFFFF
+            if vendor == VIRTIO_GPU_VENDOR && device_id == VIRTIO_GPU_DEVICE { return dev }
+        }
+        dev = dev + 1
+    }
+    -1
+}
+
+// Initialize VirtIO-GPU virtqueues
+@kernel fn virtio_gpu_init() -> i64 {
+    let dev = gpu_find_virtio_device()
+    if dev < 0 {
+        volatile_write_u64(GPU_STATE + GPU_OFF_ACTIVE, 0)
+        return -1
+    }
+    // Read BAR0
+    let bar0 = pci_read32(0, dev, 0, 0x10) & 0xFFFFFFF0
+    volatile_write_u64(GPU_STATE + GPU_OFF_BAR0, bar0)
+    // Enable bus master
+    let cmd = pci_read32(0, dev, 0, 4)
+    pci_write32(0, dev, 0, 4, cmd | 4)
+    // Set default resolution
+    volatile_write_u64(GPU_STATE + GPU_OFF_WIDTH, GPU_FB_WIDTH)
+    volatile_write_u64(GPU_STATE + GPU_OFF_HEIGHT, GPU_FB_HEIGHT)
+    volatile_write_u64(GPU_STATE + GPU_OFF_ACTIVE, 1)
+    volatile_write_u64(GPU_STATE + GPU_OFF_RESOURCE_ID, 1)
+    volatile_write_u64(GPU_STATE + GPU_OFF_SCANOUT_ID, 0)
+    0
+}
+
+// ═══════════════════════════════════════════════
+// VirtIO-GPU Protocol Commands
+// ═══════════════════════════════════════════════
+
+// Create 2D resource (framebuffer)
+@kernel fn gpu_resource_create_2d(resource_id: i64, width: i64, height: i64) {
+    let cmd = GPU_CMD_BUF
+    // VirtIO-GPU header: type(4B), flags(4B), fence_id(8B), ctx_id(4B), padding(4B) = 24B
+    volatile_write_u32_le(cmd, VIRTIO_GPU_CMD_RESOURCE_CREATE_2D)
+    volatile_write_u32_le(cmd + 4, 0)
+    volatile_write_u64(cmd + 8, 0)
+    volatile_write_u32_le(cmd + 16, 0)
+    volatile_write_u32_le(cmd + 20, 0)
+    // Resource create params: resource_id(4B), format(4B), width(4B), height(4B)
+    volatile_write_u32_le(cmd + 24, resource_id)
+    volatile_write_u32_le(cmd + 28, 1)  // format = B8G8R8A8_UNORM
+    volatile_write_u32_le(cmd + 32, width)
+    volatile_write_u32_le(cmd + 36, height)
+}
+
+// Attach backing store (host memory for framebuffer)
+@kernel fn gpu_resource_attach_backing(resource_id: i64, addr: i64, length: i64) {
+    let cmd = GPU_CMD_BUF
+    volatile_write_u32_le(cmd, VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING)
+    volatile_write_u32_le(cmd + 4, 0)
+    volatile_write_u64(cmd + 8, 0)
+    volatile_write_u32_le(cmd + 16, 0)
+    volatile_write_u32_le(cmd + 20, 0)
+    // Attach params: resource_id(4B), nr_entries(4B)
+    volatile_write_u32_le(cmd + 24, resource_id)
+    volatile_write_u32_le(cmd + 28, 1)
+    // Entry: addr(8B), length(4B), padding(4B)
+    volatile_write_u64(cmd + 32, addr)
+    volatile_write_u32_le(cmd + 40, length)
+    volatile_write_u32_le(cmd + 44, 0)
+}
+
+// Set scanout (display resource on screen)
+@kernel fn gpu_set_scanout(scanout_id: i64, resource_id: i64, width: i64, height: i64) {
+    let cmd = GPU_CMD_BUF
+    volatile_write_u32_le(cmd, VIRTIO_GPU_CMD_SET_SCANOUT)
+    volatile_write_u32_le(cmd + 4, 0)
+    volatile_write_u64(cmd + 8, 0)
+    volatile_write_u32_le(cmd + 16, 0)
+    volatile_write_u32_le(cmd + 20, 0)
+    // Scanout params: x, y, width, height, scanout_id, resource_id
+    volatile_write_u32_le(cmd + 24, 0)
+    volatile_write_u32_le(cmd + 28, 0)
+    volatile_write_u32_le(cmd + 32, width)
+    volatile_write_u32_le(cmd + 36, height)
+    volatile_write_u32_le(cmd + 40, scanout_id)
+    volatile_write_u32_le(cmd + 44, resource_id)
+}
+
+// Transfer framebuffer data to host
+@kernel fn gpu_transfer_to_host_2d(resource_id: i64, width: i64, height: i64) {
+    let cmd = GPU_CMD_BUF
+    volatile_write_u32_le(cmd, VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D)
+    volatile_write_u32_le(cmd + 4, 0)
+    volatile_write_u64(cmd + 8, 0)
+    volatile_write_u32_le(cmd + 16, 0)
+    volatile_write_u32_le(cmd + 20, 0)
+    // Transfer: x, y, width, height, offset, resource_id, padding
+    volatile_write_u32_le(cmd + 24, 0)
+    volatile_write_u32_le(cmd + 28, 0)
+    volatile_write_u32_le(cmd + 32, width)
+    volatile_write_u32_le(cmd + 36, height)
+    volatile_write_u64(cmd + 40, 0)
+    volatile_write_u32_le(cmd + 48, resource_id)
+    volatile_write_u32_le(cmd + 52, 0)
+}
+
+// Flush resource to display
+@kernel fn gpu_resource_flush(resource_id: i64, width: i64, height: i64) {
+    let cmd = GPU_CMD_BUF
+    volatile_write_u32_le(cmd, VIRTIO_GPU_CMD_RESOURCE_FLUSH)
+    volatile_write_u32_le(cmd + 4, 0)
+    volatile_write_u64(cmd + 8, 0)
+    volatile_write_u32_le(cmd + 16, 0)
+    volatile_write_u32_le(cmd + 20, 0)
+    // Flush: x, y, width, height, resource_id, padding
+    volatile_write_u32_le(cmd + 24, 0)
+    volatile_write_u32_le(cmd + 28, 0)
+    volatile_write_u32_le(cmd + 32, width)
+    volatile_write_u32_le(cmd + 36, height)
+    volatile_write_u32_le(cmd + 40, resource_id)
+    volatile_write_u32_le(cmd + 44, 0)
+}
+
+// ═══════════════════════════════════════════════
+// Framebuffer Drawing Operations
+// ═══════════════════════════════════════════════
+
+@kernel fn gpu_draw_pixel(x: i64, y: i64, color: i64) {
+    if x < 0 || x >= GPU_FB_WIDTH || y < 0 || y >= GPU_FB_HEIGHT { return }
+    let offset = (y * GPU_FB_WIDTH + x) * GPU_FB_BPP
+    volatile_write_u32_le(GPU_FB_BASE + offset, color)
+}
+
+@kernel fn gpu_fill_rect(x: i64, y: i64, w: i64, h: i64, color: i64) {
+    let mut py = y
+    while py < y + h && py < GPU_FB_HEIGHT {
+        let mut px = x
+        while px < x + w && px < GPU_FB_WIDTH {
+            gpu_draw_pixel(px, py, color)
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+@kernel fn gpu_clear(color: i64) {
+    gpu_fill_rect(0, 0, GPU_FB_WIDTH, GPU_FB_HEIGHT, color)
+}
+
+// ═══════════════════════════════════════════════
+// VirtIO-GPU Shell Command
+// ═══════════════════════════════════════════════
+
+@kernel fn cmd_virtio_gpu() {
+    let active = volatile_read_u64(GPU_STATE + GPU_OFF_ACTIVE)
+    if active == 0 {
+        cprintln("No VirtIO-GPU detected", WHITE_ON_BLACK)
+        cprintln("  Start QEMU with: -device virtio-gpu-pci", YELLOW_ON_BLACK)
+        return
+    }
+    cprintln("VirtIO-GPU:", YELLOW_ON_BLACK)
+    cprint("  BAR0: 0x", WHITE_ON_BLACK)
+    cprint_hex(volatile_read_u64(GPU_STATE + GPU_OFF_BAR0), 8, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Resolution: ", WHITE_ON_BLACK)
+    cprint_decimal(GPU_FB_WIDTH, CYAN_ON_BLACK)
+    cprint("x", WHITE_ON_BLACK)
+    cprint_decimal(GPU_FB_HEIGHT, CYAN_ON_BLACK)
+    cprintln(" (32bpp RGBA)", WHITE_ON_BLACK)
+    cprint("  Framebuffer: 0x", WHITE_ON_BLACK)
+    cprint_hex(GPU_FB_BASE, 8, CYAN_ON_BLACK)
+    cprint(" (", WHITE_ON_BLACK)
+    cprint_decimal(GPU_FB_SIZE / 1024, CYAN_ON_BLACK)
+    cprintln(" KB)", WHITE_ON_BLACK)
+}

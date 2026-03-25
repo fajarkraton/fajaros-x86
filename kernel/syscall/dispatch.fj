@@ -1,9 +1,9 @@
-// FajarOS Nova v1.2.0 "Nexus" — Syscall Dispatch Table
+// FajarOS Nova v1.4.0 "Zenith" — Syscall Dispatch Table
 // Part of the modular kernel build (concatenated by Makefile)
-// Updated: v0.7 "Nexus" — 26 unified syscalls via table dispatch
+// Updated: v1.4.0 "Zenith" — 29 syscalls (0-26 + GPU 35-36)
 
 // ═══════════════════════════════════════════════════
-// Syscall Numbers (v0.7 — 27 syscalls: 0-26)
+// Syscall Numbers (v1.4.0 — 29 syscalls: 0-26 + GPU 35-36)
 // ═══════════════════════════════════════════════════
 
 const SYSCALL_TABLE: i64 = 0x884000      // 32 entries x 8 bytes
@@ -127,6 +127,9 @@ const USER_HEAP_BASE: i64 = 0x2800000
     if num == SYS_RECV { return ipc2_recv_checked(arg0, arg1) }
     if num == SYS_REPLY { return ipc2_reply_checked(arg0, arg1) }
     if num == SYS_NOTIFY { return ipc2_notify_checked(arg0, arg1) }
+    // GPU compute (v1.4.0 Zenith)
+    if num == SYS_GPU_ALLOC { return sys_gpu_alloc(arg0, arg1, arg2) }
+    if num == SYS_GPU_DISPATCH { return sys_gpu_dispatch(arg0, arg1, arg2) }
     -1
 }
 
