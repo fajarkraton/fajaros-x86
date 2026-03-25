@@ -1,0 +1,162 @@
+// FajarOS Nova v1.4.0 "Zenith" — Daemon Infrastructure
+// Synced from Nova kernel v0.9 Sprint U2
+// syslogd, crond, PID files, kernel log, log rotation
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Kernel Log Ring Buffer at 0x9B2000 (8KB)
+// ═══════════════════════════════════════════════
+
+const KLOG_BUF: i64 = 0x9B2000
+const KLOG_SIZE: i64 = 8192
+const KLOG_HEAD: i64 = 0x9B4000
+const KLOG_COUNT: i64 = 0x9B4008
+
+// Syslog buffer at 0x9B5000 (8KB)
+const SYSLOG_BUF2: i64 = 0x9B5000
+const SYSLOG_SIZE2: i64 = 8192
+const SYSLOG_POS2: i64 = 0x9B7000
+const SYSLOG_MAX_ROTATE2: i64 = 65536
+
+// Crontab at 0x9B8000: 8 entries x 64B
+const CRONTAB2: i64 = 0x9B8000
+const CRON2_MAX: i64 = 8
+const CRON2_SIZE: i64 = 64
+const CRON2_OFF_INTERVAL: i64 = 16
+const CRON2_OFF_LAST_RUN: i64 = 24
+const CRON2_OFF_CMD: i64 = 32
+const CRON2_OFF_ACTIVE: i64 = 56
+
+// PID file table at 0x9B9000 (16 x 16B)
+const PIDFILE2_TABLE: i64 = 0x9B9000
+
+// ═══════════════════════════════════════════════
+// Syslog — centralized logging
+// ═══════════════════════════════════════════════
+
+@kernel fn syslog2_write(msg_addr: i64, msg_len: i64) {
+    let pos = volatile_read_u64(SYSLOG_POS2)
+    let tick = volatile_read_u64(0x6FE08)
+    let secs = tick / 100
+    let mut wp = pos
+    // Write [tick]
+    volatile_write_u8(SYSLOG_BUF2 + (wp % SYSLOG_SIZE2), 91)
+    wp = wp + 1
+    let digit_buf: i64 = 0x9B7010
+    let mut tmp = secs
+    let mut dc: i64 = 0
+    if tmp == 0 { volatile_write_u8(digit_buf, 48); dc = 1 }
+    else { while tmp > 0 { volatile_write_u8(digit_buf + dc, 48 + (tmp % 10)); dc = dc + 1; tmp = tmp / 10 } }
+    let mut di = dc - 1
+    while di >= 0 {
+        volatile_write_u8(SYSLOG_BUF2 + (wp % SYSLOG_SIZE2), volatile_read_u8(digit_buf + di))
+        wp = wp + 1; di = di - 1
+    }
+    volatile_write_u8(SYSLOG_BUF2 + (wp % SYSLOG_SIZE2), 93)
+    wp = wp + 1
+    volatile_write_u8(SYSLOG_BUF2 + (wp % SYSLOG_SIZE2), 32)
+    wp = wp + 1
+    // Write message
+    let mut i: i64 = 0
+    while i < msg_len {
+        volatile_write_u8(SYSLOG_BUF2 + (wp % SYSLOG_SIZE2), volatile_read_u8(msg_addr + i))
+        wp = wp + 1; i = i + 1
+    }
+    volatile_write_u8(SYSLOG_BUF2 + (wp % SYSLOG_SIZE2), 10)
+    wp = wp + 1
+    volatile_write_u64(SYSLOG_POS2, wp)
+    volatile_write_u64(KLOG_COUNT, volatile_read_u64(KLOG_COUNT) + 1)
+}
+
+// Log rotation
+@kernel fn syslog2_check_rotate() {
+    let pos = volatile_read_u64(SYSLOG_POS2)
+    if pos >= SYSLOG_MAX_ROTATE2 {
+        volatile_write_u64(SYSLOG_POS2, 0)
+    }
+}
+
+// ═══════════════════════════════════════════════
+// Crond — periodic task execution
+// ═══════════════════════════════════════════════
+
+@kernel fn cron2_init() {
+    let mut i: i64 = 0
+    while i < CRON2_MAX * CRON2_SIZE { volatile_write_u8(CRONTAB2 + i, 0); i = i + 1 }
+}
+
+@kernel fn cron2_add(interval_ticks: i64, cmd_addr: i64, cmd_len: i64) -> i64 {
+    let mut slot: i64 = -1
+    let mut i: i64 = 0
+    while i < CRON2_MAX && slot == -1 {
+        if volatile_read_u64(CRONTAB2 + i * CRON2_SIZE + CRON2_OFF_ACTIVE) == 0 { slot = i }
+        i = i + 1
+    }
+    if slot == -1 { return -1 }
+    let entry = CRONTAB2 + slot * CRON2_SIZE
+    volatile_write_u64(entry + CRON2_OFF_INTERVAL, interval_ticks)
+    volatile_write_u64(entry + CRON2_OFF_LAST_RUN, volatile_read_u64(0x6FE08))
+    let cl = if cmd_len < 31 { cmd_len } else { 31 }
+    let mut ci: i64 = 0
+    while ci < cl { volatile_write_u8(entry + CRON2_OFF_CMD + ci, volatile_read_u8(cmd_addr + ci)); ci = ci + 1 }
+    volatile_write_u8(entry + CRON2_OFF_CMD + cl, 0)
+    volatile_write_u64(entry + CRON2_OFF_ACTIVE, 1)
+    slot
+}
+
+// PID files
+@kernel fn pidfile2_write(svc_slot: i64, pid: i64) {
+    volatile_write_u64(PIDFILE2_TABLE + svc_slot * 16, svc_slot + 1)
+    volatile_write_u64(PIDFILE2_TABLE + svc_slot * 16 + 8, pid)
+}
+
+@kernel fn pidfile2_read(svc_slot: i64) -> i64 {
+    volatile_read_u64(PIDFILE2_TABLE + svc_slot * 16 + 8)
+}
+
+// Kernel message ring buffer
+@kernel fn klog2_write(msg_addr: i64, msg_len: i64) {
+    let head = volatile_read_u64(KLOG_HEAD)
+    let mut i: i64 = 0
+    while i < msg_len {
+        volatile_write_u8(KLOG_BUF + ((head + i) % KLOG_SIZE), volatile_read_u8(msg_addr + i))
+        i = i + 1
+    }
+    volatile_write_u8(KLOG_BUF + ((head + msg_len) % KLOG_SIZE), 10)
+    volatile_write_u64(KLOG_HEAD, head + msg_len + 1)
+}
+
+// `crontab` command
+@kernel fn cmd_crontab_v2() {
+    cprintln("Crontab:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    let mut count: i64 = 0
+    while i < CRON2_MAX {
+        let entry = CRONTAB2 + i * CRON2_SIZE
+        if volatile_read_u64(entry + CRON2_OFF_ACTIVE) == 1 {
+            cprint("  [", WHITE_ON_BLACK); cprint_decimal(i, CYAN_ON_BLACK); cprint("] every ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(entry + CRON2_OFF_INTERVAL) / 100, CYAN_ON_BLACK)
+            cprint("s: ", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < 31 { let ch = volatile_read_u8(entry + CRON2_OFF_CMD + j); if ch == 0 { j = 31 } else { console_putchar(ch, GREEN_ON_BLACK); j = j + 1 } }
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (empty)", WHITE_ON_BLACK) }
+}
+
+// `dmesg` — kernel messages
+@kernel fn cmd_dmesg_v2() {
+    cprintln("Kernel messages:", YELLOW_ON_BLACK)
+    let head = volatile_read_u64(KLOG_HEAD)
+    let start = if head > KLOG_SIZE { head - KLOG_SIZE } else { 0 }
+    let mut pos = start
+    while pos < head {
+        let ch = volatile_read_u8(KLOG_BUF + (pos % KLOG_SIZE))
+        console_putchar(ch, WHITE_ON_BLACK)
+        pos = pos + 1
+    }
+    if head == 0 { cprintln("  (empty)", WHITE_ON_BLACK) }
+}

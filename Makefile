@@ -116,7 +116,13 @@ SOURCES := \
 	services/gui/main.fj \
 	services/auth/main.fj \
 	services/shell/main.fj \
+	services/init/service.fj \
+	services/init/runlevel.fj \
+	services/init/daemon.fj \
+	services/init/shutdown.fj \
 	services/init/main.fj \
+	services/pkg/manager.fj \
+	services/pkg/registry.fj \
 	services/vfs/main.fj \
 	apps/editor/main.fj \
 	apps/compiler/main.fj \

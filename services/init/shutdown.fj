@@ -1,0 +1,30 @@
+// FajarOS Nova v1.4.0 "Zenith" — Shutdown Sequence
+// Synced from Nova kernel v0.9 Sprint U2
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Shutdown — stop services in reverse order, sync fs
+// ═══════════════════════════════════════════════
+
+@kernel fn shutdown_services_v2() {
+    cprintln("[INIT] Stopping services...", YELLOW_ON_BLACK)
+    let mut i = SVC2_MAX - 1
+    while i >= 0 {
+        let entry = SVC2_TABLE + i * SVC2_SIZE
+        if volatile_read_u64(entry + SVC2_OFF_ENABLED) == 1 && volatile_read_u64(entry + SVC2_OFF_STATE) == SVC2_STATE_RUNNING {
+            svc2_stop(i)
+        }
+        i = i - 1
+    }
+    cprintln("[INIT] All services stopped", GREEN_ON_BLACK)
+    // Sync journal
+    journal_commit()
+    cprintln("[INIT] Filesystem synced", GREEN_ON_BLACK)
+}
+
+// `halt` — safe shutdown
+@kernel fn cmd_halt_v2() {
+    cprintln("System halting...", YELLOW_ON_BLACK)
+    shutdown_services_v2()
+    cprintln("[INIT] System halted", RED_ON_BLACK)
+}

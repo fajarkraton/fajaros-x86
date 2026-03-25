@@ -1,0 +1,64 @@
+// FajarOS Nova v1.4.0 "Zenith" — Package Registry
+// 5 standard packages + semver comparison
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Standard Package Registry
+// ═══════════════════════════════════════════════
+
+// String scratch at 0x9C1000 for building package names
+const PKG_STR_BUF: i64 = 0x9C1000
+
+@kernel fn pkg_str_write(s: i64, offset: i64, c0: i64, c1: i64, c2: i64, c3: i64) {
+    volatile_write_u8(s + offset, c0)
+    volatile_write_u8(s + offset + 1, c1)
+    volatile_write_u8(s + offset + 2, c2)
+    volatile_write_u8(s + offset + 3, c3)
+}
+
+// Semver comparison: returns -1, 0, +1
+@kernel fn pkg2_version_compare(a: i64, b: i64) -> i64 {
+    let a_maj = a / 10000
+    let b_maj = b / 10000
+    if a_maj < b_maj { return -1 }
+    if a_maj > b_maj { return 1 }
+    let a_min = (a / 100) % 100
+    let b_min = (b / 100) % 100
+    if a_min < b_min { return -1 }
+    if a_min > b_min { return 1 }
+    let a_pat = a % 100
+    let b_pat = b % 100
+    if a_pat < b_pat { return -1 }
+    if a_pat > b_pat { return 1 }
+    0
+}
+
+// Register 5 standard packages
+@kernel fn pkg2_registry_init() {
+    let s = PKG_STR_BUF
+    // fj-math (102,106,45,109,97,116,104)
+    pkg_str_write(s, 0, 102, 106, 45, 109); pkg_str_write(s, 4, 97, 116, 104, 0)
+    let d = PKG_STR_BUF + 64
+    pkg_str_write(d, 0, 77, 97, 116, 104); volatile_write_u8(d + 4, 0)  // "Math"
+    pkg2_reg_add(s, 7, 1, 0, 0, d, 4)
+
+    // fj-nn (102,106,45,110,110)
+    pkg_str_write(s, 0, 102, 106, 45, 110); volatile_write_u8(s + 4, 110); volatile_write_u8(s + 5, 0)
+    pkg_str_write(d, 0, 78, 101, 117, 114); pkg_str_write(d, 4, 97, 108, 0, 0)  // "Neural"
+    pkg2_reg_add(s, 5, 1, 0, 0, d, 6)
+
+    // fj-hal (102,106,45,104,97,108)
+    pkg_str_write(s, 0, 102, 106, 45, 104); volatile_write_u8(s + 4, 97); volatile_write_u8(s + 5, 108); volatile_write_u8(s + 6, 0)
+    pkg_str_write(d, 0, 72, 65, 76, 0)  // "HAL"
+    pkg2_reg_add(s, 6, 1, 0, 0, d, 3)
+
+    // fj-http (102,106,45,104,116,116,112)
+    pkg_str_write(s, 0, 102, 106, 45, 104); pkg_str_write(s, 4, 116, 116, 112, 0)
+    pkg_str_write(d, 0, 72, 84, 84, 80); volatile_write_u8(d + 4, 0)  // "HTTP"
+    pkg2_reg_add(s, 7, 1, 0, 0, d, 4)
+
+    // fj-crypto (102,106,45,99,114,121,112,116,111)
+    pkg_str_write(s, 0, 102, 106, 45, 99); pkg_str_write(s, 4, 114, 121, 112, 116); volatile_write_u8(s + 8, 111); volatile_write_u8(s + 9, 0)
+    pkg_str_write(d, 0, 67, 114, 121, 112); pkg_str_write(d, 4, 116, 111, 0, 0)  // "Crypto"
+    pkg2_reg_add(s, 9, 1, 0, 0, d, 6)
+}

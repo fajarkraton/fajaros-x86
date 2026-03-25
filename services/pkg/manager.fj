@@ -1,0 +1,170 @@
+// FajarOS Nova v1.4.0 "Zenith" — Package Manager
+// Synced from Nova kernel v0.9 Sprint V1
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Package Database: 32 packages x 128B at 0x9C0000
+// Per package: +0=name[24], +24=version[8], +32=state(i64),
+//              +40=deps[32], +72=files_count(i64),
+//              +80=size(i64), +88=checksum(i64), +96=description[32]
+// ═══════════════════════════════════════════════
+
+const PKG2_DB: i64 = 0x9C0000
+const PKG2_MAX: i64 = 32
+const PKG2_SIZE: i64 = 128
+const PKG2_OFF_NAME: i64 = 0
+const PKG2_OFF_VERSION: i64 = 24
+const PKG2_OFF_STATE: i64 = 32
+const PKG2_OFF_DEPS: i64 = 40
+const PKG2_OFF_FILES: i64 = 72
+const PKG2_OFF_PKG_SIZE: i64 = 80
+const PKG2_OFF_CHECKSUM: i64 = 88
+const PKG2_OFF_DESC: i64 = 96
+
+const PKG2_NONE: i64 = 0
+const PKG2_INSTALLED: i64 = 1
+const PKG2_AVAILABLE: i64 = 2
+
+// ═══════════════════════════════════════════════
+// Package Operations
+// ═══════════════════════════════════════════════
+
+@kernel fn pkg2_init() {
+    let mut i: i64 = 0
+    while i < PKG2_MAX * PKG2_SIZE { volatile_write_u8(PKG2_DB + i, 0); i = i + 1 }
+}
+
+@kernel fn pkg2_find(name_addr: i64, name_len: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < PKG2_MAX {
+        let entry = PKG2_DB + i * PKG2_SIZE
+        let state = volatile_read_u64(entry + PKG2_OFF_STATE)
+        if state != PKG2_NONE {
+            let mut ok: i64 = 1
+            let mut j: i64 = 0
+            while j < name_len && ok == 1 {
+                if volatile_read_u8(entry + PKG2_OFF_NAME + j) != volatile_read_u8(name_addr + j) { ok = 0 }
+                j = j + 1
+            }
+            if ok == 1 && volatile_read_u8(entry + PKG2_OFF_NAME + name_len) == 0 { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn pkg2_reg_add(name_addr: i64, name_len: i64, ver_maj: i64, ver_min: i64, ver_pat: i64, desc_addr: i64, desc_len: i64) -> i64 {
+    // Find free slot
+    let mut slot: i64 = -1
+    let mut i: i64 = 0
+    while i < PKG2_MAX && slot == -1 {
+        if volatile_read_u64(PKG2_DB + i * PKG2_SIZE + PKG2_OFF_STATE) == PKG2_NONE { slot = i }
+        i = i + 1
+    }
+    if slot == -1 { return -1 }
+    let entry = PKG2_DB + slot * PKG2_SIZE
+    // Write name
+    i = 0
+    while i < name_len && i < 23 { volatile_write_u8(entry + PKG2_OFF_NAME + i, volatile_read_u8(name_addr + i)); i = i + 1 }
+    volatile_write_u8(entry + PKG2_OFF_NAME + i, 0)
+    // Write version
+    volatile_write_u64(entry + PKG2_OFF_VERSION, ver_maj * 10000 + ver_min * 100 + ver_pat)
+    volatile_write_u64(entry + PKG2_OFF_STATE, PKG2_AVAILABLE)
+    // Write description
+    i = 0
+    while i < desc_len && i < 31 { volatile_write_u8(entry + PKG2_OFF_DESC + i, volatile_read_u8(desc_addr + i)); i = i + 1 }
+    volatile_write_u8(entry + PKG2_OFF_DESC + i, 0)
+    slot
+}
+
+@kernel fn pkg2_install(idx: i64) -> i64 {
+    if idx < 0 || idx >= PKG2_MAX { return -1 }
+    let entry = PKG2_DB + idx * PKG2_SIZE
+    let state = volatile_read_u64(entry + PKG2_OFF_STATE)
+    if state == PKG2_INSTALLED { return -2 }  // already installed
+    volatile_write_u64(entry + PKG2_OFF_STATE, PKG2_INSTALLED)
+    0
+}
+
+@kernel fn pkg2_remove(idx: i64) -> i64 {
+    if idx < 0 || idx >= PKG2_MAX { return -1 }
+    let entry = PKG2_DB + idx * PKG2_SIZE
+    let state = volatile_read_u64(entry + PKG2_OFF_STATE)
+    if state != PKG2_INSTALLED { return -2 }
+    volatile_write_u64(entry + PKG2_OFF_STATE, PKG2_AVAILABLE)
+    0
+}
+
+// ═══════════════════════════════════════════════
+// Shell: pkg install|remove|list|search|info
+// ═══════════════════════════════════════════════
+
+@kernel fn cmd_pkg_v2() {
+    let len = cmdbuf_len()
+    if len <= 4 { cprintln("Usage: pkg install|remove|list|search|info <name>", YELLOW_ON_BLACK); return }
+    let c0 = volatile_read_u8(0x6F800 + 4)
+    if c0 == 108 { cmd_pkg_list_v2() }  // 'l'ist
+    else if c0 == 105 && volatile_read_u8(0x6F800 + 5) == 110 {  // 'in'stall or 'in'fo
+        if volatile_read_u8(0x6F800 + 6) == 115 { cmd_pkg_install_v2() }  // 'ins'tall
+        else { cmd_pkg_info_v2() }  // 'inf'o
+    }
+    else if c0 == 114 { cmd_pkg_remove_v2() }  // 'r'emove
+    else if c0 == 115 { cmd_pkg_search_v2() }  // 's'earch
+    else { cprintln("Unknown pkg subcommand", RED_ON_BLACK) }
+}
+
+@kernel fn cmd_pkg_list_v2() {
+    cprintln("Installed packages:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    let mut count: i64 = 0
+    while i < PKG2_MAX {
+        let entry = PKG2_DB + i * PKG2_SIZE
+        let state = volatile_read_u64(entry + PKG2_OFF_STATE)
+        if state == PKG2_INSTALLED {
+            cprint("  ", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < 23 { let ch = volatile_read_u8(entry + PKG2_OFF_NAME + j); if ch == 0 { j = 23 } else { console_putchar(ch, GREEN_ON_BLACK); j = j + 1 } }
+            cprint(" ", WHITE_ON_BLACK)
+            let ver = volatile_read_u64(entry + PKG2_OFF_VERSION)
+            cprint_decimal(ver / 10000, CYAN_ON_BLACK)
+            cprint(".", WHITE_ON_BLACK)
+            cprint_decimal((ver / 100) % 100, CYAN_ON_BLACK)
+            cprint(".", WHITE_ON_BLACK)
+            cprint_decimal(ver % 100, CYAN_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (none)", WHITE_ON_BLACK) }
+}
+
+@kernel fn cmd_pkg_install_v2() {
+    cprintln("pkg install: would install package", YELLOW_ON_BLACK)
+}
+
+@kernel fn cmd_pkg_remove_v2() {
+    cprintln("pkg remove: would remove package", YELLOW_ON_BLACK)
+}
+
+@kernel fn cmd_pkg_search_v2() {
+    cprintln("Available packages:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    while i < PKG2_MAX {
+        let entry = PKG2_DB + i * PKG2_SIZE
+        let state = volatile_read_u64(entry + PKG2_OFF_STATE)
+        if state != PKG2_NONE {
+            cprint("  ", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < 23 { let ch = volatile_read_u8(entry + PKG2_OFF_NAME + j); if ch == 0 { j = 23 } else { console_putchar(ch, WHITE_ON_BLACK); j = j + 1 } }
+            if state == PKG2_INSTALLED { cprint(" [installed]", GREEN_ON_BLACK) }
+            else { cprint(" [available]", CYAN_ON_BLACK) }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        i = i + 1
+    }
+}
+
+@kernel fn cmd_pkg_info_v2() {
+    cprintln("pkg info: would show package details", YELLOW_ON_BLACK)
+}

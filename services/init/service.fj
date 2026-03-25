@@ -1,0 +1,186 @@
+// FajarOS Nova v1.4.0 "Zenith" — Service Manager
+// Synced from Nova kernel v0.9 Sprint U1
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Service Table: 16 services x 64B at 0x9B0000
+// ═══════════════════════════════════════════════
+
+const SVC2_TABLE: i64 = 0x9B0000
+const SVC2_MAX: i64 = 16
+const SVC2_SIZE: i64 = 64
+const SVC2_OFF_NAME: i64 = 0
+const SVC2_OFF_PID: i64 = 16
+const SVC2_OFF_STATE: i64 = 24
+const SVC2_OFF_RESTART: i64 = 32
+const SVC2_OFF_START_TICK: i64 = 40
+const SVC2_OFF_RESTARTS: i64 = 48
+const SVC2_OFF_ENABLED: i64 = 56
+
+const SVC2_STATE_STOPPED: i64 = 0
+const SVC2_STATE_RUNNING: i64 = 1
+const SVC2_STATE_FAILED: i64 = 2
+const SVC2_STATE_STARTING: i64 = 3
+
+const SVC2_RESTART_NO: i64 = 0
+const SVC2_RESTART_ALWAYS: i64 = 1
+const SVC2_RESTART_ON_FAILURE: i64 = 2
+
+// ═══════════════════════════════════════════════
+// Service Operations
+// ═══════════════════════════════════════════════
+
+@kernel fn svc2_init() {
+    let mut i: i64 = 0
+    while i < SVC2_MAX * SVC2_SIZE { volatile_write_u8(SVC2_TABLE + i, 0); i = i + 1 }
+}
+
+@kernel fn svc2_register(name_addr: i64, name_len: i64, restart_policy: i64) -> i64 {
+    let mut slot: i64 = -1
+    let mut i: i64 = 0
+    while i < SVC2_MAX && slot == -1 {
+        if volatile_read_u64(SVC2_TABLE + i * SVC2_SIZE + SVC2_OFF_ENABLED) == 0 { slot = i }
+        i = i + 1
+    }
+    if slot == -1 { return -1 }
+    let entry = SVC2_TABLE + slot * SVC2_SIZE
+    let mut ni: i64 = 0
+    while ni < name_len && ni < 15 {
+        volatile_write_u8(entry + SVC2_OFF_NAME + ni, volatile_read_u8(name_addr + ni))
+        ni = ni + 1
+    }
+    volatile_write_u8(entry + SVC2_OFF_NAME + ni, 0)
+    volatile_write_u64(entry + SVC2_OFF_PID, 0)
+    volatile_write_u64(entry + SVC2_OFF_STATE, SVC2_STATE_STOPPED)
+    volatile_write_u64(entry + SVC2_OFF_RESTART, restart_policy)
+    volatile_write_u64(entry + SVC2_OFF_RESTARTS, 0)
+    volatile_write_u64(entry + SVC2_OFF_ENABLED, 1)
+    slot
+}
+
+@kernel fn svc2_find(name_addr: i64, name_len: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < SVC2_MAX {
+        let entry = SVC2_TABLE + i * SVC2_SIZE
+        if volatile_read_u64(entry + SVC2_OFF_ENABLED) == 1 {
+            let mut ok: i64 = 1
+            let mut j: i64 = 0
+            while j < name_len && ok == 1 {
+                if volatile_read_u8(entry + SVC2_OFF_NAME + j) != volatile_read_u8(name_addr + j) { ok = 0 }
+                j = j + 1
+            }
+            if ok == 1 && volatile_read_u8(entry + SVC2_OFF_NAME + name_len) == 0 { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn svc2_start(slot: i64) {
+    let entry = SVC2_TABLE + slot * SVC2_SIZE
+    volatile_write_u64(entry + SVC2_OFF_STATE, SVC2_STATE_RUNNING)
+    volatile_write_u64(entry + SVC2_OFF_START_TICK, volatile_read_u64(0x6FE08))
+    cprint("[SVC] Started: ", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < 15 { let ch = volatile_read_u8(entry + SVC2_OFF_NAME + i); if ch == 0 { i = 15 } else { console_putchar(ch, GREEN_ON_BLACK); i = i + 1 } }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn svc2_stop(slot: i64) {
+    let entry = SVC2_TABLE + slot * SVC2_SIZE
+    volatile_write_u64(entry + SVC2_OFF_STATE, SVC2_STATE_STOPPED)
+    cprint("[SVC] Stopped: ", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < 15 { let ch = volatile_read_u8(entry + SVC2_OFF_NAME + i); if ch == 0 { i = 15 } else { console_putchar(ch, YELLOW_ON_BLACK); i = i + 1 } }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+// Auto-restart crashed services
+@kernel fn svc2_check_restart() {
+    let mut i: i64 = 0
+    while i < SVC2_MAX {
+        let entry = SVC2_TABLE + i * SVC2_SIZE
+        if volatile_read_u64(entry + SVC2_OFF_ENABLED) == 1 {
+            let state = volatile_read_u64(entry + SVC2_OFF_STATE)
+            let policy = volatile_read_u64(entry + SVC2_OFF_RESTART)
+            if state == SVC2_STATE_FAILED && (policy == SVC2_RESTART_ALWAYS || policy == SVC2_RESTART_ON_FAILURE) {
+                let restarts = volatile_read_u64(entry + SVC2_OFF_RESTARTS)
+                volatile_write_u64(entry + SVC2_OFF_RESTARTS, restarts + 1)
+                svc2_start(i)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════
+// Shell: `service start|stop|status`
+// ═══════════════════════════════════════════════
+
+@kernel fn cmd_service_v2() {
+    let len = cmdbuf_len()
+    if len <= 8 { cprintln("Usage: service start|stop|status [name]", YELLOW_ON_BLACK); return }
+    let c0 = volatile_read_u8(0x6F800 + 8)
+    if c0 == 115 && volatile_read_u8(0x6F800 + 9) == 116 && volatile_read_u8(0x6F800 + 10) == 97 && volatile_read_u8(0x6F800 + 11) == 114 {
+        // "start"
+        if len > 14 { svc2_start_by_name(14) }
+        else { cprintln("Usage: service start <name>", YELLOW_ON_BLACK) }
+    } else if c0 == 115 && volatile_read_u8(0x6F800 + 9) == 116 && volatile_read_u8(0x6F800 + 10) == 111 {
+        // "stop"
+        if len > 13 { svc2_stop_by_name(13) }
+        else { cprintln("Usage: service stop <name>", YELLOW_ON_BLACK) }
+    } else { cmd_service_status_v2() }
+}
+
+@kernel fn svc2_start_by_name(prefix: i64) {
+    let name_buf: i64 = 0x9B1100
+    let len = cmdbuf_len()
+    let mut ni: i64 = 0
+    let mut pos: i64 = prefix
+    while pos < len && ni < 15 { volatile_write_u8(name_buf + ni, volatile_read_u8(0x6F800 + pos)); ni = ni + 1; pos = pos + 1 }
+    volatile_write_u8(name_buf + ni, 0)
+    let slot = svc2_find(name_buf, ni)
+    if slot < 0 {
+        let ns = svc2_register(name_buf, ni, SVC2_RESTART_NO)
+        if ns < 0 { cprintln("Cannot register service", RED_ON_BLACK); return }
+        svc2_start(ns)
+    } else { svc2_start(slot) }
+}
+
+@kernel fn svc2_stop_by_name(prefix: i64) {
+    let name_buf: i64 = 0x9B1100
+    let len = cmdbuf_len()
+    let mut ni: i64 = 0
+    let mut pos: i64 = prefix
+    while pos < len && ni < 15 { volatile_write_u8(name_buf + ni, volatile_read_u8(0x6F800 + pos)); ni = ni + 1; pos = pos + 1 }
+    volatile_write_u8(name_buf + ni, 0)
+    let slot = svc2_find(name_buf, ni)
+    if slot < 0 { cprintln("Service not found", RED_ON_BLACK); return }
+    svc2_stop(slot)
+}
+
+@kernel fn cmd_service_status_v2() {
+    cprintln("Services:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    let mut count: i64 = 0
+    while i < SVC2_MAX {
+        let entry = SVC2_TABLE + i * SVC2_SIZE
+        if volatile_read_u64(entry + SVC2_OFF_ENABLED) == 1 {
+            cprint("  ", WHITE_ON_BLACK)
+            let mut j: i64 = 0
+            while j < 15 { let ch = volatile_read_u8(entry + SVC2_OFF_NAME + j); if ch == 0 { j = 15 } else { console_putchar(ch, WHITE_ON_BLACK); j = j + 1 } }
+            cprint(": ", WHITE_ON_BLACK)
+            let state = volatile_read_u64(entry + SVC2_OFF_STATE)
+            if state == SVC2_STATE_RUNNING { cprint("running", GREEN_ON_BLACK) }
+            else if state == SVC2_STATE_STOPPED { cprint("stopped", WHITE_ON_BLACK) }
+            else if state == SVC2_STATE_FAILED { cprint("failed", RED_ON_BLACK) }
+            else { cprint("starting", YELLOW_ON_BLACK) }
+            let restarts = volatile_read_u64(entry + SVC2_OFF_RESTARTS)
+            if restarts > 0 { cprint(" (restarts: ", WHITE_ON_BLACK); cprint_decimal(restarts, CYAN_ON_BLACK); cprint(")", WHITE_ON_BLACK) }
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (no services)", WHITE_ON_BLACK) }
+}
