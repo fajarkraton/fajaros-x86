@@ -5,7 +5,7 @@ operating system written entirely in Fajar Lang.
 
 ## Prerequisites
 
-- **Fajar Lang compiler** (`fj`) v4.1.0 or later
+- **Fajar Lang compiler** (`fj`) v5.5.0 or later
 - **GNU Make** 4.0+
 - **QEMU** 8.0+ with `qemu-system-x86_64`
 - **GRUB** and `xorriso` for ISO generation
@@ -102,6 +102,28 @@ kernel function, add at least one corresponding test.
 
 When adding new error codes, follow the existing numbering scheme and document
 them in `docs/ERROR_CODES.md`.
+
+## Adding New Modules
+
+1. Create your `.fj` file in the appropriate directory
+2. Add it to the `SOURCES` list in `Makefile` in the correct dependency order
+3. Run `fj dump-tokens your_file.fj` to verify lexing
+4. Run `make build` to verify concatenation compiles
+5. Run `make test` in QEMU to verify boot
+
+## Lex Verification
+
+Every `.fj` file must pass lexer verification before commit:
+
+```bash
+# Verify single file
+fj dump-tokens path/to/file.fj
+
+# Verify all files
+for f in $(find . -name "*.fj" -not -path "*/build/*"); do
+    fj dump-tokens "$f" 2>&1 | tail -1
+done
+```
 
 ## License
 
