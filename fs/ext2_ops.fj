@@ -1,0 +1,211 @@
+// FajarOS Nova v1.4.0 "Zenith" — ext2 Directory + File Operations
+// Synced from Nova kernel v0.9 Sprint S2
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// ext2 Directory Entry Format
+// Each 128B: +0=inode(i64), +8=name_len(i64), +16=name[112]
+// ═══════════════════════════════════════════════
+
+const EXT2_DIRENT_SIZE: i64 = 128
+const EXT2_DIRENTS_PER_BLOCK: i64 = 32
+const EXT2_ROOT_INODE: i64 = 2
+
+// ext2 scratch buffer #2 at 0xA02000 (4KB for directory block I/O)
+const EXT2_DIR_BUF: i64 = 0xA02000
+// ext2 file data buffer at 0xA03000 (4KB)
+const EXT2_FILE_BUF: i64 = 0xA03000
+
+// ═══════════════════════════════════════════════
+// Directory Entry Helpers
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_dirent_inode(buf: i64, idx: i64) -> i64 {
+    volatile_read_u64(buf + idx * EXT2_DIRENT_SIZE)
+}
+
+@kernel fn ext2_dirent_name_len(buf: i64, idx: i64) -> i64 {
+    volatile_read_u64(buf + idx * EXT2_DIRENT_SIZE + 8)
+}
+
+@kernel fn ext2_dirent_set(buf: i64, idx: i64, inode: i64, name_addr: i64, name_len: i64) {
+    let off = idx * EXT2_DIRENT_SIZE
+    volatile_write_u64(buf + off, inode)
+    volatile_write_u64(buf + off + 8, name_len)
+    let mut i: i64 = 0
+    while i < name_len && i < 112 {
+        volatile_write_u8(buf + off + 16 + i, volatile_read_u8(name_addr + i))
+        i = i + 1
+    }
+    volatile_write_u8(buf + off + 16 + name_len, 0)
+}
+
+// ═══════════════════════════════════════════════
+// lookup — find entry in directory
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_lookup(dir_inode: i64, name_addr: i64, name_len: i64) -> i64 {
+    let iaddr = ext2_read_inode(dir_inode)
+    if iaddr < 0 { return -1 }
+    let block0 = volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0) + volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0 + 1) * 256
+    if block0 == 0 { return -1 }
+    let result = ext2_read_block(block0, EXT2_DIR_BUF)
+    if result < 0 { return -1 }
+    let mut idx: i64 = 0
+    while idx < EXT2_DIRENTS_PER_BLOCK {
+        let dinode = ext2_dirent_inode(EXT2_DIR_BUF, idx)
+        if dinode != 0 {
+            let dlen = ext2_dirent_name_len(EXT2_DIR_BUF, idx)
+            if dlen == name_len {
+                let mut match_ok: i64 = 1
+                let mut j: i64 = 0
+                while j < name_len && match_ok == 1 {
+                    if volatile_read_u8(EXT2_DIR_BUF + idx * EXT2_DIRENT_SIZE + 16 + j) != volatile_read_u8(name_addr + j) {
+                        match_ok = 0
+                    }
+                    j = j + 1
+                }
+                if match_ok == 1 { return dinode }
+            }
+        }
+        idx = idx + 1
+    }
+    -1
+}
+
+// ═══════════════════════════════════════════════
+// create — create new file in directory
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_create(dir_inode: i64, name_addr: i64, name_len: i64, mode: i64) -> i64 {
+    let new_inode = ext2_inode_alloc()
+    if new_inode < 0 { return -1 }
+    let new_block = ext2_block_alloc()
+    if new_block < 0 { return -1 }
+    let iaddr = ext2_read_inode(new_inode)
+    if iaddr < 0 { return -1 }
+    volatile_write_u8(iaddr + EXT2_INO_OFF_MODE, mode & 0xFF)
+    volatile_write_u8(iaddr + EXT2_INO_OFF_MODE + 1, (mode >> 8) & 0xFF)
+    volatile_write_u32_le(iaddr + EXT2_INO_OFF_SIZE, 0)
+    volatile_write_u8(iaddr + EXT2_INO_OFF_LINKS, 1)
+    volatile_write_u8(iaddr + EXT2_INO_OFF_BLOCK0, new_block & 0xFF)
+    volatile_write_u8(iaddr + EXT2_INO_OFF_BLOCK0 + 1, (new_block >> 8) & 0xFF)
+    let isector = EXT2_INODE_TABLE_SECTOR + ((new_inode - 1) * EXT2_INODE_SIZE) / 512
+    blk_write(volatile_read_u64(EXT2_STATE + 8), isector, 1, EXT2_BUF)
+    // Add entry to parent directory
+    let diaddr = ext2_read_inode(dir_inode)
+    if diaddr < 0 { return -1 }
+    let dblock = volatile_read_u8(diaddr + EXT2_INO_OFF_BLOCK0) + volatile_read_u8(diaddr + EXT2_INO_OFF_BLOCK0 + 1) * 256
+    if dblock == 0 { return -1 }
+    ext2_read_block(dblock, EXT2_DIR_BUF)
+    let mut idx: i64 = 0
+    let mut found: i64 = -1
+    while idx < EXT2_DIRENTS_PER_BLOCK && found == -1 {
+        if ext2_dirent_inode(EXT2_DIR_BUF, idx) == 0 { found = idx }
+        idx = idx + 1
+    }
+    if found == -1 { return -1 }
+    ext2_dirent_set(EXT2_DIR_BUF, found, new_inode, name_addr, name_len)
+    ext2_write_block(dblock, EXT2_DIR_BUF)
+    new_inode
+}
+
+// ═══════════════════════════════════════════════
+// read / write / unlink
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_read_file(inode_num: i64, buf: i64, max_len: i64) -> i64 {
+    let iaddr = ext2_read_inode(inode_num)
+    if iaddr < 0 { return -1 }
+    let size = volatile_read_u8(iaddr + EXT2_INO_OFF_SIZE) +
+               volatile_read_u8(iaddr + EXT2_INO_OFF_SIZE + 1) * 256 +
+               volatile_read_u8(iaddr + EXT2_INO_OFF_SIZE + 2) * 65536
+    let to_read = if max_len < size { max_len } else { size }
+    let block0 = volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0) + volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0 + 1) * 256
+    if block0 == 0 { return 0 }
+    ext2_read_block(block0, EXT2_FILE_BUF)
+    let mut i: i64 = 0
+    while i < to_read { volatile_write_u8(buf + i, volatile_read_u8(EXT2_FILE_BUF + i)); i = i + 1 }
+    to_read
+}
+
+@kernel fn ext2_write_file(inode_num: i64, data: i64, data_len: i64) -> i64 {
+    let iaddr = ext2_read_inode(inode_num)
+    if iaddr < 0 { return -1 }
+    let block0 = volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0) + volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0 + 1) * 256
+    if block0 == 0 { return -1 }
+    let mut i: i64 = 0
+    while i < data_len && i < EXT2_BLOCK_SIZE { volatile_write_u8(EXT2_FILE_BUF + i, volatile_read_u8(data + i)); i = i + 1 }
+    ext2_write_block(block0, EXT2_FILE_BUF)
+    volatile_write_u32_le(iaddr + EXT2_INO_OFF_SIZE, data_len)
+    let isector = EXT2_INODE_TABLE_SECTOR + ((inode_num - 1) * EXT2_INODE_SIZE) / 512
+    blk_write(volatile_read_u64(EXT2_STATE + 8), isector, 1, EXT2_BUF)
+    data_len
+}
+
+@kernel fn ext2_unlink(dir_inode: i64, name_addr: i64, name_len: i64) -> i64 {
+    let diaddr = ext2_read_inode(dir_inode)
+    if diaddr < 0 { return -1 }
+    let dblock = volatile_read_u8(diaddr + EXT2_INO_OFF_BLOCK0) + volatile_read_u8(diaddr + EXT2_INO_OFF_BLOCK0 + 1) * 256
+    if dblock == 0 { return -1 }
+    ext2_read_block(dblock, EXT2_DIR_BUF)
+    let mut idx: i64 = 0
+    while idx < EXT2_DIRENTS_PER_BLOCK {
+        let dinode = ext2_dirent_inode(EXT2_DIR_BUF, idx)
+        if dinode != 0 {
+            let dlen = ext2_dirent_name_len(EXT2_DIR_BUF, idx)
+            if dlen == name_len {
+                let mut ok: i64 = 1
+                let mut j: i64 = 0
+                while j < name_len && ok == 1 {
+                    if volatile_read_u8(EXT2_DIR_BUF + idx * EXT2_DIRENT_SIZE + 16 + j) != volatile_read_u8(name_addr + j) { ok = 0 }
+                    j = j + 1
+                }
+                if ok == 1 {
+                    volatile_write_u64(EXT2_DIR_BUF + idx * EXT2_DIRENT_SIZE, 0)
+                    ext2_write_block(dblock, EXT2_DIR_BUF)
+                    return 0
+                }
+            }
+        }
+        idx = idx + 1
+    }
+    -1
+}
+
+// ═══════════════════════════════════════════════
+// VFS Integration + Shell Commands
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_vfs_stat(path_addr: i64, path_len: i64) -> i64 {
+    if volatile_read_u64(EXT2_STATE) != 1 { return -1 }
+    ext2_lookup(EXT2_ROOT_INODE, path_addr, path_len)
+}
+
+// `ext2ls` — list root directory
+@kernel fn cmd_ext2ls() {
+    if volatile_read_u64(EXT2_STATE) != 1 { cprintln("ext2 not mounted", RED_ON_BLACK); return }
+    cprintln("ext2 root directory:", YELLOW_ON_BLACK)
+    let iaddr = ext2_read_inode(EXT2_ROOT_INODE)
+    if iaddr < 0 { cprintln("  Cannot read root inode", RED_ON_BLACK); return }
+    let block0 = volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0) + volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0 + 1) * 256
+    if block0 == 0 { cprintln("  (empty)", WHITE_ON_BLACK); return }
+    ext2_read_block(block0, EXT2_DIR_BUF)
+    let mut idx: i64 = 0
+    while idx < EXT2_DIRENTS_PER_BLOCK {
+        let dinode = ext2_dirent_inode(EXT2_DIR_BUF, idx)
+        if dinode != 0 {
+            cprint("  inode=", WHITE_ON_BLACK)
+            cprint_decimal(dinode, CYAN_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            let nlen = ext2_dirent_name_len(EXT2_DIR_BUF, idx)
+            let mut j: i64 = 0
+            while j < nlen {
+                console_putchar(volatile_read_u8(EXT2_DIR_BUF + idx * EXT2_DIRENT_SIZE + 16 + j), GREEN_ON_BLACK)
+                j = j + 1
+            }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        idx = idx + 1
+    }
+}

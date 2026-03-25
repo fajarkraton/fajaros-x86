@@ -75,6 +75,8 @@ SOURCES := \
 	fs/links.fj \
 	fs/journal.fj \
 	fs/fsck.fj \
+	fs/ext2_super.fj \
+	fs/ext2_ops.fj \
 	fs/fat32.fj \
 	fs/vfs.fj \
 	shell/pipes.fj \
@@ -102,6 +104,9 @@ SOURCES := \
 	services/net/tcp.fj \
 	services/net/dns.fj \
 	services/net/http.fj \
+	services/net/tcp_v2.fj \
+	services/net/udp.fj \
+	services/net/stats.fj \
 	services/net/tls.fj \
 	kernel/stubs/framebuffer.fj \
 	kernel/stubs/gpu_stub.fj \

@@ -1,0 +1,235 @@
+// FajarOS Nova v1.4.0 "Zenith" — TCP State Machine (RFC 793)
+// Synced from Nova kernel v0.9 Sprint T1
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// TCP Connection States (RFC 793)
+// ═══════════════════════════════════════════════
+
+const TCP_CLOSED: i64 = 0
+const TCP_LISTEN: i64 = 1
+const TCP_SYN_SENT: i64 = 2
+const TCP_SYN_RCVD: i64 = 3
+const TCP_ESTABLISHED: i64 = 4
+const TCP_FIN_WAIT_1: i64 = 5
+const TCP_FIN_WAIT_2: i64 = 6
+const TCP_CLOSE_WAIT: i64 = 7
+const TCP_CLOSING: i64 = 8
+const TCP_LAST_ACK: i64 = 9
+const TCP_TIME_WAIT: i64 = 10
+
+// TCP flags
+const TCP_FIN: i64 = 0x01
+const TCP_SYN: i64 = 0x02
+const TCP_RST: i64 = 0x04
+const TCP_PSH: i64 = 0x08
+const TCP_ACK: i64 = 0x10
+const TCP_URG: i64 = 0x20
+
+// TCP Control Block table at 0xA04000: 16 connections x 128B
+const TCB_TABLE: i64 = 0xA04000
+const TCB_MAX: i64 = 16
+const TCB_SIZE: i64 = 128
+
+const TCB_OFF_STATE: i64 = 0
+const TCB_OFF_LOCAL_PORT: i64 = 8
+const TCB_OFF_REMOTE_IP: i64 = 16
+const TCB_OFF_REMOTE_PORT: i64 = 24
+const TCB_OFF_SND_NXT: i64 = 32
+const TCB_OFF_SND_UNA: i64 = 40
+const TCB_OFF_RCV_NXT: i64 = 48
+const TCB_OFF_WINDOW: i64 = 56
+const TCB_OFF_TIMER: i64 = 64
+const TCB_OFF_RETRIES: i64 = 72
+const TCB_OFF_SOCKET: i64 = 80
+const TCB_OFF_RX_LEN: i64 = 88
+const TCB_OFF_TX_LEN: i64 = 96
+
+const TCP_RTO: i64 = 20
+const TCP_MAX_RETRIES: i64 = 5
+
+// ═══════════════════════════════════════════════
+// TCB Management
+// ═══════════════════════════════════════════════
+
+@kernel fn tcp_v2_init() {
+    let mut i: i64 = 0
+    while i < TCB_MAX * TCB_SIZE { volatile_write_u8(TCB_TABLE + i, 0); i = i + 1 }
+}
+
+@kernel fn tcb_v2_alloc() -> i64 {
+    let mut i: i64 = 0
+    while i < TCB_MAX {
+        if volatile_read_u64(TCB_TABLE + i * TCB_SIZE + TCB_OFF_STATE) == TCP_CLOSED { return i }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn tcb_v2_addr(idx: i64) -> i64 { TCB_TABLE + idx * TCB_SIZE }
+@kernel fn tcb_v2_get(idx: i64, field: i64) -> i64 { volatile_read_u64(tcb_v2_addr(idx) + field) }
+@kernel fn tcb_v2_set(idx: i64, field: i64, val: i64) { volatile_write_u64(tcb_v2_addr(idx) + field, val) }
+
+// ═══════════════════════════════════════════════
+// TCP State Machine Operations
+// ═══════════════════════════════════════════════
+
+@kernel fn tcp_v2_state_name(state: i64) {
+    if state == TCP_CLOSED { cprint("CLOSED", WHITE_ON_BLACK) }
+    else if state == TCP_LISTEN { cprint("LISTEN", GREEN_ON_BLACK) }
+    else if state == TCP_SYN_SENT { cprint("SYN_SENT", YELLOW_ON_BLACK) }
+    else if state == TCP_SYN_RCVD { cprint("SYN_RCVD", YELLOW_ON_BLACK) }
+    else if state == TCP_ESTABLISHED { cprint("ESTABLISHED", GREEN_ON_BLACK) }
+    else if state == TCP_FIN_WAIT_1 { cprint("FIN_WAIT_1", YELLOW_ON_BLACK) }
+    else if state == TCP_FIN_WAIT_2 { cprint("FIN_WAIT_2", YELLOW_ON_BLACK) }
+    else if state == TCP_CLOSE_WAIT { cprint("CLOSE_WAIT", YELLOW_ON_BLACK) }
+    else if state == TCP_CLOSING { cprint("CLOSING", YELLOW_ON_BLACK) }
+    else if state == TCP_LAST_ACK { cprint("LAST_ACK", YELLOW_ON_BLACK) }
+    else if state == TCP_TIME_WAIT { cprint("TIME_WAIT", YELLOW_ON_BLACK) }
+    else { cprint("???", RED_ON_BLACK) }
+}
+
+// Active open (client) — send SYN
+@kernel fn tcp_v2_connect(tcb: i64, remote_ip: i64, remote_port: i64, local_port: i64) -> i64 {
+    tcb_v2_set(tcb, TCB_OFF_LOCAL_PORT, local_port)
+    tcb_v2_set(tcb, TCB_OFF_REMOTE_IP, remote_ip)
+    tcb_v2_set(tcb, TCB_OFF_REMOTE_PORT, remote_port)
+    let isn: i64 = volatile_read_u64(0x6FE08) * 1000
+    tcb_v2_set(tcb, TCB_OFF_SND_NXT, isn + 1)
+    tcb_v2_set(tcb, TCB_OFF_SND_UNA, isn)
+    tcb_v2_set(tcb, TCB_OFF_WINDOW, 65535)
+    tcb_v2_set(tcb, TCB_OFF_STATE, TCP_SYN_SENT)
+    tcb_v2_set(tcb, TCB_OFF_TIMER, volatile_read_u64(0x6FE08) + TCP_RTO)
+    tcb_v2_set(tcb, TCB_OFF_RETRIES, 0)
+    0
+}
+
+// Passive open (server) — listen
+@kernel fn tcp_v2_listen(tcb: i64, local_port: i64) -> i64 {
+    tcb_v2_set(tcb, TCB_OFF_LOCAL_PORT, local_port)
+    tcb_v2_set(tcb, TCB_OFF_STATE, TCP_LISTEN)
+    tcb_v2_set(tcb, TCB_OFF_WINDOW, 65535)
+    0
+}
+
+@kernel fn tcp_v2_on_syn_received(tcb: i64, remote_ip: i64, remote_port: i64, their_seq: i64) {
+    tcb_v2_set(tcb, TCB_OFF_REMOTE_IP, remote_ip)
+    tcb_v2_set(tcb, TCB_OFF_REMOTE_PORT, remote_port)
+    tcb_v2_set(tcb, TCB_OFF_RCV_NXT, their_seq + 1)
+    let isn = volatile_read_u64(0x6FE08) * 1000
+    tcb_v2_set(tcb, TCB_OFF_SND_NXT, isn + 1)
+    tcb_v2_set(tcb, TCB_OFF_SND_UNA, isn)
+    tcb_v2_set(tcb, TCB_OFF_STATE, TCP_SYN_RCVD)
+}
+
+@kernel fn tcp_v2_on_data(tcb: i64, data_seq: i64, data_len: i64) {
+    let expected = tcb_v2_get(tcb, TCB_OFF_RCV_NXT)
+    if data_seq == expected {
+        tcb_v2_set(tcb, TCB_OFF_RCV_NXT, expected + data_len)
+        let rx_len = tcb_v2_get(tcb, TCB_OFF_RX_LEN)
+        tcb_v2_set(tcb, TCB_OFF_RX_LEN, rx_len + data_len)
+    }
+}
+
+@kernel fn tcp_v2_on_ack(tcb: i64, ack_num: i64) {
+    let una = tcb_v2_get(tcb, TCB_OFF_SND_UNA)
+    if ack_num > una {
+        tcb_v2_set(tcb, TCB_OFF_SND_UNA, ack_num)
+        tcb_v2_set(tcb, TCB_OFF_TIMER, volatile_read_u64(0x6FE08) + TCP_RTO)
+        tcb_v2_set(tcb, TCB_OFF_RETRIES, 0)
+    }
+    let state = tcb_v2_get(tcb, TCB_OFF_STATE)
+    if state == TCP_SYN_SENT { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_ESTABLISHED) }
+    if state == TCP_SYN_RCVD { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_ESTABLISHED) }
+    if state == TCP_FIN_WAIT_1 { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_FIN_WAIT_2) }
+    if state == TCP_LAST_ACK { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_CLOSED) }
+}
+
+@kernel fn tcp_v2_close(tcb: i64) {
+    let state = tcb_v2_get(tcb, TCB_OFF_STATE)
+    if state == TCP_ESTABLISHED { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_FIN_WAIT_1) }
+    if state == TCP_CLOSE_WAIT { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_LAST_ACK) }
+}
+
+@kernel fn tcp_v2_on_fin(tcb: i64) {
+    let state = tcb_v2_get(tcb, TCB_OFF_STATE)
+    let rcv_nxt = tcb_v2_get(tcb, TCB_OFF_RCV_NXT)
+    tcb_v2_set(tcb, TCB_OFF_RCV_NXT, rcv_nxt + 1)
+    if state == TCP_ESTABLISHED { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_CLOSE_WAIT) }
+    if state == TCP_FIN_WAIT_1 { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_CLOSING) }
+    if state == TCP_FIN_WAIT_2 { tcb_v2_set(tcb, TCB_OFF_STATE, TCP_TIME_WAIT) }
+}
+
+@kernel fn tcp_v2_reset(tcb: i64) {
+    tcb_v2_set(tcb, TCB_OFF_STATE, TCP_CLOSED)
+    tcb_v2_set(tcb, TCB_OFF_RX_LEN, 0)
+    tcb_v2_set(tcb, TCB_OFF_TX_LEN, 0)
+}
+
+// Retransmission timer check
+@kernel fn tcp_v2_check_timers() {
+    let now = volatile_read_u64(0x6FE08)
+    let mut i: i64 = 0
+    while i < TCB_MAX {
+        let state = tcb_v2_get(i, TCB_OFF_STATE)
+        if state != TCP_CLOSED && state != TCP_LISTEN {
+            let timer = tcb_v2_get(i, TCB_OFF_TIMER)
+            if timer > 0 && now >= timer {
+                let retries = tcb_v2_get(i, TCB_OFF_RETRIES)
+                if retries >= TCP_MAX_RETRIES {
+                    tcp_v2_reset(i)
+                } else {
+                    tcb_v2_set(i, TCB_OFF_RETRIES, retries + 1)
+                    tcb_v2_set(i, TCB_OFF_TIMER, now + TCP_RTO)
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Server accept
+@kernel fn tcp_v2_server_accept(listen_tcb: i64) -> i64 {
+    let state = tcb_v2_get(listen_tcb, TCB_OFF_STATE)
+    if state != TCP_LISTEN { return -1 }
+    let new_tcb = tcb_v2_alloc()
+    if new_tcb < 0 { return -1 }
+    tcb_v2_set(new_tcb, TCB_OFF_LOCAL_PORT, tcb_v2_get(listen_tcb, TCB_OFF_LOCAL_PORT))
+    tcb_v2_set(new_tcb, TCB_OFF_STATE, TCP_ESTABLISHED)
+    tcb_v2_set(new_tcb, TCB_OFF_WINDOW, 65535)
+    let isn = volatile_read_u64(0x6FE08) * 1000
+    tcb_v2_set(new_tcb, TCB_OFF_SND_NXT, isn + 1)
+    tcb_v2_set(new_tcb, TCB_OFF_SND_UNA, isn)
+    new_tcb
+}
+
+// ═══════════════════════════════════════════════
+// Shell: tcpstat
+// ═══════════════════════════════════════════════
+
+@kernel fn cmd_tcpstat_v2() {
+    cprintln("TCP connections:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    let mut count: i64 = 0
+    while i < TCB_MAX {
+        let state = tcb_v2_get(i, TCB_OFF_STATE)
+        if state != TCP_CLOSED {
+            cprint("  [", WHITE_ON_BLACK)
+            cprint_decimal(i, CYAN_ON_BLACK)
+            cprint("] :", WHITE_ON_BLACK)
+            cprint_decimal(tcb_v2_get(i, TCB_OFF_LOCAL_PORT), CYAN_ON_BLACK)
+            cprint(" -> :", WHITE_ON_BLACK)
+            cprint_decimal(tcb_v2_get(i, TCB_OFF_REMOTE_PORT), WHITE_ON_BLACK)
+            cprint(" seq=", WHITE_ON_BLACK)
+            cprint_decimal(tcb_v2_get(i, TCB_OFF_SND_NXT), WHITE_ON_BLACK)
+            cprint(" ack=", WHITE_ON_BLACK)
+            cprint_decimal(tcb_v2_get(i, TCB_OFF_RCV_NXT), WHITE_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            tcp_v2_state_name(state)
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (none)", WHITE_ON_BLACK) }
+}

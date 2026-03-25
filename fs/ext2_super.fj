@@ -1,0 +1,208 @@
+// FajarOS Nova v1.4.0 "Zenith" — ext2 Superblock + Allocators
+// Synced from Nova kernel v0.9 Sprint S1
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// ext2 On-Disk Layout (simplified for Nova)
+// Sector 0-1: boot (reserved)
+// Sector 2-3: Superblock (1KB)
+// Sector 4-7: Block bitmap (4 sectors = 2KB = 16K blocks trackable)
+// Sector 8-11: Inode bitmap (4 sectors = 2KB = 16K inodes trackable)
+// Sector 12-139: Inode table (128 sectors = 256 inodes x 128B each)
+// Sector 140+: Data blocks (4KB each = 8 sectors per block)
+// ═══════════════════════════════════════════════
+
+const EXT2_SUPERBLOCK_SECTOR: i64 = 2
+const EXT2_BLOCK_BITMAP_SECTOR: i64 = 4
+const EXT2_INODE_BITMAP_SECTOR: i64 = 8
+const EXT2_INODE_TABLE_SECTOR: i64 = 12
+const EXT2_DATA_START_SECTOR: i64 = 140
+const EXT2_BLOCK_SIZE: i64 = 4096
+const EXT2_SECTORS_PER_BLOCK: i64 = 8
+const EXT2_INODE_SIZE: i64 = 128
+const EXT2_MAX_INODES: i64 = 256
+const EXT2_MAX_BLOCKS: i64 = 16384
+
+// Superblock fields (at sector 2, 1024 bytes)
+const EXT2_SB_MAGIC: i64 = 0xEF53
+const EXT2_SB_OFF_MAGIC: i64 = 56
+const EXT2_SB_OFF_INODE_COUNT: i64 = 0
+const EXT2_SB_OFF_BLOCK_COUNT: i64 = 4
+const EXT2_SB_OFF_FREE_BLOCKS: i64 = 12
+const EXT2_SB_OFF_FREE_INODES: i64 = 16
+const EXT2_SB_OFF_BLOCK_SIZE: i64 = 24
+const EXT2_SB_OFF_FIRST_DATA: i64 = 20
+
+// Inode fields (128 bytes each)
+const EXT2_INO_OFF_MODE: i64 = 0
+const EXT2_INO_OFF_UID: i64 = 2
+const EXT2_INO_OFF_SIZE: i64 = 4
+const EXT2_INO_OFF_GID: i64 = 24
+const EXT2_INO_OFF_LINKS: i64 = 26
+const EXT2_INO_OFF_BLOCKS: i64 = 28
+const EXT2_INO_OFF_BLOCK0: i64 = 40
+const EXT2_INO_OFF_INDIRECT: i64 = 88
+
+// ext2 state buffer at 0xA00000 (4KB scratch for NVMe I/O)
+const EXT2_BUF: i64 = 0xA00000
+const EXT2_STATE: i64 = 0xA01000
+
+// ═══════════════════════════════════════════════
+// Superblock I/O
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_read_superblock() -> i64 {
+    let blk_dev = volatile_read_u64(EXT2_STATE + 8)
+    let result = blk_read(blk_dev, EXT2_SUPERBLOCK_SECTOR, 2, EXT2_BUF)
+    if result < 0 { return -1 }
+    let magic = volatile_read_u8(EXT2_BUF + EXT2_SB_OFF_MAGIC) + volatile_read_u8(EXT2_BUF + EXT2_SB_OFF_MAGIC + 1) * 256
+    if magic != EXT2_SB_MAGIC { return -2 }
+    0
+}
+
+// ═══════════════════════════════════════════════
+// Inode Table I/O
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_read_inode(inode_num: i64) -> i64 {
+    if inode_num < 1 || inode_num > EXT2_MAX_INODES { return -1 }
+    let idx = inode_num - 1
+    let sector = EXT2_INODE_TABLE_SECTOR + (idx * EXT2_INODE_SIZE) / 512
+    let offset_in_sector = (idx * EXT2_INODE_SIZE) % 512
+    let result = blk_read(volatile_read_u64(EXT2_STATE + 8), sector, 1, EXT2_BUF)
+    if result < 0 { return -1 }
+    EXT2_BUF + offset_in_sector
+}
+
+// ═══════════════════════════════════════════════
+// Block + Inode Allocators
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_block_alloc() -> i64 {
+    let blk_dev = volatile_read_u64(EXT2_STATE + 8)
+    let result = blk_read(blk_dev, EXT2_BLOCK_BITMAP_SECTOR, 4, EXT2_BUF)
+    if result < 0 { return -1 }
+    let mut byte: i64 = 0
+    while byte < 2048 {
+        let val = volatile_read_u8(EXT2_BUF + byte)
+        if val != 0xFF {
+            let mut bit: i64 = 0
+            while bit < 8 {
+                if (val & (1 << bit)) == 0 {
+                    let block_num = byte * 8 + bit
+                    volatile_write_u8(EXT2_BUF + byte, val | (1 << bit))
+                    blk_write(blk_dev, EXT2_BLOCK_BITMAP_SECTOR, 4, EXT2_BUF)
+                    return block_num
+                }
+                bit = bit + 1
+            }
+        }
+        byte = byte + 1
+    }
+    -1
+}
+
+@kernel fn ext2_inode_alloc() -> i64 {
+    let blk_dev = volatile_read_u64(EXT2_STATE + 8)
+    let result = blk_read(blk_dev, EXT2_INODE_BITMAP_SECTOR, 4, EXT2_BUF)
+    if result < 0 { return -1 }
+    let mut byte: i64 = 0
+    while byte < 32 {
+        let val = volatile_read_u8(EXT2_BUF + byte)
+        if val != 0xFF {
+            let mut bit: i64 = 0
+            while bit < 8 {
+                if (val & (1 << bit)) == 0 {
+                    let inode_num = byte * 8 + bit + 1
+                    volatile_write_u8(EXT2_BUF + byte, val | (1 << bit))
+                    blk_write(blk_dev, EXT2_INODE_BITMAP_SECTOR, 4, EXT2_BUF)
+                    return inode_num
+                }
+                bit = bit + 1
+            }
+        }
+        byte = byte + 1
+    }
+    -1
+}
+
+// ═══════════════════════════════════════════════
+// Block I/O
+// ═══════════════════════════════════════════════
+
+@kernel fn ext2_read_block(block_num: i64, buf: i64) -> i64 {
+    let sector = EXT2_DATA_START_SECTOR + block_num * EXT2_SECTORS_PER_BLOCK
+    blk_read(volatile_read_u64(EXT2_STATE + 8), sector, EXT2_SECTORS_PER_BLOCK, buf)
+}
+
+@kernel fn ext2_write_block(block_num: i64, buf: i64) -> i64 {
+    let sector = EXT2_DATA_START_SECTOR + block_num * EXT2_SECTORS_PER_BLOCK
+    blk_write(volatile_read_u64(EXT2_STATE + 8), sector, EXT2_SECTORS_PER_BLOCK, buf)
+}
+
+// ═══════════════════════════════════════════════
+// mkfs.ext2 — Format NVMe with ext2
+// ═══════════════════════════════════════════════
+
+@kernel fn cmd_mkfs_ext2() {
+    let len = cmdbuf_len()
+    let blk_dev: i64 = if len > 10 { volatile_read_u8(0x6F800 + 10) - 48 } else { 0 }
+    volatile_write_u64(EXT2_STATE + 8, blk_dev)
+    cprintln("Formatting ext2...", YELLOW_ON_BLACK)
+
+    // Write superblock
+    let mut i: i64 = 0
+    while i < 1024 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
+    volatile_write_u32_le(EXT2_BUF + EXT2_SB_OFF_INODE_COUNT, EXT2_MAX_INODES)
+    volatile_write_u32_le(EXT2_BUF + EXT2_SB_OFF_BLOCK_COUNT, EXT2_MAX_BLOCKS)
+    volatile_write_u32_le(EXT2_BUF + EXT2_SB_OFF_FREE_BLOCKS, EXT2_MAX_BLOCKS - 1)
+    volatile_write_u32_le(EXT2_BUF + EXT2_SB_OFF_FREE_INODES, EXT2_MAX_INODES - 1)
+    volatile_write_u32_le(EXT2_BUF + EXT2_SB_OFF_FIRST_DATA, EXT2_DATA_START_SECTOR)
+    volatile_write_u32_le(EXT2_BUF + EXT2_SB_OFF_BLOCK_SIZE, 2)
+    volatile_write_u8(EXT2_BUF + EXT2_SB_OFF_MAGIC, EXT2_SB_MAGIC & 0xFF)
+    volatile_write_u8(EXT2_BUF + EXT2_SB_OFF_MAGIC + 1, (EXT2_SB_MAGIC >> 8) & 0xFF)
+    blk_write(blk_dev, EXT2_SUPERBLOCK_SECTOR, 2, EXT2_BUF)
+
+    // Clear bitmaps
+    i = 0
+    while i < 2048 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
+    blk_write(blk_dev, EXT2_BLOCK_BITMAP_SECTOR, 4, EXT2_BUF)
+    blk_write(blk_dev, EXT2_INODE_BITMAP_SECTOR, 4, EXT2_BUF)
+
+    // Create root inode (inode 2)
+    i = 0
+    while i < 512 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
+    volatile_write_u8(EXT2_BUF + EXT2_INO_OFF_MODE, 0xED)
+    volatile_write_u8(EXT2_BUF + EXT2_INO_OFF_MODE + 1, 0x41)
+    volatile_write_u8(EXT2_BUF + EXT2_INO_OFF_LINKS, 2)
+    blk_write(blk_dev, EXT2_INODE_TABLE_SECTOR + 1, 1, EXT2_BUF)
+
+    // Mark inode 1+2 as used
+    i = 0
+    while i < 2048 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
+    volatile_write_u8(EXT2_BUF, 0x03)
+    blk_write(blk_dev, EXT2_INODE_BITMAP_SECTOR, 4, EXT2_BUF)
+
+    volatile_write_u64(EXT2_STATE, 1)
+    volatile_write_u64(EXT2_STATE + 16, EXT2_MAX_BLOCKS)
+    volatile_write_u64(EXT2_STATE + 24, EXT2_MAX_BLOCKS - 1)
+
+    cprintln("ext2 formatted:", GREEN_ON_BLACK)
+    cprint("  Inodes: ", WHITE_ON_BLACK); cprint_decimal(EXT2_MAX_INODES, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Blocks: ", WHITE_ON_BLACK); cprint_decimal(EXT2_MAX_BLOCKS, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Block size: ", WHITE_ON_BLACK); cprint_decimal(EXT2_BLOCK_SIZE, CYAN_ON_BLACK); cprintln(" bytes", WHITE_ON_BLACK)
+    cprintln("  Root inode: 2", WHITE_ON_BLACK)
+}
+
+// Mount ext2 from NVMe
+@kernel fn cmd_mount_ext2() {
+    let blk_dev: i64 = 0
+    volatile_write_u64(EXT2_STATE + 8, blk_dev)
+    let result = ext2_read_superblock()
+    if result < 0 {
+        cprintln("ext2 mount failed (bad superblock)", RED_ON_BLACK)
+        return
+    }
+    volatile_write_u64(EXT2_STATE, 1)
+    cprintln("ext2 mounted on /mnt", GREEN_ON_BLACK)
+}

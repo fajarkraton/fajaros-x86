@@ -1,0 +1,51 @@
+// FajarOS Nova v1.4.0 "Zenith" — UDP Protocol
+// Synced from Nova kernel v0.9 Sprint T2
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// UDP Send — build UDP header + data
+// ═══════════════════════════════════════════════
+
+// UDP packet scratch buffer at 0xA06100
+const UDP_PKT_BUF: i64 = 0xA06100
+
+@kernel fn udp_v2_send(local_port: i64, remote_ip: i64, remote_port: i64, data: i64, len: i64) -> i64 {
+    let pkt = UDP_PKT_BUF
+    // Source port (2B big-endian)
+    volatile_write_u8(pkt, (local_port >> 8) & 0xFF)
+    volatile_write_u8(pkt + 1, local_port & 0xFF)
+    // Dest port (2B big-endian)
+    volatile_write_u8(pkt + 2, (remote_port >> 8) & 0xFF)
+    volatile_write_u8(pkt + 3, remote_port & 0xFF)
+    // Length (2B)
+    let total = 8 + len
+    volatile_write_u8(pkt + 4, (total >> 8) & 0xFF)
+    volatile_write_u8(pkt + 5, total & 0xFF)
+    // Checksum (0 = disabled)
+    volatile_write_u8(pkt + 6, 0)
+    volatile_write_u8(pkt + 7, 0)
+    // Copy data
+    let mut i: i64 = 0
+    while i < len { volatile_write_u8(pkt + 8 + i, volatile_read_u8(data + i)); i = i + 1 }
+    total
+}
+
+// DNS client v2 — with retry
+@kernel fn dns_resolve_v2(name_addr: i64, name_len: i64) -> i64 {
+    let mut retries: i64 = 0
+    let max_retries: i64 = 3
+    let mut result: i64 = -1
+    while retries < max_retries && result < 0 {
+        result = udp_v2_send(53000 + retries, 0x0A000203, 53, name_addr, name_len)
+        if result < 0 { retries = retries + 1 }
+        else { result = 0 }
+    }
+    result
+}
+
+// DHCP renew
+@kernel fn dhcp_v2_renew() {
+    cprint("[DHCP] Renewing lease at T=", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(0x6FE08), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}

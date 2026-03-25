@@ -1,0 +1,106 @@
+// FajarOS Nova v1.4.0 "Zenith" — Network Statistics
+// Synced from Nova kernel v0.9 Sprint T2
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Network Statistics at 0xA06000
+// ═══════════════════════════════════════════════
+
+const NET_STATS: i64 = 0xA06000
+const NSTAT_RX_PACKETS: i64 = 0
+const NSTAT_TX_PACKETS: i64 = 8
+const NSTAT_RX_BYTES: i64 = 16
+const NSTAT_TX_BYTES: i64 = 24
+const NSTAT_ERRORS: i64 = 32
+const NSTAT_DROPPED: i64 = 40
+const NSTAT_TCP_CONNS: i64 = 48
+const NSTAT_UDP_DGRAMS: i64 = 56
+
+// ARP aging constants
+const ARP_MAX_AGE: i64 = 300
+const ARP_MAX_ENTRIES: i64 = 16
+
+// ═══════════════════════════════════════════════
+// Statistics Init + Helpers
+// ═══════════════════════════════════════════════
+
+@kernel fn net_stats_init() {
+    let mut i: i64 = 0
+    while i < 64 { volatile_write_u8(NET_STATS + i, 0); i = i + 1 }
+}
+
+@kernel fn net_stat_inc(field: i64, amount: i64) {
+    let val = volatile_read_u64(NET_STATS + field)
+    volatile_write_u64(NET_STATS + field, val + amount)
+}
+
+// ARP table aging
+@kernel fn arp_check_age() {
+    let now = volatile_read_u64(0x6FE08)
+    let arp_cache = 0x878000
+    let mut i: i64 = 0
+    while i < ARP_MAX_ENTRIES {
+        let entry = arp_cache + i * 16
+        let ip = volatile_read_u64(entry)
+        if ip != 0 {
+            let timestamp = volatile_read_u64(entry + 8) & 0xFFFFFFFF0000
+            let age = now - (timestamp >> 16)
+            if age > ARP_MAX_AGE {
+                volatile_write_u64(entry, 0)
+                volatile_write_u64(entry + 8, 0)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════
+
+// Enhanced ifconfig with statistics
+@kernel fn cmd_ifconfig_v2() {
+    cprintln("Network interfaces:", YELLOW_ON_BLACK)
+    cprint("  eth0: ", WHITE_ON_BLACK)
+    let ip = net_state_read(16)
+    if ip != 0 {
+        cprint_decimal((ip >> 24) & 0xFF, CYAN_ON_BLACK); cprint(".", WHITE_ON_BLACK)
+        cprint_decimal((ip >> 16) & 0xFF, CYAN_ON_BLACK); cprint(".", WHITE_ON_BLACK)
+        cprint_decimal((ip >> 8) & 0xFF, CYAN_ON_BLACK); cprint(".", WHITE_ON_BLACK)
+        cprint_decimal(ip & 0xFF, CYAN_ON_BLACK)
+    } else { cprint("(no IP)", WHITE_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  RX: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_RX_PACKETS), CYAN_ON_BLACK)
+    cprint(" pkts, ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_RX_BYTES), CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+    cprint("  TX: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_TX_PACKETS), CYAN_ON_BLACK)
+    cprint(" pkts, ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_TX_BYTES), CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+    cprint("  Errors: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_ERRORS), WHITE_ON_BLACK)
+    cprint("  Dropped: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_DROPPED), WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  TCP conns: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_TCP_CONNS), CYAN_ON_BLACK)
+    cprint("  UDP dgrams: ", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_UDP_DGRAMS), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+// netstat v2 — detailed statistics
+@kernel fn cmd_netstat_v2() {
+    cprintln("Network statistics:", YELLOW_ON_BLACK)
+    cprint("  RX packets: ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_RX_PACKETS), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  TX packets: ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_TX_PACKETS), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  RX bytes:   ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_RX_BYTES), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  TX bytes:   ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_TX_BYTES), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Errors:     ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_ERRORS), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Dropped:    ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_DROPPED), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  TCP conns:  ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_TCP_CONNS), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  UDP dgrams: ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(NET_STATS + NSTAT_UDP_DGRAMS), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+}
