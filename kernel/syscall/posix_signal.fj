@@ -1,0 +1,31 @@
+// FajarOS Nova v2.0.0 "Absolute" — POSIX Signal + Process Syscalls
+// sigaction, alarm, getppid, nanosleep
+
+const SYS_SIGACTION: i64 = 46
+const SYS_ALARM: i64 = 48
+const SYS_GETPPID: i64 = 49
+const SYS_NANOSLEEP: i64 = 50
+
+@kernel fn sys_sigaction(signum: i64, handler: i64, old_handler_buf: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    if signum < 1 || signum > 8 { return -1 }
+    let old = signal_get_handler(pid, signum)
+    if old_handler_buf != 0 { volatile_write_u64(old_handler_buf, old) }
+    signal_set_handler(pid, signum, handler)
+    0
+}
+
+@kernel fn sys_alarm(seconds: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let ticks = seconds * 100
+    let target = volatile_read_u64(0x6FE08) + ticks
+    volatile_write_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + 104, target)
+    0
+}
+
+@kernel fn sys_getppid() -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_PPID)
+}
+
+@kernel fn sys_nanosleep(ms: i64) -> i64 { sys_sleep(ms) }

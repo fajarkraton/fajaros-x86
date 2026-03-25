@@ -1,0 +1,58 @@
+// FajarOS Nova v2.0.0 "Absolute" — TCP V3: Congestion Control + Checksum
+
+const TCP_MSS: i64 = 1460
+const TCP_CWND_INIT: i64 = 1460
+const TCB_OFF_CWND: i64 = 104
+const TCB_OFF_SSTHRESH: i64 = 112
+
+// Nagle algorithm — coalesce small segments
+@kernel fn tcp_nagle_check(tcb: i64, data_len: i64) -> i64 {
+    let pending = tcb_v2_get(tcb, TCB_OFF_TX_LEN)
+    let una = tcb_v2_get(tcb, TCB_OFF_SND_UNA)
+    let nxt = tcb_v2_get(tcb, TCB_OFF_SND_NXT)
+    if nxt > una && data_len < TCP_MSS { return 0 }
+    1
+}
+
+// AIMD congestion control
+@kernel fn tcp_congestion_on_ack(tcb: i64) {
+    let cwnd = volatile_read_u64(tcb_v2_addr(tcb) + TCB_OFF_CWND)
+    let ssthresh = volatile_read_u64(tcb_v2_addr(tcb) + TCB_OFF_SSTHRESH)
+    if cwnd < ssthresh {
+        volatile_write_u64(tcb_v2_addr(tcb) + TCB_OFF_CWND, cwnd + TCP_MSS)
+    } else {
+        volatile_write_u64(tcb_v2_addr(tcb) + TCB_OFF_CWND, cwnd + TCP_MSS * TCP_MSS / cwnd)
+    }
+}
+
+@kernel fn tcp_congestion_on_loss(tcb: i64) {
+    let cwnd = volatile_read_u64(tcb_v2_addr(tcb) + TCB_OFF_CWND)
+    let new_ssthresh = if cwnd / 2 > TCP_MSS { cwnd / 2 } else { TCP_MSS }
+    volatile_write_u64(tcb_v2_addr(tcb) + TCB_OFF_SSTHRESH, new_ssthresh)
+    volatile_write_u64(tcb_v2_addr(tcb) + TCB_OFF_CWND, TCP_MSS)
+}
+
+// TCP checksum (RFC 793)
+@kernel fn tcp_checksum(src_ip: i64, dst_ip: i64, tcp_buf: i64, tcp_len: i64) -> i64 {
+    let mut sum: i64 = 0
+    sum = sum + ((src_ip >> 16) & 0xFFFF) + (src_ip & 0xFFFF)
+    sum = sum + ((dst_ip >> 16) & 0xFFFF) + (dst_ip & 0xFFFF)
+    sum = sum + 6 + tcp_len
+    let mut i: i64 = 0
+    while i < tcp_len - 1 {
+        sum = sum + volatile_read_u8(tcp_buf + i) * 256 + volatile_read_u8(tcp_buf + i + 1)
+        i = i + 2
+    }
+    if tcp_len % 2 == 1 { sum = sum + volatile_read_u8(tcp_buf + tcp_len - 1) * 256 }
+    while sum > 0xFFFF { sum = (sum >> 16) + (sum & 0xFFFF) }
+    (sum ^ 0xFFFF) & 0xFFFF
+}
+
+// MSS option builder
+@kernel fn tcp_build_options(buf: i64) -> i64 {
+    volatile_write_u8(buf, 2)
+    volatile_write_u8(buf + 1, 4)
+    volatile_write_u8(buf + 2, (TCP_MSS >> 8) & 0xFF)
+    volatile_write_u8(buf + 3, TCP_MSS & 0xFF)
+    4
+}

@@ -1,0 +1,33 @@
+// FajarOS Nova v2.0.0 "Absolute" — Per-CPU Run Queues
+// Linked list via PROC_OFF_RQ_NEXT in process table
+
+const PROC_OFF_CPU: i64 = 184
+const PROC_OFF_RQ_NEXT: i64 = 216
+
+@kernel fn pcpu_rq_enqueue(cpu: i64, pid: i64) {
+    volatile_write_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_RQ_NEXT, -1)
+    volatile_write_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_CPU, cpu)
+    let tail = pcpu_get(cpu, PCPU_OFF_RQ_TAIL)
+    if tail == -1 {
+        pcpu_set(cpu, PCPU_OFF_RQ_HEAD, pid)
+        pcpu_set(cpu, PCPU_OFF_RQ_TAIL, pid)
+    } else {
+        volatile_write_u64(PROC_TABLE + tail * PROC_ENTRY_SIZE + PROC_OFF_RQ_NEXT, pid)
+        pcpu_set(cpu, PCPU_OFF_RQ_TAIL, pid)
+    }
+    let count = pcpu_get(cpu, PCPU_OFF_RQ_COUNT)
+    pcpu_set(cpu, PCPU_OFF_RQ_COUNT, count + 1)
+    let load = pcpu_get(cpu, PCPU_OFF_LOAD)
+    pcpu_set(cpu, PCPU_OFF_LOAD, load + 1)
+}
+
+@kernel fn pcpu_rq_dequeue(cpu: i64) -> i64 {
+    let head = pcpu_get(cpu, PCPU_OFF_RQ_HEAD)
+    if head == -1 { return -1 }
+    let next = volatile_read_u64(PROC_TABLE + head * PROC_ENTRY_SIZE + PROC_OFF_RQ_NEXT)
+    pcpu_set(cpu, PCPU_OFF_RQ_HEAD, next)
+    if next == -1 { pcpu_set(cpu, PCPU_OFF_RQ_TAIL, -1) }
+    let count = pcpu_get(cpu, PCPU_OFF_RQ_COUNT)
+    if count > 0 { pcpu_set(cpu, PCPU_OFF_RQ_COUNT, count - 1) }
+    head
+}

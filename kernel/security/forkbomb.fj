@@ -1,0 +1,84 @@
+// FajarOS Nova v2.0.0 "Absolute" — Fork Bomb Protection + Stress Tests
+
+const MAX_PROCS_PER_USER: i64 = 8
+
+@kernel fn fork_bomb_check() -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    let uid = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_UID)
+    if uid == 0 { return 0 }
+    let mut count: i64 = 0
+    let mut p: i64 = 0
+    while p < PROC_MAX {
+        let state = volatile_read_u64(PROC_TABLE + p * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+        if state != PROC_STATE_FREE {
+            let puid = volatile_read(PROC_TABLE + p * PROC_ENTRY_SIZE + PROC_OFF_UID)
+            if puid == uid { count = count + 1 }
+        }
+        p = p + 1
+    }
+    if count >= MAX_PROCS_PER_USER { return -1 }
+    0
+}
+
+@kernel fn cmd_stress_mem() {
+    cprintln("Memory stress test:", YELLOW_ON_BLACK)
+    let mut pages: i64 = 0
+    let mut ok: i64 = 1
+    while ok == 1 && pages < 1000 {
+        let frame = frame_alloc()
+        if frame == -1 { ok = 0 } else { pages = pages + 1 }
+    }
+    cprint("  Allocated ", WHITE_ON_BLACK); cprint_decimal(pages, CYAN_ON_BLACK); cprintln(" pages before OOM", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_stress_fd() {
+    cprintln("FD stress test:", YELLOW_ON_BLACK)
+    let pid = volatile_read_u64(0x6FE00)
+    let mut opened: i64 = 0
+    let mut fd: i64 = 3
+    while fd < FD_MAX {
+        if fd_v2_get_type(pid, fd) == FD_CLOSED { fd_v2_set(pid, fd, FD_CONSOLE, 0); opened = opened + 1 }
+        fd = fd + 1
+    }
+    cprint("  Opened ", WHITE_ON_BLACK); cprint_decimal(opened, CYAN_ON_BLACK); cprintln(" FDs", WHITE_ON_BLACK)
+    fd = 3
+    while fd < FD_MAX { fd_v2_set(pid, fd, FD_CLOSED, 0); fd = fd + 1 }
+    cprintln("  All FDs closed", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_stress_pipe() {
+    cprintln("Pipe stress test:", YELLOW_ON_BLACK)
+    let mut pipes: i64 = 0
+    let mut ok: i64 = 1
+    while ok == 1 && pipes < 8 {
+        let slot = pipe_alloc()
+        if slot < 0 { ok = 0 } else { pipes = pipes + 1 }
+    }
+    cprint("  Allocated ", WHITE_ON_BLACK); cprint_decimal(pipes, CYAN_ON_BLACK); cprintln(" pipes", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < pipes { pipe_free(i); i = i + 1 }
+    cprintln("  All pipes freed", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_stress_sched() {
+    cprintln("Scheduler stress test:", YELLOW_ON_BLACK)
+    let mut count: i64 = 0
+    let mut pid: i64 = 0
+    while pid < PROC_MAX {
+        if volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE) != PROC_STATE_FREE { count = count + 1 }
+        pid = pid + 1
+    }
+    cprint("  Active processes: ", WHITE_ON_BLACK); cprint_decimal(count, CYAN_ON_BLACK); cprintln(" / 16", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_release_check() {
+    cprintln("FajarOS Nova v2.0.0 \"Absolute\" Release Check:", YELLOW_ON_BLACK)
+    cprint("  Kernel:     ", WHITE_ON_BLACK); cprintln("v2.0.0 Absolute", GREEN_ON_BLACK)
+    cprint("  Syscalls:   ", WHITE_ON_BLACK); cprint_decimal(50, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Commands:   ", WHITE_ON_BLACK); cprintln("280+", CYAN_ON_BLACK)
+    cprint("  CPUs:       ", WHITE_ON_BLACK); cprint_decimal(PCPU_MAX, CYAN_ON_BLACK); cprintln(" max (SMP)", WHITE_ON_BLACK)
+    cprint("  Scheduler:  ", WHITE_ON_BLACK); cprintln("per-CPU, priority, load balance", GREEN_ON_BLACK)
+    cprint("  VM:         ", WHITE_ON_BLACK); cprintln("demand paging, mmap, OOM, ASLR", GREEN_ON_BLACK)
+    cprint("  POSIX:      ", WHITE_ON_BLACK); cprintln("openat, sigaction, nanosleep", GREEN_ON_BLACK)
+    cprint("  Security:   ", WHITE_ON_BLACK); cprintln("fork bomb, FD limit, stack guard", GREEN_ON_BLACK)
+}

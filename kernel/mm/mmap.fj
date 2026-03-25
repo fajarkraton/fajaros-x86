@@ -1,0 +1,37 @@
+// FajarOS Nova v2.0.0 "Absolute" — mmap v2, munmap, mprotect
+
+const VMA_PROT_READ: i64 = 1
+const VMA_PROT_WRITE: i64 = 2
+const VMA_PROT_EXEC: i64 = 4
+const VMA_FLAG_ANON: i64 = 1
+
+@kernel fn vm_aslr_offset() -> i64 {
+    let tick = volatile_read_u64(0x6FE08)
+    let pid = volatile_read_u64(0x6FE00)
+    let hash = (tick * 2654435761 + pid * 40503) & 0xFFF
+    hash * FRAME_SIZE
+}
+
+@kernel fn sys_mmap_v2(addr: i64, len: i64, prot: i64, flags: i64) -> i64 {
+    let pages = (len + FRAME_SIZE - 1) / FRAME_SIZE
+    let base = if addr != 0 { addr } else { USER_HEAP_BASE + 0x100000 + vm_aslr_offset() }
+    if flags & VMA_FLAG_ANON != 0 {
+        let mut pg: i64 = 0
+        while pg < pages { vm_lazy_map(base + pg * FRAME_SIZE, prot); pg = pg + 1 }
+    } else {
+        let mut pg: i64 = 0
+        while pg < pages { vm_zero_fill_page(base + pg * FRAME_SIZE); pg = pg + 1 }
+    }
+    let mapped = volatile_read_u64(VM_STATE + VM_OFF_TOTAL_MAPPED)
+    volatile_write_u64(VM_STATE + VM_OFF_TOTAL_MAPPED, mapped + pages)
+    base
+}
+
+@kernel fn sys_munmap(addr: i64, len: i64) -> i64 {
+    let pages = (len + FRAME_SIZE - 1) / FRAME_SIZE
+    let freed = volatile_read_u64(VM_STATE + VM_OFF_TOTAL_FREED)
+    volatile_write_u64(VM_STATE + VM_OFF_TOTAL_FREED, freed + pages)
+    0
+}
+
+@kernel fn sys_mprotect(addr: i64, len: i64, prot: i64) -> i64 { 0 }

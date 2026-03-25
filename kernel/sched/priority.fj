@@ -1,0 +1,62 @@
+// FajarOS Nova v2.0.0 "Absolute" — Priority Scheduling
+// Priority 0-39 (nice -20 to +19), timeslice by priority
+
+const PROC_OFF_PRIORITY: i64 = 200
+const PROC_OFF_TIMESLICE: i64 = 208
+const PROC_OFF_AFFINITY: i64 = 192
+
+const PRIO_MIN: i64 = 0
+const PRIO_DEFAULT: i64 = 20
+const PRIO_MAX: i64 = 39
+const PRIO_RT_MAX: i64 = 9
+
+@kernel fn proc_set_priority(pid: i64, prio: i64) {
+    if pid < 0 || pid >= PROC_MAX { return }
+    let p = if prio < PRIO_MIN { PRIO_MIN } else if prio > PRIO_MAX { PRIO_MAX } else { prio }
+    volatile_write_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_PRIORITY, p)
+}
+
+@kernel fn proc_get_priority(pid: i64) -> i64 {
+    if pid < 0 || pid >= PROC_MAX { return PRIO_DEFAULT }
+    volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_PRIORITY)
+}
+
+// Priority inheritance for mutex holders
+@kernel fn prio_inherit(holder_pid: i64, waiter_pid: i64) {
+    let holder_prio = proc_get_priority(holder_pid)
+    let waiter_prio = proc_get_priority(waiter_pid)
+    if waiter_prio < holder_prio { proc_set_priority(holder_pid, waiter_prio) }
+}
+
+// Timer tick — per-CPU scheduling with timeslice
+@kernel fn pcpu_timer_tick(cpu: i64) {
+    let current = pcpu_get(cpu, PCPU_OFF_CURRENT)
+    if current >= 0 && current < PROC_MAX {
+        let ts = volatile_read_u64(PROC_TABLE + current * PROC_ENTRY_SIZE + PROC_OFF_TIMESLICE)
+        if ts > 0 {
+            volatile_write_u64(PROC_TABLE + current * PROC_ENTRY_SIZE + PROC_OFF_TIMESLICE, ts - 1)
+            if ts - 1 == 0 {
+                pcpu_rq_enqueue(cpu, current)
+                let next = pcpu_rq_dequeue(cpu)
+                if next >= 0 {
+                    pcpu_set(cpu, PCPU_OFF_CURRENT, next)
+                    let prio = volatile_read_u64(PROC_TABLE + next * PROC_ENTRY_SIZE + PROC_OFF_PRIORITY)
+                    let slice = if prio < 10 { 20 } else if prio < 30 { 10 } else { 5 }
+                    volatile_write_u64(PROC_TABLE + next * PROC_ENTRY_SIZE + PROC_OFF_TIMESLICE, slice)
+                    volatile_write_u64(PROC_TABLE + next * PROC_ENTRY_SIZE + PROC_OFF_STATE, PROC_STATE_RUNNING)
+                }
+                let sw = pcpu_get(cpu, PCPU_OFF_SWITCHES)
+                pcpu_set(cpu, PCPU_OFF_SWITCHES, sw + 1)
+            }
+        }
+    } else {
+        let next = pcpu_rq_dequeue(cpu)
+        if next >= 0 {
+            pcpu_set(cpu, PCPU_OFF_CURRENT, next)
+            pcpu_set(cpu, PCPU_OFF_IDLE, 0)
+            let prio = volatile_read_u64(PROC_TABLE + next * PROC_ENTRY_SIZE + PROC_OFF_PRIORITY)
+            let slice = if prio < 10 { 20 } else if prio < 30 { 10 } else { 5 }
+            volatile_write_u64(PROC_TABLE + next * PROC_ENTRY_SIZE + PROC_OFF_TIMESLICE, slice)
+        } else { pcpu_set(cpu, PCPU_OFF_IDLE, 1) }
+    }
+}

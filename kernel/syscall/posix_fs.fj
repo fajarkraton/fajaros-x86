@@ -1,0 +1,53 @@
+// FajarOS Nova v2.0.0 "Absolute" — POSIX Filesystem Syscalls
+// openat, readdir, ftruncate, rename, mkdir, rmdir
+
+const SYS_OPENAT: i64 = 37
+const SYS_READDIR: i64 = 38
+const SYS_FTRUNCATE: i64 = 39
+const SYS_RENAME: i64 = 40
+const SYS_MKDIR_V2: i64 = 41
+const SYS_RMDIR_V2: i64 = 42
+
+@kernel fn sys_openat(dirfd: i64, path_addr: i64, flags: i64) -> i64 {
+    sys_open(path_addr, flags)
+}
+
+@kernel fn sys_ftruncate(fd: i64, length: i64) -> i64 {
+    let pid = volatile_read_u64(0x6FE00)
+    if fd < 0 || fd >= FD_MAX { return -1 }
+    let ftype = fd_v2_get_type(pid, fd)
+    if ftype != FD_RAMFS { return -1 }
+    let idx = fd_v2_get_data(pid, fd) & 0xFFFFFFFF
+    let entry = ramfs_entry_addr(idx)
+    volatile_write(entry + 32, length)
+    0
+}
+
+@kernel fn sys_rename(old_path: i64, new_path: i64) -> i64 {
+    let old_idx = ramfs_find_by_addr(old_path)
+    if old_idx < 0 { return -1 }
+    let entry = ramfs_entry_addr(old_idx)
+    let mut i: i64 = 0
+    while i < 31 {
+        let ch = volatile_read_u8(new_path + i)
+        volatile_write_u8(entry + i, ch)
+        if ch == 0 { return 0 }
+        i = i + 1
+    }
+    volatile_write_u8(entry + 31, 0)
+    0
+}
+
+@kernel fn sys_mkdir_posix(path: i64) -> i64 {
+    let idx = ramfs_create_entry(path, 2)
+    if idx < 0 { -1 } else { 0 }
+}
+
+@kernel fn sys_rmdir_posix(path: i64) -> i64 {
+    let idx = ramfs_find_by_addr(path)
+    if idx < 0 { return -1 }
+    let entry = ramfs_entry_addr(idx)
+    if volatile_read(entry + 48) != 2 { return -1 }
+    volatile_write_u8(entry, 0)
+    0
+}

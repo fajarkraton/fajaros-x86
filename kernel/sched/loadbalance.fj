@@ -1,0 +1,127 @@
+// FajarOS Nova v2.0.0 "Absolute" — Load Balancing + CPU Affinity
+
+// Find least-loaded CPU
+@kernel fn pcpu_find_least_loaded() -> i64 {
+    let mut best_cpu: i64 = 0
+    let mut best_load: i64 = pcpu_get(0, PCPU_OFF_LOAD)
+    let mut cpu: i64 = 1
+    while cpu < PCPU_MAX {
+        if pcpu_get(cpu, PCPU_OFF_ONLINE) == 1 {
+            let load = pcpu_get(cpu, PCPU_OFF_LOAD)
+            if load < best_load { best_load = load; best_cpu = cpu }
+        }
+        cpu = cpu + 1
+    }
+    best_cpu
+}
+
+// Assign process to CPU (respects affinity mask)
+@kernel fn pcpu_assign_process(pid: i64) {
+    let affinity = volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_AFFINITY)
+    let cpu = if affinity != 0 {
+        let mut c: i64 = 0
+        let mut found: i64 = 0
+        while c < PCPU_MAX && found == 0 {
+            if (affinity & (1 << c)) != 0 && pcpu_get(c, PCPU_OFF_ONLINE) == 1 { found = c + 1 }
+            c = c + 1
+        }
+        if found > 0 { found - 1 } else { pcpu_find_least_loaded() }
+    } else { pcpu_find_least_loaded() }
+    pcpu_rq_enqueue(cpu, pid)
+}
+
+// Migrate from overloaded to idle CPU
+@kernel fn pcpu_load_balance() {
+    let mut max_cpu: i64 = 0
+    let mut max_load: i64 = 0
+    let mut min_cpu: i64 = 0
+    let mut min_load: i64 = 99999
+    let mut cpu: i64 = 0
+    while cpu < PCPU_MAX {
+        if pcpu_get(cpu, PCPU_OFF_ONLINE) == 1 {
+            let load = pcpu_get(cpu, PCPU_OFF_LOAD)
+            if load > max_load { max_load = load; max_cpu = cpu }
+            if load < min_load { min_load = load; min_cpu = cpu }
+        }
+        cpu = cpu + 1
+    }
+    if max_load - min_load > 2 && max_cpu != min_cpu {
+        let pid = pcpu_rq_dequeue(max_cpu)
+        if pid >= 0 {
+            pcpu_rq_enqueue(min_cpu, pid)
+            let load = pcpu_get(max_cpu, PCPU_OFF_LOAD)
+            if load > 0 { pcpu_set(max_cpu, PCPU_OFF_LOAD, load - 1) }
+            let mig = pcpu_get(min_cpu, PCPU_OFF_MIGRATIONS)
+            pcpu_set(min_cpu, PCPU_OFF_MIGRATIONS, mig + 1)
+        }
+    }
+}
+
+// IPI for reschedule
+@kernel fn pcpu_send_ipi(target_cpu: i64) {
+    let lapic_id = pcpu_get(target_cpu, PCPU_OFF_LAPIC_ID)
+    volatile_write_u32(LAPIC_BASE + LAPIC_ICR_HI, lapic_id << 24)
+    volatile_write_u32(LAPIC_BASE + LAPIC_ICR_LO, 0x00004030)
+}
+
+// CPU affinity
+@kernel fn pcpu_set_affinity(pid: i64, mask: i64) {
+    if pid < 0 || pid >= PROC_MAX { return }
+    volatile_write_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_AFFINITY, mask)
+}
+
+// Shell commands: mpstat, schedstat, top, taskset, nice, renice
+@kernel fn cmd_mpstat() {
+    cprintln("Per-CPU Statistics:", YELLOW_ON_BLACK)
+    cprintln("CPU  Online  Idle  Load  RunQ  Switches  Migrations", WHITE_ON_BLACK)
+    let mut cpu: i64 = 0
+    while cpu < PCPU_MAX {
+        if pcpu_get(cpu, PCPU_OFF_ONLINE) == 1 {
+            cprint("  ", WHITE_ON_BLACK); cprint_decimal(cpu, CYAN_ON_BLACK)
+            cprint("    yes    ", WHITE_ON_BLACK)
+            if pcpu_get(cpu, PCPU_OFF_IDLE) == 1 { cprint("yes ", YELLOW_ON_BLACK) } else { cprint("no  ", GREEN_ON_BLACK) }
+            cprint("  ", WHITE_ON_BLACK); cprint_decimal(pcpu_get(cpu, PCPU_OFF_LOAD), CYAN_ON_BLACK)
+            cprint("     ", WHITE_ON_BLACK); cprint_decimal(pcpu_get(cpu, PCPU_OFF_RQ_COUNT), CYAN_ON_BLACK)
+            cprint("     ", WHITE_ON_BLACK); cprint_decimal(pcpu_get(cpu, PCPU_OFF_SWITCHES), CYAN_ON_BLACK)
+            cprint("          ", WHITE_ON_BLACK); cprint_decimal(pcpu_get(cpu, PCPU_OFF_MIGRATIONS), CYAN_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        cpu = cpu + 1
+    }
+}
+
+@kernel fn cmd_schedstat() {
+    cprintln("Scheduler Statistics:", YELLOW_ON_BLACK)
+    let mut total_sw: i64 = 0
+    let mut total_mig: i64 = 0
+    let mut cpu: i64 = 0
+    while cpu < PCPU_MAX {
+        if pcpu_get(cpu, PCPU_OFF_ONLINE) == 1 {
+            total_sw = total_sw + pcpu_get(cpu, PCPU_OFF_SWITCHES)
+            total_mig = total_mig + pcpu_get(cpu, PCPU_OFF_MIGRATIONS)
+        }
+        cpu = cpu + 1
+    }
+    cprint("  Context switches: ", WHITE_ON_BLACK); cprint_decimal(total_sw, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Migrations:       ", WHITE_ON_BLACK); cprint_decimal(total_mig, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_top_v2() {
+    cprintln("  PID  CPU  PRI  STATE      NAME", YELLOW_ON_BLACK)
+    let mut pid: i64 = 0
+    while pid < PROC_MAX {
+        let state = volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+        if state != PROC_STATE_FREE {
+            cprint("  ", WHITE_ON_BLACK); cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint("    ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_CPU), CYAN_ON_BLACK)
+            cprint("   ", WHITE_ON_BLACK); cprint_decimal(proc_get_priority(pid), CYAN_ON_BLACK)
+            cprint("   ", WHITE_ON_BLACK)
+            if state == PROC_STATE_READY { cprint("ready  ", GREEN_ON_BLACK) }
+            else if state == PROC_STATE_RUNNING { cprint("running", CYAN_ON_BLACK) }
+            else if state == PROC_STATE_BLOCKED { cprint("blocked", YELLOW_ON_BLACK) }
+            else if state == PROC_STATE_ZOMBIE { cprint("zombie ", RED_ON_BLACK) }
+            console_putchar(10, WHITE_ON_BLACK)
+        }
+        pid = pid + 1
+    }
+}

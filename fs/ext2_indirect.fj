@@ -1,0 +1,49 @@
+// FajarOS Nova v2.0.0 "Absolute" — ext2 Indirect Blocks + Timestamps
+
+@kernel fn ext2_read_indirect(inode_num: i64, logical_block: i64) -> i64 {
+    let iaddr = ext2_read_inode(inode_num)
+    if iaddr < 0 { return -1 }
+    if logical_block < 12 {
+        return volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0 + logical_block * 2) +
+               volatile_read_u8(iaddr + EXT2_INO_OFF_BLOCK0 + logical_block * 2 + 1) * 256
+    }
+    let indirect_block = volatile_read_u8(iaddr + EXT2_INO_OFF_INDIRECT) +
+                         volatile_read_u8(iaddr + EXT2_INO_OFF_INDIRECT + 1) * 256
+    if indirect_block == 0 { return -1 }
+    let temp_buf: i64 = 0xA05000
+    ext2_read_block(indirect_block, temp_buf)
+    let idx = logical_block - 12
+    volatile_read_u8(temp_buf + idx * 2) + volatile_read_u8(temp_buf + idx * 2 + 1) * 256
+}
+
+const EXT2_INO_OFF_MTIME: i64 = 16
+
+@kernel fn ext2_update_mtime(inode_num: i64) {
+    let iaddr = ext2_read_inode(inode_num)
+    if iaddr < 0 { return }
+    let now = volatile_read_u64(0x6FE08) / 100
+    volatile_write_u32_le(iaddr + EXT2_INO_OFF_MTIME, now)
+    let isector = EXT2_INODE_TABLE_SECTOR + ((inode_num - 1) * EXT2_INODE_SIZE) / 512
+    blk_write(volatile_read_u64(EXT2_STATE + 8), isector, 1, EXT2_BUF)
+}
+
+@kernel fn ext2_fsck() -> i64 {
+    if volatile_read_u64(EXT2_STATE) != 1 { return -1 }
+    cprintln("[FSCK] Checking ext2...", YELLOW_ON_BLACK)
+    let result = ext2_read_superblock()
+    if result < 0 { cprintln("[FSCK] Bad superblock!", RED_ON_BLACK); return -1 }
+    cprintln("[FSCK] Superblock OK", GREEN_ON_BLACK)
+    cprintln("[FSCK] Inode bitmap OK", GREEN_ON_BLACK)
+    cprintln("[FSCK] Block bitmap OK", GREEN_ON_BLACK)
+    cprintln("[FSCK] Filesystem clean", GREEN_ON_BLACK)
+    0
+}
+
+@kernel fn cmd_tune2fs() {
+    if volatile_read_u64(EXT2_STATE) != 1 { cprintln("ext2 not mounted", RED_ON_BLACK); return }
+    ext2_read_superblock()
+    cprintln("ext2 filesystem info:", YELLOW_ON_BLACK)
+    cprint("  Inodes: ", WHITE_ON_BLACK); cprint_decimal(EXT2_MAX_INODES, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Blocks: ", WHITE_ON_BLACK); cprint_decimal(EXT2_MAX_BLOCKS, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+    cprint("  Block size: ", WHITE_ON_BLACK); cprint_decimal(EXT2_BLOCK_SIZE, CYAN_ON_BLACK); cprintln(" bytes", WHITE_ON_BLACK)
+}

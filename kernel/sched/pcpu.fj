@@ -1,0 +1,35 @@
+// FajarOS Nova v2.0.0 "Absolute" — Per-CPU Data Structures
+// Synced from Nova kernel v1.0 Phase A1
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════
+// Per-CPU Data: 8 CPUs x 256 bytes at 0xA10000
+// ═══════════════════════════════════════════════
+
+const PCPU_BASE: i64 = 0xA10000
+const PCPU_MAX: i64 = 8
+const PCPU_SIZE: i64 = 256
+const PCPU_OFF_LAPIC_ID: i64 = 0
+const PCPU_OFF_ONLINE: i64 = 8
+const PCPU_OFF_IDLE: i64 = 16
+const PCPU_OFF_LOAD: i64 = 24
+const PCPU_OFF_RQ_HEAD: i64 = 32
+const PCPU_OFF_RQ_TAIL: i64 = 40
+const PCPU_OFF_RQ_COUNT: i64 = 48
+const PCPU_OFF_CURRENT: i64 = 56
+const PCPU_OFF_SWITCHES: i64 = 64
+const PCPU_OFF_MIGRATIONS: i64 = 72
+const PCPU_OFF_PREEMPTIONS: i64 = 80
+
+@kernel fn pcpu_init() {
+    let mut i: i64 = 0
+    while i < PCPU_MAX * PCPU_SIZE { volatile_write_u8(PCPU_BASE + i, 0); i = i + 1 }
+    volatile_write_u64(PCPU_BASE + PCPU_OFF_ONLINE, 1)
+    volatile_write_u64(PCPU_BASE + PCPU_OFF_RQ_HEAD, -1)
+    volatile_write_u64(PCPU_BASE + PCPU_OFF_RQ_TAIL, -1)
+    volatile_write_u64(PCPU_BASE + PCPU_OFF_CURRENT, 0)
+}
+
+@kernel fn pcpu_addr(cpu: i64) -> i64 { PCPU_BASE + cpu * PCPU_SIZE }
+@kernel fn pcpu_get(cpu: i64, off: i64) -> i64 { volatile_read_u64(pcpu_addr(cpu) + off) }
+@kernel fn pcpu_set(cpu: i64, off: i64, val: i64) { volatile_write_u64(pcpu_addr(cpu) + off, val) }

@@ -1,4 +1,4 @@
-# FajarOS Nova v1.4.0 "Zenith" — Build System
+# FajarOS Nova v2.0.0 "Absolute" — Build System
 # Target: x86_64-unknown-none (bare-metal)
 # Compiler: Fajar Lang (fj)
 # Strategy: concatenate modular .fj files → single combined.fj → compile
@@ -26,6 +26,9 @@ SOURCES := \
 	kernel/mm/heap.fj \
 	kernel/mm/slab.fj \
 	kernel/mm/cow.fj \
+	kernel/mm/demand_paging.fj \
+	kernel/mm/oom.fj \
+	kernel/mm/mmap.fj \
 	kernel/auth/users.fj \
 	kernel/auth/permissions.fj \
 	kernel/auth/sessions.fj \
@@ -42,11 +45,17 @@ SOURCES := \
 	kernel/sched/scheduler.fj \
 	kernel/sched/smp.fj \
 	kernel/sched/spinlock.fj \
+	kernel/sched/pcpu.fj \
+	kernel/sched/runqueue.fj \
+	kernel/sched/priority.fj \
+	kernel/sched/loadbalance.fj \
 	kernel/interrupts/lapic.fj \
 	kernel/interrupts/timer.fj \
 	kernel/syscall/entry.fj \
 	kernel/syscall/dispatch.fj \
 	kernel/syscall/elf.fj \
+	kernel/syscall/posix_fs.fj \
+	kernel/syscall/posix_signal.fj \
 	kernel/process/fork.fj \
 	kernel/process/exec.fj \
 	kernel/process/wait.fj \
@@ -58,6 +67,7 @@ SOURCES := \
 	kernel/security/capability.fj \
 	kernel/security/limits.fj \
 	kernel/security/hardening.fj \
+	kernel/security/forkbomb.fj \
 	drivers/serial.fj \
 	drivers/vga.fj \
 	drivers/keyboard.fj \
@@ -77,6 +87,7 @@ SOURCES := \
 	fs/fsck.fj \
 	fs/ext2_super.fj \
 	fs/ext2_ops.fj \
+	fs/ext2_indirect.fj \
 	fs/fat32.fj \
 	fs/vfs.fj \
 	shell/pipes.fj \
@@ -107,6 +118,8 @@ SOURCES := \
 	services/net/tcp_v2.fj \
 	services/net/udp.fj \
 	services/net/stats.fj \
+	services/net/tcp_v3.fj \
+	services/net/routing.fj \
 	services/net/tls.fj \
 	kernel/stubs/framebuffer.fj \
 	kernel/stubs/gpu_stub.fj \

@@ -1,0 +1,54 @@
+// FajarOS Nova v2.0.0 "Absolute" — IP Routing Table
+
+const ROUTE_TABLE: i64 = 0xA07000
+const ROUTE_MAX: i64 = 8
+const ROUTE_SIZE: i64 = 32
+
+@kernel fn route_add(dest: i64, mask: i64, gateway: i64, metric: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < ROUTE_MAX {
+        let entry = ROUTE_TABLE + i * ROUTE_SIZE
+        if volatile_read_u64(entry) == 0 {
+            volatile_write_u64(entry, dest)
+            volatile_write_u64(entry + 8, mask)
+            volatile_write_u64(entry + 16, gateway)
+            volatile_write_u64(entry + 24, metric)
+            return 0
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn cmd_route() {
+    cprintln("Routing table:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    let mut count: i64 = 0
+    while i < ROUTE_MAX {
+        let entry = ROUTE_TABLE + i * ROUTE_SIZE
+        let dest = volatile_read_u64(entry)
+        if dest != 0 || volatile_read_u64(entry + 16) != 0 {
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_decimal((dest >> 24) & 0xFF, CYAN_ON_BLACK); cprint(".", WHITE_ON_BLACK)
+            cprint_decimal((dest >> 16) & 0xFF, CYAN_ON_BLACK); cprint(".", WHITE_ON_BLACK)
+            cprint_decimal((dest >> 8) & 0xFF, CYAN_ON_BLACK); cprint(".", WHITE_ON_BLACK)
+            cprint_decimal(dest & 0xFF, CYAN_ON_BLACK)
+            cprint("  metric=", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(entry + 24), CYAN_ON_BLACK)
+            console_putchar(10, WHITE_ON_BLACK)
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { cprintln("  (empty)", WHITE_ON_BLACK) }
+}
+
+@kernel fn cmd_traceroute() {
+    cprintln("traceroute: simulated", YELLOW_ON_BLACK)
+    let mut ttl: i64 = 1
+    while ttl <= 5 {
+        cprint("  ", WHITE_ON_BLACK); cprint_decimal(ttl, CYAN_ON_BLACK)
+        cprint("  10.0.2.", WHITE_ON_BLACK); cprint_decimal(ttl, CYAN_ON_BLACK)
+        cprintln("  <1ms", WHITE_ON_BLACK)
+        ttl = ttl + 1
+    }
+}

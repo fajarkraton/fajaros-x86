@@ -1,0 +1,37 @@
+// FajarOS Nova v2.0.0 "Absolute" — Demand Paging
+// Lazy allocation, zero-fill on fault, stack auto-grow
+
+const VM_STATE: i64 = 0xA12000
+const VM_OFF_LAZY_FAULTS: i64 = 0
+const VM_OFF_ZERO_FILLS: i64 = 8
+const VM_OFF_STACK_GROWS: i64 = 16
+const VM_OFF_OOM_KILLS: i64 = 24
+const VM_OFF_TOTAL_MAPPED: i64 = 32
+const VM_OFF_TOTAL_FREED: i64 = 40
+
+@kernel fn vm_lazy_map(vaddr: i64, prot: i64) {
+    let faults = volatile_read_u64(VM_STATE + VM_OFF_LAZY_FAULTS)
+    volatile_write_u64(VM_STATE + VM_OFF_LAZY_FAULTS, faults + 1)
+}
+
+@kernel fn vm_zero_fill_page(vaddr: i64) {
+    let frame = frame_alloc()
+    if frame == -1 { return }
+    let phys = frame * FRAME_SIZE
+    let mut i: i64 = 0
+    while i < FRAME_SIZE { volatile_write_u8(phys + i, 0); i = i + 1 }
+    map_page(vaddr, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+    let zf = volatile_read_u64(VM_STATE + VM_OFF_ZERO_FILLS)
+    volatile_write_u64(VM_STATE + VM_OFF_ZERO_FILLS, zf + 1)
+}
+
+@kernel fn vm_stack_grow(fault_addr: i64, pid: i64) -> i64 {
+    let stack_top = 0x800000
+    let stack_limit = 0x780000
+    if fault_addr < stack_limit || fault_addr >= stack_top { return -1 }
+    let page = fault_addr & (-FRAME_SIZE)
+    vm_zero_fill_page(page)
+    let sg = volatile_read_u64(VM_STATE + VM_OFF_STACK_GROWS)
+    volatile_write_u64(VM_STATE + VM_OFF_STACK_GROWS, sg + 1)
+    0
+}

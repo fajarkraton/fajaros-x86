@@ -1,0 +1,38 @@
+// FajarOS Nova v2.0.0 "Absolute" — OOM Killer
+
+@kernel fn vm_oom_kill() -> i64 {
+    let mut max_pid: i64 = -1
+    let mut max_pages: i64 = 0
+    let mut pid: i64 = 1
+    while pid < PROC_MAX {
+        let state = volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+        if state == PROC_STATE_READY || state == PROC_STATE_RUNNING || state == PROC_STATE_BLOCKED {
+            let brk = volatile_read_u64(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_BRK)
+            let pages = if brk > USER_HEAP_BASE { (brk - USER_HEAP_BASE) / FRAME_SIZE } else { 0 }
+            if pages > max_pages { max_pages = pages; max_pid = pid }
+        }
+        pid = pid + 1
+    }
+    if max_pid > 0 {
+        cprint("[OOM] Killing PID ", RED_ON_BLACK)
+        cprint_decimal(max_pid, RED_ON_BLACK)
+        cprint(" (", WHITE_ON_BLACK); cprint_decimal(max_pages, CYAN_ON_BLACK); cprintln(" pages)", WHITE_ON_BLACK)
+        volatile_write_u64(PROC_TABLE + max_pid * PROC_ENTRY_SIZE + PROC_OFF_STATE, PROC_STATE_ZOMBIE)
+        let oom = volatile_read_u64(VM_STATE + VM_OFF_OOM_KILLS)
+        volatile_write_u64(VM_STATE + VM_OFF_OOM_KILLS, oom + 1)
+    }
+    max_pid
+}
+
+@kernel fn cmd_free_v2() {
+    cprintln("Memory:", YELLOW_ON_BLACK)
+    let total_frames: i64 = 32768
+    let mut used: i64 = 0
+    let mut i: i64 = 0
+    while i < total_frames { if frame_is_used(i) { used = used + 1 }; i = i + 1 }
+    let free_f = total_frames - used
+    cprint("  Total:  ", WHITE_ON_BLACK); cprint_decimal(total_frames * 4, CYAN_ON_BLACK); cprintln(" KB", WHITE_ON_BLACK)
+    cprint("  Used:   ", WHITE_ON_BLACK); cprint_decimal(used * 4, CYAN_ON_BLACK); cprintln(" KB", WHITE_ON_BLACK)
+    cprint("  Free:   ", WHITE_ON_BLACK); cprint_decimal(free_f * 4, CYAN_ON_BLACK); cprintln(" KB", WHITE_ON_BLACK)
+    cprint("  OOM kills: ", WHITE_ON_BLACK); cprint_decimal(volatile_read_u64(VM_STATE + VM_OFF_OOM_KILLS), CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)
+}
