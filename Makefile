@@ -1,4 +1,4 @@
-# FajarOS Nova v1.0.0 "Genesis" — Build System
+# FajarOS Nova v1.4.0 "Zenith" — Build System
 # Target: x86_64-unknown-none (bare-metal)
 # Compiler: Fajar Lang (fj)
 # Strategy: concatenate modular .fj files → single combined.fj → compile
