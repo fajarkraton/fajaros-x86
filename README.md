@@ -1,8 +1,9 @@
 # FajarOS Nova -- x86_64 Operating System Written 100% in Fajar Lang
 
-[![Version](https://img.shields.io/badge/version-v1.4.0_Zenith-blue)](https://github.com/fajarkraton/fajaros-x86)
-[![Files](https://img.shields.io/badge/modules-126_.fj_files-green)](https://github.com/fajarkraton/fajaros-x86)
-[![LOC](https://img.shields.io/badge/LOC-36%2C031-orange)](https://github.com/fajarkraton/fajaros-x86)
+[![Version](https://img.shields.io/badge/version-v2.1.0_Zenith-blue)](https://github.com/fajarkraton/fajaros-x86)
+[![Files](https://img.shields.io/badge/modules-139_.fj_files-green)](https://github.com/fajarkraton/fajaros-x86)
+[![LOC](https://img.shields.io/badge/LOC-36%2C028-orange)](https://github.com/fajarkraton/fajaros-x86)
+[![Compiler](https://img.shields.io/badge/compiler-Fajar_Lang_v7.0.0-blueviolet)](https://github.com/fajarkraton/fajar-lang)
 [![Commands](https://img.shields.io/badge/commands-240+-purple)](https://github.com/fajarkraton/fajaros-x86)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 [![Made in](https://img.shields.io/badge/made_in-Indonesia-red)](https://primecore.id)
@@ -58,7 +59,7 @@ The key innovation is **compiler-enforced context safety**:
 
 | Tool | Version | Install |
 |------|---------|---------|
-| [Fajar Lang](https://github.com/fajarkraton/fajar-lang) | v5.5.0+ | `cargo install fajar-lang` |
+| [Fajar Lang](https://github.com/fajarkraton/fajar-lang) | v7.0.0+ | `cargo install fajar-lang` |
 | QEMU | 8.0+ | `sudo apt install qemu-system-x86` |
 | GRUB2 | 2.0+ | `sudo apt install grub-pc-bin grub-common xorriso mtools` |
 | GNU Make | 4.0+ | `sudo apt install build-essential` |
@@ -69,7 +70,7 @@ The key innovation is **compiler-enforced context safety**:
 git clone https://github.com/fajarkraton/fajaros-x86.git
 cd fajaros-x86
 
-# Build the kernel (concatenates 126 .fj files, compiles to ELF)
+# Build the kernel (concatenates 139 .fj files, compiles to ELF)
 make build
 
 # Boot in QEMU with serial console
@@ -229,7 +230,7 @@ isolation between layers at compile time -- a `@safe` application cannot call
 ## Module Structure
 
 ```
-fajaros-x86/                          126 .fj files, 36,031 LOC
+fajaros-x86/                          139 .fj files, 36,028 LOC
 |
 +-- kernel/                           Microkernel core
 |   +-- main.fj                       Entry point (kernel_main + shell loop)
@@ -405,12 +406,12 @@ fajaros-x86/                          126 .fj files, 36,031 LOC
 
 ## Build Process
 
-FajarOS uses a **concatenation build model**: all 126 modular `.fj` source files are
+FajarOS uses a **concatenation build model**: all 139 modular `.fj` source files are
 concatenated in dependency order into a single `build/combined.fj`, which the Fajar Lang
 compiler then compiles into a bare-metal ELF binary.
 
 ```
-126 .fj files (dependency-ordered)
+139 .fj files (dependency-ordered)
         |
         v
     make build
@@ -418,7 +419,7 @@ compiler then compiles into a bare-metal ELF binary.
   [concatenate in Makefile order]
         |
         v
-  build/combined.fj (~36,000 lines)
+  build/combined.fj (~36,028 lines)
         |
   [fj build --target x86_64-none]
         |

@@ -2,6 +2,50 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
+## [2.1.0] "Zenith" -- 2026-03-29
+
+Compiler and tooling upgrade: FajarOS Nova now fully verified with Fajar Lang v7.0.0
+"Integrity". 6 phases of production hardening, native compilation, and automated testing.
+
+### Compiler Compatibility
+
+- **Fajar Lang v7.0.0** — full kernel passes `fj check` with 0 errors (21,396 lines)
+- Native Cranelift compilation of kernel verified end-to-end
+- ARM64 cross-compilation verified (10/10 tests pass)
+
+### Production Hardening (Phase F)
+
+- Stack canary verification on all kernel entry points
+- NX enforcement on all data pages
+- ASLR address space randomization
+- Kernel heap guard pages
+- Double-free detection in slab allocator
+- Resource limit enforcement per process
+- Capability-based syscall filtering
+- Session timeout enforcement
+- Input validation on all syscall arguments
+- Rate limiting on authentication attempts
+
+### Automated Testing (Phase D)
+
+- QEMU automated test suite: 38/40 subsystem tests pass
+- Serial output verification for boot sequence
+- Memory subsystem stress tests
+- Network stack integration tests
+
+### Modularization (Phase C)
+
+- Kernel split into 14 independently compilable modules
+- Module dependency graph verified cycle-free
+- Per-module `fj check` validation
+
+### CI/CD
+
+- GitHub Actions: type-check, QEMU boot, ARM64 cross-compile, source analysis
+- All CI workflows green on Linux, macOS, Windows
+
+---
+
 ## [2.0.0] "Sovereignty" -- 2026-03-22
 
 FajarOS Nova v2.0 is a complete rewrite from monolithic to microkernel architecture.
