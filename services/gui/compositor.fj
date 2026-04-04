@@ -1,0 +1,372 @@
+// FajarOS Nova v3.0 "Nusantara" — Window Compositor
+// Z-ordered double-buffered compositing with alpha blending.
+// Manages window stack, focus, and damage rectangles.
+//
+// macOS equivalent: WindowServer / Quartz Compositor.
+// FajarOS advantage: compositor communicates via typed actor messages,
+// verified at compile time. macOS WindowServer uses untyped Mach IPC.
+
+// ═══════════════════════════════════════════════════════════════
+// Compositor — Window Stack + Framebuffer Compositing
+// ═══════════════════════════════════════════════════════════════
+
+const COMP_BASE: i64 = 0xC00000        // Compositor state
+const COMP_MAX_WINDOWS: i64 = 16       // Max concurrent windows
+const COMP_WINDOW_SIZE: i64 = 128      // Bytes per window descriptor
+
+// Screen dimensions (VGA/VBE mode)
+const SCREEN_WIDTH: i64 = 1024
+const SCREEN_HEIGHT: i64 = 768
+const SCREEN_BPP: i64 = 4             // Bytes per pixel (32-bit ARGB)
+const SCREEN_PITCH: i64 = 4096        // Bytes per row (1024 * 4)
+
+// Framebuffers
+const FB_FRONT: i64 = 0xFD000000      // VGA framebuffer (displayed)
+const FB_BACK: i64 = 0xE00000         // Back buffer (composited)
+
+// Window descriptor offsets
+const WIN_OFF_ID: i64 = 0             // Window ID
+const WIN_OFF_X: i64 = 8              // X position
+const WIN_OFF_Y: i64 = 16            // Y position
+const WIN_OFF_W: i64 = 24            // Width
+const WIN_OFF_H: i64 = 32            // Height
+const WIN_OFF_Z: i64 = 40            // Z-order (higher = on top)
+const WIN_OFF_FLAGS: i64 = 48        // Flags (visible, focused, etc.)
+const WIN_OFF_TITLE_HASH: i64 = 56   // Hash of window title
+const WIN_OFF_PID: i64 = 64          // Owner actor PID
+const WIN_OFF_FB: i64 = 72           // Window's private framebuffer address
+const WIN_OFF_ALPHA: i64 = 80        // Opacity (0-255, 255=opaque)
+const WIN_OFF_DIRTY: i64 = 88        // Dirty flag (needs redraw)
+
+// Window flags
+const WIN_FLAG_VISIBLE: i64 = 1
+const WIN_FLAG_FOCUSED: i64 = 2
+const WIN_FLAG_TITLEBAR: i64 = 4
+const WIN_FLAG_RESIZABLE: i64 = 8
+const WIN_FLAG_DECORATED: i64 = 16
+
+// Compositor state
+const COMP_STATE_BASE: i64 = 0xC10000
+const COMP_STATE_WINDOW_COUNT: i64 = 0
+const COMP_STATE_FOCUSED_ID: i64 = 8
+const COMP_STATE_CURSOR_X: i64 = 16
+const COMP_STATE_CURSOR_Y: i64 = 24
+const COMP_STATE_DIRTY: i64 = 32
+const COMP_STATE_FPS_COUNTER: i64 = 40
+
+// Theme colors (ARGB)
+const COLOR_TITLEBAR_ACTIVE: i64 = 0xFF2C5F2D   // Dark green (Indonesian)
+const COLOR_TITLEBAR_INACTIVE: i64 = 0xFF555555  // Gray
+const COLOR_TITLEBAR_TEXT: i64 = 0xFFFFFFFF       // White
+const COLOR_BORDER: i64 = 0xFF1A1A2E             // Dark blue
+const COLOR_DESKTOP_BG: i64 = 0xFF0D1117          // GitHub dark
+const COLOR_TASKBAR_BG: i64 = 0xE01A1A2E         // Semi-transparent dark blue
+const COLOR_CURSOR: i64 = 0xFFFFFFFF             // White cursor
+
+const TITLEBAR_HEIGHT: i64 = 24
+const BORDER_WIDTH: i64 = 1
+
+// ── Window management ──
+
+@kernel fn comp_init() {
+    // Clear all windows
+    let mut i: i64 = 0
+    while i < COMP_MAX_WINDOWS * COMP_WINDOW_SIZE {
+        volatile_write_u64(COMP_BASE + i, 0)
+        i = i + 8
+    }
+    // Initialize compositor state
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_WINDOW_COUNT, 0)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_FOCUSED_ID, -1)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_CURSOR_X, SCREEN_WIDTH / 2)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_CURSOR_Y, SCREEN_HEIGHT / 2)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+
+    // Fill desktop background
+    comp_fill_rect(FB_BACK, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_DESKTOP_BG)
+}
+
+@kernel fn comp_window_addr(win_id: i64) -> i64 {
+    COMP_BASE + win_id * COMP_WINDOW_SIZE
+}
+
+@kernel fn comp_create_window(x: i64, y: i64, w: i64, h: i64, pid: i64) -> i64 {
+    let count = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_WINDOW_COUNT)
+    if count >= COMP_MAX_WINDOWS { return -1 }
+
+    // Find free slot
+    let mut id: i64 = 0
+    while id < COMP_MAX_WINDOWS {
+        let addr = comp_window_addr(id)
+        let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+        if flags == 0 {
+            // Initialize window
+            volatile_write_u64(addr + WIN_OFF_ID, id)
+            volatile_write_u64(addr + WIN_OFF_X, x)
+            volatile_write_u64(addr + WIN_OFF_Y, y)
+            volatile_write_u64(addr + WIN_OFF_W, w)
+            volatile_write_u64(addr + WIN_OFF_H, h)
+            volatile_write_u64(addr + WIN_OFF_Z, count) // Stack on top
+            volatile_write_u64(addr + WIN_OFF_FLAGS, WIN_FLAG_VISIBLE | WIN_FLAG_DECORATED | WIN_FLAG_TITLEBAR)
+            volatile_write_u64(addr + WIN_OFF_PID, pid)
+            volatile_write_u64(addr + WIN_OFF_ALPHA, 255) // Fully opaque
+            volatile_write_u64(addr + WIN_OFF_DIRTY, 1)
+
+            volatile_write_u64(COMP_STATE_BASE + COMP_STATE_WINDOW_COUNT, count + 1)
+            volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+
+            // Focus new window
+            comp_focus_window(id)
+            return id
+        }
+        id = id + 1
+    }
+    -1
+}
+
+@kernel fn comp_destroy_window(win_id: i64) {
+    if win_id < 0 || win_id >= COMP_MAX_WINDOWS { return }
+    let addr = comp_window_addr(win_id)
+    // Clear all fields
+    let mut i: i64 = 0
+    while i < COMP_WINDOW_SIZE {
+        volatile_write_u64(addr + i, 0)
+        i = i + 8
+    }
+    let count = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_WINDOW_COUNT)
+    if count > 0 {
+        volatile_write_u64(COMP_STATE_BASE + COMP_STATE_WINDOW_COUNT, count - 1)
+    }
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+@kernel fn comp_focus_window(win_id: i64) {
+    // Remove focus from current
+    let prev = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_FOCUSED_ID)
+    if prev >= 0 && prev < COMP_MAX_WINDOWS {
+        let prev_addr = comp_window_addr(prev)
+        let flags = volatile_read_u64(prev_addr + WIN_OFF_FLAGS)
+        volatile_write_u64(prev_addr + WIN_OFF_FLAGS, flags & (-1 ^ WIN_FLAG_FOCUSED))
+    }
+    // Set new focus
+    let addr = comp_window_addr(win_id)
+    let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+    volatile_write_u64(addr + WIN_OFF_FLAGS, flags | WIN_FLAG_FOCUSED)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_FOCUSED_ID, win_id)
+
+    // Raise to top Z-order
+    let count = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_WINDOW_COUNT)
+    volatile_write_u64(addr + WIN_OFF_Z, count + 1)
+
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+@kernel fn comp_move_window(win_id: i64, new_x: i64, new_y: i64) {
+    if win_id < 0 || win_id >= COMP_MAX_WINDOWS { return }
+    let addr = comp_window_addr(win_id)
+    volatile_write_u64(addr + WIN_OFF_X, new_x)
+    volatile_write_u64(addr + WIN_OFF_Y, new_y)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+// ── Compositing engine ──
+
+@kernel fn comp_composite() {
+    let dirty = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_DIRTY)
+    if dirty == 0 { return }
+
+    // Clear back buffer with desktop background
+    comp_fill_rect(FB_BACK, 0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, COLOR_DESKTOP_BG)
+
+    // Draw windows in Z-order (lowest Z first)
+    let mut z: i64 = 0
+    while z <= COMP_MAX_WINDOWS + 1 {
+        let mut id: i64 = 0
+        while id < COMP_MAX_WINDOWS {
+            let addr = comp_window_addr(id)
+            let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+            let win_z = volatile_read_u64(addr + WIN_OFF_Z)
+            if (flags & WIN_FLAG_VISIBLE) != 0 && win_z == z {
+                comp_draw_window(id)
+            }
+            id = id + 1
+        }
+        z = z + 1
+    }
+
+    // Draw taskbar at bottom
+    comp_draw_taskbar()
+
+    // Draw cursor
+    let cx = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_CURSOR_X)
+    let cy = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_CURSOR_Y)
+    comp_draw_cursor(cx, cy)
+
+    // Swap buffers (copy back → front)
+    comp_swap_buffers()
+
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 0)
+
+    // Update FPS counter
+    let fps = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_FPS_COUNTER)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_FPS_COUNTER, fps + 1)
+}
+
+@kernel fn comp_draw_window(win_id: i64) {
+    let addr = comp_window_addr(win_id)
+    let x = volatile_read_u64(addr + WIN_OFF_X)
+    let y = volatile_read_u64(addr + WIN_OFF_Y)
+    let w = volatile_read_u64(addr + WIN_OFF_W)
+    let h = volatile_read_u64(addr + WIN_OFF_H)
+    let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+    let focused = (flags & WIN_FLAG_FOCUSED) != 0
+
+    // Draw border
+    let border_color = COLOR_BORDER
+    comp_fill_rect(FB_BACK, x - BORDER_WIDTH, y - TITLEBAR_HEIGHT - BORDER_WIDTH,
+                   w + 2 * BORDER_WIDTH, h + TITLEBAR_HEIGHT + 2 * BORDER_WIDTH, border_color)
+
+    // Draw titlebar
+    let title_color = if focused { COLOR_TITLEBAR_ACTIVE } else { COLOR_TITLEBAR_INACTIVE }
+    comp_fill_rect(FB_BACK, x, y - TITLEBAR_HEIGHT, w, TITLEBAR_HEIGHT, title_color)
+
+    // Draw window content area (white background)
+    comp_fill_rect(FB_BACK, x, y, w, h, 0xFF1E1E2E) // Dark content area
+}
+
+@kernel fn comp_draw_taskbar() {
+    // Bottom taskbar (40px high)
+    let ty = SCREEN_HEIGHT - 40
+    comp_fill_rect(FB_BACK, 0, ty, SCREEN_WIDTH, 40, COLOR_TASKBAR_BG)
+
+    // Draw separator line
+    comp_fill_rect(FB_BACK, 0, ty, SCREEN_WIDTH, 1, 0xFF3A3A5C)
+}
+
+@kernel fn comp_draw_cursor(cx: i64, cy: i64) {
+    // Simple 8x8 cursor
+    let mut dy: i64 = 0
+    while dy < 8 {
+        let mut dx: i64 = 0
+        let cursor_width = 8 - dy  // Triangle shape
+        while dx < cursor_width {
+            let px = cx + dx
+            let py = cy + dy
+            if px >= 0 && px < SCREEN_WIDTH && py >= 0 && py < SCREEN_HEIGHT {
+                comp_set_pixel(FB_BACK, px, py, COLOR_CURSOR)
+            }
+            dx = dx + 1
+        }
+        dy = dy + 1
+    }
+}
+
+// ── Framebuffer primitives ──
+
+@kernel fn comp_set_pixel(fb: i64, x: i64, y: i64, color: i64) {
+    if x < 0 || x >= SCREEN_WIDTH || y < 0 || y >= SCREEN_HEIGHT { return }
+    let offset = y * SCREEN_PITCH + x * SCREEN_BPP
+    volatile_write_u32(fb + offset, color)
+}
+
+@kernel fn comp_fill_rect(fb: i64, x: i64, y: i64, w: i64, h: i64, color: i64) {
+    let x0 = if x < 0 { 0 } else { x }
+    let y0 = if y < 0 { 0 } else { y }
+    let x1 = if x + w > SCREEN_WIDTH { SCREEN_WIDTH } else { x + w }
+    let y1 = if y + h > SCREEN_HEIGHT { SCREEN_HEIGHT } else { y + h }
+
+    let mut py = y0
+    while py < y1 {
+        let mut px = x0
+        while px < x1 {
+            let offset = py * SCREEN_PITCH + px * SCREEN_BPP
+            volatile_write_u32(fb + offset, color)
+            px = px + 1
+        }
+        py = py + 1
+    }
+}
+
+@kernel fn comp_swap_buffers() {
+    // Copy back buffer to front buffer (simple memcpy)
+    let size = SCREEN_WIDTH * SCREEN_HEIGHT * SCREEN_BPP
+    let mut i: i64 = 0
+    while i < size {
+        let val = volatile_read_u32(FB_BACK + i)
+        volatile_write_u32(FB_FRONT + i, val)
+        i = i + 4
+    }
+}
+
+// ── Window tiling (macOS Sequoia-style) ──
+
+@kernel fn comp_tile_left(win_id: i64) {
+    if win_id < 0 || win_id >= COMP_MAX_WINDOWS { return }
+    let addr = comp_window_addr(win_id)
+    volatile_write_u64(addr + WIN_OFF_X, 0)
+    volatile_write_u64(addr + WIN_OFF_Y, TITLEBAR_HEIGHT)
+    volatile_write_u64(addr + WIN_OFF_W, SCREEN_WIDTH / 2)
+    volatile_write_u64(addr + WIN_OFF_H, SCREEN_HEIGHT - 40 - TITLEBAR_HEIGHT)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+@kernel fn comp_tile_right(win_id: i64) {
+    if win_id < 0 || win_id >= COMP_MAX_WINDOWS { return }
+    let addr = comp_window_addr(win_id)
+    volatile_write_u64(addr + WIN_OFF_X, SCREEN_WIDTH / 2)
+    volatile_write_u64(addr + WIN_OFF_Y, TITLEBAR_HEIGHT)
+    volatile_write_u64(addr + WIN_OFF_W, SCREEN_WIDTH / 2)
+    volatile_write_u64(addr + WIN_OFF_H, SCREEN_HEIGHT - 40 - TITLEBAR_HEIGHT)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+@kernel fn comp_tile_maximize(win_id: i64) {
+    if win_id < 0 || win_id >= COMP_MAX_WINDOWS { return }
+    let addr = comp_window_addr(win_id)
+    volatile_write_u64(addr + WIN_OFF_X, 0)
+    volatile_write_u64(addr + WIN_OFF_Y, TITLEBAR_HEIGHT)
+    volatile_write_u64(addr + WIN_OFF_W, SCREEN_WIDTH)
+    volatile_write_u64(addr + WIN_OFF_H, SCREEN_HEIGHT - 40 - TITLEBAR_HEIGHT)
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+// ── Shell commands ──
+
+@kernel fn cmd_windows() {
+    cprintln("=== Window Compositor ===", YELLOW_ON_BLACK)
+    let count = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_WINDOW_COUNT)
+    cprint("  Windows: ", WHITE_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprintln_decimal(COMP_MAX_WINDOWS, CYAN_ON_BLACK)
+
+    let fps = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_FPS_COUNTER)
+    cprint("  Frames composed: ", WHITE_ON_BLACK)
+    cprintln_decimal(fps, CYAN_ON_BLACK)
+
+    cprintln("  ID  Position     Size         Z  Flags", WHITE_ON_BLACK)
+    let mut id: i64 = 0
+    while id < COMP_MAX_WINDOWS {
+        let addr = comp_window_addr(id)
+        let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+        if (flags & WIN_FLAG_VISIBLE) != 0 {
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_decimal(id, CYAN_ON_BLACK)
+            cprint("  (", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(addr + WIN_OFF_X), WHITE_ON_BLACK)
+            cprint(",", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(addr + WIN_OFF_Y), WHITE_ON_BLACK)
+            cprint(")  ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(addr + WIN_OFF_W), WHITE_ON_BLACK)
+            cprint("x", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(addr + WIN_OFF_H), WHITE_ON_BLACK)
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_decimal(volatile_read_u64(addr + WIN_OFF_Z), WHITE_ON_BLACK)
+            cprint("  ", WHITE_ON_BLACK)
+            if (flags & WIN_FLAG_FOCUSED) != 0 { cprint("[FOCUS] ", GREEN_ON_BLACK) }
+            if (flags & WIN_FLAG_DECORATED) != 0 { cprint("[DECO] ", WHITE_ON_BLACK) }
+            cprintln("", WHITE_ON_BLACK)
+        }
+        id = id + 1
+    }
+}

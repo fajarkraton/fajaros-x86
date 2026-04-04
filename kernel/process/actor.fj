@@ -1,0 +1,316 @@
+// FajarOS Nova v3.0 "Nusantara" — Actor Process Model
+// Typed actor processes with mailbox channels and supervision.
+// Replaces traditional fork/exec with actor_spawn/actor_send.
+//
+// macOS uses Mach IPC (untyped ports). FajarOS uses typed actors
+// with compile-time verified message types via @kernel/@safe.
+
+// ═══════════════════════════════════════════════════════════════
+// Actor Process System
+//
+// Each actor is a lightweight process with:
+// - A bounded message mailbox (ring buffer)
+// - Typed message channels (enforced by @kernel annotations)
+// - Supervision hierarchy (parent restarts crashed children)
+// - Priority level (ML scheduler assigns optimal core)
+//
+// Actor lifecycle: Spawned → Running → Stopped/Crashed → Restarted
+// ═══════════════════════════════════════════════════════════════
+
+const ACTOR_TABLE_BASE: i64 = 0xA30000  // Actor metadata storage
+const ACTOR_MAX: i64 = 16               // Max concurrent actors
+const ACTOR_ENTRY_SIZE: i64 = 128       // Bytes per actor entry
+
+// Actor entry offsets
+const ACTOR_OFF_PID: i64 = 0            // Process ID
+const ACTOR_OFF_PARENT: i64 = 8         // Parent actor PID (-1 = root)
+const ACTOR_OFF_STATUS: i64 = 16        // Status code
+const ACTOR_OFF_PRIORITY: i64 = 24      // Scheduling priority (0=highest)
+const ACTOR_OFF_MSG_COUNT: i64 = 32     // Messages received
+const ACTOR_OFF_RESTART_COUNT: i64 = 40 // Times restarted
+const ACTOR_OFF_SUPERVISOR: i64 = 48    // Supervision strategy
+const ACTOR_OFF_MAILBOX_HEAD: i64 = 56  // Mailbox write position
+const ACTOR_OFF_MAILBOX_TAIL: i64 = 64  // Mailbox read position
+const ACTOR_OFF_CAPS: i64 = 72          // Capability token
+const ACTOR_OFF_NAME_HASH: i64 = 80     // Hash of actor name
+
+// Actor status
+const ACTOR_STATUS_FREE: i64 = 0
+const ACTOR_STATUS_SPAWNING: i64 = 1
+const ACTOR_STATUS_RUNNING: i64 = 2
+const ACTOR_STATUS_BLOCKED: i64 = 3     // Waiting for message
+const ACTOR_STATUS_STOPPED: i64 = 4
+const ACTOR_STATUS_CRASHED: i64 = 5
+
+// Supervision strategies
+const SUPERVISOR_ONE_FOR_ONE: i64 = 1   // Restart only crashed actor
+const SUPERVISOR_ALL_FOR_ONE: i64 = 2   // Restart all siblings
+const SUPERVISOR_REST_FOR_ONE: i64 = 3  // Restart crashed + later siblings
+
+// Mailbox (per-actor message queue)
+const MAILBOX_BASE: i64 = 0xA40000      // Mailbox storage
+const MAILBOX_CAPACITY: i64 = 16        // Messages per actor
+const MAILBOX_MSG_SIZE: i64 = 32        // Bytes per message
+const MAILBOX_ACTOR_SIZE: i64 = 512     // Total mailbox per actor (16 * 32)
+
+// Message offsets
+const MSG_OFF_TYPE: i64 = 0             // Message type tag
+const MSG_OFF_SENDER: i64 = 8           // Sender PID
+const MSG_OFF_PAYLOAD0: i64 = 16        // Payload word 0
+const MSG_OFF_PAYLOAD1: i64 = 24        // Payload word 1
+
+// ── Actor table operations ──
+
+@kernel fn actor_entry_addr(actor_id: i64) -> i64 {
+    ACTOR_TABLE_BASE + actor_id * ACTOR_ENTRY_SIZE
+}
+
+@kernel fn actor_init() {
+    // Initialize actor table
+    let mut i: i64 = 0
+    while i < ACTOR_MAX * ACTOR_ENTRY_SIZE {
+        volatile_write_u64(ACTOR_TABLE_BASE + i, 0)
+        i = i + 8
+    }
+    // Initialize mailboxes
+    i = 0
+    while i < ACTOR_MAX * MAILBOX_ACTOR_SIZE {
+        volatile_write_u64(MAILBOX_BASE + i, 0)
+        i = i + 8
+    }
+}
+
+// ── Actor lifecycle ──
+
+@kernel fn actor_spawn_with_parent(parent_pid: i64, priority: i64, name_hash: i64) -> i64 {
+    // Find free actor slot
+    let mut id: i64 = 0
+    while id < ACTOR_MAX {
+        let addr = actor_entry_addr(id)
+        let status = volatile_read_u64(addr + ACTOR_OFF_STATUS)
+        if status == ACTOR_STATUS_FREE {
+            // Initialize actor
+            volatile_write_u64(addr + ACTOR_OFF_PID, id)
+            volatile_write_u64(addr + ACTOR_OFF_PARENT, parent_pid)
+            volatile_write_u64(addr + ACTOR_OFF_STATUS, ACTOR_STATUS_SPAWNING)
+            volatile_write_u64(addr + ACTOR_OFF_PRIORITY, priority)
+            volatile_write_u64(addr + ACTOR_OFF_MSG_COUNT, 0)
+            volatile_write_u64(addr + ACTOR_OFF_RESTART_COUNT, 0)
+            volatile_write_u64(addr + ACTOR_OFF_SUPERVISOR, SUPERVISOR_ONE_FOR_ONE)
+            volatile_write_u64(addr + ACTOR_OFF_MAILBOX_HEAD, 0)
+            volatile_write_u64(addr + ACTOR_OFF_MAILBOX_TAIL, 0)
+            volatile_write_u64(addr + ACTOR_OFF_CAPS, CAP_SAFE_DEFAULT)
+            volatile_write_u64(addr + ACTOR_OFF_NAME_HASH, name_hash)
+
+            // Log the spawn
+            audit_log(AUDIT_EVT_EXEC, id, parent_pid, priority, 1)
+
+            return id
+        }
+        id = id + 1
+    }
+    -1  // No free slots
+}
+
+@kernel fn actor_start(actor_id: i64) {
+    if actor_id < 0 || actor_id >= ACTOR_MAX { return }
+    let addr = actor_entry_addr(actor_id)
+    volatile_write_u64(addr + ACTOR_OFF_STATUS, ACTOR_STATUS_RUNNING)
+}
+
+@kernel fn actor_stop(actor_id: i64) {
+    if actor_id < 0 || actor_id >= ACTOR_MAX { return }
+    let addr = actor_entry_addr(actor_id)
+    volatile_write_u64(addr + ACTOR_OFF_STATUS, ACTOR_STATUS_STOPPED)
+    audit_log(AUDIT_EVT_KILL, actor_id, 0, 0, 1)
+}
+
+@kernel fn actor_crash(actor_id: i64) {
+    if actor_id < 0 || actor_id >= ACTOR_MAX { return }
+    let addr = actor_entry_addr(actor_id)
+    volatile_write_u64(addr + ACTOR_OFF_STATUS, ACTOR_STATUS_CRASHED)
+    audit_log(AUDIT_EVT_KILL, actor_id, 0, 0, 0)
+
+    // Trigger supervision
+    let parent = volatile_read_u64(addr + ACTOR_OFF_PARENT)
+    if parent >= 0 {
+        supervisor_handle_crash(parent, actor_id)
+    }
+}
+
+// ── Mailbox operations ──
+
+@kernel fn actor_send_msg(dst_id: i64, msg_type: i64, sender: i64, payload0: i64, payload1: i64) -> i64 {
+    if dst_id < 0 || dst_id >= ACTOR_MAX { return -1 }
+
+    let addr = actor_entry_addr(dst_id)
+    let status = volatile_read_u64(addr + ACTOR_OFF_STATUS)
+    if status == ACTOR_STATUS_FREE || status == ACTOR_STATUS_STOPPED { return -2 }
+
+    // Check capability
+    if cap_check(sender, CAP_IPC_SEND) == 0 {
+        audit_ipc(sender, dst_id, 0)
+        return -3
+    }
+
+    // Write to mailbox ring buffer
+    let head = volatile_read_u64(addr + ACTOR_OFF_MAILBOX_HEAD)
+    let tail = volatile_read_u64(addr + ACTOR_OFF_MAILBOX_TAIL)
+    let next_head = (head + 1) % MAILBOX_CAPACITY
+    if next_head == tail { return -4 } // Mailbox full
+
+    let msg_addr = MAILBOX_BASE + dst_id * MAILBOX_ACTOR_SIZE + head * MAILBOX_MSG_SIZE
+    volatile_write_u64(msg_addr + MSG_OFF_TYPE, msg_type)
+    volatile_write_u64(msg_addr + MSG_OFF_SENDER, sender)
+    volatile_write_u64(msg_addr + MSG_OFF_PAYLOAD0, payload0)
+    volatile_write_u64(msg_addr + MSG_OFF_PAYLOAD1, payload1)
+
+    volatile_write_u64(addr + ACTOR_OFF_MAILBOX_HEAD, next_head)
+
+    // Update stats
+    let count = volatile_read_u64(addr + ACTOR_OFF_MSG_COUNT)
+    volatile_write_u64(addr + ACTOR_OFF_MSG_COUNT, count + 1)
+
+    // Wake blocked actor
+    if status == ACTOR_STATUS_BLOCKED {
+        volatile_write_u64(addr + ACTOR_OFF_STATUS, ACTOR_STATUS_RUNNING)
+    }
+
+    audit_ipc(sender, dst_id, 1)
+    0  // Success
+}
+
+@kernel fn actor_recv_msg(actor_id: i64, buf_addr: i64) -> i64 {
+    if actor_id < 0 || actor_id >= ACTOR_MAX { return -1 }
+
+    let addr = actor_entry_addr(actor_id)
+    let head = volatile_read_u64(addr + ACTOR_OFF_MAILBOX_HEAD)
+    let tail = volatile_read_u64(addr + ACTOR_OFF_MAILBOX_TAIL)
+
+    if head == tail {
+        // Mailbox empty — block
+        volatile_write_u64(addr + ACTOR_OFF_STATUS, ACTOR_STATUS_BLOCKED)
+        return -2
+    }
+
+    // Read message
+    let msg_addr = MAILBOX_BASE + actor_id * MAILBOX_ACTOR_SIZE + tail * MAILBOX_MSG_SIZE
+    volatile_write_u64(buf_addr, volatile_read_u64(msg_addr + MSG_OFF_TYPE))
+    volatile_write_u64(buf_addr + 8, volatile_read_u64(msg_addr + MSG_OFF_SENDER))
+    volatile_write_u64(buf_addr + 16, volatile_read_u64(msg_addr + MSG_OFF_PAYLOAD0))
+    volatile_write_u64(buf_addr + 24, volatile_read_u64(msg_addr + MSG_OFF_PAYLOAD1))
+
+    // Advance tail
+    volatile_write_u64(addr + ACTOR_OFF_MAILBOX_TAIL, (tail + 1) % MAILBOX_CAPACITY)
+
+    0  // Success
+}
+
+// ── Supervision ──
+
+@kernel fn actor_set_supervisor(actor_id: i64, strategy: i64) {
+    if actor_id < 0 || actor_id >= ACTOR_MAX { return }
+    let addr = actor_entry_addr(actor_id)
+    volatile_write_u64(addr + ACTOR_OFF_SUPERVISOR, strategy)
+}
+
+@kernel fn supervisor_handle_crash(parent_id: i64, crashed_id: i64) {
+    let parent_addr = actor_entry_addr(parent_id)
+    let strategy = volatile_read_u64(parent_addr + ACTOR_OFF_SUPERVISOR)
+
+    if strategy == SUPERVISOR_ONE_FOR_ONE {
+        // Restart only the crashed actor
+        actor_restart(crashed_id)
+    } else if strategy == SUPERVISOR_ALL_FOR_ONE {
+        // Restart all children of this parent
+        let mut i: i64 = 0
+        while i < ACTOR_MAX {
+            let addr = actor_entry_addr(i)
+            let parent = volatile_read_u64(addr + ACTOR_OFF_PARENT)
+            if parent == parent_id {
+                actor_restart(i)
+            }
+            i = i + 1
+        }
+    } else if strategy == SUPERVISOR_REST_FOR_ONE {
+        // Restart crashed + all actors spawned after it
+        let mut found = 0
+        let mut i: i64 = 0
+        while i < ACTOR_MAX {
+            if i == crashed_id { found = 1 }
+            if found != 0 {
+                let addr = actor_entry_addr(i)
+                let parent = volatile_read_u64(addr + ACTOR_OFF_PARENT)
+                if parent == parent_id {
+                    actor_restart(i)
+                }
+            }
+            i = i + 1
+        }
+    }
+}
+
+@kernel fn actor_restart(actor_id: i64) {
+    if actor_id < 0 || actor_id >= ACTOR_MAX { return }
+    let addr = actor_entry_addr(actor_id)
+
+    // Increment restart count
+    let restarts = volatile_read_u64(addr + ACTOR_OFF_RESTART_COUNT)
+    volatile_write_u64(addr + ACTOR_OFF_RESTART_COUNT, restarts + 1)
+
+    // Clear mailbox
+    volatile_write_u64(addr + ACTOR_OFF_MAILBOX_HEAD, 0)
+    volatile_write_u64(addr + ACTOR_OFF_MAILBOX_TAIL, 0)
+
+    // Set to running
+    volatile_write_u64(addr + ACTOR_OFF_STATUS, ACTOR_STATUS_RUNNING)
+}
+
+// ── Shell command ──
+
+@kernel fn cmd_actors() {
+    cprintln("=== Actor Process Table ===", YELLOW_ON_BLACK)
+    cprintln("  ID  Parent  Status     Priority  Msgs  Restarts  Supervisor", WHITE_ON_BLACK)
+    cprintln("  --  ------  ------     --------  ----  --------  ----------", WHITE_ON_BLACK)
+
+    let mut i: i64 = 0
+    while i < ACTOR_MAX {
+        let addr = actor_entry_addr(i)
+        let status = volatile_read_u64(addr + ACTOR_OFF_STATUS)
+        if status != ACTOR_STATUS_FREE {
+            cprint("  ", WHITE_ON_BLACK)
+            cprint_decimal(i, CYAN_ON_BLACK)
+            cprint("   ", WHITE_ON_BLACK)
+            let parent = volatile_read_u64(addr + ACTOR_OFF_PARENT)
+            cprint_decimal(parent, WHITE_ON_BLACK)
+            cprint("       ", WHITE_ON_BLACK)
+
+            if status == ACTOR_STATUS_SPAWNING { cprint("SPAWNING  ", YELLOW_ON_BLACK) }
+            else if status == ACTOR_STATUS_RUNNING { cprint("RUNNING   ", GREEN_ON_BLACK) }
+            else if status == ACTOR_STATUS_BLOCKED { cprint("BLOCKED   ", YELLOW_ON_BLACK) }
+            else if status == ACTOR_STATUS_STOPPED { cprint("STOPPED   ", WHITE_ON_BLACK) }
+            else if status == ACTOR_STATUS_CRASHED { cprint("CRASHED   ", RED_ON_BLACK) }
+
+            let pri = volatile_read_u64(addr + ACTOR_OFF_PRIORITY)
+            cprint_decimal(pri, CYAN_ON_BLACK)
+            cprint("         ", WHITE_ON_BLACK)
+
+            let msgs = volatile_read_u64(addr + ACTOR_OFF_MSG_COUNT)
+            cprint_decimal(msgs, WHITE_ON_BLACK)
+            cprint("     ", WHITE_ON_BLACK)
+
+            let restarts = volatile_read_u64(addr + ACTOR_OFF_RESTART_COUNT)
+            cprint_decimal(restarts, WHITE_ON_BLACK)
+            cprint("         ", WHITE_ON_BLACK)
+
+            let sup = volatile_read_u64(addr + ACTOR_OFF_SUPERVISOR)
+            if sup == SUPERVISOR_ONE_FOR_ONE { cprint("one-for-one", WHITE_ON_BLACK) }
+            else if sup == SUPERVISOR_ALL_FOR_ONE { cprint("all-for-one", WHITE_ON_BLACK) }
+            else if sup == SUPERVISOR_REST_FOR_ONE { cprint("rest-for-one", WHITE_ON_BLACK) }
+            cprintln("", WHITE_ON_BLACK)
+        }
+        i = i + 1
+    }
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("  macOS: Mach IPC (untyped ports). FajarOS: typed actors + supervision.", GREEN_ON_BLACK)
+}

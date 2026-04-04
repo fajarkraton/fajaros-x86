@@ -1,0 +1,80 @@
+// FajarOS Nova v3.0 "Nusantara" — Taskbar
+// Bottom panel showing running actors, clock, system tray.
+// Similar to macOS Dock but shows actor hierarchy.
+
+// ═══════════════════════════════════════════════════════════════
+// Taskbar — Bottom Panel
+// ═══════════════════════════════════════════════════════════════
+
+const TASKBAR_HEIGHT: i64 = 40
+const TASKBAR_Y: i64 = 728         // SCREEN_HEIGHT - TASKBAR_HEIGHT
+const TASKBAR_ITEM_WIDTH: i64 = 100
+const TASKBAR_ITEM_HEIGHT: i64 = 30
+const TASKBAR_PADDING: i64 = 5
+
+// ── Taskbar drawing ──
+
+@kernel fn taskbar_draw() {
+    // Background
+    comp_fill_rect(FB_BACK, 0, TASKBAR_Y, SCREEN_WIDTH, TASKBAR_HEIGHT, COLOR_TASKBAR_BG)
+    // Top border line
+    comp_fill_rect(FB_BACK, 0, TASKBAR_Y, SCREEN_WIDTH, 1, 0xFF3A3A5C)
+
+    // Draw items for each running actor with a window
+    let mut item_x: i64 = TASKBAR_PADDING
+    let mut id: i64 = 0
+    while id < COMP_MAX_WINDOWS {
+        let addr = comp_window_addr(id)
+        let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+        if (flags & WIN_FLAG_VISIBLE) != 0 {
+            let focused = (flags & WIN_FLAG_FOCUSED) != 0
+            let bg = if focused { 0xFF3A5A8C } else { 0xFF2A2A4C }
+            let item_y = TASKBAR_Y + (TASKBAR_HEIGHT - TASKBAR_ITEM_HEIGHT) / 2
+            comp_fill_rect(FB_BACK, item_x, item_y, TASKBAR_ITEM_WIDTH, TASKBAR_ITEM_HEIGHT, bg)
+
+            // Draw focused indicator (bottom line)
+            if focused {
+                comp_fill_rect(FB_BACK, item_x, TASKBAR_Y + TASKBAR_HEIGHT - 3,
+                              TASKBAR_ITEM_WIDTH, 3, 0xFF4CAF50)
+            }
+
+            item_x = item_x + TASKBAR_ITEM_WIDTH + TASKBAR_PADDING
+        }
+        id = id + 1
+    }
+
+    // System tray area (right side)
+    let tray_x = SCREEN_WIDTH - 120
+    let tray_y = TASKBAR_Y + 10
+    // Clock placeholder
+    comp_fill_rect(FB_BACK, tray_x, tray_y, 80, 20, 0xFF2A2A4C)
+
+    // FajarOS logo indicator (far right)
+    comp_fill_rect(FB_BACK, SCREEN_WIDTH - 30, tray_y, 20, 20, COLOR_TITLEBAR_ACTIVE)
+}
+
+// ── Taskbar click handling ──
+
+@kernel fn taskbar_handle_click(x: i64, y: i64) -> i64 {
+    if y < TASKBAR_Y || y >= SCREEN_HEIGHT { return -1 }
+
+    // Calculate which item was clicked
+    let item_idx = (x - TASKBAR_PADDING) / (TASKBAR_ITEM_WIDTH + TASKBAR_PADDING)
+
+    // Map to window ID
+    let mut visible_idx: i64 = 0
+    let mut id: i64 = 0
+    while id < COMP_MAX_WINDOWS {
+        let addr = comp_window_addr(id)
+        let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+        if (flags & WIN_FLAG_VISIBLE) != 0 {
+            if visible_idx == item_idx {
+                comp_focus_window(id)
+                return id
+            }
+            visible_idx = visible_idx + 1
+        }
+        id = id + 1
+    }
+    -1
+}

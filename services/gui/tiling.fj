@@ -1,0 +1,125 @@
+// FajarOS Nova v3.0 "Nusantara" — Window Tiling Manager
+// Automatic window layout: left/right split, quadrant, cascade.
+// Similar to macOS Sequoia's window tiling but with typed actor IPC.
+
+// ═══════════════════════════════════════════════════════════════
+// Tiling Layouts
+// ═══════════════════════════════════════════════════════════════
+
+const LAYOUT_NONE: i64 = 0
+const LAYOUT_LEFT_RIGHT: i64 = 1   // Two windows side by side
+const LAYOUT_TOP_BOTTOM: i64 = 2   // Two windows stacked
+const LAYOUT_QUADRANT: i64 = 3     // Four windows in corners
+const LAYOUT_CASCADE: i64 = 4      // Staggered cascade
+const LAYOUT_MAXIMIZE: i64 = 5     // Single window fullscreen
+
+const TILE_STATE_BASE: i64 = 0xC20000
+const TILE_CURRENT_LAYOUT: i64 = 0
+const TILE_GAP: i64 = 4            // Pixel gap between tiled windows
+
+// ── Tiling operations ──
+
+@kernel fn tile_apply_layout(layout: i64) {
+    volatile_write_u64(TILE_STATE_BASE + TILE_CURRENT_LAYOUT, layout)
+
+    // Collect visible window IDs
+    let mut win_ids: [i64; 16] = [0; 16]
+    let mut count: i64 = 0
+    let mut id: i64 = 0
+    while id < COMP_MAX_WINDOWS {
+        let addr = comp_window_addr(id)
+        let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+        if (flags & WIN_FLAG_VISIBLE) != 0 {
+            win_ids[count] = id
+            count = count + 1
+        }
+        id = id + 1
+    }
+
+    if count == 0 { return }
+
+    let usable_y = TITLEBAR_HEIGHT + TILE_GAP
+    let usable_h = SCREEN_HEIGHT - 40 - TITLEBAR_HEIGHT - 2 * TILE_GAP
+    let usable_w = SCREEN_WIDTH - 2 * TILE_GAP
+
+    if layout == LAYOUT_LEFT_RIGHT && count >= 2 {
+        // First window: left half
+        let half_w = (usable_w - TILE_GAP) / 2
+        comp_move_window(win_ids[0], TILE_GAP, usable_y)
+        let a0 = comp_window_addr(win_ids[0])
+        volatile_write_u64(a0 + WIN_OFF_W, half_w)
+        volatile_write_u64(a0 + WIN_OFF_H, usable_h)
+
+        // Second window: right half
+        comp_move_window(win_ids[1], TILE_GAP + half_w + TILE_GAP, usable_y)
+        let a1 = comp_window_addr(win_ids[1])
+        volatile_write_u64(a1 + WIN_OFF_W, half_w)
+        volatile_write_u64(a1 + WIN_OFF_H, usable_h)
+
+    } else if layout == LAYOUT_QUADRANT && count >= 4 {
+        let half_w = (usable_w - TILE_GAP) / 2
+        let half_h = (usable_h - TILE_GAP) / 2
+
+        // Top-left
+        comp_move_window(win_ids[0], TILE_GAP, usable_y)
+        let a0 = comp_window_addr(win_ids[0])
+        volatile_write_u64(a0 + WIN_OFF_W, half_w)
+        volatile_write_u64(a0 + WIN_OFF_H, half_h)
+
+        // Top-right
+        comp_move_window(win_ids[1], TILE_GAP + half_w + TILE_GAP, usable_y)
+        let a1 = comp_window_addr(win_ids[1])
+        volatile_write_u64(a1 + WIN_OFF_W, half_w)
+        volatile_write_u64(a1 + WIN_OFF_H, half_h)
+
+        // Bottom-left
+        comp_move_window(win_ids[2], TILE_GAP, usable_y + half_h + TILE_GAP)
+        let a2 = comp_window_addr(win_ids[2])
+        volatile_write_u64(a2 + WIN_OFF_W, half_w)
+        volatile_write_u64(a2 + WIN_OFF_H, half_h)
+
+        // Bottom-right
+        comp_move_window(win_ids[3], TILE_GAP + half_w + TILE_GAP, usable_y + half_h + TILE_GAP)
+        let a3 = comp_window_addr(win_ids[3])
+        volatile_write_u64(a3 + WIN_OFF_W, half_w)
+        volatile_write_u64(a3 + WIN_OFF_H, half_h)
+
+    } else if layout == LAYOUT_CASCADE {
+        let mut i: i64 = 0
+        while i < count {
+            let offset = i * 30
+            comp_move_window(win_ids[i], TILE_GAP + offset, usable_y + offset)
+            let a = comp_window_addr(win_ids[i])
+            volatile_write_u64(a + WIN_OFF_W, usable_w - offset * 2)
+            volatile_write_u64(a + WIN_OFF_H, usable_h - offset * 2)
+            i = i + 1
+        }
+
+    } else if layout == LAYOUT_MAXIMIZE && count >= 1 {
+        comp_tile_maximize(win_ids[0])
+    }
+
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+// ── Shell commands ──
+
+@kernel fn cmd_tile_left_right() {
+    tile_apply_layout(LAYOUT_LEFT_RIGHT)
+    cprintln("Layout: left/right split", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_tile_quad() {
+    tile_apply_layout(LAYOUT_QUADRANT)
+    cprintln("Layout: quadrant (4 windows)", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_tile_cascade() {
+    tile_apply_layout(LAYOUT_CASCADE)
+    cprintln("Layout: cascade", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_tile_max() {
+    tile_apply_layout(LAYOUT_MAXIMIZE)
+    cprintln("Layout: maximize", GREEN_ON_BLACK)
+}
