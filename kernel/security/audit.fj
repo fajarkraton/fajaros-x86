@@ -1,7 +1,8 @@
 // FajarOS Nova v3.0 "Nusantara" — Security Audit Log
 // Ring-buffer audit log recording @kernel transitions, capability checks,
-// and security-relevant events. Stronger than macOS SIP because events
-// are logged at compile-time enforcement boundaries, not runtime hooks.
+// and security-relevant events. Uses RDTSC for nanosecond timestamps.
+// Stronger than macOS SIP because events are logged at compile-time
+// enforcement boundaries, not runtime hooks.
 //
 // Part of the modular kernel build (concatenated by Makefile)
 
@@ -85,8 +86,8 @@ const AUDIT_EVT_ANOMALY: i64 = 14      // ML anomaly detection alert
 
     // Write entry
     let entry_addr = AUDIT_BASE + head * AUDIT_ENTRY_SIZE
-    // Read TSC for timestamp (RDTSC via simulated counter)
-    let tsc = volatile_read_u64(0x6FF00) // Kernel tick counter
+    // Read hardware timestamp counter (nanosecond-precision on modern CPUs)
+    let tsc = rdtsc()
     volatile_write_u64(entry_addr + AUDIT_OFF_TIMESTAMP, tsc)
     volatile_write_u64(entry_addr + AUDIT_OFF_EVENT_TYPE, event_type)
     volatile_write_u64(entry_addr + AUDIT_OFF_PID, pid)

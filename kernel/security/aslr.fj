@@ -1,6 +1,6 @@
 // FajarOS Nova v3.0 "Nusantara" — Address Space Layout Randomization
 // Randomizes process virtual address base on exec to prevent
-// ROP/code injection attacks. Uses LFSR PRNG seeded from TSC.
+// ROP/code injection attacks. Uses RDRAND hardware true random.
 //
 // macOS equivalent: ASLR (introduced OS X Leopard).
 // FajarOS advantage: combined with @kernel compile-time checks,
@@ -16,21 +16,32 @@ const ASLR_PAGE_SIZE: i64 = 4096        // 4KB page alignment
 const ASLR_USER_BASE_MIN: i64 = 0x400000    // Min user base (4MB)
 const ASLR_USER_BASE_MAX: i64 = 0x10000000  // Max user base (256MB)
 
-// LFSR state for pseudo-random generation (seeded from TSC)
+// RDRAND fallback state (used only if RDRAND is unavailable)
 const ASLR_LFSR_STATE: i64 = 0  // Offset in ASLR_BASE
+const ASLR_HAS_RDRAND: i64 = 8  // 1 if RDRAND available
 
-// ── PRNG (Linear Feedback Shift Register) ──
+// ── Hardware Random (RDRAND) with LFSR fallback ──
 
 @kernel fn aslr_init() {
-    // Seed from TSC (time stamp counter) — unique per boot
-    let tsc = volatile_read_u64(0x6FF00)
+    // Test RDRAND availability by reading it; if CPU supports it, use it
+    // RDRAND returns true random from Intel/AMD hardware RNG
+    let test = rdrand()
+    let has_hw = if test != 0 { 1 } else { 0 }
+    volatile_write_u64(ASLR_BASE + ASLR_HAS_RDRAND, has_hw)
+    // Seed LFSR fallback from RDTSC in case RDRAND is unavailable
+    let tsc = rdtsc()
     let seed = if tsc == 0 { 0xDEADBEEF } else { tsc }
     volatile_write_u64(ASLR_BASE + ASLR_LFSR_STATE, seed)
 }
 
 @kernel fn aslr_next() -> i64 {
+    // Prefer RDRAND (hardware true random) over LFSR
+    let has_hw = volatile_read_u64(ASLR_BASE + ASLR_HAS_RDRAND)
+    if has_hw != 0 {
+        return rdrand()
+    }
+    // Fallback: Galois LFSR with polynomial x^32 + x^22 + x^2 + x + 1
     let state = volatile_read_u64(ASLR_BASE + ASLR_LFSR_STATE)
-    // Galois LFSR with polynomial x^32 + x^22 + x^2 + x + 1
     let bit = ((state >> 0) ^ (state >> 2) ^ (state >> 6) ^ (state >> 7)) & 1
     let next = (state >> 1) | (bit << 31)
     volatile_write_u64(ASLR_BASE + ASLR_LFSR_STATE, next)
@@ -69,6 +80,10 @@ const ASLR_LFSR_STATE: i64 = 0  // Offset in ASLR_BASE
 
 @kernel fn cmd_aslr() {
     cprintln("=== ASLR Status ===", YELLOW_ON_BLACK)
+    let has_hw = volatile_read_u64(ASLR_BASE + ASLR_HAS_RDRAND)
+    cprint("  RNG: ", WHITE_ON_BLACK)
+    if has_hw != 0 { cprintln("RDRAND (hardware)", GREEN_ON_BLACK) }
+    else { cprintln("LFSR (software fallback)", YELLOW_ON_BLACK) }
     let state = volatile_read_u64(ASLR_BASE + ASLR_LFSR_STATE)
     cprint("  LFSR state: 0x", WHITE_ON_BLACK)
     cprintln_hex(state, 8, CYAN_ON_BLACK)

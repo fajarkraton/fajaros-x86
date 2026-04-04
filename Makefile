@@ -21,6 +21,8 @@ GRUB_CFG := grub.cfg
 # 7. Main entry point (MUST be last)
 SOURCES := \
 	kernel/boot/constants.fj \
+	kernel/hw/msr.fj \
+	kernel/hw/cpuid.fj \
 	kernel/mm/frames.fj \
 	kernel/mm/paging.fj \
 	kernel/mm/heap.fj \
@@ -68,6 +70,10 @@ SOURCES := \
 	kernel/security/limits.fj \
 	kernel/security/hardening.fj \
 	kernel/security/forkbomb.fj \
+	kernel/security/seccomp.fj \
+	kernel/security/aslr.fj \
+	kernel/security/audit.fj \
+	kernel/security/crypto.fj \
 	drivers/serial.fj \
 	drivers/vga.fj \
 	drivers/keyboard.fj \

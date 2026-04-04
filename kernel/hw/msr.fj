@@ -1,0 +1,117 @@
+// FajarOS Nova v3.0 "Nusantara" — MSR (Model-Specific Register) Access
+// Provides rdmsr/wrmsr as @kernel builtins for hardware configuration.
+// Used by: paging (EFER.NXE), LAPIC (x2APIC), power management, etc.
+
+// ═══════════════════════════════════════════════════════════════
+// MSR — Read/Write Model-Specific Registers
+//
+// rdmsr: ECX=index → EDX:EAX = 64-bit value
+// wrmsr: ECX=index, EDX:EAX = value → write to MSR
+//
+// Common MSRs:
+//   0xC0000080 = EFER (Extended Feature Enable Register)
+//   0xC0000100 = FS_BASE
+//   0xC0000101 = GS_BASE
+//   0xC0000102 = KERNEL_GS_BASE
+//   0x1B       = APIC_BASE
+//   0x174      = SYSENTER_CS
+//   0x175      = SYSENTER_ESP
+//   0x176      = SYSENTER_EIP
+// ═══════════════════════════════════════════════════════════════
+
+// Well-known MSR indices
+const MSR_EFER: i64 = 0xC0000080
+const MSR_STAR: i64 = 0xC0000081
+const MSR_LSTAR: i64 = 0xC0000082
+const MSR_FS_BASE: i64 = 0xC0000100
+const MSR_GS_BASE: i64 = 0xC0000101
+const MSR_KERNEL_GS_BASE: i64 = 0xC0000102
+const MSR_APIC_BASE: i64 = 0x1B
+const MSR_SYSENTER_CS: i64 = 0x174
+const MSR_SYSENTER_ESP: i64 = 0x175
+const MSR_SYSENTER_EIP: i64 = 0x176
+
+// EFER bits
+const EFER_SCE: i64 = 1       // Bit 0: SYSCALL/SYSRET Enable
+const EFER_LME: i64 = 256     // Bit 8: Long Mode Enable
+const EFER_LMA: i64 = 1024    // Bit 10: Long Mode Active
+const EFER_NXE: i64 = 2048    // Bit 11: No-Execute Enable
+const EFER_SVME: i64 = 4096   // Bit 12: SVM Enable (AMD)
+
+// ── MSR read/write (inline assembly) ──
+
+@kernel fn rdmsr(index: i64) -> i64 {
+    // RDMSR: read MSR[ECX] → EDX:EAX
+    // We use inline asm to implement this.
+    // Template: "rdmsr; shlq $32, %rdx; orq %rdx, %rax"
+    // Input: ECX = index, Output: RAX = combined 64-bit value
+    asm("rdmsr\n\tshlq $$32, %%rdx\n\torq %%rdx, %%rax",
+        in("ecx") index,
+        out("rax") -> i64,
+        clobber("rdx"),
+        volatile)
+}
+
+@kernel fn wrmsr(index: i64, value: i64) {
+    // WRMSR: write EDX:EAX → MSR[ECX]
+    // Low 32 bits in EAX, high 32 bits in EDX
+    let lo = value & 0xFFFFFFFF
+    let hi = (value >> 32) & 0xFFFFFFFF
+    asm("wrmsr",
+        in("ecx") index,
+        in("eax") lo,
+        in("edx") hi,
+        volatile)
+}
+
+// ── Convenience functions ──
+
+@kernel fn msr_enable_nx() {
+    // Enable NX bit support via EFER.NXE
+    let efer = rdmsr(MSR_EFER)
+    wrmsr(MSR_EFER, efer | EFER_NXE)
+}
+
+@kernel fn msr_enable_syscall() {
+    // Enable SYSCALL/SYSRET via EFER.SCE
+    let efer = rdmsr(MSR_EFER)
+    wrmsr(MSR_EFER, efer | EFER_SCE)
+}
+
+@kernel fn msr_get_apic_base() -> i64 {
+    rdmsr(MSR_APIC_BASE) & 0xFFFFF000
+}
+
+@kernel fn msr_enable_x2apic() {
+    // Enable x2APIC mode: set bit 10 (enable) + bit 11 (x2APIC) of APIC_BASE MSR
+    let base = rdmsr(MSR_APIC_BASE)
+    wrmsr(MSR_APIC_BASE, base | 0xC00)  // bits 10+11
+}
+
+// ── Shell command ──
+
+@kernel fn cmd_msr() {
+    cprintln("=== MSR Status ===", YELLOW_ON_BLACK)
+    let efer = rdmsr(MSR_EFER)
+    cprint("  EFER: 0x", WHITE_ON_BLACK)
+    cprintln_hex(efer, 16, CYAN_ON_BLACK)
+    cprint("    LME (Long Mode):  ", WHITE_ON_BLACK)
+    if (efer & EFER_LME) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("    LMA (Long Active): ", WHITE_ON_BLACK)
+    if (efer & EFER_LMA) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("    NXE (No-Execute):  ", WHITE_ON_BLACK)
+    if (efer & EFER_NXE) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("    SCE (SYSCALL):     ", WHITE_ON_BLACK)
+    if (efer & EFER_SCE) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    let apic = rdmsr(MSR_APIC_BASE)
+    cprint("  APIC Base: 0x", WHITE_ON_BLACK)
+    cprintln_hex(apic & 0xFFFFF000, 16, CYAN_ON_BLACK)
+    cprint("    x2APIC: ", WHITE_ON_BLACK)
+    if (apic & 0x800) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", YELLOW_ON_BLACK) }
+}

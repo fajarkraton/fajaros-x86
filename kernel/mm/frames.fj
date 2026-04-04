@@ -66,16 +66,58 @@ const BITMAP_SIZE: i64 = 4096
 }
 
 @kernel fn frame_alloc() -> i64 {
-    // Find first free frame, returns physical address or -1
-    let mut f: i64 = 0
-    while f < TOTAL_FRAMES {
-        if frame_is_used(f) == 0 {
-            frame_mark_used(f)
-            return f * FRAME_SIZE
+    // Find first free frame using BSF (Bit Scan Forward) for O(1) per qword.
+    // Scans 8 bytes (64 frames) at a time, uses BSF to find first zero bit.
+    let mut byte_off: i64 = 0
+    while byte_off < BITMAP_SIZE {
+        // Read 8 bytes (64 frames) at once
+        let qword = volatile_read(BITMAP_BASE + byte_off)
+        if qword != -1 {
+            // At least one bit is 0 (free frame). Invert to find first 1-bit.
+            let inverted = qword ^ -1  // ~qword: free bits become 1
+            // BSF: find lowest set bit in inverted value
+            let bit_pos = bsf(inverted)
+            if bit_pos >= 0 {
+                let frame = (byte_off * 8) + bit_pos
+                if frame < TOTAL_FRAMES {
+                    frame_mark_used(frame)
+                    return frame * FRAME_SIZE
+                }
+            }
         }
-        f = f + 1
+        byte_off = byte_off + 8
     }
     -1  // OOM
+}
+
+@kernel fn bsf(value: i64) -> i64 {
+    // Bit Scan Forward: find index of lowest set bit (0-63), or -1 if zero.
+    // Uses x86 BSF instruction via inline asm.
+    if value == 0 { return -1 }
+    asm("bsfq %1, %0",
+        in("r") value,
+        out("r") -> i64,
+        volatile)
+}
+
+@kernel fn popcnt(value: i64) -> i64 {
+    // Population count: number of set bits.
+    asm("popcntq %1, %0",
+        in("r") value,
+        out("r") -> i64,
+        volatile)
+}
+
+@kernel fn frames_count_free() -> i64 {
+    // Count free frames using POPCNT (count used, subtract from total)
+    let mut used: i64 = 0
+    let mut byte_off: i64 = 0
+    while byte_off < BITMAP_SIZE {
+        let qword = volatile_read(BITMAP_BASE + byte_off)
+        used = used + popcnt(qword)
+        byte_off = byte_off + 8
+    }
+    TOTAL_FRAMES - used
 }
 
 @kernel fn frame_free(addr: i64) {

@@ -13,7 +13,7 @@ const PAGE_PRESENT: i64 = 1
 const PAGE_WRITABLE: i64 = 2
 const PAGE_USER: i64 = 4
 const PAGE_HUGE: i64 = 128
-const PAGE_NX: i64 = 0  // Would be bit 63, needs EFER.NXE
+const PAGE_NX: i64 = -9223372036854775808  // Bit 63 = 0x8000000000000000 (i64 min = set bit 63)
 
 @kernel fn page_table_entry(table_base: i64, index: i64) -> i64 {
     volatile_read(table_base + index * 8)
@@ -115,4 +115,43 @@ const PAGE_NX: i64 = 0  // Would be bit 63, needs EFER.NXE
     // Clear PT entry and flush TLB
     page_table_set(pt_addr, pt_idx, 0)
     invlpg(virt)
+}
+
+// ── NX (No-Execute) support via EFER.NXE ──
+
+@kernel fn enable_nx() {
+    // Enable NX bit support via EFER.NXE (bit 11) using MSR helper
+    // This allows PAGE_NX (bit 63) in page table entries to mark pages non-executable
+    msr_enable_nx()
+}
+
+@kernel fn map_page_wx(virt: i64, phys: i64, exec: i64) {
+    // Map a page with W^X enforcement: writable XOR executable, never both
+    // exec=1: executable + read-only (code), exec=0: writable + non-executable (data)
+    if exec != 0 {
+        // Code page: present + read-only (no PAGE_WRITABLE), executable
+        map_page(virt, phys, PAGE_PRESENT)
+    } else {
+        // Data page: present + writable + NX (no execute)
+        map_page(virt, phys, PAGE_PRESENT | PAGE_WRITABLE | PAGE_NX)
+    }
+}
+
+@kernel fn protect_kernel_data() {
+    // After boot: mark kernel .data/.bss/.stack as NX (non-executable)
+    // This prevents code injection into writable kernel memory
+    // .rodata and .data start at 0x108000 (after .text), stack at 0x7F0000
+    let mut addr: i64 = 0x108000
+    while addr < 0x200000 {
+        let pml4_idx = (addr >> 39) & 0x1FF
+        let pdpt_idx = (addr >> 30) & 0x1FF
+        let pd_idx = (addr >> 21) & 0x1FF
+        // For 2MB huge pages in the PD, set NX on the PD entry
+        let pd_addr: i64 = 0x72000  // PD base from boot setup
+        let entry = page_table_entry(pd_addr, pd_idx)
+        if (entry & PAGE_PRESENT) != 0 {
+            page_table_set(pd_addr, pd_idx, entry | PAGE_NX)
+        }
+        addr = addr + 0x200000  // 2MB per PD entry
+    }
 }

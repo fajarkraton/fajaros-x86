@@ -1,0 +1,138 @@
+// FajarOS Nova v3.0 "Nusantara" — CPUID Hardware Detection
+// Detects CPU features at boot: RDRAND, AVX2, AES-NI, POPCNT, etc.
+// Results stored in memory for runtime feature checks.
+
+// ═══════════════════════════════════════════════════════════════
+// CPUID — CPU Feature Detection
+//
+// CPUID instruction: EAX=leaf → EAX,EBX,ECX,EDX
+// Leaf 1 ECX: SSE3(0), SSSE3(9), FMA(12), SSE4.1(19), SSE4.2(20),
+//             POPCNT(23), AES-NI(25), AVX(28), RDRAND(30)
+// Leaf 7 EBX: BMI1(3), AVX2(5), BMI2(8), AVX512F(16)
+// Leaf 0x80000001 EDX: NX(20), RDTSCP(27), LM(29)
+// ═══════════════════════════════════════════════════════════════
+
+const CPUID_BASE: i64 = 0xA30000    // Feature flags storage
+
+// Feature flag offsets
+const CPU_HAS_RDRAND: i64 = 0
+const CPU_HAS_AES: i64 = 8
+const CPU_HAS_AVX2: i64 = 16
+const CPU_HAS_POPCNT: i64 = 24
+const CPU_HAS_SSE42: i64 = 32
+const CPU_HAS_FMA: i64 = 40
+const CPU_HAS_NX: i64 = 48
+const CPU_HAS_RDTSCP: i64 = 56
+const CPU_HAS_BMI2: i64 = 64
+const CPU_HAS_AVX512: i64 = 72
+const CPU_VENDOR_ID: i64 = 80      // 12 bytes vendor string
+
+// ── CPUID wrapper (inline assembly) ──
+
+@kernel fn cpuid_leaf1_ecx() -> i64 {
+    // CPUID leaf 1: feature flags in ECX
+    asm("movl $$1, %%eax\n\tcpuid",
+        out("ecx") -> i64,
+        clobber("eax", "ebx", "edx"),
+        volatile)
+}
+
+@kernel fn cpuid_leaf1_edx() -> i64 {
+    // CPUID leaf 1: feature flags in EDX
+    asm("movl $$1, %%eax\n\tcpuid",
+        out("edx") -> i64,
+        clobber("eax", "ebx", "ecx"),
+        volatile)
+}
+
+@kernel fn cpuid_leaf7_ebx() -> i64 {
+    // CPUID leaf 7, sub-leaf 0: extended features in EBX
+    asm("movl $$7, %%eax\n\txorl %%ecx, %%ecx\n\tcpuid",
+        out("ebx") -> i64,
+        clobber("eax", "ecx", "edx"),
+        volatile)
+}
+
+@kernel fn cpuid_ext1_edx() -> i64 {
+    // CPUID leaf 0x80000001: extended features in EDX
+    asm("movl $$0x80000001, %%eax\n\tcpuid",
+        out("edx") -> i64,
+        clobber("eax", "ebx", "ecx"),
+        volatile)
+}
+
+// ── Feature detection (called at boot) ──
+
+@kernel fn cpuid_detect() {
+    let ecx1 = cpuid_leaf1_ecx()
+    let ebx7 = cpuid_leaf7_ebx()
+    let edx_ext = cpuid_ext1_edx()
+
+    // Leaf 1 ECX features
+    volatile_write_u64(CPUID_BASE + CPU_HAS_POPCNT, if (ecx1 & (1 << 23)) != 0 { 1 } else { 0 })
+    volatile_write_u64(CPUID_BASE + CPU_HAS_AES,    if (ecx1 & (1 << 25)) != 0 { 1 } else { 0 })
+    volatile_write_u64(CPUID_BASE + CPU_HAS_RDRAND, if (ecx1 & (1 << 30)) != 0 { 1 } else { 0 })
+    volatile_write_u64(CPUID_BASE + CPU_HAS_SSE42,  if (ecx1 & (1 << 20)) != 0 { 1 } else { 0 })
+    volatile_write_u64(CPUID_BASE + CPU_HAS_FMA,    if (ecx1 & (1 << 12)) != 0 { 1 } else { 0 })
+
+    // Leaf 7 EBX features
+    volatile_write_u64(CPUID_BASE + CPU_HAS_AVX2,   if (ebx7 & (1 << 5)) != 0 { 1 } else { 0 })
+    volatile_write_u64(CPUID_BASE + CPU_HAS_BMI2,   if (ebx7 & (1 << 8)) != 0 { 1 } else { 0 })
+    volatile_write_u64(CPUID_BASE + CPU_HAS_AVX512, if (ebx7 & (1 << 16)) != 0 { 1 } else { 0 })
+
+    // Extended leaf 0x80000001 EDX features
+    volatile_write_u64(CPUID_BASE + CPU_HAS_NX,     if (edx_ext & (1 << 20)) != 0 { 1 } else { 0 })
+    volatile_write_u64(CPUID_BASE + CPU_HAS_RDTSCP, if (edx_ext & (1 << 27)) != 0 { 1 } else { 0 })
+}
+
+@kernel fn cpu_has_feature(offset: i64) -> i64 {
+    volatile_read_u64(CPUID_BASE + offset)
+}
+
+// ── Shell command ──
+
+@kernel fn cmd_cpuid() {
+    cprintln("=== CPU Features (CPUID) ===", YELLOW_ON_BLACK)
+
+    cpuid_detect()
+
+    cprint("  RDRAND:  ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_RDRAND) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  AES-NI:  ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_AES) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  AVX2:    ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_AVX2) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  POPCNT:  ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_POPCNT) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  SSE4.2:  ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_SSE42) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  FMA:     ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_FMA) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  BMI2:    ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_BMI2) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  AVX-512: ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_AVX512) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  NX:      ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_NX) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprint("  RDTSCP:  ", WHITE_ON_BLACK)
+    if cpu_has_feature(CPU_HAS_RDTSCP) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+}

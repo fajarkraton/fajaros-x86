@@ -1,14 +1,15 @@
-// FajarOS Nova v0.5.0 — LAPIC / IOAPIC
+// FajarOS Nova v3.0 "Nusantara" — LAPIC / x2APIC / IOAPIC
 // Part of the modular kernel build (concatenated by Makefile)
+//
+// Supports two modes:
+//   1. xAPIC (legacy): MMIO at 0xFEE00000 — requires identity mapping
+//   2. x2APIC (modern): MSR-based access — no MMIO needed, faster, supports >255 CPUs
 
-// ═══════════════════════════════════════════════
-// LAPIC / IOAPIC (Phase 3 Sprint 8)
-// LAPIC MMIO at 0xFEE00000 (identity-mapped in 128MB)
-// Note: only works if APIC is within 128MB mapping
-// QEMU default LAPIC is at 0xFEE00000 (outside 128MB!)
-// These functions prepare for when higher-address mapping is added
-// ═══════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════
+// LAPIC — Local Advanced Programmable Interrupt Controller
+// ═══════════════════════════════════════════════════════════════
 
+// xAPIC MMIO base (legacy mode)
 const LAPIC_BASE: i64 = 0xFEE00000
 const LAPIC_ID: i64 = 0x20
 const LAPIC_VER: i64 = 0x30
@@ -22,4 +23,118 @@ const LAPIC_TIMER_INIT: i64 = 0x380
 const LAPIC_TIMER_CUR: i64 = 0x390
 const LAPIC_TIMER_DIV: i64 = 0x3E0
 
+// x2APIC MSR base (modern mode)
+const X2APIC_MSR_BASE: i64 = 0x800
+const X2APIC_MSR_ID: i64 = 0x802
+const X2APIC_MSR_VER: i64 = 0x803
+const X2APIC_MSR_TPR: i64 = 0x808
+const X2APIC_MSR_EOI: i64 = 0x80B
+const X2APIC_MSR_SVR: i64 = 0x80F
+const X2APIC_MSR_ICR: i64 = 0x830    // x2APIC: single 64-bit ICR
+const X2APIC_MSR_TIMER_LVT: i64 = 0x832
+const X2APIC_MSR_TIMER_INIT: i64 = 0x838
+const X2APIC_MSR_TIMER_CUR: i64 = 0x839
+const X2APIC_MSR_TIMER_DIV: i64 = 0x83E
+
+// State: 0=xAPIC, 1=x2APIC
+const LAPIC_STATE_BASE: i64 = 0xA40000
+const LAPIC_MODE_OFF: i64 = 0
+
 const IOAPIC_BASE: i64 = 0xFEC00000
+
+// ── x2APIC detection and enable ──
+
+@kernel fn lapic_has_x2apic() -> i64 {
+    // CPUID leaf 1 ECX bit 21: x2APIC support
+    let ecx = cpuid_leaf1_ecx()
+    if (ecx & (1 << 21)) != 0 { 1 } else { 0 }
+}
+
+@kernel fn lapic_enable_x2apic() {
+    // Enable x2APIC: set APIC_BASE MSR bits 10 (enable) + 11 (x2APIC)
+    if lapic_has_x2apic() == 0 { return }
+    msr_enable_x2apic()
+    volatile_write_u64(LAPIC_STATE_BASE + LAPIC_MODE_OFF, 1)
+    // Enable spurious vector (0xFF) + software enable bit
+    wrmsr(X2APIC_MSR_SVR, 0x1FF)
+}
+
+@kernel fn lapic_is_x2apic() -> i64 {
+    volatile_read_u64(LAPIC_STATE_BASE + LAPIC_MODE_OFF)
+}
+
+// ── Unified read/write (x2APIC or xAPIC) ──
+
+@kernel fn lapic_read(offset: i64) -> i64 {
+    if lapic_is_x2apic() != 0 {
+        // x2APIC: MSR address = 0x800 + (offset >> 4)
+        rdmsr(X2APIC_MSR_BASE + (offset >> 4))
+    } else {
+        // xAPIC: MMIO
+        volatile_read_u32(LAPIC_BASE + offset)
+    }
+}
+
+@kernel fn lapic_write(offset: i64, value: i64) {
+    if lapic_is_x2apic() != 0 {
+        wrmsr(X2APIC_MSR_BASE + (offset >> 4), value)
+    } else {
+        volatile_write_u32(LAPIC_BASE + offset, value)
+    }
+}
+
+// ── LAPIC operations ──
+
+@kernel fn lapic_eoi() {
+    // Send End-of-Interrupt
+    lapic_write(LAPIC_EOI, 0)
+}
+
+@kernel fn lapic_get_id() -> i64 {
+    lapic_read(LAPIC_ID)
+}
+
+@kernel fn lapic_send_ipi(target_id: i64, vector: i64) {
+    // Send Inter-Processor Interrupt
+    if lapic_is_x2apic() != 0 {
+        // x2APIC: single 64-bit ICR write
+        let icr = (target_id << 32) | vector
+        wrmsr(X2APIC_MSR_ICR, icr)
+    } else {
+        // xAPIC: write high first (destination), then low (vector + flags)
+        volatile_write_u32(LAPIC_BASE + LAPIC_ICR_HI, target_id << 24)
+        volatile_write_u32(LAPIC_BASE + LAPIC_ICR_LO, vector)
+    }
+}
+
+// ── Timer setup ──
+
+@kernel fn lapic_timer_oneshot(vector: i64, count: i64, divisor: i64) {
+    // Configure LAPIC timer in one-shot mode
+    lapic_write(LAPIC_TIMER_DIV, divisor)
+    lapic_write(LAPIC_TIMER_LVT, vector)        // One-shot: bit 17=0
+    lapic_write(LAPIC_TIMER_INIT, count)
+}
+
+@kernel fn lapic_timer_periodic(vector: i64, count: i64, divisor: i64) {
+    // Configure LAPIC timer in periodic mode (bit 17 set)
+    lapic_write(LAPIC_TIMER_DIV, divisor)
+    lapic_write(LAPIC_TIMER_LVT, vector | 0x20000)  // Periodic mode
+    lapic_write(LAPIC_TIMER_INIT, count)
+}
+
+// ── Shell command ──
+
+@kernel fn cmd_lapic() {
+    cprintln("=== LAPIC Status ===", YELLOW_ON_BLACK)
+    cprint("  Mode: ", WHITE_ON_BLACK)
+    if lapic_is_x2apic() != 0 { cprintln("x2APIC (MSR)", GREEN_ON_BLACK) }
+    else { cprintln("xAPIC (MMIO)", YELLOW_ON_BLACK) }
+
+    cprint("  APIC ID: ", WHITE_ON_BLACK)
+    cprintln_decimal(lapic_get_id(), CYAN_ON_BLACK)
+
+    cprint("  x2APIC capable: ", WHITE_ON_BLACK)
+    if lapic_has_x2apic() != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+}
