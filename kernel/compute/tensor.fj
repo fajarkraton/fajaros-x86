@@ -1,0 +1,247 @@
+// FajarOS Nova v3.0 "Nusantara" — Kernel-Space Tensor Engine
+// Fixed-size, stack-allocated tensor operations for @kernel context.
+// NO heap allocation — all tensors live in pre-allocated kernel memory.
+//
+// This is what macOS CANNOT do: tensor operations verified safe at
+// compile time by @kernel annotation. Core ML runs in userspace;
+// FajarOS tensors run in kernel space with zero-copy scheduling.
+//
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Kernel Tensor Engine
+//
+// Provides fixed-size matrix/vector operations for:
+// - ML-powered process scheduling (predict runtime, choose core)
+// - Anomaly detection (syscall pattern classification)
+// - Page prefetching (predict access patterns)
+// - Network intrusion detection (packet classification)
+//
+// All operations are @kernel safe — no heap, no GC, no dynamic alloc.
+// Uses pre-allocated memory pools in kernel address space.
+// ═══════════════════════════════════════════════════════════════
+
+// Tensor memory pool (pre-allocated at boot)
+const TENSOR_POOL_BASE: i64 = 0xB00000  // 11MB mark
+const TENSOR_POOL_SIZE: i64 = 0x100000  // 1MB tensor workspace
+const TENSOR_MAX_DIM: i64 = 128         // Max dimension per tensor
+const TENSOR_MAX_SLOTS: i64 = 32        // Max concurrent tensors
+
+// Tensor slot layout: each slot = header (32B) + data (TENSOR_MAX_DIM * 8B = 1024B)
+const TENSOR_SLOT_SIZE: i64 = 1056      // 32 + 1024 bytes
+const TENSOR_HDR_ROWS: i64 = 0          // Row count
+const TENSOR_HDR_COLS: i64 = 8          // Column count
+const TENSOR_HDR_FLAGS: i64 = 16        // Flags (quantized, transposed, etc.)
+const TENSOR_HDR_QUANT_BITS: i64 = 24   // Quantization bits (0=fp64, 1-8=quantized)
+const TENSOR_DATA_OFF: i64 = 32         // Data starts at offset 32
+
+// Flags
+const TENSOR_FLAG_QUANTIZED: i64 = 1
+const TENSOR_FLAG_TRANSPOSED: i64 = 2
+const TENSOR_FLAG_READONLY: i64 = 4
+
+// ── Tensor slot management ──
+
+@kernel fn tensor_slot_addr(slot: i64) -> i64 {
+    TENSOR_POOL_BASE + slot * TENSOR_SLOT_SIZE
+}
+
+@kernel fn tensor_alloc(rows: i64, cols: i64) -> i64 {
+    // Find free slot (linear scan)
+    let mut i: i64 = 0
+    while i < TENSOR_MAX_SLOTS {
+        let addr = tensor_slot_addr(i)
+        let r = volatile_read_u64(addr + TENSOR_HDR_ROWS)
+        let c = volatile_read_u64(addr + TENSOR_HDR_COLS)
+        if r == 0 && c == 0 {
+            // Found free slot — initialize
+            volatile_write_u64(addr + TENSOR_HDR_ROWS, rows)
+            volatile_write_u64(addr + TENSOR_HDR_COLS, cols)
+            volatile_write_u64(addr + TENSOR_HDR_FLAGS, 0)
+            volatile_write_u64(addr + TENSOR_HDR_QUANT_BITS, 0)
+            // Zero the data
+            let total = rows * cols
+            let mut j: i64 = 0
+            while j < total && j < TENSOR_MAX_DIM {
+                volatile_write_u64(addr + TENSOR_DATA_OFF + j * 8, 0)
+                j = j + 1
+            }
+            return i
+        }
+        i = i + 1
+    }
+    -1 // No free slots
+}
+
+@kernel fn tensor_free(slot: i64) {
+    if slot < 0 || slot >= TENSOR_MAX_SLOTS { return }
+    let addr = tensor_slot_addr(slot)
+    volatile_write_u64(addr + TENSOR_HDR_ROWS, 0)
+    volatile_write_u64(addr + TENSOR_HDR_COLS, 0)
+}
+
+// ── Element access ──
+
+@kernel fn tensor_get(slot: i64, row: i64, col: i64) -> i64 {
+    let addr = tensor_slot_addr(slot)
+    let cols = volatile_read_u64(addr + TENSOR_HDR_COLS)
+    let idx = row * cols + col
+    volatile_read_u64(addr + TENSOR_DATA_OFF + idx * 8)
+}
+
+@kernel fn tensor_set(slot: i64, row: i64, col: i64, val: i64) {
+    let addr = tensor_slot_addr(slot)
+    let cols = volatile_read_u64(addr + TENSOR_HDR_COLS)
+    let idx = row * cols + col
+    volatile_write_u64(addr + TENSOR_DATA_OFF + idx * 8, val)
+}
+
+// ── Vector operations (fixed-point arithmetic, scaled by 1000) ──
+// Using i64 with 3 decimal places: 1.5 = 1500, 0.001 = 1
+
+@kernel fn tensor_dot(a_slot: i64, b_slot: i64, len: i64) -> i64 {
+    // Dot product of two 1D tensors (row vectors)
+    let mut sum: i64 = 0
+    let mut i: i64 = 0
+    while i < len {
+        let a_val = tensor_get(a_slot, 0, i)
+        let b_val = tensor_get(b_slot, 0, i)
+        sum = sum + (a_val * b_val) / 1000  // Fixed-point multiply
+        i = i + 1
+    }
+    sum
+}
+
+@kernel fn tensor_matmul(a_slot: i64, b_slot: i64, out_slot: i64) {
+    // Matrix multiply: C = A × B
+    let a_addr = tensor_slot_addr(a_slot)
+    let b_addr = tensor_slot_addr(b_slot)
+    let a_rows = volatile_read_u64(a_addr + TENSOR_HDR_ROWS)
+    let a_cols = volatile_read_u64(a_addr + TENSOR_HDR_COLS)
+    let b_cols = volatile_read_u64(b_addr + TENSOR_HDR_COLS)
+
+    let mut i: i64 = 0
+    while i < a_rows {
+        let mut j: i64 = 0
+        while j < b_cols {
+            let mut sum: i64 = 0
+            let mut k: i64 = 0
+            while k < a_cols {
+                let a_val = tensor_get(a_slot, i, k)
+                let b_val = tensor_get(b_slot, k, j)
+                sum = sum + (a_val * b_val) / 1000
+                k = k + 1
+            }
+            tensor_set(out_slot, i, j, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// ── Activation functions (fixed-point) ──
+
+@kernel fn tensor_relu_inplace(slot: i64) {
+    let addr = tensor_slot_addr(slot)
+    let rows = volatile_read_u64(addr + TENSOR_HDR_ROWS)
+    let cols = volatile_read_u64(addr + TENSOR_HDR_COLS)
+    let total = rows * cols
+    let mut i: i64 = 0
+    while i < total {
+        let val = volatile_read_u64(addr + TENSOR_DATA_OFF + i * 8)
+        if val < 0 { volatile_write_u64(addr + TENSOR_DATA_OFF + i * 8, 0) }
+        i = i + 1
+    }
+}
+
+@kernel fn tensor_softmax(slot: i64, len: i64) {
+    // Simplified softmax: exp approximation via shift + normalize
+    // For kernel use: good enough for classification decisions
+    let addr = tensor_slot_addr(slot)
+
+    // Find max for numerical stability
+    let mut max_val: i64 = volatile_read_u64(addr + TENSOR_DATA_OFF)
+    let mut i: i64 = 1
+    while i < len {
+        let val = volatile_read_u64(addr + TENSOR_DATA_OFF + i * 8)
+        if val > max_val { max_val = val }
+        i = i + 1
+    }
+
+    // Subtract max and compute exp approximation (e^x ≈ 1 + x for small x)
+    let mut sum: i64 = 0
+    i = 0
+    while i < len {
+        let val = volatile_read_u64(addr + TENSOR_DATA_OFF + i * 8) - max_val
+        // exp approximation: 1000 + val (clamped to positive)
+        let exp_val = if val > -1000 { 1000 + val } else { 1 }
+        volatile_write_u64(addr + TENSOR_DATA_OFF + i * 8, exp_val)
+        sum = sum + exp_val
+        i = i + 1
+    }
+
+    // Normalize to sum = 1000 (fixed-point 1.0)
+    if sum > 0 {
+        i = 0
+        while i < len {
+            let val = volatile_read_u64(addr + TENSOR_DATA_OFF + i * 8)
+            volatile_write_u64(addr + TENSOR_DATA_OFF + i * 8, (val * 1000) / sum)
+            i = i + 1
+        }
+    }
+}
+
+@kernel fn tensor_argmax(slot: i64, len: i64) -> i64 {
+    let addr = tensor_slot_addr(slot)
+    let mut max_idx: i64 = 0
+    let mut max_val: i64 = volatile_read_u64(addr + TENSOR_DATA_OFF)
+    let mut i: i64 = 1
+    while i < len {
+        let val = volatile_read_u64(addr + TENSOR_DATA_OFF + i * 8)
+        if val > max_val {
+            max_val = val
+            max_idx = i
+        }
+        i = i + 1
+    }
+    max_idx
+}
+
+// ── Shell command ──
+
+@kernel fn cmd_tensor_info() {
+    cprintln("=== Kernel Tensor Engine ===", YELLOW_ON_BLACK)
+    cprint("  Pool: 0x", WHITE_ON_BLACK)
+    cprint_hex(TENSOR_POOL_BASE, 8, CYAN_ON_BLACK)
+    cprint(" size=", WHITE_ON_BLACK)
+    cprint_decimal(TENSOR_POOL_SIZE / 1024, CYAN_ON_BLACK)
+    cprintln(" KB", WHITE_ON_BLACK)
+    cprint("  Max dim: ", WHITE_ON_BLACK)
+    cprint_decimal(TENSOR_MAX_DIM, CYAN_ON_BLACK)
+    cprint("  Slots: ", WHITE_ON_BLACK)
+    cprintln_decimal(TENSOR_MAX_SLOTS, CYAN_ON_BLACK)
+
+    // Count active tensors
+    let mut active: i64 = 0
+    let mut total_elements: i64 = 0
+    let mut i: i64 = 0
+    while i < TENSOR_MAX_SLOTS {
+        let addr = tensor_slot_addr(i)
+        let r = volatile_read_u64(addr + TENSOR_HDR_ROWS)
+        let c = volatile_read_u64(addr + TENSOR_HDR_COLS)
+        if r > 0 || c > 0 {
+            active = active + 1
+            total_elements = total_elements + r * c
+        }
+        i = i + 1
+    }
+    cprint("  Active tensors: ", WHITE_ON_BLACK)
+    cprint_decimal(active, GREEN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprintln_decimal(TENSOR_MAX_SLOTS, CYAN_ON_BLACK)
+    cprint("  Total elements: ", WHITE_ON_BLACK)
+    cprintln_decimal(total_elements, CYAN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("  NOTE: All ops are @kernel safe — no heap, no GC", GREEN_ON_BLACK)
+    cprintln("  macOS Core ML: userspace only. FajarOS: kernel-native.", GREEN_ON_BLACK)
+}

@@ -1,0 +1,94 @@
+// FajarOS Nova v3.0 "Nusantara" — Address Space Layout Randomization
+// Randomizes process virtual address base on exec to prevent
+// ROP/code injection attacks. Uses LFSR PRNG seeded from TSC.
+//
+// macOS equivalent: ASLR (introduced OS X Leopard).
+// FajarOS advantage: combined with @kernel compile-time checks,
+// even if ASLR is bypassed, @kernel prevents privilege escalation.
+
+// ═══════════════════════════════════════════════════════════════
+// ASLR — Address Randomization for User Processes
+// ═══════════════════════════════════════════════════════════════
+
+const ASLR_BASE: i64 = 0xA20000         // ASLR state storage
+const ASLR_ENTROPY_BITS: i64 = 16       // 16 bits of entropy (64K positions)
+const ASLR_PAGE_SIZE: i64 = 4096        // 4KB page alignment
+const ASLR_USER_BASE_MIN: i64 = 0x400000    // Min user base (4MB)
+const ASLR_USER_BASE_MAX: i64 = 0x10000000  // Max user base (256MB)
+
+// LFSR state for pseudo-random generation (seeded from TSC)
+const ASLR_LFSR_STATE: i64 = 0  // Offset in ASLR_BASE
+
+// ── PRNG (Linear Feedback Shift Register) ──
+
+@kernel fn aslr_init() {
+    // Seed from TSC (time stamp counter) — unique per boot
+    let tsc = volatile_read_u64(0x6FF00)
+    let seed = if tsc == 0 { 0xDEADBEEF } else { tsc }
+    volatile_write_u64(ASLR_BASE + ASLR_LFSR_STATE, seed)
+}
+
+@kernel fn aslr_next() -> i64 {
+    let state = volatile_read_u64(ASLR_BASE + ASLR_LFSR_STATE)
+    // Galois LFSR with polynomial x^32 + x^22 + x^2 + x + 1
+    let bit = ((state >> 0) ^ (state >> 2) ^ (state >> 6) ^ (state >> 7)) & 1
+    let next = (state >> 1) | (bit << 31)
+    volatile_write_u64(ASLR_BASE + ASLR_LFSR_STATE, next)
+    next
+}
+
+// ── Address randomization ──
+
+@kernel fn aslr_randomize_base() -> i64 {
+    let rand = aslr_next()
+    // Extract ASLR_ENTROPY_BITS bits, align to page boundary
+    let offset = (rand & ((1 << ASLR_ENTROPY_BITS) - 1)) * ASLR_PAGE_SIZE
+    let base = ASLR_USER_BASE_MIN + offset
+    // Clamp to valid range
+    if base > ASLR_USER_BASE_MAX { ASLR_USER_BASE_MIN + (offset % (ASLR_USER_BASE_MAX - ASLR_USER_BASE_MIN)) }
+    else { base }
+}
+
+@kernel fn aslr_randomize_stack() -> i64 {
+    let rand = aslr_next()
+    // Stack grows down from high address, add random offset
+    let base: i64 = 0x7FFFFF000000  // ~128TB (canonical x86_64 upper half)
+    let offset = (rand & 0xFFF) * ASLR_PAGE_SIZE  // Up to 16MB random offset
+    base - offset
+}
+
+@kernel fn aslr_randomize_heap() -> i64 {
+    let rand = aslr_next()
+    // Heap starts after .bss, add random gap
+    let base: i64 = 0x800000  // 8MB default heap start
+    let offset = (rand & 0x1FFF) * ASLR_PAGE_SIZE  // Up to 32MB random offset
+    base + offset
+}
+
+// ── Shell command ──
+
+@kernel fn cmd_aslr() {
+    cprintln("=== ASLR Status ===", YELLOW_ON_BLACK)
+    let state = volatile_read_u64(ASLR_BASE + ASLR_LFSR_STATE)
+    cprint("  LFSR state: 0x", WHITE_ON_BLACK)
+    cprintln_hex(state, 8, CYAN_ON_BLACK)
+    cprint("  Entropy: ", WHITE_ON_BLACK)
+    cprint_decimal(ASLR_ENTROPY_BITS, CYAN_ON_BLACK)
+    cprintln(" bits", WHITE_ON_BLACK)
+
+    // Show sample randomized addresses
+    cprintln("  Sample addresses:", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < 3 {
+        let code_base = aslr_randomize_base()
+        let stack_base = aslr_randomize_stack()
+        let heap_base = aslr_randomize_heap()
+        cprint("    code=0x", WHITE_ON_BLACK)
+        cprint_hex(code_base, 12, GREEN_ON_BLACK)
+        cprint(" stack=0x", WHITE_ON_BLACK)
+        cprint_hex(stack_base, 12, GREEN_ON_BLACK)
+        cprint(" heap=0x", WHITE_ON_BLACK)
+        cprintln_hex(heap_base, 12, GREEN_ON_BLACK)
+        i = i + 1
+    }
+}

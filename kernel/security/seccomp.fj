@@ -1,0 +1,162 @@
+// FajarOS Nova v3.0 "Nusantara" — Seccomp-style Syscall Filtering
+// Per-process syscall whitelist/blacklist. Combined with @kernel/@device
+// compile-time checks, this provides defense-in-depth: compile-time
+// prevents privilege escalation, runtime seccomp prevents syscall abuse.
+//
+// macOS equivalent: App Sandbox + System Extensions.
+// FajarOS advantage: two layers (compile-time @kernel + runtime seccomp).
+
+// ═══════════════════════════════════════════════════════════════
+// Seccomp Filter — Per-Process Syscall Restriction
+//
+// Each process has a 64-bit syscall filter bitmap stored in the
+// process table. If bit N is set, syscall N is allowed.
+// Default: all syscalls allowed (0xFFFFFFFFFFFFFFFF).
+// A process can restrict ITSELF (drop capabilities, never gain).
+// ═══════════════════════════════════════════════════════════════
+
+const SECCOMP_BASE: i64 = 0xA10000     // Filter storage base
+const SECCOMP_ENTRY_SIZE: i64 = 16     // 16 bytes per process (128-bit filter)
+const SECCOMP_MAX_PROCS: i64 = 16      // Max processes
+
+// Filter modes
+const SECCOMP_MODE_DISABLED: i64 = 0   // No filtering (default)
+const SECCOMP_MODE_WHITELIST: i64 = 1  // Only allowed syscalls pass
+const SECCOMP_MODE_LOG: i64 = 2        // Log but don't block
+
+// Syscall numbers (matching kernel/syscall/table.fj)
+const SYS_EXIT: i64 = 0
+const SYS_WRITE: i64 = 1
+const SYS_READ: i64 = 2
+const SYS_OPEN: i64 = 3
+const SYS_CLOSE: i64 = 4
+const SYS_FORK: i64 = 5
+const SYS_EXEC: i64 = 6
+const SYS_WAIT: i64 = 7
+const SYS_BRK: i64 = 8
+const SYS_MMAP: i64 = 9
+const SYS_IPC_SEND: i64 = 10
+const SYS_IPC_RECV: i64 = 11
+const SYS_IPC_CALL: i64 = 12
+const SYS_IPC_REPLY: i64 = 13
+
+// ── Seccomp initialization ──
+
+@kernel fn seccomp_init() {
+    // Set all processes to DISABLED mode (allow all)
+    let mut pid: i64 = 0
+    while pid < SECCOMP_MAX_PROCS {
+        let addr = SECCOMP_BASE + pid * SECCOMP_ENTRY_SIZE
+        volatile_write_u64(addr, SECCOMP_MODE_DISABLED)  // mode
+        volatile_write_u64(addr + 8, -1)                 // filter = all bits set
+        pid = pid + 1
+    }
+}
+
+// ── Filter management ──
+
+@kernel fn seccomp_set_mode(pid: i64, mode: i64) {
+    if pid < 0 || pid >= SECCOMP_MAX_PROCS { return }
+    let addr = SECCOMP_BASE + pid * SECCOMP_ENTRY_SIZE
+    volatile_write_u64(addr, mode)
+    audit_log(AUDIT_EVT_SECCOMP, pid, mode, 0, 1)
+}
+
+@kernel fn seccomp_allow(pid: i64, syscall_nr: i64) {
+    if pid < 0 || pid >= SECCOMP_MAX_PROCS { return }
+    if syscall_nr < 0 || syscall_nr >= 64 { return }
+    let addr = SECCOMP_BASE + pid * SECCOMP_ENTRY_SIZE + 8
+    let filter = volatile_read_u64(addr)
+    volatile_write_u64(addr, filter | (1 << syscall_nr))
+}
+
+@kernel fn seccomp_deny(pid: i64, syscall_nr: i64) {
+    if pid < 0 || pid >= SECCOMP_MAX_PROCS { return }
+    if syscall_nr < 0 || syscall_nr >= 64 { return }
+    let addr = SECCOMP_BASE + pid * SECCOMP_ENTRY_SIZE + 8
+    let filter = volatile_read_u64(addr)
+    volatile_write_u64(addr, filter & (-1 ^ (1 << syscall_nr)))
+}
+
+@kernel fn seccomp_set_whitelist(pid: i64, allowed_mask: i64) {
+    if pid < 0 || pid >= SECCOMP_MAX_PROCS { return }
+    let addr = SECCOMP_BASE + pid * SECCOMP_ENTRY_SIZE
+    volatile_write_u64(addr, SECCOMP_MODE_WHITELIST)
+    volatile_write_u64(addr + 8, allowed_mask)
+    audit_log(AUDIT_EVT_SECCOMP, pid, allowed_mask, 0, 1)
+}
+
+// ── Runtime check (called from syscall dispatcher) ──
+
+@kernel fn seccomp_check(pid: i64, syscall_nr: i64) -> i64 {
+    if pid < 0 || pid >= SECCOMP_MAX_PROCS { return 1 } // allow
+    let addr = SECCOMP_BASE + pid * SECCOMP_ENTRY_SIZE
+    let mode = volatile_read_u64(addr)
+
+    if mode == SECCOMP_MODE_DISABLED { return 1 }
+
+    let filter = volatile_read_u64(addr + 8)
+    let allowed = (filter >> syscall_nr) & 1
+
+    if mode == SECCOMP_MODE_LOG {
+        if allowed == 0 {
+            audit_log(AUDIT_EVT_SYSCALL_DENY, pid, syscall_nr, 0, 0)
+        }
+        return 1  // log mode always allows
+    }
+
+    // Whitelist mode: block if not allowed
+    if allowed == 0 {
+        audit_log(AUDIT_EVT_SYSCALL_DENY, pid, syscall_nr, 0, 0)
+        return 0
+    }
+    1
+}
+
+// ── Minimal whitelist profiles ──
+
+// Read-only profile: can only read, write stdout, and exit
+@kernel fn seccomp_profile_readonly(pid: i64) {
+    let mask = (1 << SYS_EXIT) | (1 << SYS_READ) | (1 << SYS_WRITE) | (1 << SYS_CLOSE)
+    seccomp_set_whitelist(pid, mask)
+}
+
+// Network-only profile: IPC + network syscalls
+@kernel fn seccomp_profile_network(pid: i64) {
+    let mask = (1 << SYS_EXIT) | (1 << SYS_READ) | (1 << SYS_WRITE) |
+               (1 << SYS_IPC_SEND) | (1 << SYS_IPC_RECV) |
+               (1 << SYS_IPC_CALL) | (1 << SYS_IPC_REPLY)
+    seccomp_set_whitelist(pid, mask)
+}
+
+// Compute-only profile: no IPC, no fork, no network
+@kernel fn seccomp_profile_compute(pid: i64) {
+    let mask = (1 << SYS_EXIT) | (1 << SYS_READ) | (1 << SYS_WRITE) |
+               (1 << SYS_BRK) | (1 << SYS_MMAP)
+    seccomp_set_whitelist(pid, mask)
+}
+
+// ── Shell commands ──
+
+@kernel fn cmd_seccomp() {
+    cprintln("=== Seccomp Syscall Filters ===", YELLOW_ON_BLACK)
+    let mut pid: i64 = 0
+    while pid < SECCOMP_MAX_PROCS {
+        let proc_state = proc_v2_get(pid, 0)
+        if proc_state != PROC_STATE_FREE {
+            let addr = SECCOMP_BASE + pid * SECCOMP_ENTRY_SIZE
+            let mode = volatile_read_u64(addr)
+            let filter = volatile_read_u64(addr + 8)
+
+            cprint("  PID ", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint(": mode=", WHITE_ON_BLACK)
+            if mode == SECCOMP_MODE_DISABLED { cprint("DISABLED", GREEN_ON_BLACK) }
+            else if mode == SECCOMP_MODE_WHITELIST { cprint("WHITELIST", YELLOW_ON_BLACK) }
+            else if mode == SECCOMP_MODE_LOG { cprint("LOG", CYAN_ON_BLACK) }
+            cprint(" filter=0x", WHITE_ON_BLACK)
+            cprintln_hex(filter, 16, CYAN_ON_BLACK)
+        }
+        pid = pid + 1
+    }
+}

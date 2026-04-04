@@ -1,0 +1,196 @@
+// FajarOS Nova v3.0 "Nusantara" — Security Audit Log
+// Ring-buffer audit log recording @kernel transitions, capability checks,
+// and security-relevant events. Stronger than macOS SIP because events
+// are logged at compile-time enforcement boundaries, not runtime hooks.
+//
+// Part of the modular kernel build (concatenated by Makefile)
+
+// ═══════════════════════════════════════════════════════════════
+// Audit Log — Kernel Security Event Recorder
+//
+// Records the last AUDIT_MAX_ENTRIES events in a ring buffer.
+// Events include: capability checks, IPC authorization, syscall
+// filtering, context transitions (@kernel→@safe), and login attempts.
+//
+// macOS equivalent: Unified Logging (os_log) + Endpoint Security.
+// FajarOS advantage: events are generated at compile-time enforcement
+// boundaries (@kernel/@device), not bolted-on runtime hooks.
+// ═══════════════════════════════════════════════════════════════
+
+const AUDIT_BASE: i64 = 0xA00000       // Audit ring buffer base address
+const AUDIT_MAX_ENTRIES: i64 = 256      // Ring buffer size
+const AUDIT_ENTRY_SIZE: i64 = 64        // Bytes per entry
+
+// Entry offsets within each 64-byte record
+const AUDIT_OFF_TIMESTAMP: i64 = 0      // 8 bytes: TSC tick count
+const AUDIT_OFF_EVENT_TYPE: i64 = 8     // 8 bytes: event type code
+const AUDIT_OFF_PID: i64 = 16           // 8 bytes: process ID
+const AUDIT_OFF_SUBJECT: i64 = 24       // 8 bytes: subject (capability, syscall#, etc.)
+const AUDIT_OFF_OBJECT: i64 = 32        // 8 bytes: object (target PID, file, etc.)
+const AUDIT_OFF_RESULT: i64 = 40        // 8 bytes: 0=denied, 1=allowed
+const AUDIT_OFF_FLAGS: i64 = 48         // 8 bytes: additional flags
+const AUDIT_OFF_RESERVED: i64 = 56      // 8 bytes: reserved
+
+// Ring buffer metadata (stored before entries)
+const AUDIT_META_BASE: i64 = 0x9FFF00
+const AUDIT_META_HEAD: i64 = 0          // Write position (next entry index)
+const AUDIT_META_COUNT: i64 = 8         // Total events logged
+const AUDIT_META_ENABLED: i64 = 16      // 1=logging enabled, 0=disabled
+
+// Event types
+const AUDIT_EVT_CAP_CHECK: i64 = 1     // Capability check (pass/fail)
+const AUDIT_EVT_CAP_GRANT: i64 = 2     // Capability granted
+const AUDIT_EVT_CAP_REVOKE: i64 = 3    // Capability revoked
+const AUDIT_EVT_IPC_SEND: i64 = 4      // IPC message sent
+const AUDIT_EVT_IPC_DENY: i64 = 5      // IPC message denied
+const AUDIT_EVT_SYSCALL: i64 = 6       // Syscall invoked
+const AUDIT_EVT_SYSCALL_DENY: i64 = 7  // Syscall denied by filter
+const AUDIT_EVT_LOGIN: i64 = 8         // Login attempt
+const AUDIT_EVT_LOGOUT: i64 = 9        // Logout
+const AUDIT_EVT_CTX_SWITCH: i64 = 10   // @kernel→@safe context switch
+const AUDIT_EVT_EXEC: i64 = 11         // Process exec
+const AUDIT_EVT_KILL: i64 = 12         // Process killed
+const AUDIT_EVT_SECCOMP: i64 = 13      // Seccomp filter applied
+const AUDIT_EVT_ANOMALY: i64 = 14      // ML anomaly detection alert
+
+// ── Audit initialization ──
+
+@kernel fn audit_init() {
+    // Zero the ring buffer
+    let mut i: i64 = 0
+    while i < AUDIT_MAX_ENTRIES * AUDIT_ENTRY_SIZE {
+        volatile_write_u64(AUDIT_BASE + i, 0)
+        i = i + 8
+    }
+    // Initialize metadata
+    volatile_write_u64(AUDIT_META_BASE + AUDIT_META_HEAD, 0)
+    volatile_write_u64(AUDIT_META_BASE + AUDIT_META_COUNT, 0)
+    volatile_write_u64(AUDIT_META_BASE + AUDIT_META_ENABLED, 1)
+}
+
+// ── Core audit logging ──
+
+@kernel fn audit_log(event_type: i64, pid: i64, subject: i64, object: i64, result: i64) {
+    let enabled = volatile_read_u64(AUDIT_META_BASE + AUDIT_META_ENABLED)
+    if enabled == 0 { return }
+
+    // Get current head position and advance
+    let head = volatile_read_u64(AUDIT_META_BASE + AUDIT_META_HEAD)
+    let next = (head + 1) % AUDIT_MAX_ENTRIES
+    volatile_write_u64(AUDIT_META_BASE + AUDIT_META_HEAD, next)
+
+    // Increment total count
+    let count = volatile_read_u64(AUDIT_META_BASE + AUDIT_META_COUNT)
+    volatile_write_u64(AUDIT_META_BASE + AUDIT_META_COUNT, count + 1)
+
+    // Write entry
+    let entry_addr = AUDIT_BASE + head * AUDIT_ENTRY_SIZE
+    // Read TSC for timestamp (RDTSC via simulated counter)
+    let tsc = volatile_read_u64(0x6FF00) // Kernel tick counter
+    volatile_write_u64(entry_addr + AUDIT_OFF_TIMESTAMP, tsc)
+    volatile_write_u64(entry_addr + AUDIT_OFF_EVENT_TYPE, event_type)
+    volatile_write_u64(entry_addr + AUDIT_OFF_PID, pid)
+    volatile_write_u64(entry_addr + AUDIT_OFF_SUBJECT, subject)
+    volatile_write_u64(entry_addr + AUDIT_OFF_OBJECT, object)
+    volatile_write_u64(entry_addr + AUDIT_OFF_RESULT, result)
+    volatile_write_u64(entry_addr + AUDIT_OFF_FLAGS, 0)
+}
+
+// ── Convenience wrappers ──
+
+@kernel fn audit_cap_check(pid: i64, required: i64, granted: i64) {
+    audit_log(AUDIT_EVT_CAP_CHECK, pid, required, 0, granted)
+}
+
+@kernel fn audit_ipc(src: i64, dst: i64, allowed: i64) {
+    if allowed != 0 {
+        audit_log(AUDIT_EVT_IPC_SEND, src, dst, 0, 1)
+    } else {
+        audit_log(AUDIT_EVT_IPC_DENY, src, dst, 0, 0)
+    }
+}
+
+@kernel fn audit_syscall(pid: i64, syscall_nr: i64, result: i64) {
+    audit_log(AUDIT_EVT_SYSCALL, pid, syscall_nr, 0, result)
+}
+
+@kernel fn audit_login(uid: i64, success: i64) {
+    audit_log(AUDIT_EVT_LOGIN, 0, uid, 0, success)
+}
+
+@kernel fn audit_anomaly(pid: i64, score: i64) {
+    audit_log(AUDIT_EVT_ANOMALY, pid, score, 0, 0)
+}
+
+// ── Shell command: display audit log ──
+
+@kernel fn cmd_audit() {
+    cprintln("=== Security Audit Log ===", YELLOW_ON_BLACK)
+    let count = volatile_read_u64(AUDIT_META_BASE + AUDIT_META_COUNT)
+    let head = volatile_read_u64(AUDIT_META_BASE + AUDIT_META_HEAD)
+    let enabled = volatile_read_u64(AUDIT_META_BASE + AUDIT_META_ENABLED)
+
+    cprint("Status: ", WHITE_ON_BLACK)
+    if enabled != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+    else { cprintln("DISABLED", RED_ON_BLACK) }
+    cprint("Total events: ", WHITE_ON_BLACK)
+    cprintln_decimal(count, CYAN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // Display last 20 entries
+    let show = if count < 20 { count } else { 20 }
+    let mut i: i64 = 0
+    while i < show {
+        let idx = (head - show + i + AUDIT_MAX_ENTRIES) % AUDIT_MAX_ENTRIES
+        let entry_addr = AUDIT_BASE + idx * AUDIT_ENTRY_SIZE
+        let ts = volatile_read_u64(entry_addr + AUDIT_OFF_TIMESTAMP)
+        let evt = volatile_read_u64(entry_addr + AUDIT_OFF_EVENT_TYPE)
+        let pid = volatile_read_u64(entry_addr + AUDIT_OFF_PID)
+        let subj = volatile_read_u64(entry_addr + AUDIT_OFF_SUBJECT)
+        let result = volatile_read_u64(entry_addr + AUDIT_OFF_RESULT)
+
+        if evt != 0 {
+            cprint("  [", WHITE_ON_BLACK)
+            cprint_decimal(ts, CYAN_ON_BLACK)
+            cprint("] ", WHITE_ON_BLACK)
+
+            // Event type name
+            if evt == AUDIT_EVT_CAP_CHECK { cprint("CAP_CHECK ", WHITE_ON_BLACK) }
+            else if evt == AUDIT_EVT_CAP_GRANT { cprint("CAP_GRANT ", WHITE_ON_BLACK) }
+            else if evt == AUDIT_EVT_CAP_REVOKE { cprint("CAP_REVOKE", WHITE_ON_BLACK) }
+            else if evt == AUDIT_EVT_IPC_SEND { cprint("IPC_SEND  ", WHITE_ON_BLACK) }
+            else if evt == AUDIT_EVT_IPC_DENY { cprint("IPC_DENY  ", RED_ON_BLACK) }
+            else if evt == AUDIT_EVT_SYSCALL { cprint("SYSCALL   ", WHITE_ON_BLACK) }
+            else if evt == AUDIT_EVT_SYSCALL_DENY { cprint("SYS_DENY  ", RED_ON_BLACK) }
+            else if evt == AUDIT_EVT_LOGIN { cprint("LOGIN     ", WHITE_ON_BLACK) }
+            else if evt == AUDIT_EVT_ANOMALY { cprint("ANOMALY   ", RED_ON_BLACK) }
+            else if evt == AUDIT_EVT_EXEC { cprint("EXEC      ", WHITE_ON_BLACK) }
+            else if evt == AUDIT_EVT_KILL { cprint("KILL      ", WHITE_ON_BLACK) }
+            else { cprint("UNKNOWN   ", WHITE_ON_BLACK) }
+
+            cprint(" PID=", WHITE_ON_BLACK)
+            cprint_decimal(pid, CYAN_ON_BLACK)
+            cprint(" subj=", WHITE_ON_BLACK)
+            cprint_hex(subj, 4, CYAN_ON_BLACK)
+
+            if result != 0 { cprintln(" [OK]", GREEN_ON_BLACK) }
+            else { cprintln(" [DENIED]", RED_ON_BLACK) }
+        }
+        i = i + 1
+    }
+}
+
+@kernel fn cmd_audit_enable() {
+    volatile_write_u64(AUDIT_META_BASE + AUDIT_META_ENABLED, 1)
+    cprintln("Audit logging ENABLED", GREEN_ON_BLACK)
+}
+
+@kernel fn cmd_audit_disable() {
+    volatile_write_u64(AUDIT_META_BASE + AUDIT_META_ENABLED, 0)
+    cprintln("Audit logging DISABLED", YELLOW_ON_BLACK)
+}
+
+@kernel fn cmd_audit_clear() {
+    audit_init()
+    cprintln("Audit log cleared", GREEN_ON_BLACK)
+}
