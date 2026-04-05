@@ -172,6 +172,8 @@ QEMU_KVM := -enable-kvm -cpu host
 QEMU_SMP := -smp 4
 QEMU_NVME := -drive file=disk.img,if=none,id=nvme0 -device nvme,serial=fajaros,drive=nvme0 -boot d
 QEMU_NET := -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+QEMU_GPU := -device virtio-gpu-pci -display gtk
+QEMU_FULL := $(QEMU_KVM) $(QEMU_SMP) $(QEMU_NET) -device virtio-gpu-pci
 
 .PHONY: all build build-llvm build-llvm-custom run run-kvm run-vga run-smp run-nvme run-net \
        run-llvm run-kvm-llvm debug debug-llvm iso run-iso test clean help loc
@@ -288,6 +290,24 @@ debug-llvm: build-llvm
 	@echo "  continue"
 	$(QEMU) -kernel $(KERNEL_LLVM) $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_CPU) -s -S -nographic
 
+# Run LLVM kernel with VirtIO-GPU (graphical output)
+run-gpu-llvm: build-llvm
+	$(QEMU) -kernel $(KERNEL_LLVM) -serial stdio -no-reboot -no-shutdown $(QEMU_MEM) $(QEMU_KVM) $(QEMU_GPU)
+
+# Run LLVM kernel with everything: KVM + SMP + GPU + NVMe + Net (i9 + RTX 4090)
+run-full-llvm: build-llvm
+	@test -f disk.img || qemu-img create -f raw disk.img 64M
+	$(QEMU) -kernel $(KERNEL_LLVM) -serial stdio -no-reboot -no-shutdown \
+		$(QEMU_MEM) $(QEMU_FULL) $(QEMU_NVME) -display gtk
+
+# LLVM ISO: bootable ISO with GRUB2 for LLVM kernel
+iso-llvm: build-llvm
+	@mkdir -p $(BUILD_DIR)/iso-llvm/boot/grub
+	cp $(KERNEL_LLVM) $(BUILD_DIR)/iso-llvm/boot/fajaros.elf
+	cp $(GRUB_CFG) $(BUILD_DIR)/iso-llvm/boot/grub/grub.cfg
+	grub-mkrescue -o $(BUILD_DIR)/fajaros-llvm.iso $(BUILD_DIR)/iso-llvm 2>/dev/null
+	@echo "[OK] LLVM ISO created: $(BUILD_DIR)/fajaros-llvm.iso"
+
 # Create bootable ISO with GRUB2
 iso: build
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
@@ -396,6 +416,9 @@ help:
 	@echo "  make run-kvm-llvm    Run LLVM kernel with KVM (near-native)"
 	@echo "  make run-smp-llvm    Run LLVM kernel with KVM + 4 cores"
 	@echo "  make debug-llvm      Debug LLVM kernel with GDB"
+	@echo "  make run-gpu-llvm    Run LLVM kernel with VirtIO-GPU (GTK window)"
+	@echo "  make run-full-llvm   Run with KVM+SMP+GPU+NVMe+Net (full hardware)"
+	@echo "  make iso-llvm        Create bootable GRUB2 ISO (LLVM kernel)"
 	@echo ""
 	@echo "  Other:"
 	@echo "  make iso             Create bootable GRUB2 ISO"
