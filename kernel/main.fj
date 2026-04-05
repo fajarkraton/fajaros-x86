@@ -265,16 +265,21 @@
     irq_enable()
 
     // Serial confirmation
-    println("[NOVA] FajarOS Nova v1.1.0 Ascension booted")
-    println("[NOVA] 11600+ LOC | 160 commands | Preemptive | 100% Fajar Lang")
+    println("[NOVA] FajarOS Nova v3.0 Nusantara booted")
+    println("[NOVA] 42600+ LOC | 250+ commands | Preemptive | 100% Fajar Lang")
     println("[NOVA] Frame allocator: 32768 frames (128MB)")
     println("[NOVA] RamFS: 64 entries, 832KB data")
-    println("[NOVA] VGA console active at 0xB8000")
+    if fb_state_read(FB_MAPPED) != 0 {
+        println("[NOVA] Graphics mode: framebuffer active")
+    } else {
+        println("[NOVA] VGA text console at 0xB8000")
+    }
 
     // Boot banner
     cprintln("============================================", WHITE_ON_BLUE)
-    cprintln("  FajarOS Nova v1.1.0 — x86_64 Shell", WHITE_ON_BLUE)
+    cprintln("  FajarOS Nova v3.0 Nusantara — x86_64", WHITE_ON_BLUE)
     cprintln("  Written 100% in Fajar Lang", WHITE_ON_BLUE)
+    cprintln("  Desktop: compositor + animations + apps", WHITE_ON_BLUE)
     cprintln("============================================", WHITE_ON_BLUE)
     cprintln("", WHITE_ON_BLACK)
     cprintln("Type 'help' for available commands.", YELLOW_ON_BLACK)
