@@ -564,3 +564,398 @@ const TILE_ENTRY_SIZE: i64 = 64
         cprintln(" active", WHITE_ON_BLACK)
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 9: Advanced Graphics Engine
+// ═══════════════════════════════════════════════════════════════
+
+// ── 9.1: Damage Rectangle System ──
+
+const DAMAGE_MAX: i64 = 32
+const DAMAGE_STATE: i64 = 0x940000  // 32 entries × 32 bytes
+// Each entry: [+0: active, +8: x, +16: y, +24: w, +32: h]
+const DAMAGE_ENTRY_SIZE: i64 = 40
+
+@kernel fn damage_init() {
+    let mut i: i64 = 0
+    while i < DAMAGE_MAX * DAMAGE_ENTRY_SIZE {
+        volatile_write_u64(DAMAGE_STATE + i, 0)
+        i = i + 8
+    }
+}
+
+@kernel fn damage_add(x: i64, y: i64, w: i64, h: i64) {
+    // Find first free slot
+    let mut i: i64 = 0
+    while i < DAMAGE_MAX {
+        let base = DAMAGE_STATE + i * DAMAGE_ENTRY_SIZE
+        if volatile_read_u64(base) == 0 {
+            volatile_write_u64(base, 1)
+            volatile_write_u64(base + 8, x)
+            volatile_write_u64(base + 16, y)
+            volatile_write_u64(base + 24, w)
+            volatile_write_u64(base + 32, h)
+            return
+        }
+        i = i + 1
+    }
+    // Full — merge into first slot (union all)
+    let base = DAMAGE_STATE
+    volatile_write_u64(base + 8, 0)
+    volatile_write_u64(base + 16, 0)
+    volatile_write_u64(base + 24, fb_state_read(FB_WIDTH))
+    volatile_write_u64(base + 32, fb_state_read(FB_HEIGHT))
+}
+
+@kernel fn damage_clear() {
+    let mut i: i64 = 0
+    while i < DAMAGE_MAX {
+        volatile_write_u64(DAMAGE_STATE + i * DAMAGE_ENTRY_SIZE, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn damage_get_union(out_x: i64, out_y: i64, out_w: i64, out_h: i64) {
+    let mut min_x: i64 = 9999
+    let mut min_y: i64 = 9999
+    let mut max_x: i64 = 0
+    let mut max_y: i64 = 0
+    let mut i: i64 = 0
+    while i < DAMAGE_MAX {
+        let base = DAMAGE_STATE + i * DAMAGE_ENTRY_SIZE
+        if volatile_read_u64(base) != 0 {
+            let x = volatile_read_u64(base + 8)
+            let y = volatile_read_u64(base + 16)
+            let w = volatile_read_u64(base + 24)
+            let h = volatile_read_u64(base + 32)
+            if x < min_x { min_x = x }
+            if y < min_y { min_y = y }
+            if x + w > max_x { max_x = x + w }
+            if y + h > max_y { max_y = y + h }
+        }
+        i = i + 1
+    }
+    volatile_write_u64(out_x, min_x)
+    volatile_write_u64(out_y, min_y)
+    volatile_write_u64(out_w, max_x - min_x)
+    volatile_write_u64(out_h, max_y - min_y)
+}
+
+// ── 9.2: Per-Pixel Alpha Blending ──
+
+@kernel fn fb_read_pixel(x: i64, y: i64) -> i64 {
+    let fb_addr = fb_state_read(FB_MAPPED)
+    if fb_addr == 0 { return 0 }
+    let width = fb_state_read(FB_WIDTH)
+    let height = fb_state_read(FB_HEIGHT)
+    if x < 0 || x >= width || y < 0 || y >= height { return 0 }
+    let pitch = fb_state_read(FB_PITCH)
+    let bpp = fb_state_read(FB_BPP)
+    let offset = y * pitch + x * (bpp / 8)
+    let b = volatile_read_u8(fb_addr + offset)
+    let g = volatile_read_u8(fb_addr + offset + 1)
+    let r = volatile_read_u8(fb_addr + offset + 2)
+    (r << 16) | (g << 8) | b
+}
+
+// Blend src color over dst with alpha (0=transparent, 255=opaque)
+@kernel fn comp_blend_pixel(x: i64, y: i64, src_color: i64, alpha: i64) {
+    if alpha >= 255 { fb_putpixel(x, y, src_color); return }
+    if alpha <= 0 { return }
+    let dst = fb_read_pixel(x, y)
+    let sr = (src_color >> 16) & 0xFF
+    let sg = (src_color >> 8) & 0xFF
+    let sb = src_color & 0xFF
+    let dr = (dst >> 16) & 0xFF
+    let dg = (dst >> 8) & 0xFF
+    let db = dst & 0xFF
+    let r = (sr * alpha + dr * (255 - alpha)) / 255
+    let g = (sg * alpha + dg * (255 - alpha)) / 255
+    let b = (sb * alpha + db * (255 - alpha)) / 255
+    fb_putpixel(x, y, (r << 16) | (g << 8) | b)
+}
+
+// Fill rectangle with alpha blending
+@kernel fn fb_fill_rect_alpha(x: i64, y: i64, w: i64, h: i64, color: i64, alpha: i64) {
+    let mut row: i64 = 0
+    while row < h {
+        let mut col: i64 = 0
+        while col < w {
+            comp_blend_pixel(x + col, y + row, color, alpha)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// ── 9.3: Anti-Aliased Line Drawing (Wu's Algorithm) ──
+
+@kernel fn fb_draw_line(x0: i64, y0: i64, x1: i64, y1: i64, color: i64) {
+    // Bresenham's line algorithm
+    let mut dx = x1 - x0
+    let mut dy = y1 - y0
+    if dx < 0 { dx = 0 - dx }
+    if dy < 0 { dy = 0 - dy }
+    let sx = if x0 < x1 { 1 } else { -1 }
+    let sy = if y0 < y1 { 1 } else { -1 }
+    let mut err = dx - dy
+    let mut cx = x0
+    let mut cy = y0
+    while cx != x1 || cy != y1 {
+        fb_putpixel(cx, cy, color)
+        let e2 = err * 2
+        if e2 > 0 - dy { err = err - dy; cx = cx + sx }
+        if e2 < dx { err = err + dx; cy = cy + sy }
+    }
+    fb_putpixel(x1, y1, color)
+}
+
+@kernel fn fb_draw_line_aa(x0: i64, y0: i64, x1: i64, y1: i64, color: i64) {
+    // Wu's anti-aliased line: draw with alpha blending on edges
+    let mut dx = x1 - x0
+    let mut dy = y1 - y0
+    let steep = if dy < 0 { 0 - dy } else { dy }
+    let wide = if dx < 0 { 0 - dx } else { dx }
+
+    if steep > wide {
+        // Steep: iterate over Y, blend along X
+        let mut y = if y0 < y1 { y0 } else { y1 }
+        let ye = if y0 < y1 { y1 } else { y0 }
+        let xs = if y0 < y1 { x0 } else { x1 }
+        let xe = if y0 < y1 { x1 } else { x0 }
+        while y <= ye {
+            let t = if ye == y { 0 } else { ((y - (if y0 < y1 { y0 } else { y1 })) * 256) / steep }
+            let x_pos = xs + ((xe - xs) * t) / 256
+            fb_putpixel(x_pos, y, color)
+            // Anti-alias: blend neighbors
+            comp_blend_pixel(x_pos - 1, y, color, 64)
+            comp_blend_pixel(x_pos + 1, y, color, 64)
+            y = y + 1
+        }
+    } else {
+        // Wide: iterate over X, blend along Y
+        let mut x = if x0 < x1 { x0 } else { x1 }
+        let xend = if x0 < x1 { x1 } else { x0 }
+        let ys = if x0 < x1 { y0 } else { y1 }
+        let yend = if x0 < x1 { y1 } else { y0 }
+        while x <= xend {
+            let t = if xend == x { 0 } else { ((x - (if x0 < x1 { x0 } else { x1 })) * 256) / wide }
+            let y_pos = ys + ((yend - ys) * t) / 256
+            fb_putpixel(x, y_pos, color)
+            comp_blend_pixel(x, y_pos - 1, color, 64)
+            comp_blend_pixel(x, y_pos + 1, color, 64)
+            x = x + 1
+        }
+    }
+}
+
+// ── 9.4: Rounded Rectangle Drawing ──
+
+@kernel fn fb_draw_rounded_rect(x: i64, y: i64, w: i64, h: i64, radius: i64, color: i64) {
+    // Flat edges
+    fb_fill_rect(x + radius, y, w - 2 * radius, h, color)         // center
+    fb_fill_rect(x, y + radius, radius, h - 2 * radius, color)    // left
+    fb_fill_rect(x + w - radius, y + radius, radius, h - 2 * radius, color)  // right
+
+    // Rounded corners using midpoint circle algorithm
+    let mut cx: i64 = 0
+    let mut cy: i64 = radius
+    let mut d: i64 = 1 - radius
+    while cx <= cy {
+        // Top-left corner
+        fb_draw_hline(x + radius - cy, y + radius - cx, cy, color)
+        fb_draw_hline(x + radius - cx, y + radius - cy, cx, color)
+        // Top-right corner
+        fb_draw_hline(x + w - radius, y + radius - cx, cy, color)
+        fb_draw_hline(x + w - radius + cy - cx, y + radius - cy, cx, color)
+        // Bottom-left corner
+        fb_draw_hline(x + radius - cy, y + h - radius + cx - 1, cy, color)
+        fb_draw_hline(x + radius - cx, y + h - radius + cy - 1, cx, color)
+        // Bottom-right corner
+        fb_draw_hline(x + w - radius, y + h - radius + cx - 1, cy, color)
+        fb_draw_hline(x + w - radius + cy - cx, y + h - radius + cy - 1, cx, color)
+
+        if d < 0 { d = d + 2 * cx + 3 }
+        else { d = d + 2 * (cx - cy) + 5; cy = cy - 1 }
+        cx = cx + 1
+    }
+}
+
+@kernel fn fb_draw_hline(x: i64, y: i64, len: i64, color: i64) {
+    let mut i: i64 = 0
+    while i < len { fb_putpixel(x + i, y, color); i = i + 1 }
+}
+
+// Outlined rounded rectangle (border only)
+@kernel fn fb_draw_rounded_rect_outline(x: i64, y: i64, w: i64, h: i64, radius: i64, color: i64) {
+    // Horizontal edges
+    fb_draw_hline(x + radius, y, w - 2 * radius, color)           // top
+    fb_draw_hline(x + radius, y + h - 1, w - 2 * radius, color)  // bottom
+    // Vertical edges
+    let mut i: i64 = radius
+    while i < h - radius { fb_putpixel(x, y + i, color); fb_putpixel(x + w - 1, y + i, color); i = i + 1 }
+    // Corner arcs
+    let mut cx: i64 = 0
+    let mut cy: i64 = radius
+    let mut d: i64 = 1 - radius
+    while cx <= cy {
+        fb_putpixel(x + radius - cx, y + radius - cy, color)  // TL
+        fb_putpixel(x + radius - cy, y + radius - cx, color)
+        fb_putpixel(x + w - 1 - radius + cx, y + radius - cy, color)  // TR
+        fb_putpixel(x + w - 1 - radius + cy, y + radius - cx, color)
+        fb_putpixel(x + radius - cx, y + h - 1 - radius + cy, color)  // BL
+        fb_putpixel(x + radius - cy, y + h - 1 - radius + cx, color)
+        fb_putpixel(x + w - 1 - radius + cx, y + h - 1 - radius + cy, color)  // BR
+        fb_putpixel(x + w - 1 - radius + cy, y + h - 1 - radius + cx, color)
+        if d < 0 { d = d + 2 * cx + 3 }
+        else { d = d + 2 * (cx - cy) + 5; cy = cy - 1 }
+        cx = cx + 1
+    }
+}
+
+// ── 9.5: Gradient Fill ──
+
+// Direction: 0=horizontal, 1=vertical, 2=diagonal
+@kernel fn fb_gradient_rect(x: i64, y: i64, w: i64, h: i64, color1: i64, color2: i64, direction: i64) {
+    let r1 = (color1 >> 16) & 0xFF
+    let g1 = (color1 >> 8) & 0xFF
+    let b1 = color1 & 0xFF
+    let r2 = (color2 >> 16) & 0xFF
+    let g2 = (color2 >> 8) & 0xFF
+    let b2 = color2 & 0xFF
+
+    let mut row: i64 = 0
+    while row < h {
+        let mut col: i64 = 0
+        while col < w {
+            let t = if direction == 0 {
+                if w > 1 { (col * 255) / (w - 1) } else { 0 }
+            } else if direction == 1 {
+                if h > 1 { (row * 255) / (h - 1) } else { 0 }
+            } else {
+                // Diagonal: average of horizontal and vertical
+                let th = if w > 1 { (col * 255) / (w - 1) } else { 0 }
+                let tv = if h > 1 { (row * 255) / (h - 1) } else { 0 }
+                (th + tv) / 2
+            }
+            let r = r1 + ((r2 - r1) * t) / 255
+            let g = g1 + ((g2 - g1) * t) / 255
+            let b = b1 + ((b2 - b1) * t) / 255
+            fb_putpixel(x + col, y + row, (r << 16) | (g << 8) | b)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// ── 9.6: Bitmap/Sprite Rendering ──
+
+// Draw raw ARGB bitmap from memory (32-bit per pixel: 0xAARRGGBB)
+@kernel fn fb_draw_bitmap(x: i64, y: i64, w: i64, h: i64, data_addr: i64) {
+    let mut row: i64 = 0
+    while row < h {
+        let mut col: i64 = 0
+        while col < w {
+            let offset = (row * w + col) * 4
+            let b = volatile_read_u8(data_addr + offset)
+            let g = volatile_read_u8(data_addr + offset + 1)
+            let r = volatile_read_u8(data_addr + offset + 2)
+            let a = volatile_read_u8(data_addr + offset + 3)
+            let color = (r << 16) | (g << 8) | b
+            if a >= 255 {
+                fb_putpixel(x + col, y + row, color)
+            } else if a > 0 {
+                comp_blend_pixel(x + col, y + row, color, a)
+            }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// Draw bitmap with scaling (nearest-neighbor)
+@kernel fn fb_draw_bitmap_scaled(x: i64, y: i64, src_w: i64, src_h: i64, dst_w: i64, dst_h: i64, data_addr: i64) {
+    let mut row: i64 = 0
+    while row < dst_h {
+        let sy = (row * src_h) / dst_h
+        let mut col: i64 = 0
+        while col < dst_w {
+            let sx = (col * src_w) / dst_w
+            let offset = (sy * src_w + sx) * 4
+            let b = volatile_read_u8(data_addr + offset)
+            let g = volatile_read_u8(data_addr + offset + 1)
+            let r = volatile_read_u8(data_addr + offset + 2)
+            fb_putpixel(x + col, y + row, (r << 16) | (g << 8) | b)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// ── 9.7: VBE/Multiboot Framebuffer Mode ──
+
+const FB_MULTIBOOT_INFO: i64 = 0x6FF00  // Multiboot2 info ptr (set by startup.S)
+
+@kernel fn fb_detect_multiboot() {
+    // Try to detect multiboot2 framebuffer tag
+    let mb_info = volatile_read_u64(FB_MULTIBOOT_INFO)
+    if mb_info == 0 { return }
+    // Multiboot2 framebuffer tag type = 8
+    // Walk tags starting at mb_info + 8
+    let mut offset: i64 = 8
+    while offset < 4096 {
+        let tag_type = volatile_read_u32(mb_info + offset)
+        let tag_size = volatile_read_u32(mb_info + offset + 4)
+        if tag_type == 0 { return }  // end tag
+        if tag_type == 8 {
+            // Framebuffer tag found!
+            let addr = volatile_read_u64(mb_info + offset + 8)
+            let pitch = volatile_read_u32(mb_info + offset + 16)
+            let width = volatile_read_u32(mb_info + offset + 20)
+            let height = volatile_read_u32(mb_info + offset + 24)
+            let bpp = volatile_read_u8(mb_info + offset + 28)
+            fb_state_write(FB_MAPPED, addr)
+            fb_state_write(FB_WIDTH, width)
+            fb_state_write(FB_HEIGHT, height)
+            fb_state_write(FB_PITCH, pitch)
+            fb_state_write(FB_BPP, bpp)
+            return
+        }
+        // Align to 8 bytes
+        offset = offset + ((tag_size + 7) & (~7))
+    }
+}
+
+// ── 9.8: Circle Drawing (for cursors, buttons) ──
+
+@kernel fn fb_draw_circle(cx: i64, cy: i64, radius: i64, color: i64) {
+    // Midpoint circle algorithm — filled
+    let mut x: i64 = 0
+    let mut y: i64 = radius
+    let mut d: i64 = 1 - radius
+    while x <= y {
+        fb_draw_hline(cx - y, cy + x, 2 * y + 1, color)
+        fb_draw_hline(cx - y, cy - x, 2 * y + 1, color)
+        fb_draw_hline(cx - x, cy + y, 2 * x + 1, color)
+        fb_draw_hline(cx - x, cy - y, 2 * x + 1, color)
+        if d < 0 { d = d + 2 * x + 3 }
+        else { d = d + 2 * (x - y) + 5; y = y - 1 }
+        x = x + 1
+    }
+}
+
+// Circle outline
+@kernel fn fb_draw_circle_outline(cx: i64, cy: i64, radius: i64, color: i64) {
+    let mut x: i64 = 0
+    let mut y: i64 = radius
+    let mut d: i64 = 1 - radius
+    while x <= y {
+        fb_putpixel(cx + x, cy + y, color); fb_putpixel(cx - x, cy + y, color)
+        fb_putpixel(cx + x, cy - y, color); fb_putpixel(cx - x, cy - y, color)
+        fb_putpixel(cx + y, cy + x, color); fb_putpixel(cx - y, cy + x, color)
+        fb_putpixel(cx + y, cy - x, color); fb_putpixel(cx - y, cy - x, color)
+        if d < 0 { d = d + 2 * x + 3 }
+        else { d = d + 2 * (x - y) + 5; y = y - 1 }
+        x = x + 1
+    }
+}
