@@ -148,6 +148,7 @@ SOURCES := \
 	services/gui/spaces.fj \
 	services/gui/app_switcher.fj \
 	services/gui/hot_corners.fj \
+	services/gui/animation.fj \
 	services/gui/main.fj \
 	services/auth/main.fj \
 	services/shell/main.fj \

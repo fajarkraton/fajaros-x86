@@ -1,0 +1,291 @@
+// FajarOS Nova v3.0 — Animation Framework
+// Cubic bezier easing + timer-driven animations for smooth UI.
+// Equivalent to macOS Core Animation (simplified, integer math).
+//
+// Usage: anim_create(target, property, from, to, duration_ms, easing)
+//        Call anim_tick() every frame (~16ms for 60fps)
+
+// ═══════════════════════════════════════════════════════════════
+// Animation State
+// ═══════════════════════════════════════════════════════════════
+
+const ANIM_BASE: i64 = 0x966000
+const ANIM_MAX: i64 = 32
+const ANIM_SIZE: i64 = 80  // Per-animation entry
+
+// Per-entry layout:
+// +0:  active (0/1)
+// +8:  target_id (window or widget ID)
+// +16: property (0=x, 1=y, 2=w, 3=h, 4=opacity, 5=color)
+// +24: from_value
+// +32: to_value
+// +40: duration_ms
+// +48: elapsed_ms
+// +56: easing_type (0=linear, 1=ease-in, 2=ease-out, 3=ease-in-out, 4=spring)
+// +64: callback_addr (function to call with interpolated value)
+// +72: done (0/1)
+
+const ANIM_ACTIVE: i64 = 0
+const ANIM_TARGET: i64 = 8
+const ANIM_PROP: i64 = 16
+const ANIM_FROM: i64 = 24
+const ANIM_TO: i64 = 32
+const ANIM_DURATION: i64 = 40
+const ANIM_ELAPSED: i64 = 48
+const ANIM_EASING: i64 = 56
+const ANIM_CALLBACK: i64 = 64
+const ANIM_DONE: i64 = 72
+
+// Easing types
+const EASE_LINEAR: i64 = 0
+const EASE_IN: i64 = 1        // Slow start, fast end
+const EASE_OUT: i64 = 2       // Fast start, slow end
+const EASE_IN_OUT: i64 = 3    // Slow start + end
+const EASE_SPRING: i64 = 4    // Overshoot + settle
+
+// Properties
+const PROP_X: i64 = 0
+const PROP_Y: i64 = 1
+const PROP_W: i64 = 2
+const PROP_H: i64 = 3
+const PROP_OPACITY: i64 = 4
+const PROP_COLOR: i64 = 5
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn anim_init() {
+    let mut i: i64 = 0
+    while i < ANIM_MAX * ANIM_SIZE {
+        volatile_write_u64(ANIM_BASE + i, 0)
+        i = i + 8
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Easing Functions — Integer Math (input/output 0-1000)
+// ═══════════════════════════════════════════════════════════════
+
+// All easing functions: t in [0, 1000] → result in [0, 1000]
+// Using fixed-point: 1000 = 1.0
+
+@kernel fn ease_linear(t: i64) -> i64 { t }
+
+@kernel fn ease_in_quad(t: i64) -> i64 {
+    // t² (accelerate)
+    (t * t) / 1000
+}
+
+@kernel fn ease_out_quad(t: i64) -> i64 {
+    // 1 - (1-t)² (decelerate)
+    let inv = 1000 - t
+    1000 - (inv * inv) / 1000
+}
+
+@kernel fn ease_in_out_quad(t: i64) -> i64 {
+    // Combine in + out at midpoint
+    if t < 500 {
+        (2 * t * t) / 1000
+    } else {
+        let inv = 1000 - t
+        1000 - (2 * inv * inv) / 1000
+    }
+}
+
+@kernel fn ease_in_cubic(t: i64) -> i64 {
+    // t³
+    (t * t / 1000 * t) / 1000
+}
+
+@kernel fn ease_out_cubic(t: i64) -> i64 {
+    let inv = 1000 - t
+    1000 - (inv * inv / 1000 * inv) / 1000
+}
+
+@kernel fn ease_in_out_cubic(t: i64) -> i64 {
+    if t < 500 {
+        (4 * t * t / 1000 * t) / 1000000
+    } else {
+        let inv = 1000 - t
+        1000 - (4 * inv * inv / 1000 * inv) / 1000000
+    }
+}
+
+@kernel fn ease_spring(t: i64) -> i64 {
+    // Spring: overshoot then settle
+    // Simplified: ease_out_cubic * (1 + overshoot * sin(decay))
+    let base = ease_out_cubic(t)
+    // Add 15% overshoot that decays
+    let overshoot = if t < 700 { (1000 - t) * 150 / 1000 } else { 0 }
+    let result = base + overshoot
+    if result > 1100 { 1100 } else { result }
+}
+
+// Dispatch to easing function
+@kernel fn ease_apply(t: i64, easing: i64) -> i64 {
+    if easing == EASE_LINEAR { ease_linear(t) }
+    else if easing == EASE_IN { ease_in_cubic(t) }
+    else if easing == EASE_OUT { ease_out_cubic(t) }
+    else if easing == EASE_IN_OUT { ease_in_out_cubic(t) }
+    else if easing == EASE_SPRING { ease_spring(t) }
+    else { ease_linear(t) }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Animation Lifecycle
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn anim_create(target: i64, prop: i64, from: i64, to: i64, duration_ms: i64, easing: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < ANIM_MAX {
+        let base = ANIM_BASE + i * ANIM_SIZE
+        if volatile_read_u64(base + ANIM_ACTIVE) == 0 {
+            volatile_write_u64(base + ANIM_ACTIVE, 1)
+            volatile_write_u64(base + ANIM_TARGET, target)
+            volatile_write_u64(base + ANIM_PROP, prop)
+            volatile_write_u64(base + ANIM_FROM, from)
+            volatile_write_u64(base + ANIM_TO, to)
+            volatile_write_u64(base + ANIM_DURATION, duration_ms)
+            volatile_write_u64(base + ANIM_ELAPSED, 0)
+            volatile_write_u64(base + ANIM_EASING, easing)
+            volatile_write_u64(base + ANIM_CALLBACK, 0)
+            volatile_write_u64(base + ANIM_DONE, 0)
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn anim_cancel(id: i64) {
+    if id < 0 || id >= ANIM_MAX { return }
+    volatile_write_u64(ANIM_BASE + id * ANIM_SIZE + ANIM_ACTIVE, 0)
+}
+
+// Tick all active animations (call every frame, ~16ms)
+@kernel fn anim_tick(dt_ms: i64) {
+    let mut i: i64 = 0
+    while i < ANIM_MAX {
+        let base = ANIM_BASE + i * ANIM_SIZE
+        if volatile_read_u64(base + ANIM_ACTIVE) != 0 && volatile_read_u64(base + ANIM_DONE) == 0 {
+            let elapsed = volatile_read_u64(base + ANIM_ELAPSED) + dt_ms
+            volatile_write_u64(base + ANIM_ELAPSED, elapsed)
+            let duration = volatile_read_u64(base + ANIM_DURATION)
+            let from = volatile_read_u64(base + ANIM_FROM)
+            let to = volatile_read_u64(base + ANIM_TO)
+            let easing = volatile_read_u64(base + ANIM_EASING)
+
+            if elapsed >= duration {
+                // Animation complete
+                volatile_write_u64(base + ANIM_DONE, 1)
+                anim_apply_value(base, to)
+            } else {
+                // Interpolate
+                let t = (elapsed * 1000) / duration  // t in [0, 1000]
+                let eased = ease_apply(t, easing)
+                let value = from + ((to - from) * eased) / 1000
+                anim_apply_value(base, value)
+            }
+        }
+        i = i + 1
+    }
+}
+
+// Apply interpolated value to target property
+@kernel fn anim_apply_value(anim_base: i64, value: i64) {
+    let target = volatile_read_u64(anim_base + ANIM_TARGET)
+    let prop = volatile_read_u64(anim_base + ANIM_PROP)
+    let win_base = comp_window_addr(target)
+
+    if prop == PROP_X { volatile_write_u64(win_base + WIN_OFF_X, value) }
+    else if prop == PROP_Y { volatile_write_u64(win_base + WIN_OFF_Y, value) }
+    else if prop == PROP_W { volatile_write_u64(win_base + WIN_OFF_W, value) }
+    else if prop == PROP_H { volatile_write_u64(win_base + WIN_OFF_H, value) }
+    else if prop == PROP_OPACITY { volatile_write_u64(win_base + WIN_OFF_FLAGS + 8, value) }
+}
+
+// Count active animations
+@kernel fn anim_active_count() -> i64 {
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < ANIM_MAX {
+        let base = ANIM_BASE + i * ANIM_SIZE
+        if volatile_read_u64(base + ANIM_ACTIVE) != 0 && volatile_read_u64(base + ANIM_DONE) == 0 {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    count
+}
+
+// Clean up completed animations
+@kernel fn anim_cleanup() {
+    let mut i: i64 = 0
+    while i < ANIM_MAX {
+        let base = ANIM_BASE + i * ANIM_SIZE
+        if volatile_read_u64(base + ANIM_ACTIVE) != 0 && volatile_read_u64(base + ANIM_DONE) != 0 {
+            volatile_write_u64(base + ANIM_ACTIVE, 0)
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pre-built Animation Helpers
+// ═══════════════════════════════════════════════════════════════
+
+// 11.3: Window fade in (opacity 0→255 over 200ms)
+@kernel fn anim_window_fade_in(win_id: i64) -> i64 {
+    anim_create(win_id, PROP_OPACITY, 0, 255, 200, EASE_OUT)
+}
+
+// Window fade out (opacity 255→0 over 200ms)
+@kernel fn anim_window_fade_out(win_id: i64) -> i64 {
+    anim_create(win_id, PROP_OPACITY, 255, 0, 200, EASE_IN)
+}
+
+// 11.4: Window minimize (shrink to taskbar position)
+@kernel fn anim_window_minimize(win_id: i64) {
+    let base = comp_window_addr(win_id)
+    let x = volatile_read_u64(base + WIN_OFF_X)
+    let y = volatile_read_u64(base + WIN_OFF_Y)
+    let sh = fb_state_read(FB_HEIGHT)
+    // Animate Y to bottom of screen
+    anim_create(win_id, PROP_Y, y, sh - 40, 250, EASE_IN)
+    // Animate width to 0
+    let w = volatile_read_u64(base + WIN_OFF_W)
+    anim_create(win_id, PROP_W, w, 80, 250, EASE_IN)
+    let h = volatile_read_u64(base + WIN_OFF_H)
+    anim_create(win_id, PROP_H, h, 20, 250, EASE_IN)
+}
+
+// 11.6: Space switching slide animation
+@kernel fn anim_space_slide(direction: i64) {
+    // direction: -1 = slide left, +1 = slide right
+    let sw = fb_state_read(FB_WIDTH)
+    let slide = sw * direction
+    let mut i: i64 = 0
+    while i < 16 {
+        let base = comp_window_addr(i)
+        if volatile_read_u64(base) != 0 {
+            let x = volatile_read_u64(base + WIN_OFF_X)
+            anim_create(i, PROP_X, x, x + slide, 300, EASE_IN_OUT)
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_animations() {
+    cprintln("=== Animation Framework ===", YELLOW_ON_BLACK)
+    cprint("Active animations: ", WHITE_ON_BLACK)
+    cprintln_decimal(anim_active_count(), CYAN_ON_BLACK)
+    cprint("Max slots: ", WHITE_ON_BLACK)
+    cprintln_decimal(ANIM_MAX, WHITE_ON_BLACK)
+    cprintln("Easing: linear, ease-in, ease-out, ease-in-out, spring", WHITE_ON_BLACK)
+    cprintln("Properties: x, y, w, h, opacity, color", WHITE_ON_BLACK)
+}
