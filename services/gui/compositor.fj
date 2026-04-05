@@ -372,6 +372,20 @@ const BORDER_WIDTH: i64 = 1
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Get currently focused window ID (-1 if none)
+@kernel fn comp_focused_window() -> i64 {
+    let mut i: i64 = 0
+    while i < COMP_MAX_WINDOWS {
+        let addr = COMP_BASE + i * COMP_WINDOW_SIZE
+        if volatile_read_u64(addr + WIN_OFF_ID) != 0 {
+            let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+            if (flags & WIN_FLAG_FOCUSED) != 0 { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
 // Phase 10: Advanced Compositor Features
 // ═══════════════════════════════════════════════════════════════
 

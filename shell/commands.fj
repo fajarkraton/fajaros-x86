@@ -3372,6 +3372,32 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
     // font (102,111,110,116)
     if handled == 0 && len == 4 && volatile_read_u8(0x6F800) == 102 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 110 && volatile_read_u8(0x6F803) == 116 { cmd_font(); handled = 1 }
+    // calc (99,97,108,99)
+    if handled == 0 && len == 4 && volatile_read_u8(0x6F800) == 99 && volatile_read_u8(0x6F801) == 97 && volatile_read_u8(0x6F802) == 108 && volatile_read_u8(0x6F803) == 99 { cmd_calc(); handled = 1 }
+    // sysmon (115,121,115,109,111,110)
+    if handled == 0 && len == 6 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 121 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 109 { cmd_sysmon(); handled = 1 }
+    // viewer (118,105,101,119,101,114)
+    if handled == 0 && len == 6 && volatile_read_u8(0x6F800) == 118 && volatile_read_u8(0x6F801) == 105 && volatile_read_u8(0x6F802) == 101 && volatile_read_u8(0x6F803) == 119 { cmd_viewer(); handled = 1 }
+    // filemgr (102,105,108,101,109,103,114)
+    if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 102 && volatile_read_u8(0x6F801) == 105 && volatile_read_u8(0x6F802) == 108 && volatile_read_u8(0x6F803) == 101 && volatile_read_u8(0x6F804) == 109 { cmd_filemgr(); handled = 1 }
+    // settings (115,101,116,116,105,110,103,115)
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 116 && volatile_read_u8(0x6F804) == 105 { cmd_settings(); handled = 1 }
+    // spaces (115,112,97,99,101,115)
+    if handled == 0 && len == 6 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 97 && volatile_read_u8(0x6F803) == 99 { cmd_spaces(); handled = 1 }
+    // shortcuts (115,104,111,114,116,99,117,116,115)
+    if handled == 0 && len == 9 && volatile_read_u8(0x6F800) == 115 && volatile_read_u8(0x6F801) == 104 && volatile_read_u8(0x6F802) == 111 && volatile_read_u8(0x6F803) == 114 { cmd_shortcuts(); handled = 1 }
+    // notify (110,111,116,105,102,121)
+    if handled == 0 && len == 6 && volatile_read_u8(0x6F800) == 110 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 105 { cmd_notify(); handled = 1 }
+    // compositor (99,111,109,112,111,115,105,116,111,114)
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 99 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 109 && volatile_read_u8(0x6F803) == 112 { cmd_windows(); handled = 1 }
+    // menubar (109,101,110,117,98,97,114)
+    if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 109 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 110 && volatile_read_u8(0x6F803) == 117 { cmd_menubar(); handled = 1 }
+    // hotcorners (104,111,116,99,111,114,110,101,114,115)
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 104 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 99 && volatile_read_u8(0x6F804) == 111 { cmd_hotcorners(); handled = 1 }
+    // animations (97,110,105,109,97,116,105,111,110,115)
+    if handled == 0 && len == 10 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 110 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 109 { cmd_animations(); handled = 1 }
+    // accessibility (97,99,99,101,115,115,105,98,105,108,105,116,121)
+    if handled == 0 && len == 13 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 99 && volatile_read_u8(0x6F802) == 99 && volatile_read_u8(0x6F803) == 101 { cmd_accessibility(); handled = 1 }
 
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)

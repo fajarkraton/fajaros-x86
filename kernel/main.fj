@@ -109,6 +109,49 @@
     shm_init()
     ramfs_init()
     font_init()
+
+    // GUI subsystem initialization
+    comp_init()
+    damage_init()
+    spaces_init()
+    switcher_init()
+    hot_corners_init()
+    anim_init()
+    cursor_init()
+    clipboard_init()
+    shortcuts_init()
+    a11y_init()
+    notify_init()
+    wallpaper_init()
+    dnd_init()
+    launcher_init()
+    settings_init()
+    menubar_init()
+    ctxmenu_init()
+    calc_init()
+    viewer_init()
+    sysmon_init()
+    filemgr_init()
+    // Detect Multiboot2 framebuffer (VBE/GOP mode from bootloader)
+    fb_detect_multiboot()
+    let fb_addr = fb_state_read(FB_MAPPED)
+    if fb_addr != 0 {
+        let fb_w = fb_state_read(FB_WIDTH)
+        let fb_h = fb_state_read(FB_HEIGHT)
+        cprint("[FB] Framebuffer: ", WHITE_ON_BLACK)
+        cprint_decimal(fb_w, CYAN_ON_BLACK)
+        cprint("x", WHITE_ON_BLACK)
+        cprint_decimal(fb_h, CYAN_ON_BLACK)
+        cprint(" at 0x", WHITE_ON_BLACK)
+        cprint_hex(fb_addr, 16, CYAN_ON_BLACK)
+        cprintln("", WHITE_ON_BLACK)
+        // Draw wallpaper + menubar + compositor if framebuffer available
+        wallpaper_draw()
+        menubar_draw()
+        comp_composite()
+    }
+    println("[GUI] Desktop compositor + 14 GUI modules initialized")
+
     mnist_init_weights()
 
     // Map LAPIC + IOAPIC MMIO pages (beyond 128MB identity region)
@@ -263,6 +306,28 @@
     while running == 1 {
         // Check serial input (COM1) — enables automated QEMU testing
         shell_poll_serial()
+
+        // GUI frame tick: animations + hot corners + notifications
+        let gui_fb = fb_state_read(FB_MAPPED)
+        if gui_fb != 0 {
+            anim_tick(16)  // ~60fps assumption: 16ms per frame
+            anim_cleanup()
+            // Check hot corners with mouse position
+            let mx = volatile_read_u64(0x6FB00)
+            let my = volatile_read_u64(0x6FB08)
+            let hc_action = hot_corners_check(mx, my)
+            if hc_action == 1 { comp_composite() }  // show desktop
+            else if hc_action == 3 { switcher_show() }
+            // Re-composite if any window is dirty
+            comp_composite()
+            switcher_draw()
+            menubar_draw()
+            notify_draw()
+            ctxmenu_draw()
+            dnd_draw()
+            launcher_draw()
+        }
+
         if kb_has_data() == 1 {
             let sc = kb_read_scancode()
 
@@ -303,7 +368,19 @@
             else if sc > 0 && sc < 128 {
                 // Sprint 5.4.7: Ctrl+C — send SIGINT to foreground process
                 let ctrl = volatile_read(0x6FBF0)
-                if ctrl == 1 && sc == 0x2E { // 0x2E = scancode for 'C'
+                // Ctrl+1/2/3/4: switch virtual desktops
+                if ctrl == 1 && sc == 0x02 { spaces_switch(0); cprint("[Space 1]", GREEN_ON_BLACK) }
+                else if ctrl == 1 && sc == 0x03 { spaces_switch(1); cprint("[Space 2]", GREEN_ON_BLACK) }
+                else if ctrl == 1 && sc == 0x04 { spaces_switch(2); cprint("[Space 3]", GREEN_ON_BLACK) }
+                else if ctrl == 1 && sc == 0x05 { spaces_switch(3); cprint("[Space 4]", GREEN_ON_BLACK) }
+                // Ctrl+Space: toggle launcher
+                else if ctrl == 1 && sc == 0x39 { launcher_show() }
+                // F11: toggle fullscreen
+                else if sc == 0x57 {
+                    let focused = comp_focused_window()
+                    if focused >= 0 { comp_toggle_fullscreen(focused) }
+                }
+                else if ctrl == 1 && sc == 0x2E { // 0x2E = scancode for 'C'
                     cprintln("^C", RED_ON_BLACK)
                     // Send SIGINT to current foreground PID (if not kernel)
                     let fg_pid = volatile_read_u64(0x6FE00)
