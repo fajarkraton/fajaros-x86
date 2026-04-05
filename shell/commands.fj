@@ -3370,6 +3370,9 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     // "respawn" = 114,101,115,112,97,119,110
     if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 114 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 115 && volatile_read_u8(0x6F803) == 112 { cmd_init_respawn(); handled = 1 }
 
+    // font (102,111,110,116)
+    if handled == 0 && len == 4 && volatile_read_u8(0x6F800) == 102 && volatile_read_u8(0x6F801) == 111 && volatile_read_u8(0x6F802) == 110 && volatile_read_u8(0x6F803) == 116 { cmd_font(); handled = 1 }
+
     if handled == 0 && len > 0 {
         cprint("Unknown: ", RED_ON_BLACK)
         let mut i: i64 = 0

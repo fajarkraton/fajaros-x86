@@ -140,6 +140,7 @@ SOURCES := \
 	services/net/tls.fj \
 	kernel/stubs/framebuffer.fj \
 	kernel/stubs/gpu_stub.fj \
+	services/display/font.fj \
 	services/display/main.fj \
 	services/input/main.fj \
 	services/gpu/main.fj \

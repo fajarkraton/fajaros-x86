@@ -108,6 +108,7 @@
     irq_notify_init()
     shm_init()
     ramfs_init()
+    font_init()
     mnist_init_weights()
 
     // Map LAPIC + IOAPIC MMIO pages (beyond 128MB identity region)

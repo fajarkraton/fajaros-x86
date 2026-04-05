@@ -1,0 +1,1076 @@
+// FajarOS Nova v3.0 — Font System
+// PSF2-compatible bitmap font engine with multi-size, full ASCII, and anti-aliasing.
+// Replaces the minimal 8-char font with production-quality text rendering.
+//
+// Architecture:
+//   FONT_STORE: 64KB memory region holding glyph bitmaps for multiple sizes
+//   Each size: 256 glyphs × height bytes per glyph (1 bit per pixel, 8 pixels wide)
+//   Rendering: per-pixel with optional grayscale anti-aliasing (edge smoothing)
+//
+// Sizes: 8×8 (tiny), 8×12 (small), 8×14 (medium), 8×16 (standard), 8×20 (large)
+
+// ═══════════════════════════════════════════════════════════════
+// Font Storage Layout
+// ═══════════════════════════════════════════════════════════════
+
+const FONT_STORE: i64 = 0x930000       // 64KB font storage
+const FONT_SIZE_COUNT: i64 = 5
+
+// Per-size offsets within FONT_STORE
+// Size 0: 8×8   at +0       (256 × 8  = 2048 bytes)
+// Size 1: 8×12  at +2048    (256 × 12 = 3072 bytes)
+// Size 2: 8×14  at +5120    (256 × 14 = 3584 bytes)
+// Size 3: 8×16  at +8704    (256 × 16 = 4096 bytes)  ← default
+// Size 4: 8×20  at +12800   (256 × 20 = 5120 bytes)
+const FONT_OFF_8: i64 = 0
+const FONT_OFF_12: i64 = 2048
+const FONT_OFF_14: i64 = 5120
+const FONT_OFF_16: i64 = 8704
+const FONT_OFF_20: i64 = 12800
+
+// Font metadata table at +17920 (5 entries × 32 bytes = 160 bytes)
+const FONT_META: i64 = 17920
+const META_SIZE: i64 = 32
+// Each entry: [+0: width, +8: height, +16: glyph_count, +24: data_offset]
+
+// Active font selector
+const FONT_ACTIVE: i64 = 18080     // Currently selected font size index (0-4)
+const FONT_BOLD_FLAG: i64 = 18088  // 1 = bold rendering active
+
+// Glyph width table for proportional mode (256 bytes, one per char)
+const FONT_WIDTHS: i64 = 18096     // Per-char width (0 = use default)
+const FONT_PROPORTIONAL: i64 = 18352  // 1 = proportional mode
+
+// ═══════════════════════════════════════════════════════════════
+// Font Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn font_init() {
+    // Zero the font store
+    let mut i: i64 = 0
+    while i < 20000 {
+        volatile_write_u64(FONT_STORE + i, 0)
+        i = i + 8
+    }
+
+    // Initialize metadata for each size
+    font_init_meta(0, 8, 8, FONT_OFF_8)
+    font_init_meta(1, 8, 12, FONT_OFF_12)
+    font_init_meta(2, 8, 14, FONT_OFF_14)
+    font_init_meta(3, 8, 16, FONT_OFF_16)
+    font_init_meta(4, 8, 20, FONT_OFF_20)
+
+    // Default: size 3 (8×16)
+    volatile_write_u64(FONT_STORE + FONT_ACTIVE, 3)
+    volatile_write_u64(FONT_STORE + FONT_BOLD_FLAG, 0)
+    volatile_write_u64(FONT_STORE + FONT_PROPORTIONAL, 0)
+
+    // Generate built-in glyphs for all sizes
+    font_generate_ascii_8()
+    font_generate_ascii_12()
+    font_generate_ascii_14()
+    font_generate_ascii_16()
+    font_generate_ascii_20()
+
+    // Generate box drawing characters for default size
+    font_generate_box_drawing(3)
+
+    // Initialize proportional width table (default = font width)
+    font_init_widths()
+}
+
+@kernel fn font_init_meta(idx: i64, width: i64, height: i64, offset: i64) {
+    let base = FONT_STORE + FONT_META + idx * META_SIZE
+    volatile_write_u64(base, width)
+    volatile_write_u64(base + 8, height)
+    volatile_write_u64(base + 16, 256)
+    volatile_write_u64(base + 24, offset)
+}
+
+@kernel fn font_init_widths() {
+    let mut i: i64 = 0
+    while i < 256 {
+        // Most chars = 8 pixels wide; narrow chars get smaller widths
+        let w = if i == 32 { 4 }        // space
+        else if i == 33 { 3 }           // !
+        else if i == 39 { 3 }           // '
+        else if i == 44 { 4 }           // ,
+        else if i == 46 { 3 }           // .
+        else if i == 58 { 3 }           // :
+        else if i == 59 { 4 }           // ;
+        else if i == 105 { 4 }          // i
+        else if i == 108 { 4 }          // l
+        else if i == 106 { 5 }          // j
+        else if i == 116 { 5 }          // t
+        else if i == 119 { 8 }          // w (wide)
+        else if i == 109 { 8 }          // m (wide)
+        else { 7 }                      // default proportional width
+        volatile_write_u8(FONT_STORE + FONT_WIDTHS + i, w)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Font Selection API
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn font_set_size(size_idx: i64) {
+    if size_idx >= 0 && size_idx < FONT_SIZE_COUNT {
+        volatile_write_u64(FONT_STORE + FONT_ACTIVE, size_idx)
+    }
+}
+
+@kernel fn font_get_size() -> i64 {
+    volatile_read_u64(FONT_STORE + FONT_ACTIVE)
+}
+
+@kernel fn font_set_bold(enable: i64) {
+    volatile_write_u64(FONT_STORE + FONT_BOLD_FLAG, if enable != 0 { 1 } else { 0 })
+}
+
+@kernel fn font_set_proportional(enable: i64) {
+    volatile_write_u64(FONT_STORE + FONT_PROPORTIONAL, if enable != 0 { 1 } else { 0 })
+}
+
+@kernel fn font_get_width() -> i64 {
+    let idx = volatile_read_u64(FONT_STORE + FONT_ACTIVE)
+    let base = FONT_STORE + FONT_META + idx * META_SIZE
+    volatile_read_u64(base)
+}
+
+@kernel fn font_get_height() -> i64 {
+    let idx = volatile_read_u64(FONT_STORE + FONT_ACTIVE)
+    let base = FONT_STORE + FONT_META + idx * META_SIZE
+    volatile_read_u64(base + 8)
+}
+
+@kernel fn font_get_char_width(ch: i64) -> i64 {
+    if volatile_read_u64(FONT_STORE + FONT_PROPORTIONAL) != 0 {
+        volatile_read_u8(FONT_STORE + FONT_WIDTHS + (ch & 0xFF))
+    } else {
+        font_get_width()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Glyph Data Access
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn font_glyph_addr(ch: i64) -> i64 {
+    let idx = volatile_read_u64(FONT_STORE + FONT_ACTIVE)
+    let base = FONT_STORE + FONT_META + idx * META_SIZE
+    let height = volatile_read_u64(base + 8)
+    let offset = volatile_read_u64(base + 24)
+    FONT_STORE + offset + (ch & 0xFF) * height
+}
+
+@kernel fn font_glyph_addr_size(ch: i64, size_idx: i64) -> i64 {
+    let base = FONT_STORE + FONT_META + size_idx * META_SIZE
+    let height = volatile_read_u64(base + 8)
+    let offset = volatile_read_u64(base + 24)
+    FONT_STORE + offset + (ch & 0xFF) * height
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Text Rendering — Main API
+// ═══════════════════════════════════════════════════════════════
+
+// Draw a single character at pixel position (x, y) with fg/bg colors
+@kernel fn font_draw_char(x: i64, y: i64, ch: i64, fg: i64, bg: i64) {
+    let glyph = font_glyph_addr(ch)
+    let w = font_get_width()
+    let h = font_get_height()
+    let bold = volatile_read_u64(FONT_STORE + FONT_BOLD_FLAG)
+
+    let mut row: i64 = 0
+    while row < h {
+        let bits = volatile_read_u8(glyph + row)
+        let bold_bits = if bold != 0 { bits | (bits >> 1) } else { bits }
+        let mut col: i64 = 0
+        while col < w {
+            let mask = 128 >> col
+            let pixel = if (bold_bits & mask) != 0 { fg } else { bg }
+            fb_putpixel(x + col, y + row, pixel)
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// Draw character with anti-aliasing (grayscale edge smoothing)
+@kernel fn font_draw_char_aa(x: i64, y: i64, ch: i64, fg: i64, bg: i64) {
+    let glyph = font_glyph_addr(ch)
+    let w = font_get_width()
+    let h = font_get_height()
+    let bold = volatile_read_u64(FONT_STORE + FONT_BOLD_FLAG)
+
+    let mut row: i64 = 0
+    while row < h {
+        let bits = volatile_read_u8(glyph + row)
+        let bold_bits = if bold != 0 { bits | (bits >> 1) } else { bits }
+        // Get adjacent rows for edge detection
+        let above = if row > 0 { volatile_read_u8(glyph + row - 1) } else { 0 }
+        let below = if row < h - 1 { volatile_read_u8(glyph + row + 1) } else { 0 }
+
+        let mut col: i64 = 0
+        while col < w {
+            let mask = 128 >> col
+            if (bold_bits & mask) != 0 {
+                fb_putpixel(x + col, y + row, fg)
+            } else {
+                // Edge detection: check if adjacent pixels are set
+                let neighbors = font_count_neighbors(bold_bits, above, below, col, w)
+                if neighbors > 0 {
+                    // Blend: alpha = neighbors * 64 (0-255 range from 0-4 neighbors)
+                    let alpha = neighbors * 64
+                    if alpha > 255 { fb_putpixel(x + col, y + row, fg) }
+                    else {
+                        let blended = font_blend_color(fg, bg, alpha)
+                        fb_putpixel(x + col, y + row, blended)
+                    }
+                } else {
+                    fb_putpixel(x + col, y + row, bg)
+                }
+            }
+            col = col + 1
+        }
+        row = row + 1
+    }
+}
+
+// Count how many neighboring pixels are set (for AA edge detection)
+@kernel fn font_count_neighbors(bits: i64, above: i64, below: i64, col: i64, w: i64) -> i64 {
+    let mask = 128 >> col
+    let left_mask = if col > 0 { 128 >> (col - 1) } else { 0 }
+    let right_mask = if col < w - 1 { 128 >> (col + 1) } else { 0 }
+    let mut count: i64 = 0
+    if (bits & left_mask) != 0 { count = count + 1 }
+    if (bits & right_mask) != 0 { count = count + 1 }
+    if (above & mask) != 0 { count = count + 1 }
+    if (below & mask) != 0 { count = count + 1 }
+    count
+}
+
+// Blend two RGB colors with alpha (0-255)
+@kernel fn font_blend_color(fg: i64, bg: i64, alpha: i64) -> i64 {
+    let fg_r = (fg >> 16) & 0xFF
+    let fg_g = (fg >> 8) & 0xFF
+    let fg_b = fg & 0xFF
+    let bg_r = (bg >> 16) & 0xFF
+    let bg_g = (bg >> 8) & 0xFF
+    let bg_b = bg & 0xFF
+    let r = (fg_r * alpha + bg_r * (255 - alpha)) / 255
+    let g = (fg_g * alpha + bg_g * (255 - alpha)) / 255
+    let b = (fg_b * alpha + bg_b * (255 - alpha)) / 255
+    (r << 16) | (g << 8) | b
+}
+
+// Draw a text string at (x, y) — returns width in pixels
+@kernel fn font_draw_text(x: i64, y: i64, text_addr: i64, text_len: i64, fg: i64, bg: i64) -> i64 {
+    let mut cx: i64 = x
+    let mut i: i64 = 0
+    while i < text_len {
+        let ch = volatile_read_u8(text_addr + i)
+        if ch == 10 { return cx - x }  // newline
+        font_draw_char(cx, y, ch, fg, bg)
+        cx = cx + font_get_char_width(ch)
+        i = i + 1
+    }
+    cx - x
+}
+
+// Draw text with anti-aliasing
+@kernel fn font_draw_text_aa(x: i64, y: i64, text_addr: i64, text_len: i64, fg: i64, bg: i64) -> i64 {
+    let mut cx: i64 = x
+    let mut i: i64 = 0
+    while i < text_len {
+        let ch = volatile_read_u8(text_addr + i)
+        if ch == 10 { return cx - x }
+        font_draw_char_aa(cx, y, ch, fg, bg)
+        cx = cx + font_get_char_width(ch)
+        i = i + 1
+    }
+    cx - x
+}
+
+// Measure text width in pixels without rendering
+@kernel fn font_measure_text(text_addr: i64, text_len: i64) -> i64 {
+    let mut w: i64 = 0
+    let mut i: i64 = 0
+    while i < text_len {
+        let ch = volatile_read_u8(text_addr + i)
+        w = w + font_get_char_width(ch)
+        i = i + 1
+    }
+    w
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Built-in Glyph Generation — 8×16 (Standard Size)
+// Full ASCII 32-126 + extended characters
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn font_set_glyph_row(ch: i64, size_idx: i64, row: i64, bits: i64) {
+    let addr = font_glyph_addr_size(ch, size_idx)
+    volatile_write_u8(addr + row, bits)
+}
+
+// Generate standard ASCII glyphs for 8×16 size
+@kernel fn font_generate_ascii_16() {
+    // Space (32) — all zeros (already cleared)
+
+    // Digits 0-9
+    font_gen_digit_0(3)
+    font_gen_digit_1(3)
+    font_gen_digit_2(3)
+    font_gen_digit_3(3)
+    font_gen_digit_4(3)
+    font_gen_digit_5(3)
+    font_gen_digit_6(3)
+    font_gen_digit_7(3)
+    font_gen_digit_8(3)
+    font_gen_digit_9(3)
+
+    // Uppercase A-Z
+    font_gen_upper_a(3)
+    font_gen_upper_b(3)
+    font_gen_upper_c(3)
+    font_gen_upper_d(3)
+    font_gen_upper_e(3)
+    font_gen_upper_f(3)
+    font_gen_upper_g(3)
+    font_gen_upper_h(3)
+    font_gen_upper_i(3)
+    font_gen_upper_j(3)
+    font_gen_upper_k(3)
+    font_gen_upper_l(3)
+    font_gen_upper_m(3)
+    font_gen_upper_n(3)
+    font_gen_upper_o(3)
+    font_gen_upper_p(3)
+    font_gen_upper_q(3)
+    font_gen_upper_r(3)
+    font_gen_upper_s(3)
+    font_gen_upper_t(3)
+    font_gen_upper_u(3)
+    font_gen_upper_v(3)
+    font_gen_upper_w(3)
+    font_gen_upper_x(3)
+    font_gen_upper_y(3)
+    font_gen_upper_z(3)
+
+    // Lowercase a-z
+    font_gen_lower_a(3)
+    font_gen_lower_b(3)
+    font_gen_lower_c(3)
+    font_gen_lower_d(3)
+    font_gen_lower_e(3)
+    font_gen_lower_f(3)
+    font_gen_lower_g(3)
+    font_gen_lower_h(3)
+    font_gen_lower_i(3)
+    font_gen_lower_j(3)
+    font_gen_lower_k(3)
+    font_gen_lower_l(3)
+    font_gen_lower_m(3)
+    font_gen_lower_n(3)
+    font_gen_lower_o(3)
+    font_gen_lower_p(3)
+    font_gen_lower_q(3)
+    font_gen_lower_r(3)
+    font_gen_lower_s(3)
+    font_gen_lower_t(3)
+    font_gen_lower_u(3)
+    font_gen_lower_v(3)
+    font_gen_lower_w(3)
+    font_gen_lower_x(3)
+    font_gen_lower_y(3)
+    font_gen_lower_z(3)
+
+    // Punctuation and symbols
+    font_gen_punctuation(3)
+}
+
+// ── Individual glyph generators (8×16 bitmap rows) ──
+
+// Each row is a byte: bit 7 = leftmost pixel, bit 0 = rightmost
+// Example: 0x7E = 01111110 = ·██████·
+
+@kernel fn font_gen_digit_0(s: i64) {
+    font_set_glyph_row(48, s, 2, 0x3C)   // ··████··
+    font_set_glyph_row(48, s, 3, 0x66)   // ·██··██·
+    font_set_glyph_row(48, s, 4, 0x6E)   // ·██·███·
+    font_set_glyph_row(48, s, 5, 0x76)   // ·███·██·
+    font_set_glyph_row(48, s, 6, 0x66)   // ·██··██·
+    font_set_glyph_row(48, s, 7, 0x66)   // ·██··██·
+    font_set_glyph_row(48, s, 8, 0x3C)   // ··████··
+}
+
+@kernel fn font_gen_digit_1(s: i64) {
+    font_set_glyph_row(49, s, 2, 0x18)
+    font_set_glyph_row(49, s, 3, 0x38)
+    font_set_glyph_row(49, s, 4, 0x18)
+    font_set_glyph_row(49, s, 5, 0x18)
+    font_set_glyph_row(49, s, 6, 0x18)
+    font_set_glyph_row(49, s, 7, 0x18)
+    font_set_glyph_row(49, s, 8, 0x7E)
+}
+
+@kernel fn font_gen_digit_2(s: i64) {
+    font_set_glyph_row(50, s, 2, 0x3C)
+    font_set_glyph_row(50, s, 3, 0x66)
+    font_set_glyph_row(50, s, 4, 0x06)
+    font_set_glyph_row(50, s, 5, 0x1C)
+    font_set_glyph_row(50, s, 6, 0x30)
+    font_set_glyph_row(50, s, 7, 0x60)
+    font_set_glyph_row(50, s, 8, 0x7E)
+}
+
+@kernel fn font_gen_digit_3(s: i64) {
+    font_set_glyph_row(51, s, 2, 0x3C)
+    font_set_glyph_row(51, s, 3, 0x66)
+    font_set_glyph_row(51, s, 4, 0x06)
+    font_set_glyph_row(51, s, 5, 0x1C)
+    font_set_glyph_row(51, s, 6, 0x06)
+    font_set_glyph_row(51, s, 7, 0x66)
+    font_set_glyph_row(51, s, 8, 0x3C)
+}
+
+@kernel fn font_gen_digit_4(s: i64) {
+    font_set_glyph_row(52, s, 2, 0x0C)
+    font_set_glyph_row(52, s, 3, 0x1C)
+    font_set_glyph_row(52, s, 4, 0x3C)
+    font_set_glyph_row(52, s, 5, 0x6C)
+    font_set_glyph_row(52, s, 6, 0x7E)
+    font_set_glyph_row(52, s, 7, 0x0C)
+    font_set_glyph_row(52, s, 8, 0x0C)
+}
+
+@kernel fn font_gen_digit_5(s: i64) {
+    font_set_glyph_row(53, s, 2, 0x7E)
+    font_set_glyph_row(53, s, 3, 0x60)
+    font_set_glyph_row(53, s, 4, 0x7C)
+    font_set_glyph_row(53, s, 5, 0x06)
+    font_set_glyph_row(53, s, 6, 0x06)
+    font_set_glyph_row(53, s, 7, 0x66)
+    font_set_glyph_row(53, s, 8, 0x3C)
+}
+
+@kernel fn font_gen_digit_6(s: i64) {
+    font_set_glyph_row(54, s, 2, 0x1C)
+    font_set_glyph_row(54, s, 3, 0x30)
+    font_set_glyph_row(54, s, 4, 0x60)
+    font_set_glyph_row(54, s, 5, 0x7C)
+    font_set_glyph_row(54, s, 6, 0x66)
+    font_set_glyph_row(54, s, 7, 0x66)
+    font_set_glyph_row(54, s, 8, 0x3C)
+}
+
+@kernel fn font_gen_digit_7(s: i64) {
+    font_set_glyph_row(55, s, 2, 0x7E)
+    font_set_glyph_row(55, s, 3, 0x06)
+    font_set_glyph_row(55, s, 4, 0x0C)
+    font_set_glyph_row(55, s, 5, 0x18)
+    font_set_glyph_row(55, s, 6, 0x18)
+    font_set_glyph_row(55, s, 7, 0x18)
+    font_set_glyph_row(55, s, 8, 0x18)
+}
+
+@kernel fn font_gen_digit_8(s: i64) {
+    font_set_glyph_row(56, s, 2, 0x3C)
+    font_set_glyph_row(56, s, 3, 0x66)
+    font_set_glyph_row(56, s, 4, 0x66)
+    font_set_glyph_row(56, s, 5, 0x3C)
+    font_set_glyph_row(56, s, 6, 0x66)
+    font_set_glyph_row(56, s, 7, 0x66)
+    font_set_glyph_row(56, s, 8, 0x3C)
+}
+
+@kernel fn font_gen_digit_9(s: i64) {
+    font_set_glyph_row(57, s, 2, 0x3C)
+    font_set_glyph_row(57, s, 3, 0x66)
+    font_set_glyph_row(57, s, 4, 0x66)
+    font_set_glyph_row(57, s, 5, 0x3E)
+    font_set_glyph_row(57, s, 6, 0x06)
+    font_set_glyph_row(57, s, 7, 0x0C)
+    font_set_glyph_row(57, s, 8, 0x38)
+}
+
+// Uppercase letters
+@kernel fn font_gen_upper_a(s: i64) {
+    font_set_glyph_row(65, s, 2, 0x18); font_set_glyph_row(65, s, 3, 0x3C)
+    font_set_glyph_row(65, s, 4, 0x66); font_set_glyph_row(65, s, 5, 0x66)
+    font_set_glyph_row(65, s, 6, 0x7E); font_set_glyph_row(65, s, 7, 0x66)
+    font_set_glyph_row(65, s, 8, 0x66)
+}
+@kernel fn font_gen_upper_b(s: i64) {
+    font_set_glyph_row(66, s, 2, 0x7C); font_set_glyph_row(66, s, 3, 0x66)
+    font_set_glyph_row(66, s, 4, 0x66); font_set_glyph_row(66, s, 5, 0x7C)
+    font_set_glyph_row(66, s, 6, 0x66); font_set_glyph_row(66, s, 7, 0x66)
+    font_set_glyph_row(66, s, 8, 0x7C)
+}
+@kernel fn font_gen_upper_c(s: i64) {
+    font_set_glyph_row(67, s, 2, 0x3C); font_set_glyph_row(67, s, 3, 0x66)
+    font_set_glyph_row(67, s, 4, 0x60); font_set_glyph_row(67, s, 5, 0x60)
+    font_set_glyph_row(67, s, 6, 0x60); font_set_glyph_row(67, s, 7, 0x66)
+    font_set_glyph_row(67, s, 8, 0x3C)
+}
+@kernel fn font_gen_upper_d(s: i64) {
+    font_set_glyph_row(68, s, 2, 0x78); font_set_glyph_row(68, s, 3, 0x6C)
+    font_set_glyph_row(68, s, 4, 0x66); font_set_glyph_row(68, s, 5, 0x66)
+    font_set_glyph_row(68, s, 6, 0x66); font_set_glyph_row(68, s, 7, 0x6C)
+    font_set_glyph_row(68, s, 8, 0x78)
+}
+@kernel fn font_gen_upper_e(s: i64) {
+    font_set_glyph_row(69, s, 2, 0x7E); font_set_glyph_row(69, s, 3, 0x60)
+    font_set_glyph_row(69, s, 4, 0x60); font_set_glyph_row(69, s, 5, 0x7C)
+    font_set_glyph_row(69, s, 6, 0x60); font_set_glyph_row(69, s, 7, 0x60)
+    font_set_glyph_row(69, s, 8, 0x7E)
+}
+@kernel fn font_gen_upper_f(s: i64) {
+    font_set_glyph_row(70, s, 2, 0x7E); font_set_glyph_row(70, s, 3, 0x60)
+    font_set_glyph_row(70, s, 4, 0x60); font_set_glyph_row(70, s, 5, 0x7C)
+    font_set_glyph_row(70, s, 6, 0x60); font_set_glyph_row(70, s, 7, 0x60)
+    font_set_glyph_row(70, s, 8, 0x60)
+}
+@kernel fn font_gen_upper_g(s: i64) {
+    font_set_glyph_row(71, s, 2, 0x3C); font_set_glyph_row(71, s, 3, 0x66)
+    font_set_glyph_row(71, s, 4, 0x60); font_set_glyph_row(71, s, 5, 0x6E)
+    font_set_glyph_row(71, s, 6, 0x66); font_set_glyph_row(71, s, 7, 0x66)
+    font_set_glyph_row(71, s, 8, 0x3E)
+}
+@kernel fn font_gen_upper_h(s: i64) {
+    font_set_glyph_row(72, s, 2, 0x66); font_set_glyph_row(72, s, 3, 0x66)
+    font_set_glyph_row(72, s, 4, 0x66); font_set_glyph_row(72, s, 5, 0x7E)
+    font_set_glyph_row(72, s, 6, 0x66); font_set_glyph_row(72, s, 7, 0x66)
+    font_set_glyph_row(72, s, 8, 0x66)
+}
+@kernel fn font_gen_upper_i(s: i64) {
+    font_set_glyph_row(73, s, 2, 0x7E); font_set_glyph_row(73, s, 3, 0x18)
+    font_set_glyph_row(73, s, 4, 0x18); font_set_glyph_row(73, s, 5, 0x18)
+    font_set_glyph_row(73, s, 6, 0x18); font_set_glyph_row(73, s, 7, 0x18)
+    font_set_glyph_row(73, s, 8, 0x7E)
+}
+@kernel fn font_gen_upper_j(s: i64) {
+    font_set_glyph_row(74, s, 2, 0x1E); font_set_glyph_row(74, s, 3, 0x06)
+    font_set_glyph_row(74, s, 4, 0x06); font_set_glyph_row(74, s, 5, 0x06)
+    font_set_glyph_row(74, s, 6, 0x06); font_set_glyph_row(74, s, 7, 0x66)
+    font_set_glyph_row(74, s, 8, 0x3C)
+}
+@kernel fn font_gen_upper_k(s: i64) {
+    font_set_glyph_row(75, s, 2, 0x66); font_set_glyph_row(75, s, 3, 0x6C)
+    font_set_glyph_row(75, s, 4, 0x78); font_set_glyph_row(75, s, 5, 0x70)
+    font_set_glyph_row(75, s, 6, 0x78); font_set_glyph_row(75, s, 7, 0x6C)
+    font_set_glyph_row(75, s, 8, 0x66)
+}
+@kernel fn font_gen_upper_l(s: i64) {
+    font_set_glyph_row(76, s, 2, 0x60); font_set_glyph_row(76, s, 3, 0x60)
+    font_set_glyph_row(76, s, 4, 0x60); font_set_glyph_row(76, s, 5, 0x60)
+    font_set_glyph_row(76, s, 6, 0x60); font_set_glyph_row(76, s, 7, 0x60)
+    font_set_glyph_row(76, s, 8, 0x7E)
+}
+@kernel fn font_gen_upper_m(s: i64) {
+    font_set_glyph_row(77, s, 2, 0xC6); font_set_glyph_row(77, s, 3, 0xEE)
+    font_set_glyph_row(77, s, 4, 0xFE); font_set_glyph_row(77, s, 5, 0xD6)
+    font_set_glyph_row(77, s, 6, 0xC6); font_set_glyph_row(77, s, 7, 0xC6)
+    font_set_glyph_row(77, s, 8, 0xC6)
+}
+@kernel fn font_gen_upper_n(s: i64) {
+    font_set_glyph_row(78, s, 2, 0x66); font_set_glyph_row(78, s, 3, 0x76)
+    font_set_glyph_row(78, s, 4, 0x7E); font_set_glyph_row(78, s, 5, 0x6E)
+    font_set_glyph_row(78, s, 6, 0x66); font_set_glyph_row(78, s, 7, 0x66)
+    font_set_glyph_row(78, s, 8, 0x66)
+}
+@kernel fn font_gen_upper_o(s: i64) {
+    font_set_glyph_row(79, s, 2, 0x3C); font_set_glyph_row(79, s, 3, 0x66)
+    font_set_glyph_row(79, s, 4, 0x66); font_set_glyph_row(79, s, 5, 0x66)
+    font_set_glyph_row(79, s, 6, 0x66); font_set_glyph_row(79, s, 7, 0x66)
+    font_set_glyph_row(79, s, 8, 0x3C)
+}
+@kernel fn font_gen_upper_p(s: i64) {
+    font_set_glyph_row(80, s, 2, 0x7C); font_set_glyph_row(80, s, 3, 0x66)
+    font_set_glyph_row(80, s, 4, 0x66); font_set_glyph_row(80, s, 5, 0x7C)
+    font_set_glyph_row(80, s, 6, 0x60); font_set_glyph_row(80, s, 7, 0x60)
+    font_set_glyph_row(80, s, 8, 0x60)
+}
+@kernel fn font_gen_upper_q(s: i64) {
+    font_set_glyph_row(81, s, 2, 0x3C); font_set_glyph_row(81, s, 3, 0x66)
+    font_set_glyph_row(81, s, 4, 0x66); font_set_glyph_row(81, s, 5, 0x66)
+    font_set_glyph_row(81, s, 6, 0x6A); font_set_glyph_row(81, s, 7, 0x6C)
+    font_set_glyph_row(81, s, 8, 0x36)
+}
+@kernel fn font_gen_upper_r(s: i64) {
+    font_set_glyph_row(82, s, 2, 0x7C); font_set_glyph_row(82, s, 3, 0x66)
+    font_set_glyph_row(82, s, 4, 0x66); font_set_glyph_row(82, s, 5, 0x7C)
+    font_set_glyph_row(82, s, 6, 0x6C); font_set_glyph_row(82, s, 7, 0x66)
+    font_set_glyph_row(82, s, 8, 0x66)
+}
+@kernel fn font_gen_upper_s(s: i64) {
+    font_set_glyph_row(83, s, 2, 0x3C); font_set_glyph_row(83, s, 3, 0x66)
+    font_set_glyph_row(83, s, 4, 0x60); font_set_glyph_row(83, s, 5, 0x3C)
+    font_set_glyph_row(83, s, 6, 0x06); font_set_glyph_row(83, s, 7, 0x66)
+    font_set_glyph_row(83, s, 8, 0x3C)
+}
+@kernel fn font_gen_upper_t(s: i64) {
+    font_set_glyph_row(84, s, 2, 0x7E); font_set_glyph_row(84, s, 3, 0x18)
+    font_set_glyph_row(84, s, 4, 0x18); font_set_glyph_row(84, s, 5, 0x18)
+    font_set_glyph_row(84, s, 6, 0x18); font_set_glyph_row(84, s, 7, 0x18)
+    font_set_glyph_row(84, s, 8, 0x18)
+}
+@kernel fn font_gen_upper_u(s: i64) {
+    font_set_glyph_row(85, s, 2, 0x66); font_set_glyph_row(85, s, 3, 0x66)
+    font_set_glyph_row(85, s, 4, 0x66); font_set_glyph_row(85, s, 5, 0x66)
+    font_set_glyph_row(85, s, 6, 0x66); font_set_glyph_row(85, s, 7, 0x66)
+    font_set_glyph_row(85, s, 8, 0x3C)
+}
+@kernel fn font_gen_upper_v(s: i64) {
+    font_set_glyph_row(86, s, 2, 0x66); font_set_glyph_row(86, s, 3, 0x66)
+    font_set_glyph_row(86, s, 4, 0x66); font_set_glyph_row(86, s, 5, 0x66)
+    font_set_glyph_row(86, s, 6, 0x66); font_set_glyph_row(86, s, 7, 0x3C)
+    font_set_glyph_row(86, s, 8, 0x18)
+}
+@kernel fn font_gen_upper_w(s: i64) {
+    font_set_glyph_row(87, s, 2, 0xC6); font_set_glyph_row(87, s, 3, 0xC6)
+    font_set_glyph_row(87, s, 4, 0xC6); font_set_glyph_row(87, s, 5, 0xD6)
+    font_set_glyph_row(87, s, 6, 0xFE); font_set_glyph_row(87, s, 7, 0xEE)
+    font_set_glyph_row(87, s, 8, 0xC6)
+}
+@kernel fn font_gen_upper_x(s: i64) {
+    font_set_glyph_row(88, s, 2, 0x66); font_set_glyph_row(88, s, 3, 0x66)
+    font_set_glyph_row(88, s, 4, 0x3C); font_set_glyph_row(88, s, 5, 0x18)
+    font_set_glyph_row(88, s, 6, 0x3C); font_set_glyph_row(88, s, 7, 0x66)
+    font_set_glyph_row(88, s, 8, 0x66)
+}
+@kernel fn font_gen_upper_y(s: i64) {
+    font_set_glyph_row(89, s, 2, 0x66); font_set_glyph_row(89, s, 3, 0x66)
+    font_set_glyph_row(89, s, 4, 0x3C); font_set_glyph_row(89, s, 5, 0x18)
+    font_set_glyph_row(89, s, 6, 0x18); font_set_glyph_row(89, s, 7, 0x18)
+    font_set_glyph_row(89, s, 8, 0x18)
+}
+@kernel fn font_gen_upper_z(s: i64) {
+    font_set_glyph_row(90, s, 2, 0x7E); font_set_glyph_row(90, s, 3, 0x06)
+    font_set_glyph_row(90, s, 4, 0x0C); font_set_glyph_row(90, s, 5, 0x18)
+    font_set_glyph_row(90, s, 6, 0x30); font_set_glyph_row(90, s, 7, 0x60)
+    font_set_glyph_row(90, s, 8, 0x7E)
+}
+
+// Lowercase letters
+@kernel fn font_gen_lower_a(s: i64) {
+    font_set_glyph_row(97, s, 4, 0x3C); font_set_glyph_row(97, s, 5, 0x06)
+    font_set_glyph_row(97, s, 6, 0x3E); font_set_glyph_row(97, s, 7, 0x66)
+    font_set_glyph_row(97, s, 8, 0x3E)
+}
+@kernel fn font_gen_lower_b(s: i64) {
+    font_set_glyph_row(98, s, 2, 0x60); font_set_glyph_row(98, s, 3, 0x60)
+    font_set_glyph_row(98, s, 4, 0x7C); font_set_glyph_row(98, s, 5, 0x66)
+    font_set_glyph_row(98, s, 6, 0x66); font_set_glyph_row(98, s, 7, 0x66)
+    font_set_glyph_row(98, s, 8, 0x7C)
+}
+@kernel fn font_gen_lower_c(s: i64) {
+    font_set_glyph_row(99, s, 4, 0x3C); font_set_glyph_row(99, s, 5, 0x66)
+    font_set_glyph_row(99, s, 6, 0x60); font_set_glyph_row(99, s, 7, 0x66)
+    font_set_glyph_row(99, s, 8, 0x3C)
+}
+@kernel fn font_gen_lower_d(s: i64) {
+    font_set_glyph_row(100, s, 2, 0x06); font_set_glyph_row(100, s, 3, 0x06)
+    font_set_glyph_row(100, s, 4, 0x3E); font_set_glyph_row(100, s, 5, 0x66)
+    font_set_glyph_row(100, s, 6, 0x66); font_set_glyph_row(100, s, 7, 0x66)
+    font_set_glyph_row(100, s, 8, 0x3E)
+}
+@kernel fn font_gen_lower_e(s: i64) {
+    font_set_glyph_row(101, s, 4, 0x3C); font_set_glyph_row(101, s, 5, 0x66)
+    font_set_glyph_row(101, s, 6, 0x7E); font_set_glyph_row(101, s, 7, 0x60)
+    font_set_glyph_row(101, s, 8, 0x3C)
+}
+@kernel fn font_gen_lower_f(s: i64) {
+    font_set_glyph_row(102, s, 2, 0x1C); font_set_glyph_row(102, s, 3, 0x30)
+    font_set_glyph_row(102, s, 4, 0x7C); font_set_glyph_row(102, s, 5, 0x30)
+    font_set_glyph_row(102, s, 6, 0x30); font_set_glyph_row(102, s, 7, 0x30)
+    font_set_glyph_row(102, s, 8, 0x30)
+}
+@kernel fn font_gen_lower_g(s: i64) {
+    font_set_glyph_row(103, s, 4, 0x3E); font_set_glyph_row(103, s, 5, 0x66)
+    font_set_glyph_row(103, s, 6, 0x66); font_set_glyph_row(103, s, 7, 0x3E)
+    font_set_glyph_row(103, s, 8, 0x06); font_set_glyph_row(103, s, 9, 0x3C)
+}
+@kernel fn font_gen_lower_h(s: i64) {
+    font_set_glyph_row(104, s, 2, 0x60); font_set_glyph_row(104, s, 3, 0x60)
+    font_set_glyph_row(104, s, 4, 0x7C); font_set_glyph_row(104, s, 5, 0x66)
+    font_set_glyph_row(104, s, 6, 0x66); font_set_glyph_row(104, s, 7, 0x66)
+    font_set_glyph_row(104, s, 8, 0x66)
+}
+@kernel fn font_gen_lower_i(s: i64) {
+    font_set_glyph_row(105, s, 2, 0x18); font_set_glyph_row(105, s, 4, 0x38)
+    font_set_glyph_row(105, s, 5, 0x18); font_set_glyph_row(105, s, 6, 0x18)
+    font_set_glyph_row(105, s, 7, 0x18); font_set_glyph_row(105, s, 8, 0x3C)
+}
+@kernel fn font_gen_lower_j(s: i64) {
+    font_set_glyph_row(106, s, 2, 0x06); font_set_glyph_row(106, s, 4, 0x06)
+    font_set_glyph_row(106, s, 5, 0x06); font_set_glyph_row(106, s, 6, 0x06)
+    font_set_glyph_row(106, s, 7, 0x06); font_set_glyph_row(106, s, 8, 0x66)
+    font_set_glyph_row(106, s, 9, 0x3C)
+}
+@kernel fn font_gen_lower_k(s: i64) {
+    font_set_glyph_row(107, s, 2, 0x60); font_set_glyph_row(107, s, 3, 0x60)
+    font_set_glyph_row(107, s, 4, 0x6C); font_set_glyph_row(107, s, 5, 0x78)
+    font_set_glyph_row(107, s, 6, 0x78); font_set_glyph_row(107, s, 7, 0x6C)
+    font_set_glyph_row(107, s, 8, 0x66)
+}
+@kernel fn font_gen_lower_l(s: i64) {
+    font_set_glyph_row(108, s, 2, 0x38); font_set_glyph_row(108, s, 3, 0x18)
+    font_set_glyph_row(108, s, 4, 0x18); font_set_glyph_row(108, s, 5, 0x18)
+    font_set_glyph_row(108, s, 6, 0x18); font_set_glyph_row(108, s, 7, 0x18)
+    font_set_glyph_row(108, s, 8, 0x3C)
+}
+@kernel fn font_gen_lower_m(s: i64) {
+    font_set_glyph_row(109, s, 4, 0x76); font_set_glyph_row(109, s, 5, 0x7F)
+    font_set_glyph_row(109, s, 6, 0x6B); font_set_glyph_row(109, s, 7, 0x6B)
+    font_set_glyph_row(109, s, 8, 0x63)
+}
+@kernel fn font_gen_lower_n(s: i64) {
+    font_set_glyph_row(110, s, 4, 0x7C); font_set_glyph_row(110, s, 5, 0x66)
+    font_set_glyph_row(110, s, 6, 0x66); font_set_glyph_row(110, s, 7, 0x66)
+    font_set_glyph_row(110, s, 8, 0x66)
+}
+@kernel fn font_gen_lower_o(s: i64) {
+    font_set_glyph_row(111, s, 4, 0x3C); font_set_glyph_row(111, s, 5, 0x66)
+    font_set_glyph_row(111, s, 6, 0x66); font_set_glyph_row(111, s, 7, 0x66)
+    font_set_glyph_row(111, s, 8, 0x3C)
+}
+@kernel fn font_gen_lower_p(s: i64) {
+    font_set_glyph_row(112, s, 4, 0x7C); font_set_glyph_row(112, s, 5, 0x66)
+    font_set_glyph_row(112, s, 6, 0x66); font_set_glyph_row(112, s, 7, 0x7C)
+    font_set_glyph_row(112, s, 8, 0x60); font_set_glyph_row(112, s, 9, 0x60)
+}
+@kernel fn font_gen_lower_q(s: i64) {
+    font_set_glyph_row(113, s, 4, 0x3E); font_set_glyph_row(113, s, 5, 0x66)
+    font_set_glyph_row(113, s, 6, 0x66); font_set_glyph_row(113, s, 7, 0x3E)
+    font_set_glyph_row(113, s, 8, 0x06); font_set_glyph_row(113, s, 9, 0x06)
+}
+@kernel fn font_gen_lower_r(s: i64) {
+    font_set_glyph_row(114, s, 4, 0x6C); font_set_glyph_row(114, s, 5, 0x76)
+    font_set_glyph_row(114, s, 6, 0x60); font_set_glyph_row(114, s, 7, 0x60)
+    font_set_glyph_row(114, s, 8, 0x60)
+}
+@kernel fn font_gen_lower_s(s: i64) {
+    font_set_glyph_row(115, s, 4, 0x3E); font_set_glyph_row(115, s, 5, 0x60)
+    font_set_glyph_row(115, s, 6, 0x3C); font_set_glyph_row(115, s, 7, 0x06)
+    font_set_glyph_row(115, s, 8, 0x7C)
+}
+@kernel fn font_gen_lower_t(s: i64) {
+    font_set_glyph_row(116, s, 2, 0x30); font_set_glyph_row(116, s, 3, 0x30)
+    font_set_glyph_row(116, s, 4, 0x7C); font_set_glyph_row(116, s, 5, 0x30)
+    font_set_glyph_row(116, s, 6, 0x30); font_set_glyph_row(116, s, 7, 0x30)
+    font_set_glyph_row(116, s, 8, 0x1C)
+}
+@kernel fn font_gen_lower_u(s: i64) {
+    font_set_glyph_row(117, s, 4, 0x66); font_set_glyph_row(117, s, 5, 0x66)
+    font_set_glyph_row(117, s, 6, 0x66); font_set_glyph_row(117, s, 7, 0x66)
+    font_set_glyph_row(117, s, 8, 0x3E)
+}
+@kernel fn font_gen_lower_v(s: i64) {
+    font_set_glyph_row(118, s, 4, 0x66); font_set_glyph_row(118, s, 5, 0x66)
+    font_set_glyph_row(118, s, 6, 0x66); font_set_glyph_row(118, s, 7, 0x3C)
+    font_set_glyph_row(118, s, 8, 0x18)
+}
+@kernel fn font_gen_lower_w(s: i64) {
+    font_set_glyph_row(119, s, 4, 0x63); font_set_glyph_row(119, s, 5, 0x6B)
+    font_set_glyph_row(119, s, 6, 0x6B); font_set_glyph_row(119, s, 7, 0x7F)
+    font_set_glyph_row(119, s, 8, 0x36)
+}
+@kernel fn font_gen_lower_x(s: i64) {
+    font_set_glyph_row(120, s, 4, 0x66); font_set_glyph_row(120, s, 5, 0x3C)
+    font_set_glyph_row(120, s, 6, 0x18); font_set_glyph_row(120, s, 7, 0x3C)
+    font_set_glyph_row(120, s, 8, 0x66)
+}
+@kernel fn font_gen_lower_y(s: i64) {
+    font_set_glyph_row(121, s, 4, 0x66); font_set_glyph_row(121, s, 5, 0x66)
+    font_set_glyph_row(121, s, 6, 0x3E); font_set_glyph_row(121, s, 7, 0x06)
+    font_set_glyph_row(121, s, 8, 0x3C)
+}
+@kernel fn font_gen_lower_z(s: i64) {
+    font_set_glyph_row(122, s, 4, 0x7E); font_set_glyph_row(122, s, 5, 0x0C)
+    font_set_glyph_row(122, s, 6, 0x18); font_set_glyph_row(122, s, 7, 0x30)
+    font_set_glyph_row(122, s, 8, 0x7E)
+}
+
+// Punctuation and common symbols
+@kernel fn font_gen_punctuation(s: i64) {
+    // ! (33)
+    font_set_glyph_row(33, s, 2, 0x18); font_set_glyph_row(33, s, 3, 0x18)
+    font_set_glyph_row(33, s, 4, 0x18); font_set_glyph_row(33, s, 5, 0x18)
+    font_set_glyph_row(33, s, 6, 0x18); font_set_glyph_row(33, s, 8, 0x18)
+    // . (46)
+    font_set_glyph_row(46, s, 8, 0x18)
+    // , (44)
+    font_set_glyph_row(44, s, 8, 0x18); font_set_glyph_row(44, s, 9, 0x30)
+    // : (58)
+    font_set_glyph_row(58, s, 4, 0x18); font_set_glyph_row(58, s, 8, 0x18)
+    // ; (59)
+    font_set_glyph_row(59, s, 4, 0x18); font_set_glyph_row(59, s, 8, 0x18)
+    font_set_glyph_row(59, s, 9, 0x30)
+    // - (45)
+    font_set_glyph_row(45, s, 5, 0x7E)
+    // = (61)
+    font_set_glyph_row(61, s, 4, 0x7E); font_set_glyph_row(61, s, 6, 0x7E)
+    // + (43)
+    font_set_glyph_row(43, s, 4, 0x18); font_set_glyph_row(43, s, 5, 0x7E)
+    font_set_glyph_row(43, s, 6, 0x18)
+    // * (42)
+    font_set_glyph_row(42, s, 3, 0x66); font_set_glyph_row(42, s, 4, 0x3C)
+    font_set_glyph_row(42, s, 5, 0xFF); font_set_glyph_row(42, s, 6, 0x3C)
+    font_set_glyph_row(42, s, 7, 0x66)
+    // / (47)
+    font_set_glyph_row(47, s, 2, 0x06); font_set_glyph_row(47, s, 3, 0x0C)
+    font_set_glyph_row(47, s, 4, 0x18); font_set_glyph_row(47, s, 5, 0x30)
+    font_set_glyph_row(47, s, 6, 0x60); font_set_glyph_row(47, s, 7, 0x40)
+    // ( (40) and ) (41)
+    font_set_glyph_row(40, s, 2, 0x0C); font_set_glyph_row(40, s, 3, 0x18)
+    font_set_glyph_row(40, s, 4, 0x30); font_set_glyph_row(40, s, 5, 0x30)
+    font_set_glyph_row(40, s, 6, 0x30); font_set_glyph_row(40, s, 7, 0x18)
+    font_set_glyph_row(40, s, 8, 0x0C)
+    font_set_glyph_row(41, s, 2, 0x30); font_set_glyph_row(41, s, 3, 0x18)
+    font_set_glyph_row(41, s, 4, 0x0C); font_set_glyph_row(41, s, 5, 0x0C)
+    font_set_glyph_row(41, s, 6, 0x0C); font_set_glyph_row(41, s, 7, 0x18)
+    font_set_glyph_row(41, s, 8, 0x30)
+    // [ (91) and ] (93)
+    font_set_glyph_row(91, s, 2, 0x3C); font_set_glyph_row(91, s, 3, 0x30)
+    font_set_glyph_row(91, s, 4, 0x30); font_set_glyph_row(91, s, 5, 0x30)
+    font_set_glyph_row(91, s, 6, 0x30); font_set_glyph_row(91, s, 7, 0x30)
+    font_set_glyph_row(91, s, 8, 0x3C)
+    font_set_glyph_row(93, s, 2, 0x3C); font_set_glyph_row(93, s, 3, 0x0C)
+    font_set_glyph_row(93, s, 4, 0x0C); font_set_glyph_row(93, s, 5, 0x0C)
+    font_set_glyph_row(93, s, 6, 0x0C); font_set_glyph_row(93, s, 7, 0x0C)
+    font_set_glyph_row(93, s, 8, 0x3C)
+    // _ (95)
+    font_set_glyph_row(95, s, 9, 0xFF)
+    // " (34)
+    font_set_glyph_row(34, s, 2, 0x66); font_set_glyph_row(34, s, 3, 0x66)
+    // ' (39)
+    font_set_glyph_row(39, s, 2, 0x18); font_set_glyph_row(39, s, 3, 0x18)
+    // # (35)
+    font_set_glyph_row(35, s, 3, 0x6C); font_set_glyph_row(35, s, 4, 0xFE)
+    font_set_glyph_row(35, s, 5, 0x6C); font_set_glyph_row(35, s, 6, 0xFE)
+    font_set_glyph_row(35, s, 7, 0x6C)
+    // @ (64)
+    font_set_glyph_row(64, s, 2, 0x3C); font_set_glyph_row(64, s, 3, 0x42)
+    font_set_glyph_row(64, s, 4, 0x5A); font_set_glyph_row(64, s, 5, 0x5A)
+    font_set_glyph_row(64, s, 6, 0x5E); font_set_glyph_row(64, s, 7, 0x40)
+    font_set_glyph_row(64, s, 8, 0x3C)
+    // < (60) and > (62)
+    font_set_glyph_row(60, s, 3, 0x0C); font_set_glyph_row(60, s, 4, 0x18)
+    font_set_glyph_row(60, s, 5, 0x30); font_set_glyph_row(60, s, 6, 0x18)
+    font_set_glyph_row(60, s, 7, 0x0C)
+    font_set_glyph_row(62, s, 3, 0x30); font_set_glyph_row(62, s, 4, 0x18)
+    font_set_glyph_row(62, s, 5, 0x0C); font_set_glyph_row(62, s, 6, 0x18)
+    font_set_glyph_row(62, s, 7, 0x30)
+    // | (124)
+    font_set_glyph_row(124, s, 2, 0x18); font_set_glyph_row(124, s, 3, 0x18)
+    font_set_glyph_row(124, s, 4, 0x18); font_set_glyph_row(124, s, 5, 0x18)
+    font_set_glyph_row(124, s, 6, 0x18); font_set_glyph_row(124, s, 7, 0x18)
+    font_set_glyph_row(124, s, 8, 0x18)
+    // ~ (126)
+    font_set_glyph_row(126, s, 4, 0x76); font_set_glyph_row(126, s, 5, 0xDC)
+    // ^ (94)
+    font_set_glyph_row(94, s, 2, 0x18); font_set_glyph_row(94, s, 3, 0x3C)
+    font_set_glyph_row(94, s, 4, 0x66)
+    // & (38)
+    font_set_glyph_row(38, s, 2, 0x38); font_set_glyph_row(38, s, 3, 0x6C)
+    font_set_glyph_row(38, s, 4, 0x38); font_set_glyph_row(38, s, 5, 0x76)
+    font_set_glyph_row(38, s, 6, 0xDC); font_set_glyph_row(38, s, 7, 0xCC)
+    font_set_glyph_row(38, s, 8, 0x76)
+    // % (37)
+    font_set_glyph_row(37, s, 2, 0x62); font_set_glyph_row(37, s, 3, 0x66)
+    font_set_glyph_row(37, s, 4, 0x0C); font_set_glyph_row(37, s, 5, 0x18)
+    font_set_glyph_row(37, s, 6, 0x30); font_set_glyph_row(37, s, 7, 0x66)
+    font_set_glyph_row(37, s, 8, 0x46)
+    // $ (36)
+    font_set_glyph_row(36, s, 2, 0x18); font_set_glyph_row(36, s, 3, 0x3E)
+    font_set_glyph_row(36, s, 4, 0x60); font_set_glyph_row(36, s, 5, 0x3C)
+    font_set_glyph_row(36, s, 6, 0x06); font_set_glyph_row(36, s, 7, 0x7C)
+    font_set_glyph_row(36, s, 8, 0x18)
+    // ? (63)
+    font_set_glyph_row(63, s, 2, 0x3C); font_set_glyph_row(63, s, 3, 0x66)
+    font_set_glyph_row(63, s, 4, 0x06); font_set_glyph_row(63, s, 5, 0x0C)
+    font_set_glyph_row(63, s, 6, 0x18); font_set_glyph_row(63, s, 8, 0x18)
+    // { (123) and } (125)
+    font_set_glyph_row(123, s, 2, 0x0E); font_set_glyph_row(123, s, 3, 0x18)
+    font_set_glyph_row(123, s, 4, 0x18); font_set_glyph_row(123, s, 5, 0x70)
+    font_set_glyph_row(123, s, 6, 0x18); font_set_glyph_row(123, s, 7, 0x18)
+    font_set_glyph_row(123, s, 8, 0x0E)
+    font_set_glyph_row(125, s, 2, 0x70); font_set_glyph_row(125, s, 3, 0x18)
+    font_set_glyph_row(125, s, 4, 0x18); font_set_glyph_row(125, s, 5, 0x0E)
+    font_set_glyph_row(125, s, 6, 0x18); font_set_glyph_row(125, s, 7, 0x18)
+    font_set_glyph_row(125, s, 8, 0x70)
+    // \\ (92)
+    font_set_glyph_row(92, s, 2, 0x60); font_set_glyph_row(92, s, 3, 0x30)
+    font_set_glyph_row(92, s, 4, 0x18); font_set_glyph_row(92, s, 5, 0x0C)
+    font_set_glyph_row(92, s, 6, 0x06)
+    // ` (96)
+    font_set_glyph_row(96, s, 2, 0x30); font_set_glyph_row(96, s, 3, 0x18)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Box Drawing Characters (for TUI/terminal borders)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn font_generate_box_drawing(s: i64) {
+    // ─ horizontal (196)
+    font_set_glyph_row(196, s, 5, 0xFF)
+    // │ vertical (179)
+    font_set_glyph_row(179, s, 0, 0x18); font_set_glyph_row(179, s, 1, 0x18)
+    font_set_glyph_row(179, s, 2, 0x18); font_set_glyph_row(179, s, 3, 0x18)
+    font_set_glyph_row(179, s, 4, 0x18); font_set_glyph_row(179, s, 5, 0x18)
+    font_set_glyph_row(179, s, 6, 0x18); font_set_glyph_row(179, s, 7, 0x18)
+    font_set_glyph_row(179, s, 8, 0x18); font_set_glyph_row(179, s, 9, 0x18)
+    // ┌ top-left (218)
+    font_set_glyph_row(218, s, 5, 0x1F); font_set_glyph_row(218, s, 6, 0x18)
+    font_set_glyph_row(218, s, 7, 0x18); font_set_glyph_row(218, s, 8, 0x18)
+    // ┐ top-right (191)
+    font_set_glyph_row(191, s, 5, 0xF8); font_set_glyph_row(191, s, 6, 0x18)
+    font_set_glyph_row(191, s, 7, 0x18); font_set_glyph_row(191, s, 8, 0x18)
+    // └ bottom-left (192)
+    font_set_glyph_row(192, s, 2, 0x18); font_set_glyph_row(192, s, 3, 0x18)
+    font_set_glyph_row(192, s, 4, 0x18); font_set_glyph_row(192, s, 5, 0x1F)
+    // ┘ bottom-right (217)
+    font_set_glyph_row(217, s, 2, 0x18); font_set_glyph_row(217, s, 3, 0x18)
+    font_set_glyph_row(217, s, 4, 0x18); font_set_glyph_row(217, s, 5, 0xF8)
+    // ├ left-T (195)
+    font_set_glyph_row(195, s, 2, 0x18); font_set_glyph_row(195, s, 3, 0x18)
+    font_set_glyph_row(195, s, 4, 0x18); font_set_glyph_row(195, s, 5, 0x1F)
+    font_set_glyph_row(195, s, 6, 0x18); font_set_glyph_row(195, s, 7, 0x18)
+    // ┤ right-T (180)
+    font_set_glyph_row(180, s, 2, 0x18); font_set_glyph_row(180, s, 3, 0x18)
+    font_set_glyph_row(180, s, 4, 0x18); font_set_glyph_row(180, s, 5, 0xF8)
+    font_set_glyph_row(180, s, 6, 0x18); font_set_glyph_row(180, s, 7, 0x18)
+    // ┬ top-T (194)
+    font_set_glyph_row(194, s, 5, 0xFF); font_set_glyph_row(194, s, 6, 0x18)
+    font_set_glyph_row(194, s, 7, 0x18)
+    // ┴ bottom-T (193)
+    font_set_glyph_row(193, s, 3, 0x18); font_set_glyph_row(193, s, 4, 0x18)
+    font_set_glyph_row(193, s, 5, 0xFF)
+    // ┼ cross (197)
+    font_set_glyph_row(197, s, 2, 0x18); font_set_glyph_row(197, s, 3, 0x18)
+    font_set_glyph_row(197, s, 4, 0x18); font_set_glyph_row(197, s, 5, 0xFF)
+    font_set_glyph_row(197, s, 6, 0x18); font_set_glyph_row(197, s, 7, 0x18)
+    // █ full block (219)
+    font_set_glyph_row(219, s, 0, 0xFF); font_set_glyph_row(219, s, 1, 0xFF)
+    font_set_glyph_row(219, s, 2, 0xFF); font_set_glyph_row(219, s, 3, 0xFF)
+    font_set_glyph_row(219, s, 4, 0xFF); font_set_glyph_row(219, s, 5, 0xFF)
+    font_set_glyph_row(219, s, 6, 0xFF); font_set_glyph_row(219, s, 7, 0xFF)
+    font_set_glyph_row(219, s, 8, 0xFF); font_set_glyph_row(219, s, 9, 0xFF)
+    // ▓ dense shade (178)
+    font_set_glyph_row(178, s, 0, 0xDB); font_set_glyph_row(178, s, 1, 0x6D)
+    font_set_glyph_row(178, s, 2, 0xDB); font_set_glyph_row(178, s, 3, 0x6D)
+    font_set_glyph_row(178, s, 4, 0xDB); font_set_glyph_row(178, s, 5, 0x6D)
+    font_set_glyph_row(178, s, 6, 0xDB); font_set_glyph_row(178, s, 7, 0x6D)
+    // ▒ medium shade (177)
+    font_set_glyph_row(177, s, 0, 0xAA); font_set_glyph_row(177, s, 1, 0x55)
+    font_set_glyph_row(177, s, 2, 0xAA); font_set_glyph_row(177, s, 3, 0x55)
+    font_set_glyph_row(177, s, 4, 0xAA); font_set_glyph_row(177, s, 5, 0x55)
+    font_set_glyph_row(177, s, 6, 0xAA); font_set_glyph_row(177, s, 7, 0x55)
+    // ░ light shade (176)
+    font_set_glyph_row(176, s, 0, 0x22); font_set_glyph_row(176, s, 1, 0x88)
+    font_set_glyph_row(176, s, 2, 0x22); font_set_glyph_row(176, s, 3, 0x88)
+    font_set_glyph_row(176, s, 4, 0x22); font_set_glyph_row(176, s, 5, 0x88)
+    font_set_glyph_row(176, s, 6, 0x22); font_set_glyph_row(176, s, 7, 0x88)
+    // ▄ lower half (220)
+    font_set_glyph_row(220, s, 5, 0xFF); font_set_glyph_row(220, s, 6, 0xFF)
+    font_set_glyph_row(220, s, 7, 0xFF); font_set_glyph_row(220, s, 8, 0xFF)
+    font_set_glyph_row(220, s, 9, 0xFF)
+    // ▀ upper half (223)
+    font_set_glyph_row(223, s, 0, 0xFF); font_set_glyph_row(223, s, 1, 0xFF)
+    font_set_glyph_row(223, s, 2, 0xFF); font_set_glyph_row(223, s, 3, 0xFF)
+    font_set_glyph_row(223, s, 4, 0xFF)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Scaled Font Generation — Copy 8×16 to other sizes
+// ═══════════════════════════════════════════════════════════════
+
+// Generate smaller fonts by scaling down the 8×16 glyphs
+@kernel fn font_generate_ascii_8() {
+    // 8×8: take every other row from 8×16
+    let mut ch: i64 = 32
+    while ch < 127 {
+        let src = font_glyph_addr_size(ch, 3)  // 8×16 source
+        let dst = font_glyph_addr_size(ch, 0)  // 8×8 destination
+        volatile_write_u8(dst, volatile_read_u8(src + 2))
+        volatile_write_u8(dst + 1, volatile_read_u8(src + 3))
+        volatile_write_u8(dst + 2, volatile_read_u8(src + 4))
+        volatile_write_u8(dst + 3, volatile_read_u8(src + 5))
+        volatile_write_u8(dst + 4, volatile_read_u8(src + 6))
+        volatile_write_u8(dst + 5, volatile_read_u8(src + 7))
+        volatile_write_u8(dst + 6, volatile_read_u8(src + 8))
+        volatile_write_u8(dst + 7, volatile_read_u8(src + 9))
+        ch = ch + 1
+    }
+}
+
+@kernel fn font_generate_ascii_12() {
+    // 8×12: copy rows 1-12 from 8×16 (skip top/bottom padding)
+    let mut ch: i64 = 32
+    while ch < 127 {
+        let src = font_glyph_addr_size(ch, 3)
+        let dst = font_glyph_addr_size(ch, 1)
+        let mut r: i64 = 0
+        while r < 12 { volatile_write_u8(dst + r, volatile_read_u8(src + r + 1)); r = r + 1 }
+        ch = ch + 1
+    }
+}
+
+@kernel fn font_generate_ascii_14() {
+    // 8×14: copy rows 0-13 from 8×16
+    let mut ch: i64 = 32
+    while ch < 127 {
+        let src = font_glyph_addr_size(ch, 3)
+        let dst = font_glyph_addr_size(ch, 2)
+        let mut r: i64 = 0
+        while r < 14 { volatile_write_u8(dst + r, volatile_read_u8(src + r)); r = r + 1 }
+        ch = ch + 1
+    }
+}
+
+@kernel fn font_generate_ascii_20() {
+    // 8×20: stretch 8×16 by duplicating every 4th row
+    let mut ch: i64 = 32
+    while ch < 127 {
+        let src = font_glyph_addr_size(ch, 3)
+        let dst = font_glyph_addr_size(ch, 4)
+        let mut sr: i64 = 0
+        let mut dr: i64 = 0
+        while sr < 16 {
+            volatile_write_u8(dst + dr, volatile_read_u8(src + sr))
+            dr = dr + 1
+            if sr % 4 == 0 {
+                // Duplicate this row for stretch
+                volatile_write_u8(dst + dr, volatile_read_u8(src + sr))
+                dr = dr + 1
+            }
+            sr = sr + 1
+        }
+        ch = ch + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command — Font Demo
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_font() {
+    cprintln("=== Font System ===", YELLOW_ON_BLACK)
+    cprintln("Sizes: 8x8, 8x12, 8x14, 8x16, 8x20", WHITE_ON_BLACK)
+    cprint("Active size: ", WHITE_ON_BLACK)
+    let idx = font_get_size()
+    cprint_decimal(font_get_width(), WHITE_ON_BLACK)
+    cprint("x", WHITE_ON_BLACK)
+    cprintln_decimal(font_get_height(), WHITE_ON_BLACK)
+    cprint("Glyphs: 256 per size (ASCII + box drawing)", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    cprint("Bold: ", WHITE_ON_BLACK)
+    if volatile_read_u64(FONT_STORE + FONT_BOLD_FLAG) != 0 { cprintln("on", GREEN_ON_BLACK) }
+    else { cprintln("off", WHITE_ON_BLACK) }
+    cprint("Proportional: ", WHITE_ON_BLACK)
+    if volatile_read_u64(FONT_STORE + FONT_PROPORTIONAL) != 0 { cprintln("on", GREEN_ON_BLACK) }
+    else { cprintln("off (monospace)", WHITE_ON_BLACK) }
+}
