@@ -144,6 +144,10 @@ SOURCES := \
 	services/display/main.fj \
 	services/input/main.fj \
 	services/gpu/main.fj \
+	services/gui/compositor.fj \
+	services/gui/spaces.fj \
+	services/gui/app_switcher.fj \
+	services/gui/hot_corners.fj \
 	services/gui/main.fj \
 	services/auth/main.fj \
 	services/shell/main.fj \

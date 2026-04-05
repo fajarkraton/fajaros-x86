@@ -1,0 +1,92 @@
+// FajarOS Nova v3.0 — Hot Corners
+// 4 screen corners trigger configurable actions when cursor reaches them.
+
+const HC_BASE: i64 = 0x965000
+// Per-corner: [+0: action, +8: timer_ticks, +16: threshold_ticks]
+const HC_SIZE: i64 = 24
+// Corners: 0=TL, 1=TR, 2=BL, 3=BR
+// Actions: 0=none, 1=show_desktop, 2=show_spaces, 3=app_switcher, 4=screen_lock
+
+const HC_ACTION_NONE: i64 = 0
+const HC_ACTION_DESKTOP: i64 = 1
+const HC_ACTION_SPACES: i64 = 2
+const HC_ACTION_SWITCHER: i64 = 3
+const HC_ACTION_LOCK: i64 = 4
+
+const HC_TRIGGER_ZONE: i64 = 4   // 4px corner zone
+const HC_TRIGGER_DELAY: i64 = 50 // ~500ms at 100Hz
+
+@kernel fn hot_corners_init() {
+    let mut i: i64 = 0
+    while i < 4 {
+        let base = HC_BASE + i * HC_SIZE
+        volatile_write_u64(base, HC_ACTION_NONE)
+        volatile_write_u64(base + 8, 0)
+        volatile_write_u64(base + 16, HC_TRIGGER_DELAY)
+        i = i + 1
+    }
+    // Default: TL = show desktop, TR = app switcher
+    volatile_write_u64(HC_BASE, HC_ACTION_DESKTOP)
+    volatile_write_u64(HC_BASE + HC_SIZE, HC_ACTION_SWITCHER)
+}
+
+@kernel fn hot_corners_set(corner: i64, action: i64) {
+    if corner < 0 || corner >= 4 { return }
+    volatile_write_u64(HC_BASE + corner * HC_SIZE, action)
+}
+
+// Called every frame with cursor position
+@kernel fn hot_corners_check(mx: i64, my: i64) -> i64 {
+    let sw = fb_state_read(FB_WIDTH)
+    let sh = fb_state_read(FB_HEIGHT)
+
+    let mut corner: i64 = -1
+    if mx < HC_TRIGGER_ZONE && my < HC_TRIGGER_ZONE { corner = 0 }
+    if mx >= sw - HC_TRIGGER_ZONE && my < HC_TRIGGER_ZONE { corner = 1 }
+    if mx < HC_TRIGGER_ZONE && my >= sh - HC_TRIGGER_ZONE { corner = 2 }
+    if mx >= sw - HC_TRIGGER_ZONE && my >= sh - HC_TRIGGER_ZONE { corner = 3 }
+
+    if corner >= 0 {
+        let base = HC_BASE + corner * HC_SIZE
+        let action = volatile_read_u64(base)
+        if action == HC_ACTION_NONE { return 0 }
+        let timer = volatile_read_u64(base + 8) + 1
+        volatile_write_u64(base + 8, timer)
+        if timer >= volatile_read_u64(base + 16) {
+            volatile_write_u64(base + 8, 0)
+            return action
+        }
+    } else {
+        // Reset all timers when not in any corner
+        let mut i: i64 = 0
+        while i < 4 { volatile_write_u64(HC_BASE + i * HC_SIZE + 8, 0); i = i + 1 }
+    }
+    0
+}
+
+@kernel fn cmd_hotcorners() {
+    cprintln("=== Hot Corners ===", YELLOW_ON_BLACK)
+    let names_0 = "none"
+    let names_1 = "show desktop"
+    let names_2 = "show spaces"
+    let names_3 = "app switcher"
+    let names_4 = "screen lock"
+    let mut i: i64 = 0
+    while i < 4 {
+        let base = HC_BASE + i * HC_SIZE
+        let action = volatile_read_u64(base)
+        cprint("  ", WHITE_ON_BLACK)
+        if i == 0 { cprint("TL", CYAN_ON_BLACK) }
+        else if i == 1 { cprint("TR", CYAN_ON_BLACK) }
+        else if i == 2 { cprint("BL", CYAN_ON_BLACK) }
+        else { cprint("BR", CYAN_ON_BLACK) }
+        cprint(": ", WHITE_ON_BLACK)
+        if action == 0 { cprintln("none", WHITE_ON_BLACK) }
+        else if action == 1 { cprintln("show desktop", GREEN_ON_BLACK) }
+        else if action == 2 { cprintln("show spaces", GREEN_ON_BLACK) }
+        else if action == 3 { cprintln("app switcher", GREEN_ON_BLACK) }
+        else if action == 4 { cprintln("screen lock", GREEN_ON_BLACK) }
+        else { cprintln("unknown", RED_ON_BLACK) }
+        i = i + 1
+    }
+}

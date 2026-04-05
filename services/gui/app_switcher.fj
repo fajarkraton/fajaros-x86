@@ -1,0 +1,107 @@
+// FajarOS Nova v3.0 — App Switcher (Alt+Tab)
+// Shows horizontal strip of window thumbnails for quick switching.
+
+const SWITCHER_BASE: i64 = 0x964000
+const SWITCHER_ACTIVE: i64 = 0       // 1 = switcher is visible
+const SWITCHER_SELECTED: i64 = 8     // Currently highlighted window index
+const SWITCHER_COUNT: i64 = 16       // Number of switchable windows
+const SWITCHER_LIST: i64 = 24        // Array of window IDs (max 16)
+
+const SWITCHER_THUMB_W: i64 = 200
+const SWITCHER_THUMB_H: i64 = 150
+const SWITCHER_PADDING: i64 = 16
+const SWITCHER_BG: i64 = 0x2A2A3A
+const SWITCHER_HIGHLIGHT: i64 = 0x5555AA
+
+@kernel fn switcher_init() {
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_ACTIVE, 0)
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_SELECTED, 0)
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_COUNT, 0)
+}
+
+// Show app switcher — collect all non-minimized windows
+@kernel fn switcher_show() {
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_ACTIVE, 1)
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_SELECTED, 0)
+    // Collect windows
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < 16 && count < 16 {
+        let base = comp_window_addr(i)
+        if volatile_read_u64(base) != 0 {
+            let flags = volatile_read_u64(base + WIN_OFF_FLAGS)
+            if (flags & WIN_FLAG_FOCUSED) != 0 || (flags & 2) == 0 {  // Not minimized
+                volatile_write_u64(SWITCHER_BASE + SWITCHER_LIST + count * 8, i)
+                count = count + 1
+            }
+        }
+        i = i + 1
+    }
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_COUNT, count)
+}
+
+// Next window in switcher
+@kernel fn switcher_next() {
+    let count = volatile_read_u64(SWITCHER_BASE + SWITCHER_COUNT)
+    if count == 0 { return }
+    let sel = volatile_read_u64(SWITCHER_BASE + SWITCHER_SELECTED)
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_SELECTED, (sel + 1) % count)
+}
+
+// Previous window
+@kernel fn switcher_prev() {
+    let count = volatile_read_u64(SWITCHER_BASE + SWITCHER_COUNT)
+    if count == 0 { return }
+    let sel = volatile_read_u64(SWITCHER_BASE + SWITCHER_SELECTED)
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_SELECTED, if sel == 0 { count - 1 } else { sel - 1 })
+}
+
+// Confirm selection and focus window
+@kernel fn switcher_confirm() {
+    let count = volatile_read_u64(SWITCHER_BASE + SWITCHER_COUNT)
+    let sel = volatile_read_u64(SWITCHER_BASE + SWITCHER_SELECTED)
+    if sel < count {
+        let win_id = volatile_read_u64(SWITCHER_BASE + SWITCHER_LIST + sel * 8)
+        comp_focus_window(win_id)
+    }
+    volatile_write_u64(SWITCHER_BASE + SWITCHER_ACTIVE, 0)
+}
+
+// Draw switcher overlay
+@kernel fn switcher_draw() {
+    if volatile_read_u64(SWITCHER_BASE + SWITCHER_ACTIVE) == 0 { return }
+    let count = volatile_read_u64(SWITCHER_BASE + SWITCHER_COUNT)
+    if count == 0 { return }
+    let sel = volatile_read_u64(SWITCHER_BASE + SWITCHER_SELECTED)
+
+    let total_w = count * (SWITCHER_THUMB_W + SWITCHER_PADDING) + SWITCHER_PADDING
+    let sw = fb_state_read(FB_WIDTH)
+    let sh = fb_state_read(FB_HEIGHT)
+    let sx = (sw - total_w) / 2
+    let sy = (sh - SWITCHER_THUMB_H - SWITCHER_PADDING * 2) / 2
+
+    // Background
+    fb_fill_rect_alpha(sx, sy, total_w, SWITCHER_THUMB_H + SWITCHER_PADDING * 2, SWITCHER_BG, 200)
+    fb_draw_rounded_rect_outline(sx, sy, total_w, SWITCHER_THUMB_H + SWITCHER_PADDING * 2, 8, COLOR_WHITE)
+
+    // Thumbnails
+    let mut i: i64 = 0
+    while i < count {
+        let tx = sx + SWITCHER_PADDING + i * (SWITCHER_THUMB_W + SWITCHER_PADDING)
+        let ty = sy + SWITCHER_PADDING
+
+        // Highlight selected
+        if i == sel {
+            fb_draw_rounded_rect(tx - 4, ty - 4, SWITCHER_THUMB_W + 8, SWITCHER_THUMB_H + 8, 4, SWITCHER_HIGHLIGHT)
+        }
+
+        // Window thumbnail (simplified: just colored rectangle with title)
+        let win_id = volatile_read_u64(SWITCHER_BASE + SWITCHER_LIST + i * 8)
+        let wbase = comp_window_addr(win_id)
+        fb_fill_rect(tx, ty, SWITCHER_THUMB_W, SWITCHER_THUMB_H, COLOR_BG_DEFAULT)
+        fb_fill_rect(tx, ty, SWITCHER_THUMB_W, 12, COMP_TITLE_ACTIVE_1)
+        fb_draw_rounded_rect_outline(tx, ty, SWITCHER_THUMB_W, SWITCHER_THUMB_H, 4, COLOR_GRAY)
+
+        i = i + 1
+    }
+}

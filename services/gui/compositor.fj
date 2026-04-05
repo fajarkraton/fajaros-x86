@@ -370,3 +370,193 @@ const BORDER_WIDTH: i64 = 1
         id = id + 1
     }
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 10: Advanced Compositor Features
+// ═══════════════════════════════════════════════════════════════
+
+// Decoration constants
+const COMP_TITLEBAR_H: i64 = 28
+const COMP_CORNER_RADIUS: i64 = 6
+const COMP_SHADOW_SIZE: i64 = 4
+const COMP_SHADOW_ALPHA: i64 = 40
+
+// Traffic light button colors (macOS-style)
+const COMP_BTN_CLOSE: i64 = 0xFF5F57
+const COMP_BTN_MINIMIZE: i64 = 0xFEBC2E
+const COMP_BTN_MAXIMIZE: i64 = 0x28C840
+const COMP_BTN_RADIUS: i64 = 6
+const COMP_BTN_SPACING: i64 = 20
+const COMP_BTN_Y: i64 = 14
+const COMP_BTN_X: i64 = 14
+
+// Titlebar gradients
+const COMP_TITLE_ACTIVE_1: i64 = 0x3A3A5C
+const COMP_TITLE_ACTIVE_2: i64 = 0x2A2A4A
+const COMP_TITLE_INACTIVE: i64 = 0x383838
+
+// 10.2: Window decorations with traffic light buttons
+@kernel fn comp_draw_decorations(win_id: i64) {
+    let base = comp_window_addr(win_id)
+    let x = volatile_read_u64(base + WIN_OFF_X)
+    let y = volatile_read_u64(base + WIN_OFF_Y)
+    let w = volatile_read_u64(base + WIN_OFF_W)
+    let flags = volatile_read_u64(base + WIN_OFF_FLAGS)
+    let is_focused = (flags & WIN_FLAG_FOCUSED) != 0
+
+    // 10.12: Gradient titlebar (active) or flat gray (inactive)
+    if is_focused {
+        fb_gradient_rect(x, y, w, COMP_TITLEBAR_H, COMP_TITLE_ACTIVE_1, COMP_TITLE_ACTIVE_2, 1)
+    } else {
+        fb_fill_rect(x, y, w, COMP_TITLEBAR_H, COMP_TITLE_INACTIVE)
+    }
+
+    // Traffic light buttons
+    let by = y + COMP_BTN_Y
+    fb_draw_circle(x + COMP_BTN_X, by, COMP_BTN_RADIUS, COMP_BTN_CLOSE)
+    fb_draw_circle(x + COMP_BTN_X + COMP_BTN_SPACING, by, COMP_BTN_RADIUS, COMP_BTN_MINIMIZE)
+    fb_draw_circle(x + COMP_BTN_X + COMP_BTN_SPACING * 2, by, COMP_BTN_RADIUS, COMP_BTN_MAXIMIZE)
+
+    // 10.7: Rounded corner outline
+    fb_draw_rounded_rect_outline(x, y, w, volatile_read_u64(base + WIN_OFF_H) + COMP_TITLEBAR_H, COMP_CORNER_RADIUS, COMP_TITLE_ACTIVE_1)
+}
+
+// 10.3: Window shadow
+@kernel fn comp_draw_shadow(win_id: i64) {
+    let base = comp_window_addr(win_id)
+    let x = volatile_read_u64(base + WIN_OFF_X)
+    let y = volatile_read_u64(base + WIN_OFF_Y)
+    let w = volatile_read_u64(base + WIN_OFF_W)
+    let h = volatile_read_u64(base + WIN_OFF_H) + COMP_TITLEBAR_H
+    let mut s: i64 = COMP_SHADOW_SIZE
+    while s > 0 {
+        let alpha = COMP_SHADOW_ALPHA * s / COMP_SHADOW_SIZE
+        fb_fill_rect_alpha(x + s, y + h, w, s, COLOR_BLACK, alpha)
+        fb_fill_rect_alpha(x + w, y + s, s, h, COLOR_BLACK, alpha)
+        s = s - 1
+    }
+}
+
+// 10.4: Resize hit test (returns direction: 0=none, 1-8=direction)
+const RESIZE_ZONE: i64 = 8
+@kernel fn comp_resize_hit(win_id: i64, mx: i64, my: i64) -> i64 {
+    let base = comp_window_addr(win_id)
+    let x = volatile_read_u64(base + WIN_OFF_X)
+    let y = volatile_read_u64(base + WIN_OFF_Y)
+    let w = volatile_read_u64(base + WIN_OFF_W)
+    let h = volatile_read_u64(base + WIN_OFF_H) + COMP_TITLEBAR_H
+    let l = mx >= x && mx < x + RESIZE_ZONE
+    let r = mx >= x + w - RESIZE_ZONE && mx < x + w
+    let t = my >= y && my < y + RESIZE_ZONE
+    let b = my >= y + h - RESIZE_ZONE && my < y + h
+    if t && l { 5 } else if t && r { 6 }
+    else if b && l { 7 } else if b && r { 8 }
+    else if t { 1 } else if b { 2 }
+    else if l { 3 } else if r { 4 }
+    else { 0 }
+}
+
+// 10.4: Apply resize delta
+@kernel fn comp_apply_resize(win_id: i64, dx: i64, dy: i64, zone: i64) {
+    let base = comp_window_addr(win_id)
+    let x = volatile_read_u64(base + WIN_OFF_X)
+    let y = volatile_read_u64(base + WIN_OFF_Y)
+    let w = volatile_read_u64(base + WIN_OFF_W)
+    let h = volatile_read_u64(base + WIN_OFF_H)
+    if zone == 4 || zone == 6 || zone == 8 {
+        let nw = w + dx; if nw > 100 { volatile_write_u64(base + WIN_OFF_W, nw) }
+    }
+    if zone == 2 || zone == 7 || zone == 8 {
+        let nh = h + dy; if nh > 50 { volatile_write_u64(base + WIN_OFF_H, nh) }
+    }
+    if zone == 3 || zone == 5 || zone == 7 {
+        let nw = w - dx; if nw > 100 { volatile_write_u64(base + WIN_OFF_W, nw); volatile_write_u64(base + WIN_OFF_X, x + dx) }
+    }
+    if zone == 1 || zone == 5 || zone == 6 {
+        let nh = h - dy; if nh > 50 { volatile_write_u64(base + WIN_OFF_H, nh); volatile_write_u64(base + WIN_OFF_Y, y + dy) }
+    }
+}
+
+// 10.6: Fullscreen toggle
+@kernel fn comp_toggle_fullscreen(win_id: i64) {
+    let base = comp_window_addr(win_id)
+    let flags = volatile_read_u64(base + WIN_OFF_FLAGS)
+    if (flags & 0x10) != 0 {
+        // Restore — saved at offsets +64..+96
+        volatile_write_u64(base + WIN_OFF_X, volatile_read_u64(base + 64))
+        volatile_write_u64(base + WIN_OFF_Y, volatile_read_u64(base + 72))
+        volatile_write_u64(base + WIN_OFF_W, volatile_read_u64(base + 80))
+        volatile_write_u64(base + WIN_OFF_H, volatile_read_u64(base + 88))
+        volatile_write_u64(base + WIN_OFF_FLAGS, flags & (~0x10))
+    } else {
+        // Save + maximize
+        volatile_write_u64(base + 64, volatile_read_u64(base + WIN_OFF_X))
+        volatile_write_u64(base + 72, volatile_read_u64(base + WIN_OFF_Y))
+        volatile_write_u64(base + 80, volatile_read_u64(base + WIN_OFF_W))
+        volatile_write_u64(base + 88, volatile_read_u64(base + WIN_OFF_H))
+        volatile_write_u64(base + WIN_OFF_X, 0)
+        volatile_write_u64(base + WIN_OFF_Y, 0)
+        volatile_write_u64(base + WIN_OFF_W, fb_state_read(FB_WIDTH))
+        volatile_write_u64(base + WIN_OFF_H, fb_state_read(FB_HEIGHT))
+        volatile_write_u64(base + WIN_OFF_FLAGS, flags | 0x10)
+    }
+}
+
+// 10.5: Cursor shapes (stored as 12×16 bitmaps)
+const CURSOR_SHAPES: i64 = 0x960000  // 5 cursors × 192 bytes (12×16)
+const CURSOR_ARROW: i64 = 0
+const CURSOR_IBEAM: i64 = 1
+const CURSOR_RESIZE: i64 = 2
+const CURSOR_HAND: i64 = 3
+const CURSOR_WAIT: i64 = 4
+const CURSOR_ACTIVE: i64 = 0x960400  // Currently active cursor index
+
+@kernel fn cursor_init() {
+    volatile_write_u64(CURSOR_ACTIVE, CURSOR_ARROW)
+    // Arrow cursor (12×16 bitmap, 1=pixel)
+    let a = CURSOR_SHAPES
+    volatile_write_u8(a + 0, 0x80); volatile_write_u8(a + 1, 0x00)   // 1...........
+    volatile_write_u8(a + 2, 0xC0); volatile_write_u8(a + 3, 0x00)   // 11..........
+    volatile_write_u8(a + 4, 0xE0); volatile_write_u8(a + 5, 0x00)   // 111.........
+    volatile_write_u8(a + 6, 0xF0); volatile_write_u8(a + 7, 0x00)   // 1111........
+    volatile_write_u8(a + 8, 0xF8); volatile_write_u8(a + 9, 0x00)   // 11111.......
+    volatile_write_u8(a + 10, 0xFC); volatile_write_u8(a + 11, 0x00) // 111111......
+    volatile_write_u8(a + 12, 0xFE); volatile_write_u8(a + 13, 0x00) // 1111111.....
+    volatile_write_u8(a + 14, 0xFF); volatile_write_u8(a + 15, 0x00) // 11111111....
+    volatile_write_u8(a + 16, 0xFF); volatile_write_u8(a + 17, 0x80) // 111111111...
+    volatile_write_u8(a + 18, 0xFC); volatile_write_u8(a + 19, 0x00) // 111111......
+    volatile_write_u8(a + 20, 0xF6); volatile_write_u8(a + 21, 0x00) // 1111.11.....
+    volatile_write_u8(a + 22, 0x66); volatile_write_u8(a + 23, 0x00) // .11..11.....
+    volatile_write_u8(a + 24, 0x06); volatile_write_u8(a + 25, 0x00) // .....11.....
+    volatile_write_u8(a + 26, 0x03); volatile_write_u8(a + 27, 0x00) // ......11....
+    volatile_write_u8(a + 28, 0x03); volatile_write_u8(a + 29, 0x00) // ......11....
+    volatile_write_u8(a + 30, 0x00); volatile_write_u8(a + 31, 0x00) // ............
+    // I-beam cursor
+    let ib = CURSOR_SHAPES + 192
+    volatile_write_u8(ib + 0, 0xFF); volatile_write_u8(ib + 1, 0xF0)
+    volatile_write_u8(ib + 2, 0x0C); volatile_write_u8(ib + 3, 0x00)
+    let mut r: i64 = 2
+    while r < 14 { volatile_write_u8(ib + r * 2, 0x0C); volatile_write_u8(ib + r * 2 + 1, 0x00); r = r + 1 }
+    volatile_write_u8(ib + 28, 0xFF); volatile_write_u8(ib + 29, 0xF0)
+}
+
+@kernel fn cursor_set(shape: i64) {
+    volatile_write_u64(CURSOR_ACTIVE, shape)
+}
+
+// Hit test button (0=none, 1=close, 2=min, 3=max)
+@kernel fn comp_button_hit(win_id: i64, mx: i64, my: i64) -> i64 {
+    let base = comp_window_addr(win_id)
+    let x = volatile_read_u64(base + WIN_OFF_X)
+    let y = volatile_read_u64(base + WIN_OFF_Y)
+    let by = y + COMP_BTN_Y
+    let mut b: i64 = 0
+    while b < 3 {
+        let bx = x + COMP_BTN_X + b * COMP_BTN_SPACING
+        let dx = mx - bx
+        let dy = my - by
+        if dx * dx + dy * dy <= COMP_BTN_RADIUS * COMP_BTN_RADIUS { return b + 1 }
+        b = b + 1
+    }
+    0
+}

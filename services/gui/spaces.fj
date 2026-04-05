@@ -1,0 +1,97 @@
+// FajarOS Nova v3.0 — Virtual Desktops (Spaces)
+// 4 independent workspaces, Ctrl+1/2/3/4 to switch.
+// Each space has its own window list; compositor only draws active space.
+
+const SPACES_BASE: i64 = 0x962000
+const SPACES_MAX: i64 = 4
+const SPACE_SIZE: i64 = 256  // Per-space: 32 window slots × 8 bytes
+
+const SPACES_ACTIVE: i64 = 0x963000  // Currently active space (0-3)
+const SPACES_NAMES: i64 = 0x963008   // 4 × 8 bytes for space name pointers
+
+@kernel fn spaces_init() {
+    let mut i: i64 = 0
+    while i < SPACES_MAX * SPACE_SIZE {
+        volatile_write_u64(SPACES_BASE + i, 0)
+        i = i + 8
+    }
+    volatile_write_u64(SPACES_ACTIVE, 0)
+}
+
+@kernel fn spaces_get_active() -> i64 {
+    volatile_read_u64(SPACES_ACTIVE)
+}
+
+@kernel fn spaces_switch(idx: i64) {
+    if idx < 0 || idx >= SPACES_MAX { return }
+    volatile_write_u64(SPACES_ACTIVE, idx)
+}
+
+// Assign window to space
+@kernel fn spaces_assign_window(space: i64, win_id: i64) {
+    if space < 0 || space >= SPACES_MAX { return }
+    let base = SPACES_BASE + space * SPACE_SIZE
+    let mut i: i64 = 0
+    while i < 32 {
+        if volatile_read_u64(base + i * 8) == 0 {
+            volatile_write_u64(base + i * 8, win_id + 1)  // +1 so 0 means empty
+            return
+        }
+        i = i + 1
+    }
+}
+
+// Remove window from space
+@kernel fn spaces_remove_window(space: i64, win_id: i64) {
+    if space < 0 || space >= SPACES_MAX { return }
+    let base = SPACES_BASE + space * SPACE_SIZE
+    let mut i: i64 = 0
+    while i < 32 {
+        if volatile_read_u64(base + i * 8) == win_id + 1 {
+            volatile_write_u64(base + i * 8, 0)
+            return
+        }
+        i = i + 1
+    }
+}
+
+// Check if window belongs to active space
+@kernel fn spaces_is_visible(win_id: i64) -> i64 {
+    let active = spaces_get_active()
+    let base = SPACES_BASE + active * SPACE_SIZE
+    let mut i: i64 = 0
+    while i < 32 {
+        if volatile_read_u64(base + i * 8) == win_id + 1 { return 1 }
+        i = i + 1
+    }
+    0
+}
+
+// Count windows in space
+@kernel fn spaces_window_count(space: i64) -> i64 {
+    let base = SPACES_BASE + space * SPACE_SIZE
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < 32 {
+        if volatile_read_u64(base + i * 8) != 0 { count = count + 1 }
+        i = i + 1
+    }
+    count
+}
+
+// Shell command
+@kernel fn cmd_spaces() {
+    cprintln("=== Virtual Desktops (Spaces) ===", YELLOW_ON_BLACK)
+    let active = spaces_get_active()
+    let mut i: i64 = 0
+    while i < SPACES_MAX {
+        cprint("  Space ", WHITE_ON_BLACK)
+        cprint_decimal(i + 1, CYAN_ON_BLACK)
+        cprint(": ", WHITE_ON_BLACK)
+        cprint_decimal(spaces_window_count(i), WHITE_ON_BLACK)
+        cprint(" windows", WHITE_ON_BLACK)
+        if i == active { cprint(" [ACTIVE]", GREEN_ON_BLACK) }
+        cprintln("", WHITE_ON_BLACK)
+        i = i + 1
+    }
+}
