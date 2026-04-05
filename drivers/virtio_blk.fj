@@ -39,6 +39,6 @@
     let bar0 = pci_read32(0, dev, 0, 0x10)
     cprint("  BAR0: 0x", WHITE_ON_BLACK)
     cprint_hex(bar0, 8, CYAN_ON_BLACK)
-    if bar0 & 1 != 0 { cprintln(" (I/O port)", WHITE_ON_BLACK) }
+    if (bar0 & 1) != 0 { cprintln(" (I/O port)", WHITE_ON_BLACK) }
     else { cprintln(" (MMIO)", WHITE_ON_BLACK) }
 }

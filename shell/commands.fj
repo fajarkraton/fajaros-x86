@@ -557,7 +557,7 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
 @kernel fn cmd_shutdown() {
     cprintln("Shutting down via ACPI...", YELLOW_ON_BLACK)
-    acpi_shutdown()
+    acpi_poweroff()
 }
 
 @kernel fn cmd_tensor() {
@@ -2729,6 +2729,75 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     }
     console_putchar(10, WHITE_ON_BLACK)
     cprintln("", WHITE_ON_BLACK)
+}
+
+// ═══════════════════════════════════════════════
+// exec / readelf shell commands
+// ═══════════════════════════════════════════════
+
+@kernel fn cmd_exec() {
+    // exec <file> — execute an ELF binary from ramfs
+    let len = cmdbuf_len()
+    if len <= 5 { cprintln("Usage: exec <file>", YELLOW_ON_BLACK); return }
+    // Build path in a scratch buffer from cmdbuf starting at offset 5
+    let path_addr: i64 = 0x6FA80
+    let mut i: i64 = 0
+    while i < len - 5 && i < 63 {
+        volatile_write_u8(path_addr + i, volatile_read_u8(0x6F800 + 5 + i))
+        i = i + 1
+    }
+    volatile_write_u8(path_addr + i, 0)
+    let result = sys_exec(path_addr, 0)
+    if result != 0 {
+        cprint("exec: failed to load '", RED_ON_BLACK)
+        let mut j: i64 = 0
+        while j < i { console_putchar(volatile_read_u8(path_addr + j), RED_ON_BLACK); j = j + 1 }
+        cprintln("'", RED_ON_BLACK)
+    }
+}
+
+@kernel fn cmd_readelf() {
+    // readelf <file> — display ELF header info from ramfs
+    let len = cmdbuf_len()
+    if len <= 8 { cprintln("Usage: readelf <file>", YELLOW_ON_BLACK); return }
+    let idx = ramfs_find_buf(8)
+    if idx == -1 { cprintln("readelf: file not found", RED_ON_BLACK); return }
+    let addr = ramfs_entry_addr(idx)
+    let size = volatile_read(addr + 32)
+    let data_ptr = volatile_read(addr + 40)
+    if size < 64 || data_ptr == 0 { cprintln("readelf: file too small for ELF", RED_ON_BLACK); return }
+    // Check ELF magic
+    let b0 = volatile_read_u8(data_ptr)
+    let b1 = volatile_read_u8(data_ptr + 1)
+    let b2 = volatile_read_u8(data_ptr + 2)
+    let b3 = volatile_read_u8(data_ptr + 3)
+    if b0 != 0x7F || b1 != 69 || b2 != 76 || b3 != 70 {
+        cprintln("readelf: not an ELF file", RED_ON_BLACK)
+        return
+    }
+    cprintln("ELF Header:", YELLOW_ON_BLACK)
+    cprint("  Class:      ", WHITE_ON_BLACK)
+    let eclass = volatile_read_u8(data_ptr + 4)
+    if eclass == 2 { cprintln("ELF64", CYAN_ON_BLACK) }
+    else { cprintln("ELF32", CYAN_ON_BLACK) }
+    cprint("  Data:       ", WHITE_ON_BLACK)
+    if volatile_read_u8(data_ptr + 5) == 1 { cprintln("Little-endian", CYAN_ON_BLACK) }
+    else { cprintln("Big-endian", CYAN_ON_BLACK) }
+    cprint("  Type:       ", WHITE_ON_BLACK)
+    let etype = volatile_read_u8(data_ptr + 16)
+    if etype == 2 { cprintln("EXEC", CYAN_ON_BLACK) }
+    else if etype == 3 { cprintln("DYN (shared)", CYAN_ON_BLACK) }
+    else { cprint_decimal(etype, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK) }
+    cprint("  Machine:    ", WHITE_ON_BLACK)
+    let machine = volatile_read_u8(data_ptr + 18)
+    if machine == 0x3E { cprintln("x86_64", CYAN_ON_BLACK) }
+    else { cprint_decimal(machine, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK) }
+    cprint("  Entry:      0x", WHITE_ON_BLACK)
+    cprint_hex(volatile_read_u64(data_ptr + 24), 16, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("  File size:  ", WHITE_ON_BLACK)
+    cprint_decimal(size, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
 }
 
 // ═══════════════════════════════════════════════

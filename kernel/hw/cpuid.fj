@@ -31,7 +31,7 @@ const CPU_VENDOR_ID: i64 = 80      // 12 bytes vendor string
 
 @kernel fn cpuid_leaf1_ecx() -> i64 {
     // CPUID leaf 1: feature flags in ECX
-    asm("movl $$1, %%eax\n\tcpuid",
+    asm("movl $$1, %eax\n\tcpuid",
         out("ecx") -> i64,
         clobber("eax", "ebx", "edx"),
         volatile)
@@ -39,7 +39,7 @@ const CPU_VENDOR_ID: i64 = 80      // 12 bytes vendor string
 
 @kernel fn cpuid_leaf1_edx() -> i64 {
     // CPUID leaf 1: feature flags in EDX
-    asm("movl $$1, %%eax\n\tcpuid",
+    asm("movl $$1, %eax\n\tcpuid",
         out("edx") -> i64,
         clobber("eax", "ebx", "ecx"),
         volatile)
@@ -47,7 +47,7 @@ const CPU_VENDOR_ID: i64 = 80      // 12 bytes vendor string
 
 @kernel fn cpuid_leaf7_ebx() -> i64 {
     // CPUID leaf 7, sub-leaf 0: extended features in EBX
-    asm("movl $$7, %%eax\n\txorl %%ecx, %%ecx\n\tcpuid",
+    asm("movl $$7, %eax\n\txorl %ecx, %ecx\n\tcpuid",
         out("ebx") -> i64,
         clobber("eax", "ecx", "edx"),
         volatile)
@@ -55,7 +55,7 @@ const CPU_VENDOR_ID: i64 = 80      // 12 bytes vendor string
 
 @kernel fn cpuid_ext1_edx() -> i64 {
     // CPUID leaf 0x80000001: extended features in EDX
-    asm("movl $$0x80000001, %%eax\n\tcpuid",
+    asm("movl $$0x80000001, %eax\n\tcpuid",
         out("edx") -> i64,
         clobber("eax", "ebx", "ecx"),
         volatile)

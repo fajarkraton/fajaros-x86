@@ -39,7 +39,7 @@ const SYS_RMDIR_V2: i64 = 42
 }
 
 @kernel fn sys_mkdir_posix(path: i64) -> i64 {
-    let idx = ramfs_create_entry(path, 2)
+    let idx = ramfs_create_at(path, 2)
     if idx < 0 { -1 } else { 0 }
 }
 

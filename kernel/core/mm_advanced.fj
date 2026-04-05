@@ -110,7 +110,7 @@ const STAT_PEAK: i64 = 24
     mm_proc_stat_add(pid, STAT_PAGES_COW, 1)
 }
 
-@kernel fn cow_handle_fault(pid: i64, virt: i64) -> i64 {
+@kernel fn cow_handle_fault_v2(pid: i64, virt: i64) -> i64 {
     let aligned_virt = (virt / FRAME_SIZE) * FRAME_SIZE
     let mut i: i64 = 0
     while i < COW_MAX {

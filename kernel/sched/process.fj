@@ -18,6 +18,26 @@ const PROC_STATE_ZOMBIE: i64 = 4
 const PROC_V2_MAX: i64 = 16
 const PROC_V2_SIZE: i64 = 256
 
+// Aliases for code that uses the short names (fork, exec, wait, signal, etc.)
+const PROC_TABLE: i64 = 0x890000
+const PROC_ENTRY_SIZE: i64 = 256
+const PROC_MAX: i64 = 16
+
+// Process table field offsets (within each 256-byte entry)
+const PROC_OFF_STATE: i64 = 0
+const PROC_OFF_PID: i64 = 8
+const PROC_OFF_PPID: i64 = 16
+const PROC_OFF_ENTRY: i64 = 24
+const PROC_OFF_RSP: i64 = 40     // kernel_rsp (used by context switch)
+const PROC_OFF_CR3: i64 = 48     // page table base
+const PROC_OFF_EXIT: i64 = 56    // exit code
+const PROC_OFF_NAME: i64 = 64    // name[32]
+const PROC_OFF_TICKS: i64 = 160  // tick counter
+
+// Kernel stack area: one stack per process
+const KSTACK_BASE: i64 = 0x900000   // kernel stacks start at 9MB
+const KSTACK_SIZE: i64 = 0x4000     // 16KB per process kernel stack
+
 @kernel fn proc_v2_init() {
     let mut i: i64 = 0
     while i < PROC_V2_MAX * PROC_V2_SIZE {

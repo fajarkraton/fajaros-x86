@@ -496,7 +496,7 @@ const TILE_ENTRY_SIZE: i64 = 64
     ipc_msg_clear(reply_buf)
     ipc_msg_set_header(reply_buf, DISP_SVC_PID, MSG_DISP_REPLY, 0)
     volatile_write_u64(reply_buf + 16, -1)
-    -1
+    return -1
 }
 
 // ═══════════════════════════════════════════════════════════════

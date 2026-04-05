@@ -177,7 +177,7 @@ const CSW_SIGNATURE: i64 = 0x53425355
 
     // Get BAR0 (MMIO)
     let bar0 = pci_read32(0, dev, 0, 0x10)
-    if bar0 & 1 != 0 { return -2 }
+    if (bar0 & 1) != 0 { return -2 }
     let base = bar0 & 0xFFFFF000
 
     // Map MMIO pages
@@ -199,17 +199,17 @@ const CSW_SIGNATURE: i64 = 0x53425355
 
     // Halt if running
     let usbsts = volatile_read_u32(op_base + 0x04)
-    if usbsts & 1 == 0 {
+    if (usbsts & 1) == 0 {
         let usbcmd = volatile_read_u32(op_base)
         volatile_write_u32(op_base, usbcmd & 0xFFFFFFFE)
         let mut wait: i64 = 100000
-        while volatile_read_u32(op_base + 0x04) & 1 == 0 && wait > 0 { pause(); wait = wait - 1 }
+        while (volatile_read_u32(op_base + 0x04) & 1) == 0 && wait > 0 { pause(); wait = wait - 1 }
     }
 
     // Reset controller
     volatile_write_u32(op_base, 0x02)
     let mut wait: i64 = 100000
-    while volatile_read_u32(op_base) & 0x02 != 0 && wait > 0 { pause(); wait = wait - 1 }
+    while (volatile_read_u32(op_base) & 0x02) != 0 && wait > 0 { pause(); wait = wait - 1 }
 
     // Check port status
     let port_base = op_base + 0x400
@@ -217,7 +217,7 @@ const CSW_SIGNATURE: i64 = 0x53425355
     let mut p: i64 = 0
     while p < max_ports {
         let portsc = volatile_read_u32(port_base + p * 0x10)
-        if portsc & 1 != 0 { connected = connected + 1 }
+        if (portsc & 1) != 0 { connected = connected + 1 }
         p = p + 1
     }
 
@@ -253,7 +253,7 @@ const CSW_SIGNATURE: i64 = 0x53425355
     let mut p: i64 = 0
     while p < max_ports {
         let portsc = volatile_read_u32(port_base + p * 0x10)
-        if portsc & 1 != 0 {
+        if (portsc & 1) != 0 {
             let speed = (portsc >> 10) & 0xF
             cprint("  Port ", WHITE_ON_BLACK)
             cprint_decimal(p + 1, CYAN_ON_BLACK)
@@ -342,7 +342,7 @@ const CSW_SIGNATURE: i64 = 0x53425355
     let usbcmd = volatile_read_u32(op_base)
     volatile_write_u32(op_base, usbcmd | 0x01 | 0x04)
     let mut wait: i64 = 100000
-    while volatile_read_u32(op_base + 0x04) & 1 != 0 && wait > 0 { pause(); wait = wait - 1 }
+    while (volatile_read_u32(op_base + 0x04) & 1) != 0 && wait > 0 { pause(); wait = wait - 1 }
 
     xhci_state_write(136, 0)
     delay_us(100000)
@@ -354,12 +354,12 @@ const CSW_SIGNATURE: i64 = 0x53425355
     let mut p: i64 = 0
     while p < max_ports {
         let portsc = volatile_read_u32(port_base + p * 0x10)
-        if portsc & 1 != 0 {
+        if (portsc & 1) != 0 {
             volatile_write_u32(port_base + p * 0x10, (portsc & 0x0E01C3E0) | (1 << 4))
             let mut rw: i64 = 100000
             while rw > 0 {
                 let ps = volatile_read_u32(port_base + p * 0x10)
-                if (ps >> 21) & 1 != 0 { rw = 0 }
+                if ((ps >> 21) & 1) != 0 { rw = 0 }
                 else { pause(); rw = rw - 1 }
             }
             let ps2 = volatile_read_u32(port_base + p * 0x10)
@@ -1173,7 +1173,7 @@ const CSW_SIGNATURE: i64 = 0x53425355
     let mut found_port: i64 = 0
     while port < max_ports && found_port == 0 {
         let portsc = volatile_read_u32(port_base + port * 0x10)
-        if portsc & 1 != 0 { port_speed = (portsc >> 10) & 0xF; found_port = port + 1 }
+        if (portsc & 1) != 0 { port_speed = (portsc >> 10) & 0xF; found_port = port + 1 }
         port = port + 1
     }
     if found_port == 0 { cprintln("  No connected port found", RED_ON_BLACK); return }

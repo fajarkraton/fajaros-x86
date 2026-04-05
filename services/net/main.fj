@@ -339,7 +339,7 @@ const SOCK_CLOSED: i64 = 4
     ipc_msg_clear(reply_buf)
     ipc_msg_set_header(reply_buf, NET_SVC_PID, MSG_NET_REPLY, 0)
     volatile_write_u64(reply_buf + 16, NET_EINVAL)
-    -1
+    return -1
 }
 
 // ═══════════════════════════════════════════════════════════════

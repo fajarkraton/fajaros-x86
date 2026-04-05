@@ -205,7 +205,7 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
     console_putchar(10, WHITE_ON_BLACK)
     let efer = rdmsr(0xC0000080)
     cprint("  EFER.SCE: ", WHITE_ON_BLACK)
-    if efer & 1 != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
+    if (efer & 1) != 0 { cprintln("ENABLED", GREEN_ON_BLACK) }
     else { cprintln("disabled", RED_ON_BLACK) }
     cprintln("  SYS_WRITE(1): serial output", WHITE_ON_BLACK)
     cprintln("  SYS_EXIT(60): halt", WHITE_ON_BLACK)

@@ -378,7 +378,7 @@ const CURSOR_PREV_Y: i64 = 0x927108
     ipc_msg_clear(reply_buf)
     ipc_msg_set_header(reply_buf, INPUT_SVC_PID, MSG_INPUT_REPLY, 0)
     volatile_write_u64(reply_buf + 16, -1)
-    -1
+    return -1
 }
 
 // ═══════════════════════════════════════════════════════════════

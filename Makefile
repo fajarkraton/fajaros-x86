@@ -1,15 +1,26 @@
-# FajarOS Nova v2.0.0 "Absolute" — Build System
+# FajarOS Nova v3.0 "Nusantara" — Build System
 # Target: x86_64-unknown-none (bare-metal)
 # Compiler: Fajar Lang (fj)
 # Strategy: concatenate modular .fj files → single combined.fj → compile
 
 # Paths
-FJ := fj
+FJ := /home/primecore/Documents/Fajar\ Lang/target/release/fj
 BUILD_DIR := build
 COMBINED := $(BUILD_DIR)/combined.fj
 KERNEL_ELF := $(BUILD_DIR)/fajaros.elf
+KERNEL_LLVM := $(BUILD_DIR)/fajaros-llvm.elf
+STARTUP_S := boot/startup.S
+STARTUP_O := $(BUILD_DIR)/startup.o
+RUNTIME_S := boot/runtime_stubs.S
+RUNTIME_O := $(BUILD_DIR)/runtime_stubs.o
+LINKER_LD := linker.ld
 ISO_FILE := $(BUILD_DIR)/fajaros.iso
 GRUB_CFG := grub.cfg
+
+# LLVM backend settings
+LLVM_OPT := 2
+LLVM_CPU := native
+LLVM_FEATURES := +avx2,+fma,+popcnt,+aes
 
 # Source files in concatenation order (dependencies first)
 # 1. Constants and low-level primitives
@@ -162,14 +173,15 @@ QEMU_SMP := -smp 4
 QEMU_NVME := -drive file=disk.img,if=none,id=nvme0 -device nvme,serial=fajaros,drive=nvme0 -boot d
 QEMU_NET := -netdev user,id=net0 -device virtio-net-pci,netdev=net0
 
-.PHONY: all build run run-kvm run-vga run-smp run-nvme run-net debug iso run-iso test clean help loc
+.PHONY: all build build-llvm build-llvm-custom run run-kvm run-vga run-smp run-nvme run-net \
+       run-llvm run-kvm-llvm debug debug-llvm iso run-iso test clean help loc
 
 all: build
 
 # Concatenate all source files into one combined file
 $(COMBINED): $(SOURCES)
 	@mkdir -p $(BUILD_DIR)
-	@echo "// FajarOS Nova v1.0.0 — Auto-generated from modular sources" > $(COMBINED)
+	@echo "// FajarOS Nova v3.0 — Auto-generated from modular sources" > $(COMBINED)
 	@echo "// DO NOT EDIT — edit individual .fj files instead" >> $(COMBINED)
 	@echo "" >> $(COMBINED)
 	@for f in $(SOURCES); do \
@@ -182,10 +194,48 @@ $(COMBINED): $(SOURCES)
 	done
 	@echo "[OK] Combined $(words $(SOURCES)) source files → $(COMBINED)"
 
-# Build kernel ELF from combined source
+# Build kernel ELF from combined source (Cranelift backend — fast compile)
 build: $(COMBINED)
 	$(FJ) build --target x86_64-none $(COMBINED) -o $(KERNEL_ELF)
 	@echo "[OK] Kernel built: $(KERNEL_ELF) ($(shell wc -l < $(COMBINED)) lines)"
+
+# Assemble runtime stubs for LLVM bare-metal builds
+$(RUNTIME_O): $(RUNTIME_S)
+	@mkdir -p $(BUILD_DIR)
+	as --64 -o $(RUNTIME_O) $(RUNTIME_S)
+	@echo "[OK] Assembled runtime stubs: $(RUNTIME_O)"
+
+# Build kernel with LLVM backend (optimized, uses hardware features)
+# Auto-generates startup.S + linker script internally
+build-llvm: $(COMBINED) $(RUNTIME_O)
+	$(FJ) build --no-std --backend llvm \
+		--opt-level $(LLVM_OPT) \
+		--target-cpu $(LLVM_CPU) \
+		--target-features "$(LLVM_FEATURES)" \
+		--linker-script $(LINKER_LD) \
+		--code-model kernel \
+		--reloc static \
+		--extra-objects $(RUNTIME_O) \
+		$(COMBINED) -o $(KERNEL_LLVM)
+	@echo "[OK] LLVM kernel built: $(KERNEL_LLVM) (O$(LLVM_OPT), $(LLVM_CPU))"
+	@size $(KERNEL_LLVM) 2>/dev/null || true
+
+# Build with custom startup.S (manual link — for advanced use)
+$(STARTUP_O): $(STARTUP_S)
+	@mkdir -p $(BUILD_DIR)
+	as --64 -o $(STARTUP_O) $(STARTUP_S)
+	@echo "[OK] Assembled: $(STARTUP_O)"
+
+build-llvm-custom: $(COMBINED) $(STARTUP_O)
+	$(FJ) build --no-std --backend llvm \
+		--opt-level $(LLVM_OPT) \
+		--target-cpu $(LLVM_CPU) \
+		--target-features "$(LLVM_FEATURES)" \
+		--linker-script $(LINKER_LD) \
+		--code-model kernel \
+		--reloc static \
+		$(COMBINED) -o $(KERNEL_LLVM)
+	@echo "[OK] LLVM kernel (custom startup): $(KERNEL_LLVM)"
 
 # Run in QEMU (serial only, no graphics)
 run: build
@@ -212,10 +262,31 @@ run-nvme: build
 run-net: build
 	$(QEMU) -kernel $(KERNEL_ELF) $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_KVM) $(QEMU_NET) -nographic
 
-# Debug with GDB
+# --- LLVM backend run targets ---
+
+# Run LLVM kernel in QEMU (serial, no KVM)
+run-llvm: build-llvm
+	$(QEMU) -kernel $(KERNEL_LLVM) $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_CPU) -nographic
+
+# Run LLVM kernel with KVM (near-native speed, real CPU features)
+run-kvm-llvm: build-llvm
+	$(QEMU) -kernel $(KERNEL_LLVM) $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_KVM) -nographic
+
+# Run LLVM kernel with KVM + SMP (4 cores)
+run-smp-llvm: build-llvm
+	$(QEMU) -kernel $(KERNEL_LLVM) $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_KVM) $(QEMU_SMP) -nographic
+
+# Debug with GDB (Cranelift)
 debug: build
 	@echo "GDB: target remote :1234 -ex 'symbol-file $(KERNEL_ELF)'"
 	$(QEMU) -kernel $(KERNEL_ELF) $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_CPU) -s -S -nographic
+
+# Debug LLVM kernel with GDB
+debug-llvm: build-llvm
+	@echo "GDB: target remote :1234 -ex 'symbol-file $(KERNEL_LLVM)'"
+	@echo "  break kernel_main"
+	@echo "  continue"
+	$(QEMU) -kernel $(KERNEL_LLVM) $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_CPU) -s -S -nographic
 
 # Create bootable ISO with GRUB2
 iso: build
@@ -307,19 +378,28 @@ clean:
 
 # Show help
 help:
-	@echo "FajarOS Nova v1.0.0 — Build Targets"
+	@echo "FajarOS Nova v3.0 \"Nusantara\" — Build Targets"
 	@echo ""
-	@echo "  make build     Concatenate + compile kernel ELF"
-	@echo "  make run       Run in QEMU (serial, no KVM)"
-	@echo "  make run-kvm   Run with KVM acceleration"
-	@echo "  make run-vga   Run with VGA display"
-	@echo "  make run-smp   Run with 4 CPU cores"
-	@echo "  make run-nvme  Run with NVMe storage"
-	@echo "  make run-net   Run with networking"
-	@echo "  make debug     Run with GDB server (:1234)"
-	@echo "  make iso       Create bootable GRUB2 ISO"
-	@echo "  make test      Run tests in QEMU"
-	@echo "  make loc       Count lines of code"
-	@echo "  make micro     Build microkernel core only (Ring 0)"
-	@echo "  make micro-loc Microkernel LOC breakdown"
-	@echo "  make clean     Remove build artifacts"
+	@echo "  Cranelift (fast compile):"
+	@echo "  make build           Concatenate + compile kernel ELF"
+	@echo "  make run             Run in QEMU (serial, no KVM)"
+	@echo "  make run-kvm         Run with KVM acceleration"
+	@echo "  make run-vga         Run with VGA display"
+	@echo "  make run-smp         Run with 4 CPU cores"
+	@echo "  make run-nvme        Run with NVMe storage"
+	@echo "  make run-net         Run with networking"
+	@echo "  make debug           Run with GDB server (:1234)"
+	@echo ""
+	@echo "  LLVM (optimized, AVX2/AES/FMA):"
+	@echo "  make build-llvm      LLVM O2 kernel with hardware features"
+	@echo "  make run-llvm        Run LLVM kernel in QEMU"
+	@echo "  make run-kvm-llvm    Run LLVM kernel with KVM (near-native)"
+	@echo "  make run-smp-llvm    Run LLVM kernel with KVM + 4 cores"
+	@echo "  make debug-llvm      Debug LLVM kernel with GDB"
+	@echo ""
+	@echo "  Other:"
+	@echo "  make iso             Create bootable GRUB2 ISO"
+	@echo "  make test            Run tests in QEMU"
+	@echo "  make loc             Count lines of code"
+	@echo "  make micro           Build microkernel core only (Ring 0)"
+	@echo "  make clean           Remove build artifacts"

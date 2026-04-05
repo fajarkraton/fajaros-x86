@@ -44,6 +44,9 @@ const PIPE_MAX: i64 = 8
     -1
 }
 
+// Alias for pipe_create (used by forkbomb stress tests)
+@kernel fn pipe_alloc() -> i64 { pipe_create() }
+
 @kernel fn pipe_write(slot: i64, data: i64, len: i64) -> i64 {
     let pipe_base = PIPE_POOL + slot * 4096
     let write_pos = volatile_read_u64(pipe_base + 16)

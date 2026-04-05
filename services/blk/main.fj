@@ -397,7 +397,7 @@ const BLK_CACHE_ENTRY_SIZE: i64 = 544  // 32 meta + 512 data
     ipc_msg_clear(reply_buf)
     ipc_msg_set_header(reply_buf, BLK_SVC_PID, MSG_BLK_REPLY, 0)
     volatile_write_u64(reply_buf + 16, BLK_EINVAL)
-    -1
+    return -1
 }
 
 // ═══════════════════════════════════════════════════════════════

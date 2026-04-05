@@ -45,7 +45,7 @@ const EFER_SVME: i64 = 4096   // Bit 12: SVM Enable (AMD)
     // We use inline asm to implement this.
     // Template: "rdmsr; shlq $32, %rdx; orq %rdx, %rax"
     // Input: ECX = index, Output: RAX = combined 64-bit value
-    asm("rdmsr\n\tshlq $$32, %%rdx\n\torq %%rdx, %%rax",
+    asm("rdmsr\n\tshlq $$32, %rdx\n\torq %rdx, %rax",
         in("ecx") index,
         out("rax") -> i64,
         clobber("rdx"),
@@ -63,6 +63,11 @@ const EFER_SVME: i64 = 4096   // Bit 12: SVM Enable (AMD)
         in("edx") hi,
         volatile)
 }
+
+// ── Aliases (legacy compatibility) ──
+
+@kernel fn read_msr(index: i64) -> i64 { rdmsr(index) }
+@kernel fn write_msr(index: i64, value: i64) { wrmsr(index, value) }
 
 // ── Convenience functions ──
 

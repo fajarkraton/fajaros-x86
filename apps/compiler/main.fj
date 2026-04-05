@@ -227,7 +227,7 @@ const FJC_PARSE_POS: i64 = 0x940028  // Current token index
 @kernel fn fjc_expect(ttype: i64) -> i64 {
     if fjc_peek() == ttype { return fjc_advance() }
     volatile_write_u64(FJC_ERR_COUNT, volatile_read_u64(FJC_ERR_COUNT) + 1)
-    -1
+    return -1
 }
 
 @kernel fn fjc_parse_int_from_token(tok_idx: i64) -> i64 {

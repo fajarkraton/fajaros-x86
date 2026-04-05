@@ -48,6 +48,21 @@ const SIG_IGN: i64 = 1
 
 @kernel fn sig_entry_addr(pid: i64) -> i64 { SIGNAL_TABLE + pid * SIG_ENTRY_SIZE }
 
+@kernel fn signal_get_handler(pid: i64, signum: i64) -> i64 {
+    let slot = sig_to_slot(signum)
+    if slot < 0 { return SIG_DFL }
+    let base = sig_entry_addr(pid)
+    volatile_read_u64(base + SIG_OFF_HANDLERS + slot * 8)
+}
+
+@kernel fn signal_set_handler(pid: i64, signum: i64, handler: i64) {
+    let slot = sig_to_slot(signum)
+    if slot < 0 { return }
+    if signum == SIGKILL || signum == SIGSTOP { return }
+    let base = sig_entry_addr(pid)
+    volatile_write_u64(base + SIG_OFF_HANDLERS + slot * 8, handler)
+}
+
 @kernel fn sig_init(pid: i64) {
     let base = sig_entry_addr(pid)
     volatile_write_u64(base + SIG_OFF_PENDING, 0)

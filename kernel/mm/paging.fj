@@ -155,3 +155,25 @@ const PAGE_NX: i64 = -9223372036854775808  // Bit 63 = 0x8000000000000000 (i64 m
         addr = addr + 0x200000  // 2MB per PD entry
     }
 }
+
+// Clone the kernel PML4: allocate a new PML4 frame and copy kernel entries
+// Returns physical address of new PML4, or -1 on failure
+@kernel fn clone_kernel_pml4() -> i64 {
+    let frame = frame_alloc()
+    if frame == -1 { return -1 }
+    let new_pml4 = frame * FRAME_SIZE
+    // Zero the new PML4
+    let mut i: i64 = 0
+    while i < 4096 { volatile_write_u8(new_pml4 + i, 0); i = i + 1 }
+    // Copy kernel-space entries (upper half: indices 256..511)
+    let mut idx: i64 = 256
+    while idx < 512 {
+        let entry = page_table_entry(PML4_BASE, idx)
+        if entry != 0 { page_table_set(new_pml4, idx, entry) }
+        idx = idx + 1
+    }
+    // Also copy low identity-mapped entries used by kernel (index 0)
+    let entry0 = page_table_entry(PML4_BASE, 0)
+    if entry0 != 0 { page_table_set(new_pml4, 0, entry0) }
+    new_pml4
+}

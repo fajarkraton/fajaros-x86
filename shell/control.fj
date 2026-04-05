@@ -124,7 +124,7 @@ const SMODE_WHILE: i64 = 3
         let ct = volatile_read_u64(SCRIPT_STATE + 16)
         let ie = volatile_read_u64(SCRIPT_STATE + 24)
         let should = (ct == 1 && ie == 0) || (ct == 0 && ie == 1)
-        if should == 1 { shell_exec_from_buf(line, line_len) }
+        if should { shell_exec_from_buf(line, line_len) }
         return
     }
     if mode == SMODE_FOR || mode == SMODE_WHILE {

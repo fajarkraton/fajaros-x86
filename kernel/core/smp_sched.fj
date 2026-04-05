@@ -186,7 +186,7 @@ const SMP_TICK_COUNTER: i64 = 0x8F42C0 // tick counter at end of SMP region (4×
         prio = prio - 1
     }
     smp_cpu_unlock(cpu_id)
-    -1
+    return -1
 }
 
 // ═══════════════════════════════════════════════════

@@ -28,3 +28,13 @@
     shutdown_services_v2()
     cprintln("[INIT] System halted", RED_ON_BLACK)
 }
+
+// Clean shutdown: stop services, sync filesystem, then power off
+@kernel fn shutdown_clean() {
+    cprintln("Clean shutdown...", YELLOW_ON_BLACK)
+    shutdown_services_v2()
+    cprintln("[INIT] Powering off", RED_ON_BLACK)
+    acpi_poweroff()
+    // If ACPI poweroff fails, halt the CPU
+    while 1 == 1 { hlt() }
+}

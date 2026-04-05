@@ -129,7 +129,7 @@ const USER_HEAP_BASE: i64 = 0x2800000
     if num == SYS_NOTIFY { return ipc2_notify_checked(arg0, arg1) }
     // GPU compute (v1.4.0 Zenith)
     if num == SYS_GPU_ALLOC { return sys_gpu_alloc(arg0, arg1, arg2) }
-    if num == SYS_GPU_DISPATCH { return sys_gpu_dispatch(arg0, arg1, arg2) }
+    if num == SYS_GPU_DISPATCH { return sys_gpu_dispatch(arg0, arg1, arg2, 0) }
     -1
 }
 

@@ -95,6 +95,31 @@ const FS_ENTRY_SIZE: i64 = 128
     -1
 }
 
+// Find file in ramfs by name stored at memory address (null-terminated)
+@kernel fn ramfs_find_by_addr(name_addr: i64) -> i64 {
+    let count = volatile_read(FS_BASE)
+    let mut i: i64 = 0
+    while i < count {
+        let addr = ramfs_entry_addr(i)
+        let mut match_ok: i64 = 1
+        let mut j: i64 = 0
+        while j < 31 && match_ok == 1 {
+            let a = volatile_read_u8(addr + j)
+            let b = volatile_read_u8(name_addr + j)
+            if a != b { match_ok = 0 }
+            if a == 0 && b == 0 { return i }
+            if a == 0 || b == 0 { match_ok = 0 }
+            j = j + 1
+        }
+        if match_ok == 1 { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// Alias: ramfs_find_at (same as ramfs_find_by_addr, used by ramfs_create_at etc.)
+@kernel fn ramfs_find_at(name_addr: i64) -> i64 { ramfs_find_by_addr(name_addr) }
+
 // Write arbitrary data from memory address to a ramfs file (by index)
 @kernel fn ramfs_write_at(index: i64, data_addr: i64, dlen: i64) -> i64 {
     if index < 0 || index >= volatile_read(FS_BASE) { return -1 }

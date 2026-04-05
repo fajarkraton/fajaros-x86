@@ -15,7 +15,7 @@ const VMA_FLAG_ANON: i64 = 1
 @kernel fn sys_mmap_v2(addr: i64, len: i64, prot: i64, flags: i64) -> i64 {
     let pages = (len + FRAME_SIZE - 1) / FRAME_SIZE
     let base = if addr != 0 { addr } else { USER_HEAP_BASE + 0x100000 + vm_aslr_offset() }
-    if flags & VMA_FLAG_ANON != 0 {
+    if (flags & VMA_FLAG_ANON) != 0 {
         let mut pg: i64 = 0
         while pg < pages { vm_lazy_map(base + pg * FRAME_SIZE, prot); pg = pg + 1 }
     } else {

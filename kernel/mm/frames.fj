@@ -94,7 +94,7 @@ const BITMAP_SIZE: i64 = 4096
     // Bit Scan Forward: find index of lowest set bit (0-63), or -1 if zero.
     // Uses x86 BSF instruction via inline asm.
     if value == 0 { return -1 }
-    asm("bsfq %1, %0",
+    asm("bsfq $1, $0",
         in("r") value,
         out("r") -> i64,
         volatile)
@@ -102,7 +102,7 @@ const BITMAP_SIZE: i64 = 4096
 
 @kernel fn popcnt(value: i64) -> i64 {
     // Population count: number of set bits.
-    asm("popcntq %1, %0",
+    asm("popcntq $1, $0",
         in("r") value,
         out("r") -> i64,
         volatile)

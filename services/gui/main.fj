@@ -429,7 +429,7 @@ const WIN_FOCUS: i64 = 0x92A000   // Currently focused window id
     ipc_msg_clear(reply_buf)
     ipc_msg_set_header(reply_buf, GUI_SVC_PID, MSG_GUI_REPLY, 0)
     volatile_write_u64(reply_buf + 16, -1)
-    -1
+    return -1
 }
 
 // ═══════════════════════════════════════════════════════════════

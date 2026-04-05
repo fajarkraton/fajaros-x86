@@ -105,6 +105,16 @@
     }
 }
 
+@kernel fn cprintln_decimal(val: i64, color: i64) {
+    cprint_decimal(val, color)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn cprintln_hex(val: i64, digits: i64, color: i64) {
+    cprint_hex(val, digits, color)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
 @kernel fn vga_update_cursor() {
     let row = volatile_read(0x6FA00)
     let col = volatile_read(0x6FA08)

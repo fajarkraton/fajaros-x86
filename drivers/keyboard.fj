@@ -17,6 +17,19 @@ const KB_BUFFER: i64 = 0x892000  // 256-byte ring buffer
     frame_mark_used(KB_BUFFER / FRAME_SIZE)
 }
 
+@kernel fn kb_has_data() -> i64 {
+    let head = volatile_read_u64(KB_BUFFER)
+    let tail = volatile_read_u64(KB_BUFFER + 8)
+    if head != tail { 1 } else { 0 }
+}
+
+@kernel fn kb_read_scancode() -> i64 {
+    // Read scancode from PS/2 keyboard status/data ports
+    let status = port_inb(KB_STATUS_PORT)
+    if (status & 1) == 0 { return -1 }
+    port_inb(KB_DATA_PORT)
+}
+
 @kernel fn kb_push_char(ch: i64) {
     let tail = volatile_read_u64(KB_BUFFER + 8)
     let new_tail = (tail + 1) % 256

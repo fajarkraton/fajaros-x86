@@ -244,7 +244,7 @@ const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
                      volatile_read_u8(name_addr + 4) == 105 && // i
                      volatile_read_u8(name_addr + 5) == 111 && // o
                      volatile_read_u8(name_addr + 6) == 110    // n
-    if is_version == 1 {
+    if is_version {
         // "FajarOS Nova v2.0 Microkernel\n"
         let ver: i64 = buf
         volatile_write_u8(ver, 70)    // F
@@ -275,7 +275,7 @@ const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
                     volatile_read_u8(name_addr + 3) == 105 &&  // i
                     volatile_read_u8(name_addr + 4) == 109 &&  // m
                     volatile_read_u8(name_addr + 5) == 101     // e
-    if is_uptime == 1 {
+    if is_uptime {
         let ticks = read_timer_ticks()
         let secs = ticks / 100
         // Write seconds as decimal
@@ -294,7 +294,7 @@ const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
     let is_cpuinfo = volatile_read_u8(name_addr) == 99 &&     // c
                      volatile_read_u8(name_addr + 1) == 112 && // p
                      volatile_read_u8(name_addr + 2) == 117    // u
-    if is_cpuinfo == 1 {
+    if is_cpuinfo {
         // "x86_64\n"
         volatile_write_u8(buf, 120)    // x
         volatile_write_u8(buf+1, 56)   // 8
@@ -310,7 +310,7 @@ const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
     let is_meminfo = volatile_read_u8(name_addr) == 109 &&    // m
                      volatile_read_u8(name_addr + 1) == 101 && // e
                      volatile_read_u8(name_addr + 2) == 109    // m
-    if is_meminfo == 1 {
+    if is_meminfo {
         let used = frame_stats_used()
         let free = TOTAL_FRAMES - used
         // Write "used:XXXX free:XXXX\n"
@@ -730,34 +730,13 @@ const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
     ipc_msg_clear(reply_buf)
     ipc_msg_set_header(reply_buf, VFS_PID, MSG_VFS_REPLY, 0)
     volatile_write_u64(reply_buf + 16, VFS_EINVAL)
-    -1
+    return -1
 }
 
 // ═══════════════════════════════════════════════════════════════
 // RamFS lookup helper (by address, not string literal)
+// NOTE: ramfs_find_at and ramfs_find_by_addr are defined in fs/ramfs.fj
 // ═══════════════════════════════════════════════════════════════
-
-@kernel fn ramfs_find_at(name_addr: i64) -> i64 {
-    // Find file in ramfs by name at memory address
-    let count = volatile_read(FS_BASE)
-    let mut i: i64 = 0
-    while i < count {
-        let addr = ramfs_entry_addr(i)
-        let mut match_ok: i64 = 1
-        let mut j: i64 = 0
-        while j < 31 && match_ok == 1 {
-            let a = volatile_read_u8(addr + j)
-            let b = volatile_read_u8(name_addr + j)
-            if a != b { match_ok = 0 }
-            if a == 0 && b == 0 { return i }  // Both null = match
-            if a == 0 || b == 0 { match_ok = 0 }  // One null = mismatch
-            j = j + 1
-        }
-        if match_ok == 1 { return i }
-        i = i + 1
-    }
-    -1
-}
 
 // ═══════════════════════════════════════════════════════════════
 // VFS Service Test Commands
