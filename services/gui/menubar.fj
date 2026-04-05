@@ -1,0 +1,249 @@
+// FajarOS Nova v3.0 "Nusantara" — Menubar
+// 24px top bar: "FajarOS  File  Edit  View" + clock on right.
+// Handles menu item hit testing and clock updates.
+
+// ═══════════════════════════════════════════════════════════════
+// Menubar State — at MENUBAR_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const MENUBAR_BASE: i64 = 0x97A000
+const MENUBAR_HEIGHT: i64 = 24
+
+// State layout (256 bytes):
+//   +0:   initialized (0/1)
+//   +8:   visible (0/1)
+//   +16:  active_menu (-1=none, 0-3=which menu open)
+//   +24:  clock_hours
+//   +32:  clock_minutes
+//   +40:  clock_seconds
+//   +48:  clock_ticks (raw counter for time estimation)
+//   +56:  menu_count (number of top-level menus)
+//   +64:  item_count_0 (items in menu 0)
+//   +72:  item_count_1 (items in menu 1)
+//   +80:  item_count_2 (items in menu 2)
+//   +88:  item_count_3 (items in menu 3)
+//   +96:  highlight_item (-1=none, index of highlighted submenu item)
+
+const MB_INIT: i64 = 0
+const MB_VISIBLE: i64 = 8
+const MB_ACTIVE: i64 = 16
+const MB_CLOCK_H: i64 = 24
+const MB_CLOCK_M: i64 = 32
+const MB_CLOCK_S: i64 = 40
+const MB_CLOCK_TICKS: i64 = 48
+const MB_MENU_COUNT: i64 = 56
+const MB_ITEMS_0: i64 = 64
+const MB_ITEMS_1: i64 = 72
+const MB_ITEMS_2: i64 = 80
+const MB_ITEMS_3: i64 = 88
+const MB_HIGHLIGHT: i64 = 96
+
+// Menu item positions (x coordinates for each top-level menu)
+// "FajarOS" at 8, "File" at 80, "Edit" at 130, "View" at 180
+const MB_MENU_X0: i64 = 8
+const MB_MENU_X1: i64 = 80
+const MB_MENU_X2: i64 = 130
+const MB_MENU_X3: i64 = 180
+const MB_MENU_ITEM_W: i64 = 50
+const MB_APPLE_W: i64 = 60
+
+// Colors
+const MB_COLOR_BG: i64 = 0x1A1A2E
+const MB_COLOR_ACTIVE: i64 = 0x313244
+const MB_COLOR_TEXT: i64 = 0xCDD6F4
+const MB_COLOR_DIM: i64 = 0x6C7086
+const MB_COLOR_ACCENT: i64 = 0x89B4FA
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn menubar_init() {
+    let mut i: i64 = 0
+    while i < 256 {
+        volatile_write_u64(MENUBAR_BASE + i, 0)
+        i = i + 8
+    }
+    volatile_write_u64(MENUBAR_BASE + MB_VISIBLE, 1)
+    volatile_write_u64(MENUBAR_BASE + MB_ACTIVE, -1)
+    volatile_write_u64(MENUBAR_BASE + MB_HIGHLIGHT, -1)
+    volatile_write_u64(MENUBAR_BASE + MB_MENU_COUNT, 4)
+    // File menu: 4 items (New, Open, Save, Close)
+    volatile_write_u64(MENUBAR_BASE + MB_ITEMS_0, 4)
+    // Edit menu: 3 items (Cut, Copy, Paste)
+    volatile_write_u64(MENUBAR_BASE + MB_ITEMS_1, 3)
+    // View menu: 3 items (Tile, Fullscreen, Desktop)
+    volatile_write_u64(MENUBAR_BASE + MB_ITEMS_2, 3)
+    // FajarOS menu: 2 items (About, Settings)
+    volatile_write_u64(MENUBAR_BASE + MB_ITEMS_3, 2)
+    // Set clock to 00:00:00
+    volatile_write_u64(MENUBAR_BASE + MB_CLOCK_H, 0)
+    volatile_write_u64(MENUBAR_BASE + MB_CLOCK_M, 0)
+    volatile_write_u64(MENUBAR_BASE + MB_CLOCK_S, 0)
+    volatile_write_u64(MENUBAR_BASE + MB_INIT, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Clock — tick-based time estimation
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn menubar_clock_update() {
+    let ticks = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_TICKS) + 1
+    volatile_write_u64(MENUBAR_BASE + MB_CLOCK_TICKS, ticks)
+
+    // Assume ~100 ticks per second (timer interrupt rate)
+    if ticks >= 100 {
+        volatile_write_u64(MENUBAR_BASE + MB_CLOCK_TICKS, 0)
+        let s = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_S) + 1
+        if s >= 60 {
+            volatile_write_u64(MENUBAR_BASE + MB_CLOCK_S, 0)
+            let m = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_M) + 1
+            if m >= 60 {
+                volatile_write_u64(MENUBAR_BASE + MB_CLOCK_M, 0)
+                let h = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_H) + 1
+                if h >= 24 { volatile_write_u64(MENUBAR_BASE + MB_CLOCK_H, 0) }
+                else { volatile_write_u64(MENUBAR_BASE + MB_CLOCK_H, h) }
+            } else {
+                volatile_write_u64(MENUBAR_BASE + MB_CLOCK_M, m)
+            }
+        } else {
+            volatile_write_u64(MENUBAR_BASE + MB_CLOCK_S, s)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn menubar_draw() {
+    if volatile_read_u64(MENUBAR_BASE + MB_VISIBLE) == 0 { return }
+
+    let sw = fb_state_read(FB_WIDTH)
+    let active = volatile_read_u64(MENUBAR_BASE + MB_ACTIVE)
+
+    // Background bar
+    fb_fill_rect(0, 0, sw, MENUBAR_HEIGHT, MB_COLOR_BG)
+
+    // Bottom separator
+    fb_draw_hline(0, MENUBAR_HEIGHT - 1, sw, 0x313244)
+
+    // "FajarOS" (bold/accent)
+    let label0: i64 = 0x97A200
+    volatile_write_u8(label0, 70)      // F
+    volatile_write_u8(label0 + 1, 97)  // a
+    volatile_write_u8(label0 + 2, 106) // j
+    volatile_write_u8(label0 + 3, 97)  // a
+    volatile_write_u8(label0 + 4, 114) // r
+    volatile_write_u8(label0 + 5, 79)  // O
+    volatile_write_u8(label0 + 6, 83)  // S
+    volatile_write_u8(label0 + 7, 0)
+    if active == 0 { fb_fill_rect(MB_MENU_X0 - 4, 0, MB_APPLE_W, MENUBAR_HEIGHT, MB_COLOR_ACTIVE) }
+    fb_draw_string(MB_MENU_X0, 4, label0, MB_COLOR_ACCENT, MB_COLOR_BG)
+
+    // "File"
+    let label1: i64 = 0x97A210
+    volatile_write_u8(label1, 70)      // F
+    volatile_write_u8(label1 + 1, 105) // i
+    volatile_write_u8(label1 + 2, 108) // l
+    volatile_write_u8(label1 + 3, 101) // e
+    volatile_write_u8(label1 + 4, 0)
+    if active == 1 { fb_fill_rect(MB_MENU_X1 - 4, 0, MB_MENU_ITEM_W, MENUBAR_HEIGHT, MB_COLOR_ACTIVE) }
+    fb_draw_string(MB_MENU_X1, 4, label1, MB_COLOR_TEXT, MB_COLOR_BG)
+
+    // "Edit"
+    let label2: i64 = 0x97A220
+    volatile_write_u8(label2, 69)      // E
+    volatile_write_u8(label2 + 1, 100) // d
+    volatile_write_u8(label2 + 2, 105) // i
+    volatile_write_u8(label2 + 3, 116) // t
+    volatile_write_u8(label2 + 4, 0)
+    if active == 2 { fb_fill_rect(MB_MENU_X2 - 4, 0, MB_MENU_ITEM_W, MENUBAR_HEIGHT, MB_COLOR_ACTIVE) }
+    fb_draw_string(MB_MENU_X2, 4, label2, MB_COLOR_TEXT, MB_COLOR_BG)
+
+    // "View"
+    let label3: i64 = 0x97A230
+    volatile_write_u8(label3, 86)      // V
+    volatile_write_u8(label3 + 1, 105) // i
+    volatile_write_u8(label3 + 2, 101) // e
+    volatile_write_u8(label3 + 3, 119) // w
+    volatile_write_u8(label3 + 4, 0)
+    if active == 3 { fb_fill_rect(MB_MENU_X3 - 4, 0, MB_MENU_ITEM_W, MENUBAR_HEIGHT, MB_COLOR_ACTIVE) }
+    fb_draw_string(MB_MENU_X3, 4, label3, MB_COLOR_TEXT, MB_COLOR_BG)
+
+    // Clock (right side): "HH:MM"
+    let h = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_H)
+    let m = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_M)
+    let clock_buf: i64 = 0x97A240
+    volatile_write_u8(clock_buf, 48 + h / 10)
+    volatile_write_u8(clock_buf + 1, 48 + h - (h / 10) * 10)
+    volatile_write_u8(clock_buf + 2, 58)  // ':'
+    volatile_write_u8(clock_buf + 3, 48 + m / 10)
+    volatile_write_u8(clock_buf + 4, 48 + m - (m / 10) * 10)
+    volatile_write_u8(clock_buf + 5, 0)
+    let clock_x = sw - 60
+    fb_draw_string(clock_x, 4, clock_buf, MB_COLOR_DIM, MB_COLOR_BG)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Hit Testing
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn menubar_hit_test(mx: i64, my: i64) -> i64 {
+    if my < 0 || my >= MENUBAR_HEIGHT { return -1 }
+    // FajarOS menu
+    if mx >= MB_MENU_X0 - 4 && mx < MB_MENU_X0 + MB_APPLE_W { return 0 }
+    // File menu
+    if mx >= MB_MENU_X1 - 4 && mx < MB_MENU_X1 + MB_MENU_ITEM_W { return 1 }
+    // Edit menu
+    if mx >= MB_MENU_X2 - 4 && mx < MB_MENU_X2 + MB_MENU_ITEM_W { return 2 }
+    // View menu
+    if mx >= MB_MENU_X3 - 4 && mx < MB_MENU_X3 + MB_MENU_ITEM_W { return 3 }
+    -1
+}
+
+@kernel fn menubar_activate(menu: i64) {
+    volatile_write_u64(MENUBAR_BASE + MB_ACTIVE, menu)
+    volatile_write_u64(MENUBAR_BASE + MB_HIGHLIGHT, -1)
+}
+
+@kernel fn menubar_deactivate() {
+    volatile_write_u64(MENUBAR_BASE + MB_ACTIVE, -1)
+    volatile_write_u64(MENUBAR_BASE + MB_HIGHLIGHT, -1)
+}
+
+// ═════════════════════════════════════════════════════════════���═
+// Shell Command
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_menubar() {
+    cprintln("=== Menubar ===", YELLOW_ON_BLACK)
+    if volatile_read_u64(MENUBAR_BASE + MB_INIT) == 0 {
+        menubar_init()
+    }
+    cprint("  Status: ", WHITE_ON_BLACK)
+    if volatile_read_u64(MENUBAR_BASE + MB_VISIBLE) != 0 { cprintln("visible", GREEN_ON_BLACK) }
+    else { cprintln("hidden", YELLOW_ON_BLACK) }
+    cprint("  Menus:  FajarOS(", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(MENUBAR_BASE + MB_ITEMS_3), CYAN_ON_BLACK)
+    cprint(") File(", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(MENUBAR_BASE + MB_ITEMS_0), CYAN_ON_BLACK)
+    cprint(") Edit(", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(MENUBAR_BASE + MB_ITEMS_1), CYAN_ON_BLACK)
+    cprint(") View(", WHITE_ON_BLACK)
+    cprint_decimal(volatile_read_u64(MENUBAR_BASE + MB_ITEMS_2), CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+    cprint("  Clock:  ", WHITE_ON_BLACK)
+    let h = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_H)
+    let m = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_M)
+    let s = volatile_read_u64(MENUBAR_BASE + MB_CLOCK_S)
+    cprint_decimal(h, CYAN_ON_BLACK)
+    cprint(":", WHITE_ON_BLACK)
+    cprint_decimal(m, CYAN_ON_BLACK)
+    cprint(":", WHITE_ON_BLACK)
+    cprintln_decimal(s, CYAN_ON_BLACK)
+    cprint("  Active: ", WHITE_ON_BLACK)
+    let active = volatile_read_u64(MENUBAR_BASE + MB_ACTIVE)
+    if active == -1 { cprintln("none", WHITE_ON_BLACK) }
+    else { cprintln_decimal(active, CYAN_ON_BLACK) }
+}

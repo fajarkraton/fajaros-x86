@@ -1,0 +1,303 @@
+// FajarOS Nova v3.0 "Nusantara" — File Manager (Dual-Pane Browser)
+// Browse ramfs directory listing, navigate, select entries.
+// Uses compositor windows and framebuffer rendering.
+
+// ═══════════════════════════════════════════════════════════════
+// File Manager State — at FMGR_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const FMGR_BASE: i64 = 0x970000
+// State layout (256 bytes):
+//   +0:  initialized (0/1)
+//   +8:  current_dir (0=root, index into ramfs)
+//   +16: selected_index (highlighted entry)
+//   +24: entry_count (files in current view)
+//   +32: scroll_offset (first visible entry)
+//   +40: win_id (compositor window ID, -1=none)
+//   +48: pane (0=left, 1=right)
+//   +56: left_dir_index (dir index for left pane)
+//   +64: right_dir_index (dir index for right pane)
+//   +72: left_selected
+//   +80: right_selected
+//   +88: left_count
+//   +96: right_count
+//   +104: view_mode (0=list, 1=detail)
+//   +112: sort_mode (0=name, 1=size, 2=type)
+
+const FMGR_INIT: i64 = 0
+const FMGR_CUR_DIR: i64 = 8
+const FMGR_SELECTED: i64 = 16
+const FMGR_ENTRY_COUNT: i64 = 24
+const FMGR_SCROLL: i64 = 32
+const FMGR_WIN_ID: i64 = 40
+const FMGR_PANE: i64 = 48
+const FMGR_LEFT_DIR: i64 = 56
+const FMGR_RIGHT_DIR: i64 = 64
+const FMGR_LEFT_SEL: i64 = 72
+const FMGR_RIGHT_SEL: i64 = 80
+const FMGR_LEFT_COUNT: i64 = 88
+const FMGR_RIGHT_COUNT: i64 = 96
+const FMGR_VIEW_MODE: i64 = 104
+const FMGR_SORT_MODE: i64 = 112
+
+// Entry cache: up to 32 entries × 64 bytes at FMGR_BASE + 0x200
+const FMGR_CACHE: i64 = 0x970200
+const FMGR_CACHE_MAX: i64 = 32
+const FMGR_CACHE_ENTRY_SIZE: i64 = 64
+// Per cache entry: +0: ramfs_index(8), +8: type(8), +16: size(8), +24: name[32]
+
+// Drawing constants
+const FMGR_ROW_HEIGHT: i64 = 18
+const FMGR_HEADER_HEIGHT: i64 = 24
+const FMGR_VISIBLE_ROWS: i64 = 20
+const FMGR_PANE_DIVIDER: i64 = 2
+
+// Colors
+const FMGR_COLOR_BG: i64 = 0x1E1E2E
+const FMGR_COLOR_HEADER: i64 = 0x313244
+const FMGR_COLOR_SELECTED: i64 = 0x45475A
+const FMGR_COLOR_DIR: i64 = 0x89B4FA
+const FMGR_COLOR_FILE: i64 = 0xCDD6F4
+const FMGR_COLOR_SIZE: i64 = 0x6C7086
+const FMGR_COLOR_DIVIDER: i64 = 0x585B70
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn fmgr_read(off: i64) -> i64 { volatile_read_u64(FMGR_BASE + off) }
+@kernel fn fmgr_write(off: i64, val: i64) { volatile_write_u64(FMGR_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn filemgr_init() {
+    let mut i: i64 = 0
+    while i < 256 {
+        volatile_write_u64(FMGR_BASE + i, 0)
+        i = i + 8
+    }
+    // Clear cache
+    i = 0
+    while i < FMGR_CACHE_MAX * FMGR_CACHE_ENTRY_SIZE {
+        volatile_write_u8(FMGR_CACHE + i, 0)
+        i = i + 1
+    }
+    fmgr_write(FMGR_CUR_DIR, 0)
+    fmgr_write(FMGR_SELECTED, 0)
+    fmgr_write(FMGR_WIN_ID, -1)
+    fmgr_write(FMGR_PANE, 0)
+    fmgr_write(FMGR_LEFT_DIR, 0)
+    fmgr_write(FMGR_RIGHT_DIR, 0)
+    fmgr_write(FMGR_INIT, 1)
+    // Build initial file list from ramfs
+    filemgr_refresh_cache()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Directory Scanning — read ramfs entries into cache
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn filemgr_refresh_cache() {
+    let file_count = volatile_read_u64(FS_BASE)
+    let mut cache_idx: i64 = 0
+    let mut fs_idx: i64 = 0
+    while fs_idx < file_count && cache_idx < FMGR_CACHE_MAX {
+        let entry_addr = ramfs_entry_addr(fs_idx)
+        let ftype = volatile_read_u64(entry_addr + 48)
+        let fsize = volatile_read_u64(entry_addr + 32)
+        let cache_addr = FMGR_CACHE + cache_idx * FMGR_CACHE_ENTRY_SIZE
+        // Store index, type, size
+        volatile_write_u64(cache_addr, fs_idx)
+        volatile_write_u64(cache_addr + 8, ftype)
+        volatile_write_u64(cache_addr + 16, fsize)
+        // Copy name (up to 31 bytes)
+        let mut j: i64 = 0
+        while j < 31 {
+            let ch = volatile_read_u8(entry_addr + j)
+            volatile_write_u8(cache_addr + 24 + j, ch)
+            if ch == 0 { j = 31 }
+            else { j = j + 1 }
+        }
+        volatile_write_u8(cache_addr + 24 + 31, 0)
+        cache_idx = cache_idx + 1
+        fs_idx = fs_idx + 1
+    }
+    fmgr_write(FMGR_ENTRY_COUNT, cache_idx)
+    fmgr_write(FMGR_LEFT_COUNT, cache_idx)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Navigation
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn filemgr_navigate(path_addr: i64) {
+    // Try to find matching directory in ramfs
+    let idx = ramfs_find_by_addr(path_addr)
+    if idx < 0 { return }
+    let entry_addr = ramfs_entry_addr(idx)
+    let ftype = volatile_read_u64(entry_addr + 48)
+    if ftype != 2 { return }  // Not a directory
+    fmgr_write(FMGR_CUR_DIR, idx)
+    fmgr_write(FMGR_SELECTED, 0)
+    fmgr_write(FMGR_SCROLL, 0)
+    filemgr_refresh_cache()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Selection
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn filemgr_select(idx: i64) {
+    let count = fmgr_read(FMGR_ENTRY_COUNT)
+    if idx < 0 || idx >= count { return }
+    fmgr_write(FMGR_SELECTED, idx)
+    let pane = fmgr_read(FMGR_PANE)
+    if pane == 0 {
+        fmgr_write(FMGR_LEFT_SEL, idx)
+    } else {
+        fmgr_write(FMGR_RIGHT_SEL, idx)
+    }
+}
+
+@kernel fn filemgr_select_up() {
+    let sel = fmgr_read(FMGR_SELECTED)
+    if sel > 0 { filemgr_select(sel - 1) }
+    // Adjust scroll
+    let scroll = fmgr_read(FMGR_SCROLL)
+    if sel - 1 < scroll {
+        fmgr_write(FMGR_SCROLL, sel - 1)
+    }
+}
+
+@kernel fn filemgr_select_down() {
+    let sel = fmgr_read(FMGR_SELECTED)
+    let count = fmgr_read(FMGR_ENTRY_COUNT)
+    if sel + 1 < count { filemgr_select(sel + 1) }
+    // Adjust scroll
+    let scroll = fmgr_read(FMGR_SCROLL)
+    if sel + 1 >= scroll + FMGR_VISIBLE_ROWS {
+        fmgr_write(FMGR_SCROLL, sel + 1 - FMGR_VISIBLE_ROWS + 1)
+    }
+}
+
+@kernel fn filemgr_switch_pane() {
+    let pane = fmgr_read(FMGR_PANE)
+    if pane == 0 { fmgr_write(FMGR_PANE, 1) }
+    else { fmgr_write(FMGR_PANE, 0) }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering — draw file list in compositor window
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn filemgr_draw(win_id: i64) {
+    let base = comp_window_addr(win_id)
+    let wx = volatile_read_u64(base + WIN_OFF_X)
+    let wy = volatile_read_u64(base + WIN_OFF_Y)
+    let ww = volatile_read_u64(base + WIN_OFF_W)
+    let wh = volatile_read_u64(base + WIN_OFF_H)
+    let pane_w = (ww - FMGR_PANE_DIVIDER) / 2
+
+    // Background
+    fb_fill_rect(wx, wy, ww, wh, FMGR_COLOR_BG)
+
+    // Header bar
+    fb_fill_rect(wx, wy, ww, FMGR_HEADER_HEIGHT, FMGR_COLOR_HEADER)
+
+    // Divider between panes
+    let div_x = wx + pane_w
+    fb_fill_rect(div_x, wy, FMGR_PANE_DIVIDER, wh, FMGR_COLOR_DIVIDER)
+
+    // Draw left pane entries
+    let scroll = fmgr_read(FMGR_SCROLL)
+    let count = fmgr_read(FMGR_ENTRY_COUNT)
+    let selected = fmgr_read(FMGR_SELECTED)
+    let active_pane = fmgr_read(FMGR_PANE)
+    let mut row: i64 = 0
+    while row < FMGR_VISIBLE_ROWS {
+        let idx = scroll + row
+        if idx < count {
+            let cache_addr = FMGR_CACHE + idx * FMGR_CACHE_ENTRY_SIZE
+            let ftype = volatile_read_u64(cache_addr + 8)
+            let fsize = volatile_read_u64(cache_addr + 16)
+            let name_addr = cache_addr + 24
+            let ry = wy + FMGR_HEADER_HEIGHT + row * FMGR_ROW_HEIGHT
+
+            // Highlight selected row in left pane
+            if idx == selected && active_pane == 0 {
+                fb_fill_rect(wx, ry, pane_w, FMGR_ROW_HEIGHT, FMGR_COLOR_SELECTED)
+            }
+
+            // Choose color by type
+            let color = if ftype == 2 { FMGR_COLOR_DIR } else { FMGR_COLOR_FILE }
+
+            // Draw name
+            fb_draw_string(wx + 4, ry + 1, name_addr, color, FMGR_COLOR_BG)
+        }
+        row = row + 1
+    }
+
+    // Mark dirty for compositor
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_filemgr() {
+    cprintln("=== File Manager ===", YELLOW_ON_BLACK)
+    if fmgr_read(FMGR_INIT) == 0 {
+        cprintln("  Not initialized, starting...", WHITE_ON_BLACK)
+        filemgr_init()
+    }
+    cprint("  Entries: ", WHITE_ON_BLACK)
+    cprintln_decimal(fmgr_read(FMGR_ENTRY_COUNT), CYAN_ON_BLACK)
+    cprint("  Selected: ", WHITE_ON_BLACK)
+    cprintln_decimal(fmgr_read(FMGR_SELECTED), CYAN_ON_BLACK)
+    cprint("  Active pane: ", WHITE_ON_BLACK)
+    let pane = fmgr_read(FMGR_PANE)
+    if pane == 0 { cprintln("left", GREEN_ON_BLACK) }
+    else { cprintln("right", GREEN_ON_BLACK) }
+    cprint("  View: ", WHITE_ON_BLACK)
+    if fmgr_read(FMGR_VIEW_MODE) == 0 { cprintln("list", WHITE_ON_BLACK) }
+    else { cprintln("detail", WHITE_ON_BLACK) }
+
+    // List cached entries
+    cprintln("  Files:", WHITE_ON_BLACK)
+    let count = fmgr_read(FMGR_ENTRY_COUNT)
+    let mut i: i64 = 0
+    while i < count && i < 16 {
+        let cache_addr = FMGR_CACHE + i * FMGR_CACHE_ENTRY_SIZE
+        let ftype = volatile_read_u64(cache_addr + 8)
+        let fsize = volatile_read_u64(cache_addr + 16)
+        cprint("    ", WHITE_ON_BLACK)
+        let sel = fmgr_read(FMGR_SELECTED)
+        if i == sel { cprint("> ", GREEN_ON_BLACK) }
+        else { cprint("  ", WHITE_ON_BLACK) }
+        if ftype == 2 { cprint("[DIR] ", CYAN_ON_BLACK) }
+        else { cprint("[FIL] ", WHITE_ON_BLACK) }
+        // Print name bytes
+        let name_addr = cache_addr + 24
+        let mut j: i64 = 0
+        while j < 30 {
+            let ch = volatile_read_u8(name_addr + j)
+            if ch == 0 { j = 30 }
+            else { console_putchar(ch, WHITE_ON_BLACK); j = j + 1 }
+        }
+        if ftype != 2 {
+            cprint("  (", WHITE_ON_BLACK)
+            cprint_decimal(fsize, CYAN_ON_BLACK)
+            cprint(" bytes)", WHITE_ON_BLACK)
+        }
+        console_putchar(10, WHITE_ON_BLACK)
+        i = i + 1
+    }
+    if count > 16 {
+        cprint("    ... and ", WHITE_ON_BLACK)
+        cprint_decimal(count - 16, CYAN_ON_BLACK)
+        cprintln(" more", WHITE_ON_BLACK)
+    }
+}

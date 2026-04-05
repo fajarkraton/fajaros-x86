@@ -1,0 +1,100 @@
+// FajarOS Nova v3.0 "Nusantara" — Clipboard
+// System-wide copy/paste buffer. Stores arbitrary byte data.
+
+// ═══════════════════════════════════════════════════════════════
+// Clipboard State — at CLIPBOARD_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const CLIPBOARD_BASE: i64 = 0x986000
+const CLIPBOARD_SIZE: i64 = 4096
+// Layout:
+//   CLIPBOARD_BASE + 0:    data_len (current stored bytes)
+//   CLIPBOARD_BASE + 8:    data_type (0=text, 1=binary, 2=image)
+//   CLIPBOARD_BASE + 16:   source_pid (who copied)
+//   CLIPBOARD_BASE + 24:   copy_count (number of copy operations)
+//   CLIPBOARD_BASE + 32:   initialized (0/1)
+//   CLIPBOARD_BASE + 0x100: data buffer (CLIPBOARD_SIZE - 0x100 = 3840 bytes)
+
+const CB_LEN: i64 = 0
+const CB_TYPE: i64 = 8
+const CB_SOURCE: i64 = 16
+const CB_COUNT: i64 = 24
+const CB_INIT: i64 = 32
+const CB_DATA: i64 = 0x100
+const CB_DATA_MAX: i64 = 3840
+
+const CB_TYPE_TEXT: i64 = 0
+const CB_TYPE_BINARY: i64 = 1
+const CB_TYPE_IMAGE: i64 = 2
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cb_read(off: i64) -> i64 { volatile_read_u64(CLIPBOARD_BASE + off) }
+@kernel fn cb_write(off: i64, val: i64) { volatile_write_u64(CLIPBOARD_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn clipboard_init() {
+    let mut i: i64 = 0
+    while i < CLIPBOARD_SIZE {
+        volatile_write_u8(CLIPBOARD_BASE + i, 0)
+        i = i + 1
+    }
+    cb_write(CB_INIT, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Copy / Paste / Clear
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn clipboard_copy(data_addr: i64, len: i64) {
+    if cb_read(CB_INIT) == 0 { clipboard_init() }
+    let copy_len = if len > CB_DATA_MAX { CB_DATA_MAX } else { len }
+    // Copy bytes
+    let mut i: i64 = 0
+    while i < copy_len {
+        volatile_write_u8(CLIPBOARD_BASE + CB_DATA + i, volatile_read_u8(data_addr + i))
+        i = i + 1
+    }
+    // Null-terminate if there's room
+    if copy_len < CB_DATA_MAX {
+        volatile_write_u8(CLIPBOARD_BASE + CB_DATA + copy_len, 0)
+    }
+    cb_write(CB_LEN, copy_len)
+    cb_write(CB_TYPE, CB_TYPE_TEXT)
+    let count = cb_read(CB_COUNT) + 1
+    cb_write(CB_COUNT, count)
+}
+
+@kernel fn clipboard_paste(dst_addr: i64) -> i64 {
+    if cb_read(CB_INIT) == 0 { return 0 }
+    let len = cb_read(CB_LEN)
+    if len == 0 { return 0 }
+    let mut i: i64 = 0
+    while i < len {
+        volatile_write_u8(dst_addr + i, volatile_read_u8(CLIPBOARD_BASE + CB_DATA + i))
+        i = i + 1
+    }
+    // Null-terminate
+    volatile_write_u8(dst_addr + len, 0)
+    len
+}
+
+@kernel fn clipboard_clear() {
+    cb_write(CB_LEN, 0)
+    cb_write(CB_TYPE, 0)
+    // Zero data buffer
+    let mut i: i64 = 0
+    while i < CB_DATA_MAX {
+        volatile_write_u8(CLIPBOARD_BASE + CB_DATA + i, 0)
+        i = i + 1
+    }
+}
+
+@kernel fn clipboard_len() -> i64 {
+    cb_read(CB_LEN)
+}

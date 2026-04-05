@@ -1,0 +1,251 @@
+// FajarOS Nova v3.0 "Nusantara" — System Monitor
+// Samples CPU usage, memory stats, and actor counts.
+// Renders bar charts in compositor window.
+
+// ═══════════════════════════════════════════════════════════════
+// System Monitor State — at SYSMON_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const SYSMON_BASE: i64 = 0x978000
+// State layout (512 bytes):
+//   +0:   initialized (0/1)
+//   +8:   cpu_usage (0-100 percent)
+//   +16:  mem_total (bytes)
+//   +24:  mem_used (bytes)
+//   +32:  mem_free (bytes)
+//   +40:  actor_count (running actors/processes)
+//   +48:  sample_count (number of updates)
+//   +56:  win_id (compositor window, -1=none)
+//   +64:  uptime_ticks
+//   +72:  irq_count (total interrupts)
+//   +80:  page_faults
+//   +88:  syscall_count
+//   +96:  heap_used
+//   +104: heap_total
+//   +112: slab_used
+//   +120: slab_total
+//   +128: cpu_history[32] — last 32 samples (1 byte each, 0-100)
+//   +160: mem_history[32]
+
+const SYSMON_INIT: i64 = 0
+const SYSMON_CPU: i64 = 8
+const SYSMON_MEM_TOTAL: i64 = 16
+const SYSMON_MEM_USED: i64 = 24
+const SYSMON_MEM_FREE: i64 = 32
+const SYSMON_ACTORS: i64 = 40
+const SYSMON_SAMPLES: i64 = 48
+const SYSMON_WIN_ID: i64 = 56
+const SYSMON_UPTIME: i64 = 64
+const SYSMON_IRQS: i64 = 72
+const SYSMON_PGFAULTS: i64 = 80
+const SYSMON_SYSCALLS: i64 = 88
+const SYSMON_HEAP_USED: i64 = 96
+const SYSMON_HEAP_TOTAL: i64 = 104
+const SYSMON_SLAB_USED: i64 = 112
+const SYSMON_SLAB_TOTAL: i64 = 120
+const SYSMON_CPU_HIST: i64 = 128
+const SYSMON_MEM_HIST: i64 = 160
+const SYSMON_HIST_SIZE: i64 = 32
+
+// Drawing constants
+const SYSMON_BAR_HEIGHT: i64 = 100
+const SYSMON_BAR_WIDTH: i64 = 20
+const SYSMON_BAR_GAP: i64 = 4
+const SYSMON_MARGIN: i64 = 10
+const SYSMON_COLOR_CPU: i64 = 0xF38BA8
+const SYSMON_COLOR_MEM: i64 = 0x89B4FA
+const SYSMON_COLOR_ACTOR: i64 = 0xA6E3A1
+const SYSMON_COLOR_BG: i64 = 0x1E1E2E
+const SYSMON_COLOR_GRID: i64 = 0x313244
+const SYSMON_COLOR_TEXT: i64 = 0xCDD6F4
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn sysmon_read(off: i64) -> i64 { volatile_read_u64(SYSMON_BASE + off) }
+@kernel fn sysmon_write(off: i64, val: i64) { volatile_write_u64(SYSMON_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn sysmon_init() {
+    let mut i: i64 = 0
+    while i < 512 {
+        volatile_write_u64(SYSMON_BASE + i, 0)
+        i = i + 8
+    }
+    sysmon_write(SYSMON_WIN_ID, -1)
+    sysmon_write(SYSMON_INIT, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Sampling — read current system state
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn sysmon_update() {
+    // Sample memory: read from heap state
+    let heap_used = volatile_read_u64(0x510000)   // HEAP_NEXT - HEAP_BASE
+    let heap_total: i64 = 0x100000                // 1MB heap
+    sysmon_write(SYSMON_HEAP_USED, heap_used)
+    sysmon_write(SYSMON_HEAP_TOTAL, heap_total)
+
+    // Memory from frame allocator (each frame = 4K)
+    let frames_used = volatile_read_u64(0x500008)  // FRAME_COUNT offset
+    let mem_used = frames_used * 4096
+    let mem_total: i64 = 512 * 1024 * 1024         // 512MB configured
+    let mem_free = mem_total - mem_used
+    sysmon_write(SYSMON_MEM_TOTAL, mem_total)
+    sysmon_write(SYSMON_MEM_USED, mem_used)
+    sysmon_write(SYSMON_MEM_FREE, mem_free)
+
+    // CPU usage estimate: based on scheduler idle ticks
+    // Read scheduler state to estimate load
+    let proc_count = volatile_read_u64(0x600000)  // PROC_TABLE count
+    let running: i64 = if proc_count > 0 { proc_count } else { 1 }
+    // Simple heuristic: more processes = higher load
+    let cpu = if running > 10 { 90 }
+              else if running > 5 { 60 }
+              else if running > 2 { 30 }
+              else { 5 }
+    sysmon_write(SYSMON_CPU, cpu)
+
+    // Actor count
+    sysmon_write(SYSMON_ACTORS, running)
+
+    // Uptime: increment
+    let uptime = sysmon_read(SYSMON_UPTIME) + 1
+    sysmon_write(SYSMON_UPTIME, uptime)
+
+    // Push to history ring
+    let samples = sysmon_read(SYSMON_SAMPLES)
+    let hist_idx = samples & (SYSMON_HIST_SIZE - 1)
+    volatile_write_u8(SYSMON_BASE + SYSMON_CPU_HIST + hist_idx, cpu)
+    let mem_pct = if mem_total > 0 { mem_used * 100 / mem_total } else { 0 }
+    volatile_write_u8(SYSMON_BASE + SYSMON_MEM_HIST + hist_idx, mem_pct)
+    sysmon_write(SYSMON_SAMPLES, samples + 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Accessors
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn sysmon_get_cpu_usage() -> i64 {
+    sysmon_read(SYSMON_CPU)
+}
+
+@kernel fn sysmon_get_mem_usage() -> i64 {
+    let total = sysmon_read(SYSMON_MEM_TOTAL)
+    let used = sysmon_read(SYSMON_MEM_USED)
+    if total > 0 { used * 100 / total } else { 0 }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering — bar charts in compositor window
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn sysmon_draw(win_id: i64) {
+    let base = comp_window_addr(win_id)
+    let wx = volatile_read_u64(base + WIN_OFF_X)
+    let wy = volatile_read_u64(base + WIN_OFF_Y)
+    let ww = volatile_read_u64(base + WIN_OFF_W)
+    let wh = volatile_read_u64(base + WIN_OFF_H)
+
+    // Background
+    fb_fill_rect(wx, wy, ww, wh, SYSMON_COLOR_BG)
+
+    // CPU bar
+    let cpu = sysmon_read(SYSMON_CPU)
+    let bar_x = wx + SYSMON_MARGIN
+    let bar_y = wy + SYSMON_MARGIN + 20
+    let bar_h = cpu * SYSMON_BAR_HEIGHT / 100
+    fb_fill_rect(bar_x, bar_y + SYSMON_BAR_HEIGHT - bar_h,
+                 SYSMON_BAR_WIDTH, bar_h, SYSMON_COLOR_CPU)
+    fb_draw_rect(bar_x, bar_y, SYSMON_BAR_WIDTH, SYSMON_BAR_HEIGHT, SYSMON_COLOR_GRID)
+
+    // Memory bar
+    let mem_pct = sysmon_get_mem_usage()
+    let mem_x = bar_x + SYSMON_BAR_WIDTH + SYSMON_BAR_GAP + 30
+    let mem_h = mem_pct * SYSMON_BAR_HEIGHT / 100
+    fb_fill_rect(mem_x, bar_y + SYSMON_BAR_HEIGHT - mem_h,
+                 SYSMON_BAR_WIDTH, mem_h, SYSMON_COLOR_MEM)
+    fb_draw_rect(mem_x, bar_y, SYSMON_BAR_WIDTH, SYSMON_BAR_HEIGHT, SYSMON_COLOR_GRID)
+
+    // History sparkline (last 32 CPU samples)
+    let spark_x = wx + SYSMON_MARGIN
+    let spark_y = bar_y + SYSMON_BAR_HEIGHT + 30
+    let spark_w = ww - 2 * SYSMON_MARGIN
+    let spark_h: i64 = 40
+    fb_draw_rect(spark_x, spark_y, spark_w, spark_h, SYSMON_COLOR_GRID)
+    let samples = sysmon_read(SYSMON_SAMPLES)
+    let mut si: i64 = 0
+    while si < SYSMON_HIST_SIZE && si < samples {
+        let idx = (samples - SYSMON_HIST_SIZE + si) & (SYSMON_HIST_SIZE - 1)
+        let val = volatile_read_u8(SYSMON_BASE + SYSMON_CPU_HIST + idx)
+        let px = spark_x + si * spark_w / SYSMON_HIST_SIZE
+        let ph = val * spark_h / 100
+        fb_fill_rect(px, spark_y + spark_h - ph, spark_w / SYSMON_HIST_SIZE, ph, SYSMON_COLOR_CPU)
+        si = si + 1
+    }
+
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_sysmon() {
+    cprintln("=== System Monitor ===", YELLOW_ON_BLACK)
+    if sysmon_read(SYSMON_INIT) == 0 {
+        sysmon_init()
+    }
+    sysmon_update()
+
+    cprint("  CPU usage:   ", WHITE_ON_BLACK)
+    cprint_decimal(sysmon_read(SYSMON_CPU), CYAN_ON_BLACK)
+    cprintln("%", WHITE_ON_BLACK)
+
+    cprint("  Memory:      ", WHITE_ON_BLACK)
+    let used_mb = sysmon_read(SYSMON_MEM_USED) / (1024 * 1024)
+    let total_mb = sysmon_read(SYSMON_MEM_TOTAL) / (1024 * 1024)
+    cprint_decimal(used_mb, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(total_mb, WHITE_ON_BLACK)
+    cprint(" MB (", WHITE_ON_BLACK)
+    cprint_decimal(sysmon_get_mem_usage(), CYAN_ON_BLACK)
+    cprintln("%)", WHITE_ON_BLACK)
+
+    cprint("  Heap:        ", WHITE_ON_BLACK)
+    cprint_decimal(sysmon_read(SYSMON_HEAP_USED) / 1024, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(sysmon_read(SYSMON_HEAP_TOTAL) / 1024, WHITE_ON_BLACK)
+    cprintln(" KB", WHITE_ON_BLACK)
+
+    cprint("  Processes:   ", WHITE_ON_BLACK)
+    cprintln_decimal(sysmon_read(SYSMON_ACTORS), CYAN_ON_BLACK)
+
+    cprint("  Uptime:      ", WHITE_ON_BLACK)
+    cprint_decimal(sysmon_read(SYSMON_UPTIME), CYAN_ON_BLACK)
+    cprintln(" ticks", WHITE_ON_BLACK)
+
+    cprint("  Samples:     ", WHITE_ON_BLACK)
+    cprintln_decimal(sysmon_read(SYSMON_SAMPLES), CYAN_ON_BLACK)
+
+    // CPU history sparkline (text mode)
+    cprint("  CPU history: [", WHITE_ON_BLACK)
+    let samples = sysmon_read(SYSMON_SAMPLES)
+    let mut si: i64 = 0
+    let show = if samples < SYSMON_HIST_SIZE { samples } else { SYSMON_HIST_SIZE }
+    while si < show {
+        let idx = (samples - show + si) & (SYSMON_HIST_SIZE - 1)
+        let val = volatile_read_u8(SYSMON_BASE + SYSMON_CPU_HIST + idx)
+        if val > 75 { cprint("#", RED_ON_BLACK) }
+        else if val > 50 { cprint("#", YELLOW_ON_BLACK) }
+        else if val > 25 { cprint("#", GREEN_ON_BLACK) }
+        else { cprint(".", WHITE_ON_BLACK) }
+        si = si + 1
+    }
+    cprintln("]", WHITE_ON_BLACK)
+}

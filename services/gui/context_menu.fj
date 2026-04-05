@@ -1,0 +1,139 @@
+// FajarOS Nova v3.0 "Nusantara" — Context Menu
+// Right-click popup with configurable items and hover highlight.
+
+// ═══════════════════════════════════════════════════════════════
+// Context Menu State — at CTXMENU_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const CTXMENU_BASE: i64 = 0x97E000
+// State layout (128 bytes):
+//   +0:   visible (0/1)
+//   +8:   x (top-left corner)
+//   +16:  y
+//   +24:  width
+//   +32:  item_count
+//   +40:  items_addr (pointer to item data array)
+//   +48:  highlight (-1=none, index of hovered item)
+//   +56:  selected (-1=none, item clicked)
+
+const CTX_VISIBLE: i64 = 0
+const CTX_X: i64 = 8
+const CTX_Y: i64 = 16
+const CTX_WIDTH: i64 = 24
+const CTX_COUNT: i64 = 32
+const CTX_ITEMS: i64 = 40
+const CTX_HIGHLIGHT: i64 = 48
+const CTX_SELECTED: i64 = 56
+
+const CTX_ITEM_HEIGHT: i64 = 24
+const CTX_PADDING: i64 = 4
+const CTX_DEFAULT_WIDTH: i64 = 150
+
+const CTX_COLOR_BG: i64 = 0x313244
+const CTX_COLOR_HIGHLIGHT: i64 = 0x45475A
+const CTX_COLOR_TEXT: i64 = 0xCDD6F4
+const CTX_COLOR_BORDER: i64 = 0x585B70
+const CTX_COLOR_SEPARATOR: i64 = 0x45475A
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ctxmenu_read(off: i64) -> i64 { volatile_read_u64(CTXMENU_BASE + off) }
+@kernel fn ctxmenu_write(off: i64, val: i64) { volatile_write_u64(CTXMENU_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ctxmenu_init() {
+    let mut i: i64 = 0
+    while i < 128 {
+        volatile_write_u64(CTXMENU_BASE + i, 0)
+        i = i + 8
+    }
+    ctxmenu_write(CTX_HIGHLIGHT, -1)
+    ctxmenu_write(CTX_SELECTED, -1)
+    ctxmenu_write(CTX_WIDTH, CTX_DEFAULT_WIDTH)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Show / Hide
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ctxmenu_show(x: i64, y: i64, items_addr: i64, item_count: i64) {
+    ctxmenu_write(CTX_X, x)
+    ctxmenu_write(CTX_Y, y)
+    ctxmenu_write(CTX_ITEMS, items_addr)
+    ctxmenu_write(CTX_COUNT, item_count)
+    ctxmenu_write(CTX_HIGHLIGHT, -1)
+    ctxmenu_write(CTX_SELECTED, -1)
+    ctxmenu_write(CTX_VISIBLE, 1)
+    // Clamp to screen bounds
+    let sw = fb_state_read(FB_WIDTH)
+    let sh = fb_state_read(FB_HEIGHT)
+    let w = ctxmenu_read(CTX_WIDTH)
+    let h = item_count * CTX_ITEM_HEIGHT + 2 * CTX_PADDING
+    if x + w > sw { ctxmenu_write(CTX_X, sw - w) }
+    if y + h > sh { ctxmenu_write(CTX_Y, sh - h) }
+}
+
+@kernel fn ctxmenu_hide() {
+    ctxmenu_write(CTX_VISIBLE, 0)
+    ctxmenu_write(CTX_HIGHLIGHT, -1)
+    ctxmenu_write(CTX_SELECTED, -1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Hit Testing
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ctxmenu_hit_test(mx: i64, my: i64) -> i64 {
+    if ctxmenu_read(CTX_VISIBLE) == 0 { return -1 }
+    let x = ctxmenu_read(CTX_X)
+    let y = ctxmenu_read(CTX_Y)
+    let w = ctxmenu_read(CTX_WIDTH)
+    let count = ctxmenu_read(CTX_COUNT)
+    let h = count * CTX_ITEM_HEIGHT + 2 * CTX_PADDING
+    if mx < x || mx >= x + w || my < y || my >= y + h { return -1 }
+    let rel_y = my - y - CTX_PADDING
+    if rel_y < 0 { return -1 }
+    let idx = rel_y / CTX_ITEM_HEIGHT
+    if idx >= count { return -1 }
+    // Update highlight
+    ctxmenu_write(CTX_HIGHLIGHT, idx)
+    idx
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn ctxmenu_draw() {
+    if ctxmenu_read(CTX_VISIBLE) == 0 { return }
+    let x = ctxmenu_read(CTX_X)
+    let y = ctxmenu_read(CTX_Y)
+    let w = ctxmenu_read(CTX_WIDTH)
+    let count = ctxmenu_read(CTX_COUNT)
+    let h = count * CTX_ITEM_HEIGHT + 2 * CTX_PADDING
+    let highlight = ctxmenu_read(CTX_HIGHLIGHT)
+
+    // Background + border
+    fb_fill_rect(x, y, w, h, CTX_COLOR_BG)
+    fb_draw_rect(x, y, w, h, CTX_COLOR_BORDER)
+
+    // Items
+    let items_addr = ctxmenu_read(CTX_ITEMS)
+    let mut i: i64 = 0
+    while i < count {
+        let iy = y + CTX_PADDING + i * CTX_ITEM_HEIGHT
+        // Highlight hovered item
+        if i == highlight {
+            fb_fill_rect(x + 1, iy, w - 2, CTX_ITEM_HEIGHT, CTX_COLOR_HIGHLIGHT)
+        }
+        // Draw item text (items_addr points to array of 32-byte strings)
+        let item_text = items_addr + i * 32
+        fb_draw_string(x + 8, iy + 4, item_text, CTX_COLOR_TEXT, CTX_COLOR_BG)
+        i = i + 1
+    }
+}

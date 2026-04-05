@@ -149,6 +149,17 @@ SOURCES := \
 	services/gui/app_switcher.fj \
 	services/gui/hot_corners.fj \
 	services/gui/animation.fj \
+	services/gui/tiling.fj \
+	services/gui/taskbar.fj \
+	services/gui/menubar.fj \
+	services/gui/notifications.fj \
+	services/gui/context_menu.fj \
+	services/gui/wallpaper.fj \
+	services/gui/dnd.fj \
+	services/gui/launcher.fj \
+	services/gui/clipboard.fj \
+	services/gui/shortcuts.fj \
+	services/gui/accessibility.fj \
 	services/gui/main.fj \
 	services/auth/main.fj \
 	services/shell/main.fj \
@@ -165,6 +176,11 @@ SOURCES := \
 	apps/pkgmgr/main.fj \
 	apps/user_programs.fj \
 	apps/mnist.fj \
+	apps/filemgr.fj \
+	apps/calc.fj \
+	apps/viewer.fj \
+	apps/settings.fj \
+	apps/sysmon.fj \
 	tests/kernel_tests.fj \
 	tests/benchmarks.fj \
 	kernel/main.fj

@@ -1,0 +1,248 @@
+// FajarOS Nova v3.0 "Nusantara" — Launcher (Spotlight-style)
+// Centered overlay with search box. Type to find commands/apps.
+// Press Enter to execute. Escape to dismiss.
+
+// ═══════════════════════════════════════════════════════════════
+// Launcher State — at LAUNCHER_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const LAUNCHER_BASE: i64 = 0x984000
+// State layout (512 bytes):
+//   +0:   visible (0/1)
+//   +8:   query_len (current search string length)
+//   +16:  result_count (number of matching results)
+//   +24:  selected_result (highlighted result index)
+//   +32:  query[64] (search string buffer, 64 bytes)
+//   +96:  results[8×8=64] (indices into command table)
+//   +160: initialized (0/1)
+
+const LAUNCH_VISIBLE: i64 = 0
+const LAUNCH_QUERY_LEN: i64 = 8
+const LAUNCH_RESULT_COUNT: i64 = 16
+const LAUNCH_SELECTED: i64 = 24
+const LAUNCH_QUERY: i64 = 32        // 64 bytes for query string
+const LAUNCH_RESULTS: i64 = 96      // 8 result slots × 8 bytes
+const LAUNCH_INIT: i64 = 160
+const LAUNCH_MAX_QUERY: i64 = 62
+const LAUNCH_MAX_RESULTS: i64 = 8
+
+// Drawing constants
+const LAUNCH_WIDTH: i64 = 400
+const LAUNCH_HEIGHT: i64 = 300
+const LAUNCH_INPUT_H: i64 = 36
+const LAUNCH_RESULT_H: i64 = 28
+
+// Colors
+const LAUNCH_COLOR_OVERLAY: i64 = 0x0D1117
+const LAUNCH_COLOR_BG: i64 = 0x1E1E2E
+const LAUNCH_COLOR_INPUT_BG: i64 = 0x11111B
+const LAUNCH_COLOR_TEXT: i64 = 0xCDD6F4
+const LAUNCH_COLOR_HIGHLIGHT: i64 = 0x45475A
+const LAUNCH_COLOR_BORDER: i64 = 0x89B4FA
+const LAUNCH_COLOR_DIM: i64 = 0x6C7086
+
+// Command table: built-in commands the launcher knows about
+// Stored at LAUNCHER_BASE + 0x200 (each entry: 32 bytes name + 8 bytes cmd_id)
+const LAUNCH_CMD_TABLE: i64 = 0x984200
+const LAUNCH_CMD_MAX: i64 = 32
+const LAUNCH_CMD_ENTRY: i64 = 40  // 32 name + 8 id
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn launch_read(off: i64) -> i64 { volatile_read_u64(LAUNCHER_BASE + off) }
+@kernel fn launch_write(off: i64, val: i64) { volatile_write_u64(LAUNCHER_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization — populate command table
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn launcher_init() {
+    let mut i: i64 = 0
+    while i < 512 {
+        volatile_write_u8(LAUNCHER_BASE + i, 0)
+        i = i + 1
+    }
+    // Clear command table
+    i = 0
+    while i < LAUNCH_CMD_MAX * LAUNCH_CMD_ENTRY {
+        volatile_write_u8(LAUNCH_CMD_TABLE + i, 0)
+        i = i + 1
+    }
+    // Register known commands (name + id)
+    launcher_register_cmd(0, "help", 1)
+    launcher_register_cmd(1, "sysmon", 2)
+    launcher_register_cmd(2, "settings", 3)
+    launcher_register_cmd(3, "calc", 4)
+    launcher_register_cmd(4, "editor", 5)
+    launcher_register_cmd(5, "filemgr", 6)
+    launcher_register_cmd(6, "viewer", 7)
+    launcher_register_cmd(7, "windows", 8)
+    launcher_register_cmd(8, "processes", 9)
+    launcher_register_cmd(9, "meminfo", 10)
+    launcher_register_cmd(10, "cpuinfo", 11)
+    launcher_register_cmd(11, "uptime", 12)
+    launch_write(LAUNCH_INIT, 1)
+}
+
+@kernel fn launcher_register_cmd(slot: i64, name: str, cmd_id: i64) {
+    if slot >= LAUNCH_CMD_MAX { return }
+    let base = LAUNCH_CMD_TABLE + slot * LAUNCH_CMD_ENTRY
+    let nlen = str_len(name)
+    let mut j: i64 = 0
+    while j < nlen && j < 31 {
+        volatile_write_u8(base + j, str_byte_at(name, j))
+        j = j + 1
+    }
+    volatile_write_u8(base + j, 0)
+    volatile_write_u64(base + 32, cmd_id)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Show / Hide
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn launcher_show() {
+    if launch_read(LAUNCH_INIT) == 0 { launcher_init() }
+    launch_write(LAUNCH_VISIBLE, 1)
+    launch_write(LAUNCH_QUERY_LEN, 0)
+    launch_write(LAUNCH_RESULT_COUNT, 0)
+    launch_write(LAUNCH_SELECTED, 0)
+    // Clear query buffer
+    let mut i: i64 = 0
+    while i < 64 { volatile_write_u8(LAUNCHER_BASE + LAUNCH_QUERY + i, 0); i = i + 1 }
+}
+
+@kernel fn launcher_hide() {
+    launch_write(LAUNCH_VISIBLE, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Input
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn launcher_type_char(ch: i64) {
+    let qlen = launch_read(LAUNCH_QUERY_LEN)
+    if qlen >= LAUNCH_MAX_QUERY { return }
+    volatile_write_u8(LAUNCHER_BASE + LAUNCH_QUERY + qlen, ch)
+    launch_write(LAUNCH_QUERY_LEN, qlen + 1)
+    volatile_write_u8(LAUNCHER_BASE + LAUNCH_QUERY + qlen + 1, 0)
+    launcher_search()
+}
+
+@kernel fn launcher_backspace() {
+    let qlen = launch_read(LAUNCH_QUERY_LEN)
+    if qlen == 0 { return }
+    let new_len = qlen - 1
+    volatile_write_u8(LAUNCHER_BASE + LAUNCH_QUERY + new_len, 0)
+    launch_write(LAUNCH_QUERY_LEN, new_len)
+    launcher_search()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Search — match query prefix against command table
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn launcher_search() -> i64 {
+    let qlen = launch_read(LAUNCH_QUERY_LEN)
+    let mut result_count: i64 = 0
+    if qlen == 0 {
+        launch_write(LAUNCH_RESULT_COUNT, 0)
+        return 0
+    }
+    let mut cmd: i64 = 0
+    while cmd < LAUNCH_CMD_MAX && result_count < LAUNCH_MAX_RESULTS {
+        let base = LAUNCH_CMD_TABLE + cmd * LAUNCH_CMD_ENTRY
+        let first_byte = volatile_read_u8(base)
+        if first_byte != 0 {
+            // Check prefix match
+            let mut match_ok: i64 = 1
+            let mut j: i64 = 0
+            while j < qlen && match_ok == 1 {
+                let qch = volatile_read_u8(LAUNCHER_BASE + LAUNCH_QUERY + j)
+                let cch = volatile_read_u8(base + j)
+                if qch != cch { match_ok = 0 }
+                j = j + 1
+            }
+            if match_ok == 1 {
+                volatile_write_u64(LAUNCHER_BASE + LAUNCH_RESULTS + result_count * 8, cmd)
+                result_count = result_count + 1
+            }
+        }
+        cmd = cmd + 1
+    }
+    launch_write(LAUNCH_RESULT_COUNT, result_count)
+    launch_write(LAUNCH_SELECTED, 0)
+    result_count
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Execute — run selected result
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn launcher_execute() {
+    let count = launch_read(LAUNCH_RESULT_COUNT)
+    if count == 0 { return }
+    let sel = launch_read(LAUNCH_SELECTED)
+    if sel >= count { return }
+    let cmd_slot = volatile_read_u64(LAUNCHER_BASE + LAUNCH_RESULTS + sel * 8)
+    let cmd_id = volatile_read_u64(LAUNCH_CMD_TABLE + cmd_slot * LAUNCH_CMD_ENTRY + 32)
+    launcher_hide()
+    // Dispatch command by ID
+    if cmd_id == 1 { cmd_help() }
+    if cmd_id == 2 { cmd_sysmon() }
+    if cmd_id == 3 { cmd_settings() }
+    if cmd_id == 4 { cmd_calc() }
+    if cmd_id == 5 { cmd_editor_info() }
+    if cmd_id == 6 { cmd_filemgr() }
+    if cmd_id == 7 { cmd_viewer() }
+    if cmd_id == 8 { cmd_windows() }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering — centered overlay with search box
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn launcher_draw() {
+    if launch_read(LAUNCH_VISIBLE) == 0 { return }
+    let sw = fb_state_read(FB_WIDTH)
+    let sh = fb_state_read(FB_HEIGHT)
+    let lx = (sw - LAUNCH_WIDTH) / 2
+    let ly = sh / 4  // Upper-third position
+
+    // Semi-transparent overlay
+    fb_fill_rect_alpha(0, 0, sw, sh, 0x000000, 120)
+
+    // Launcher panel
+    fb_fill_rect(lx, ly, LAUNCH_WIDTH, LAUNCH_HEIGHT, LAUNCH_COLOR_BG)
+    fb_draw_rect(lx, ly, LAUNCH_WIDTH, LAUNCH_HEIGHT, LAUNCH_COLOR_BORDER)
+
+    // Search input box
+    let ix = lx + 10
+    let iy = ly + 10
+    let iw = LAUNCH_WIDTH - 20
+    fb_fill_rect(ix, iy, iw, LAUNCH_INPUT_H, LAUNCH_COLOR_INPUT_BG)
+    fb_draw_rect(ix, iy, iw, LAUNCH_INPUT_H, LAUNCH_COLOR_BORDER)
+
+    // Query text
+    let qlen = launch_read(LAUNCH_QUERY_LEN)
+    if qlen > 0 {
+        fb_draw_string(ix + 8, iy + 10, LAUNCHER_BASE + LAUNCH_QUERY, LAUNCH_COLOR_TEXT, LAUNCH_COLOR_INPUT_BG)
+    }
+
+    // Results list
+    let count = launch_read(LAUNCH_RESULT_COUNT)
+    let sel = launch_read(LAUNCH_SELECTED)
+    let mut ri: i64 = 0
+    while ri < count && ri < LAUNCH_MAX_RESULTS {
+        let ry = iy + LAUNCH_INPUT_H + 8 + ri * LAUNCH_RESULT_H
+        if ri == sel {
+            fb_fill_rect(ix, ry, iw, LAUNCH_RESULT_H, LAUNCH_COLOR_HIGHLIGHT)
+        }
+        let cmd_slot = volatile_read_u64(LAUNCHER_BASE + LAUNCH_RESULTS + ri * 8)
+        let name_addr = LAUNCH_CMD_TABLE + cmd_slot * LAUNCH_CMD_ENTRY
+        fb_draw_string(ix + 12, ry + 6, name_addr, LAUNCH_COLOR_TEXT, LAUNCH_COLOR_BG)
+        ri = ri + 1
+    }
+}

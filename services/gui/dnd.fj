@@ -1,0 +1,140 @@
+// FajarOS Nova v3.0 "Nusantara" — Drag and Drop
+// Handles drag operations between windows: start, update, drop.
+// Renders ghost sprite at cursor position during drag.
+
+// ═══════════════════════════════════════════════════════════════
+// Drag and Drop State — at DND_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const DND_BASE: i64 = 0x982000
+// State layout (96 bytes):
+//   +0:  active (0=idle, 1=dragging)
+//   +8:  src_id (source window/widget ID)
+//   +16: src_type (0=file, 1=window, 2=widget, 3=text)
+//   +24: data (payload: file index, widget id, etc.)
+//   +32: cursor_x (current drag position)
+//   +40: cursor_y
+//   +48: start_x (where drag began)
+//   +56: start_y
+//   +64: target_id (window under cursor, -1=none)
+//   +72: ghost_w (ghost sprite width)
+//   +80: ghost_h (ghost sprite height)
+//   +88: ghost_color (ghost tint color)
+
+const DND_ACTIVE: i64 = 0
+const DND_SRC_ID: i64 = 8
+const DND_SRC_TYPE: i64 = 16
+const DND_DATA: i64 = 24
+const DND_CX: i64 = 32
+const DND_CY: i64 = 40
+const DND_START_X: i64 = 48
+const DND_START_Y: i64 = 56
+const DND_TARGET: i64 = 64
+const DND_GHOST_W: i64 = 72
+const DND_GHOST_H: i64 = 80
+const DND_GHOST_COLOR: i64 = 88
+
+const DND_TYPE_FILE: i64 = 0
+const DND_TYPE_WINDOW: i64 = 1
+const DND_TYPE_WIDGET: i64 = 2
+const DND_TYPE_TEXT: i64 = 3
+
+const DND_GHOST_DEFAULT_W: i64 = 48
+const DND_GHOST_DEFAULT_H: i64 = 32
+const DND_GHOST_ALPHA: i64 = 128
+const DND_COLOR_GHOST: i64 = 0x89B4FA
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn dnd_read(off: i64) -> i64 { volatile_read_u64(DND_BASE + off) }
+@kernel fn dnd_write(off: i64, val: i64) { volatile_write_u64(DND_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn dnd_init() {
+    let mut i: i64 = 0
+    while i < 96 {
+        volatile_write_u64(DND_BASE + i, 0)
+        i = i + 8
+    }
+    dnd_write(DND_TARGET, -1)
+    dnd_write(DND_GHOST_W, DND_GHOST_DEFAULT_W)
+    dnd_write(DND_GHOST_H, DND_GHOST_DEFAULT_H)
+    dnd_write(DND_GHOST_COLOR, DND_COLOR_GHOST)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Drag Lifecycle
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn dnd_start(src_id: i64, src_type: i64, data: i64) {
+    dnd_write(DND_ACTIVE, 1)
+    dnd_write(DND_SRC_ID, src_id)
+    dnd_write(DND_SRC_TYPE, src_type)
+    dnd_write(DND_DATA, data)
+    let cx = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_CURSOR_X)
+    let cy = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_CURSOR_Y)
+    dnd_write(DND_START_X, cx)
+    dnd_write(DND_START_Y, cy)
+    dnd_write(DND_CX, cx)
+    dnd_write(DND_CY, cy)
+    dnd_write(DND_TARGET, -1)
+}
+
+@kernel fn dnd_update(mx: i64, my: i64) {
+    if dnd_read(DND_ACTIVE) == 0 { return }
+    dnd_write(DND_CX, mx)
+    dnd_write(DND_CY, my)
+
+    // Find window under cursor
+    let mut found: i64 = -1
+    let mut id: i64 = 0
+    while id < COMP_MAX_WINDOWS {
+        let addr = comp_window_addr(id)
+        let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
+        if (flags & WIN_FLAG_VISIBLE) != 0 {
+            let wx = volatile_read_u64(addr + WIN_OFF_X)
+            let wy = volatile_read_u64(addr + WIN_OFF_Y)
+            let ww = volatile_read_u64(addr + WIN_OFF_W)
+            let wh = volatile_read_u64(addr + WIN_OFF_H)
+            if mx >= wx && mx < wx + ww && my >= wy && my < wy + wh {
+                found = id
+            }
+        }
+        id = id + 1
+    }
+    dnd_write(DND_TARGET, found)
+}
+
+@kernel fn dnd_drop() -> i64 {
+    if dnd_read(DND_ACTIVE) == 0 { return -1 }
+    let target = dnd_read(DND_TARGET)
+    dnd_write(DND_ACTIVE, 0)
+    target
+}
+
+@kernel fn dnd_cancel() {
+    dnd_write(DND_ACTIVE, 0)
+    dnd_write(DND_TARGET, -1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering — ghost sprite at cursor
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn dnd_draw() {
+    if dnd_read(DND_ACTIVE) == 0 { return }
+    let cx = dnd_read(DND_CX)
+    let cy = dnd_read(DND_CY)
+    let gw = dnd_read(DND_GHOST_W)
+    let gh = dnd_read(DND_GHOST_H)
+    let color = dnd_read(DND_GHOST_COLOR)
+    // Draw semi-transparent ghost rectangle
+    fb_fill_rect_alpha(cx - gw / 2, cy - gh / 2, gw, gh, color, DND_GHOST_ALPHA)
+    // Border
+    fb_draw_rect(cx - gw / 2, cy - gh / 2, gw, gh, 0xCDD6F4)
+}

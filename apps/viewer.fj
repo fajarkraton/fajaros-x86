@@ -1,0 +1,180 @@
+// FajarOS Nova v3.0 "Nusantara" — Image Viewer
+// Displays ARGB bitmaps in a compositor window with zoom support.
+
+// ═══════════════════════════════════════════════════════════════
+// Viewer State — at VIEWER_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const VIEWER_BASE: i64 = 0x974000
+// State layout (128 bytes):
+//   +0:  initialized (0/1)
+//   +8:  data_addr (pointer to ARGB pixel data)
+//   +16: img_width (source image width)
+//   +24: img_height (source image height)
+//   +32: zoom_level (percentage: 50-400, default 100)
+//   +40: pan_x (horizontal offset)
+//   +48: pan_y (vertical offset)
+//   +56: win_id (compositor window, -1=none)
+//   +64: loaded (0=no image, 1=image loaded)
+//   +72: pixel_count (w * h)
+
+const VIEWER_INIT: i64 = 0
+const VIEWER_DATA_ADDR: i64 = 8
+const VIEWER_IMG_W: i64 = 16
+const VIEWER_IMG_H: i64 = 24
+const VIEWER_ZOOM: i64 = 32
+const VIEWER_PAN_X: i64 = 40
+const VIEWER_PAN_Y: i64 = 48
+const VIEWER_WIN_ID: i64 = 56
+const VIEWER_LOADED: i64 = 64
+const VIEWER_PIXEL_COUNT: i64 = 72
+
+const VIEWER_ZOOM_MIN: i64 = 50
+const VIEWER_ZOOM_MAX: i64 = 400
+const VIEWER_ZOOM_STEP: i64 = 25
+const VIEWER_COLOR_BG: i64 = 0x0D1117
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn viewer_read(off: i64) -> i64 { volatile_read_u64(VIEWER_BASE + off) }
+@kernel fn viewer_write(off: i64, val: i64) { volatile_write_u64(VIEWER_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn viewer_init() {
+    let mut i: i64 = 0
+    while i < 128 {
+        volatile_write_u64(VIEWER_BASE + i, 0)
+        i = i + 8
+    }
+    viewer_write(VIEWER_ZOOM, 100)
+    viewer_write(VIEWER_WIN_ID, -1)
+    viewer_write(VIEWER_INIT, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Image Loading
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn viewer_load(data_addr: i64, w: i64, h: i64) {
+    if data_addr == 0 || w <= 0 || h <= 0 { return }
+    viewer_write(VIEWER_DATA_ADDR, data_addr)
+    viewer_write(VIEWER_IMG_W, w)
+    viewer_write(VIEWER_IMG_H, h)
+    viewer_write(VIEWER_PIXEL_COUNT, w * h)
+    viewer_write(VIEWER_PAN_X, 0)
+    viewer_write(VIEWER_PAN_Y, 0)
+    viewer_write(VIEWER_ZOOM, 100)
+    viewer_write(VIEWER_LOADED, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering — draw bitmap into compositor window
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn viewer_draw(win_id: i64) {
+    let base = comp_window_addr(win_id)
+    let wx = volatile_read_u64(base + WIN_OFF_X)
+    let wy = volatile_read_u64(base + WIN_OFF_Y)
+    let ww = volatile_read_u64(base + WIN_OFF_W)
+    let wh = volatile_read_u64(base + WIN_OFF_H)
+
+    // Clear window area
+    fb_fill_rect(wx, wy, ww, wh, VIEWER_COLOR_BG)
+
+    if viewer_read(VIEWER_LOADED) == 0 { return }
+
+    let data = viewer_read(VIEWER_DATA_ADDR)
+    let iw = viewer_read(VIEWER_IMG_W)
+    let ih = viewer_read(VIEWER_IMG_H)
+    let zoom = viewer_read(VIEWER_ZOOM)
+    let pan_x = viewer_read(VIEWER_PAN_X)
+    let pan_y = viewer_read(VIEWER_PAN_Y)
+
+    // Scaled dimensions
+    let dw = iw * zoom / 100
+    let dh = ih * zoom / 100
+
+    // Center in window
+    let ox = wx + (ww - dw) / 2 + pan_x
+    let oy = wy + (wh - dh) / 2 + pan_y
+
+    // Use scaled bitmap draw
+    fb_draw_bitmap_scaled(ox, oy, iw, ih, dw, dh, data)
+
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Zoom
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn viewer_zoom_in() {
+    let zoom = viewer_read(VIEWER_ZOOM)
+    let new_zoom = zoom + VIEWER_ZOOM_STEP
+    if new_zoom <= VIEWER_ZOOM_MAX {
+        viewer_write(VIEWER_ZOOM, new_zoom)
+    }
+}
+
+@kernel fn viewer_zoom_out() {
+    let zoom = viewer_read(VIEWER_ZOOM)
+    let new_zoom = zoom - VIEWER_ZOOM_STEP
+    if new_zoom >= VIEWER_ZOOM_MIN {
+        viewer_write(VIEWER_ZOOM, new_zoom)
+    }
+}
+
+@kernel fn viewer_zoom_fit(win_id: i64) {
+    if viewer_read(VIEWER_LOADED) == 0 { return }
+    let base = comp_window_addr(win_id)
+    let ww = volatile_read_u64(base + WIN_OFF_W)
+    let wh = volatile_read_u64(base + WIN_OFF_H)
+    let iw = viewer_read(VIEWER_IMG_W)
+    let ih = viewer_read(VIEWER_IMG_H)
+    if iw == 0 || ih == 0 { return }
+    let zw = ww * 100 / iw
+    let zh = wh * 100 / ih
+    let zoom = if zw < zh { zw } else { zh }
+    let clamped = if zoom < VIEWER_ZOOM_MIN { VIEWER_ZOOM_MIN }
+                  else if zoom > VIEWER_ZOOM_MAX { VIEWER_ZOOM_MAX }
+                  else { zoom }
+    viewer_write(VIEWER_ZOOM, clamped)
+    viewer_write(VIEWER_PAN_X, 0)
+    viewer_write(VIEWER_PAN_Y, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_viewer() {
+    cprintln("=== Image Viewer ===", YELLOW_ON_BLACK)
+    if viewer_read(VIEWER_INIT) == 0 {
+        viewer_init()
+    }
+    cprint("  Status: ", WHITE_ON_BLACK)
+    if viewer_read(VIEWER_LOADED) != 0 {
+        cprintln("image loaded", GREEN_ON_BLACK)
+        cprint("  Size: ", WHITE_ON_BLACK)
+        cprint_decimal(viewer_read(VIEWER_IMG_W), CYAN_ON_BLACK)
+        cprint("x", WHITE_ON_BLACK)
+        cprintln_decimal(viewer_read(VIEWER_IMG_H), CYAN_ON_BLACK)
+        cprint("  Zoom: ", WHITE_ON_BLACK)
+        cprint_decimal(viewer_read(VIEWER_ZOOM), CYAN_ON_BLACK)
+        cprintln("%", WHITE_ON_BLACK)
+        cprint("  Pan: (", WHITE_ON_BLACK)
+        cprint_decimal(viewer_read(VIEWER_PAN_X), WHITE_ON_BLACK)
+        cprint(", ", WHITE_ON_BLACK)
+        cprint_decimal(viewer_read(VIEWER_PAN_Y), WHITE_ON_BLACK)
+        cprintln(")", WHITE_ON_BLACK)
+    } else {
+        cprintln("no image loaded", YELLOW_ON_BLACK)
+    }
+    cprintln("  Zoom range: 50-400%", WHITE_ON_BLACK)
+    cprintln("  Formats: raw ARGB bitmap", WHITE_ON_BLACK)
+}

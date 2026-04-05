@@ -1,0 +1,222 @@
+// FajarOS Nova v3.0 "Nusantara" — Calculator App
+// Integer calculator with basic arithmetic: + - * /
+// Supports digit input, operator, equals, and clear.
+
+// ═══════════════════════════════════════════════════════════════
+// Calculator State — at CALC_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const CALC_BASE: i64 = 0x972000
+// State layout (128 bytes):
+//   +0:  display_value (current number being shown)
+//   +8:  accumulator (result of previous operation)
+//   +16: current_op (0=none, 1=+, 2=-, 3=*, 4=/)
+//   +24: input_mode (0=entering first number, 1=entering second)
+//   +32: has_input (0=no digits entered yet, 1=has digits)
+//   +40: last_result (result after =)
+//   +48: error (0=ok, 1=divide by zero)
+//   +56: win_id (compositor window, -1=none)
+//   +64: initialized (0/1)
+//   +72: memory (stored value for M+/MR)
+
+const CALC_DISPLAY: i64 = 0
+const CALC_ACCUM: i64 = 8
+const CALC_OP: i64 = 16
+const CALC_INPUT_MODE: i64 = 24
+const CALC_HAS_INPUT: i64 = 32
+const CALC_LAST_RESULT: i64 = 40
+const CALC_ERROR: i64 = 48
+const CALC_WIN_ID: i64 = 56
+const CALC_INITIALIZED: i64 = 64
+const CALC_MEMORY: i64 = 72
+
+// Operator codes
+const CALC_OP_NONE: i64 = 0
+const CALC_OP_ADD: i64 = 1
+const CALC_OP_SUB: i64 = 2
+const CALC_OP_MUL: i64 = 3
+const CALC_OP_DIV: i64 = 4
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn calc_read(off: i64) -> i64 { volatile_read_u64(CALC_BASE + off) }
+@kernel fn calc_write(off: i64, val: i64) { volatile_write_u64(CALC_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn calc_init() {
+    let mut i: i64 = 0
+    while i < 128 {
+        volatile_write_u64(CALC_BASE + i, 0)
+        i = i + 8
+    }
+    calc_write(CALC_WIN_ID, -1)
+    calc_write(CALC_INITIALIZED, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Input Operations
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn calc_push_digit(d: i64) {
+    if d < 0 || d > 9 { return }
+    calc_write(CALC_ERROR, 0)
+    let display = calc_read(CALC_DISPLAY)
+    let has = calc_read(CALC_HAS_INPUT)
+    // Prevent overflow (limit to 15 digits)
+    if display > 999999999999999 { return }
+    if display < -999999999999999 { return }
+    if has == 0 {
+        calc_write(CALC_DISPLAY, d)
+        calc_write(CALC_HAS_INPUT, 1)
+    } else {
+        calc_write(CALC_DISPLAY, display * 10 + d)
+    }
+}
+
+@kernel fn calc_set_op(op: i64) {
+    if op < 0 || op > 4 { return }
+    // If we already have a pending op, compute first
+    let cur_op = calc_read(CALC_OP)
+    if cur_op != CALC_OP_NONE && calc_read(CALC_HAS_INPUT) != 0 {
+        calc_compute()
+    }
+    // Save current display as accumulator
+    calc_write(CALC_ACCUM, calc_read(CALC_DISPLAY))
+    calc_write(CALC_OP, op)
+    calc_write(CALC_INPUT_MODE, 1)
+    calc_write(CALC_HAS_INPUT, 0)
+}
+
+@kernel fn calc_compute() {
+    let a = calc_read(CALC_ACCUM)
+    let b = calc_read(CALC_DISPLAY)
+    let op = calc_read(CALC_OP)
+    let mut result: i64 = 0
+    if op == CALC_OP_ADD { result = a + b }
+    else if op == CALC_OP_SUB { result = a - b }
+    else if op == CALC_OP_MUL { result = a * b }
+    else if op == CALC_OP_DIV {
+        if b == 0 {
+            calc_write(CALC_ERROR, 1)
+            calc_write(CALC_DISPLAY, 0)
+            return
+        }
+        result = a / b
+    } else {
+        result = b
+    }
+    calc_write(CALC_DISPLAY, result)
+    calc_write(CALC_LAST_RESULT, result)
+}
+
+@kernel fn calc_equals() {
+    let op = calc_read(CALC_OP)
+    if op == CALC_OP_NONE { return }
+    calc_compute()
+    calc_write(CALC_OP, CALC_OP_NONE)
+    calc_write(CALC_INPUT_MODE, 0)
+    calc_write(CALC_HAS_INPUT, 1)
+}
+
+@kernel fn calc_clear() {
+    calc_write(CALC_DISPLAY, 0)
+    calc_write(CALC_ACCUM, 0)
+    calc_write(CALC_OP, CALC_OP_NONE)
+    calc_write(CALC_INPUT_MODE, 0)
+    calc_write(CALC_HAS_INPUT, 0)
+    calc_write(CALC_ERROR, 0)
+}
+
+@kernel fn calc_get_display() -> i64 {
+    calc_read(CALC_DISPLAY)
+}
+
+@kernel fn calc_negate() {
+    let val = calc_read(CALC_DISPLAY)
+    calc_write(CALC_DISPLAY, 0 - val)
+}
+
+@kernel fn calc_memory_store() {
+    calc_write(CALC_MEMORY, calc_read(CALC_DISPLAY))
+}
+
+@kernel fn calc_memory_recall() {
+    calc_write(CALC_DISPLAY, calc_read(CALC_MEMORY))
+    calc_write(CALC_HAS_INPUT, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command — Interactive Calculator
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_calc() {
+    cprintln("=== Calculator ===", YELLOW_ON_BLACK)
+    if calc_read(CALC_INITIALIZED) == 0 {
+        calc_init()
+    }
+
+    // Show current state
+    cprint("  Display: ", WHITE_ON_BLACK)
+    if calc_read(CALC_ERROR) != 0 {
+        cprintln("ERROR (div/0)", RED_ON_BLACK)
+    } else {
+        cprintln_decimal(calc_read(CALC_DISPLAY), CYAN_ON_BLACK)
+    }
+    cprint("  Accumulator: ", WHITE_ON_BLACK)
+    cprintln_decimal(calc_read(CALC_ACCUM), WHITE_ON_BLACK)
+    cprint("  Operator: ", WHITE_ON_BLACK)
+    let op = calc_read(CALC_OP)
+    if op == CALC_OP_NONE { cprintln("none", WHITE_ON_BLACK) }
+    else if op == CALC_OP_ADD { cprintln("+", GREEN_ON_BLACK) }
+    else if op == CALC_OP_SUB { cprintln("-", GREEN_ON_BLACK) }
+    else if op == CALC_OP_MUL { cprintln("*", GREEN_ON_BLACK) }
+    else if op == CALC_OP_DIV { cprintln("/", GREEN_ON_BLACK) }
+    else { cprintln("?", RED_ON_BLACK) }
+    cprint("  Memory: ", WHITE_ON_BLACK)
+    cprintln_decimal(calc_read(CALC_MEMORY), WHITE_ON_BLACK)
+    cprint("  Last result: ", WHITE_ON_BLACK)
+    cprintln_decimal(calc_read(CALC_LAST_RESULT), CYAN_ON_BLACK)
+
+    // Demo calculation: 42 + 18 = 60
+    cprintln("  Demo: 42 + 18 =", YELLOW_ON_BLACK)
+    calc_clear()
+    calc_push_digit(4)
+    calc_push_digit(2)
+    calc_set_op(CALC_OP_ADD)
+    calc_push_digit(1)
+    calc_push_digit(8)
+    calc_equals()
+    cprint("  Result: ", WHITE_ON_BLACK)
+    cprintln_decimal(calc_get_display(), GREEN_ON_BLACK)
+
+    // Demo: 100 / 3 = 33
+    cprintln("  Demo: 100 / 3 =", YELLOW_ON_BLACK)
+    calc_clear()
+    calc_push_digit(1)
+    calc_push_digit(0)
+    calc_push_digit(0)
+    calc_set_op(CALC_OP_DIV)
+    calc_push_digit(3)
+    calc_equals()
+    cprint("  Result: ", WHITE_ON_BLACK)
+    cprintln_decimal(calc_get_display(), GREEN_ON_BLACK)
+
+    // Demo: divide by zero
+    cprintln("  Demo: 5 / 0 =", YELLOW_ON_BLACK)
+    calc_clear()
+    calc_push_digit(5)
+    calc_set_op(CALC_OP_DIV)
+    calc_push_digit(0)
+    calc_equals()
+    if calc_read(CALC_ERROR) != 0 {
+        cprintln("  Result: ERROR (division by zero)", RED_ON_BLACK)
+    } else {
+        cprint("  Result: ", WHITE_ON_BLACK)
+        cprintln_decimal(calc_get_display(), GREEN_ON_BLACK)
+    }
+}

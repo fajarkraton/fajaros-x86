@@ -1,0 +1,179 @@
+// FajarOS Nova v3.0 "Nusantara" — Keyboard Shortcuts
+// Global shortcut registry: modifier + key -> action.
+// Checked on every keystroke by the event loop.
+
+// ═══════════════════════════════════════════════════════════════
+// Shortcuts State — at SHORTCUTS_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const SHORTCUTS_BASE: i64 = 0x988000
+const SHORTCUT_MAX: i64 = 32
+const SHORTCUT_ENTRY_SIZE: i64 = 32
+
+// Per-shortcut entry (32 bytes):
+//   +0:  active (0/1)
+//   +8:  modifier (bit flags: 1=Ctrl, 2=Alt, 4=Shift, 8=Super)
+//   +16: key (ASCII code or scancode)
+//   +24: action (action ID to dispatch)
+
+const SC_ACTIVE: i64 = 0
+const SC_MODIFIER: i64 = 8
+const SC_KEY: i64 = 16
+const SC_ACTION: i64 = 24
+
+// Modifier flags
+const MOD_CTRL: i64 = 1
+const MOD_ALT: i64 = 2
+const MOD_SHIFT: i64 = 4
+const MOD_SUPER: i64 = 8
+
+// Action IDs
+const ACT_NONE: i64 = 0
+const ACT_QUIT: i64 = 1          // Ctrl+Q
+const ACT_CLOSE_WIN: i64 = 2     // Ctrl+W
+const ACT_SWITCH_APP: i64 = 3    // Alt+Tab
+const ACT_COPY: i64 = 4          // Ctrl+C
+const ACT_PASTE: i64 = 5         // Ctrl+V
+const ACT_CUT: i64 = 6           // Ctrl+X
+const ACT_SAVE: i64 = 7          // Ctrl+S
+const ACT_UNDO: i64 = 8          // Ctrl+Z
+const ACT_FIND: i64 = 9          // Ctrl+F
+const ACT_LAUNCHER: i64 = 10     // Ctrl+Space
+const ACT_FULLSCREEN: i64 = 11   // F11
+const ACT_TILE_LEFT: i64 = 12    // Super+Left
+const ACT_TILE_RIGHT: i64 = 13   // Super+Right
+const ACT_SCREENSHOT: i64 = 14   // Ctrl+Shift+S
+const ACT_TERMINAL: i64 = 15     // Ctrl+Alt+T
+
+// Global state
+const SC_STATE: i64 = 0x988800
+const SC_INITIALIZED: i64 = 0
+const SC_TOTAL: i64 = 8
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn sc_entry_addr(idx: i64) -> i64 { SHORTCUTS_BASE + idx * SHORTCUT_ENTRY_SIZE }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization — register default shortcuts
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn shortcuts_init() {
+    let mut i: i64 = 0
+    while i < SHORTCUT_MAX * SHORTCUT_ENTRY_SIZE {
+        volatile_write_u64(SHORTCUTS_BASE + i, 0)
+        i = i + 8
+    }
+    volatile_write_u64(SC_STATE + SC_TOTAL, 0)
+
+    // Register defaults
+    shortcuts_register(MOD_CTRL, 113, ACT_QUIT)         // Ctrl+Q (q=113)
+    shortcuts_register(MOD_CTRL, 119, ACT_CLOSE_WIN)    // Ctrl+W (w=119)
+    shortcuts_register(MOD_ALT, 9, ACT_SWITCH_APP)      // Alt+Tab (tab=9)
+    shortcuts_register(MOD_CTRL, 99, ACT_COPY)          // Ctrl+C (c=99)
+    shortcuts_register(MOD_CTRL, 118, ACT_PASTE)        // Ctrl+V (v=118)
+    shortcuts_register(MOD_CTRL, 120, ACT_CUT)          // Ctrl+X (x=120)
+    shortcuts_register(MOD_CTRL, 115, ACT_SAVE)         // Ctrl+S (s=115)
+    shortcuts_register(MOD_CTRL, 122, ACT_UNDO)         // Ctrl+Z (z=122)
+    shortcuts_register(MOD_CTRL, 102, ACT_FIND)         // Ctrl+F (f=102)
+    shortcuts_register(MOD_CTRL, 32, ACT_LAUNCHER)      // Ctrl+Space
+    shortcuts_register(0, 0x85, ACT_FULLSCREEN)          // F11 scancode
+    shortcuts_register(MOD_SUPER, 0x4B, ACT_TILE_LEFT)  // Super+Left
+    shortcuts_register(MOD_SUPER, 0x4D, ACT_TILE_RIGHT) // Super+Right
+    shortcuts_register(MOD_CTRL | MOD_SHIFT, 115, ACT_SCREENSHOT) // Ctrl+Shift+S
+    shortcuts_register(MOD_CTRL | MOD_ALT, 116, ACT_TERMINAL)    // Ctrl+Alt+T
+
+    volatile_write_u64(SC_STATE + SC_INITIALIZED, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Register / Check
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn shortcuts_register(modifier: i64, key: i64, action: i64) {
+    let total = volatile_read_u64(SC_STATE + SC_TOTAL)
+    if total >= SHORTCUT_MAX { return }
+    // Find free slot
+    let mut i: i64 = 0
+    while i < SHORTCUT_MAX {
+        let addr = sc_entry_addr(i)
+        if volatile_read_u64(addr + SC_ACTIVE) == 0 {
+            volatile_write_u64(addr + SC_ACTIVE, 1)
+            volatile_write_u64(addr + SC_MODIFIER, modifier)
+            volatile_write_u64(addr + SC_KEY, key)
+            volatile_write_u64(addr + SC_ACTION, action)
+            volatile_write_u64(SC_STATE + SC_TOTAL, total + 1)
+            return
+        }
+        i = i + 1
+    }
+}
+
+@kernel fn shortcuts_check(modifier: i64, key: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < SHORTCUT_MAX {
+        let addr = sc_entry_addr(i)
+        if volatile_read_u64(addr + SC_ACTIVE) != 0 {
+            let sc_mod = volatile_read_u64(addr + SC_MODIFIER)
+            let sc_key = volatile_read_u64(addr + SC_KEY)
+            if sc_mod == modifier && sc_key == key {
+                return volatile_read_u64(addr + SC_ACTION)
+            }
+        }
+        i = i + 1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command — list all shortcuts
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_shortcuts() {
+    cprintln("=== Keyboard Shortcuts ===", YELLOW_ON_BLACK)
+    if volatile_read_u64(SC_STATE + SC_INITIALIZED) == 0 {
+        shortcuts_init()
+    }
+    let total = volatile_read_u64(SC_STATE + SC_TOTAL)
+    cprint("  Registered: ", WHITE_ON_BLACK)
+    cprint_decimal(total, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprintln_decimal(SHORTCUT_MAX, WHITE_ON_BLACK)
+    cprintln("  Modifier  Key   Action", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < SHORTCUT_MAX {
+        let addr = sc_entry_addr(i)
+        if volatile_read_u64(addr + SC_ACTIVE) != 0 {
+            cprint("  ", WHITE_ON_BLACK)
+            let m = volatile_read_u64(addr + SC_MODIFIER)
+            if (m & MOD_CTRL) != 0 { cprint("Ctrl+", CYAN_ON_BLACK) }
+            if (m & MOD_ALT) != 0 { cprint("Alt+", CYAN_ON_BLACK) }
+            if (m & MOD_SHIFT) != 0 { cprint("Shift+", CYAN_ON_BLACK) }
+            if (m & MOD_SUPER) != 0 { cprint("Super+", CYAN_ON_BLACK) }
+            let k = volatile_read_u64(addr + SC_KEY)
+            if k >= 32 && k < 127 { console_putchar(k, WHITE_ON_BLACK) }
+            else { cprint_hex(k, 2, WHITE_ON_BLACK) }
+            cprint("  -> ", WHITE_ON_BLACK)
+            let act = volatile_read_u64(addr + SC_ACTION)
+            if act == ACT_QUIT { cprintln("quit", GREEN_ON_BLACK) }
+            else if act == ACT_CLOSE_WIN { cprintln("close window", GREEN_ON_BLACK) }
+            else if act == ACT_SWITCH_APP { cprintln("switch app", GREEN_ON_BLACK) }
+            else if act == ACT_COPY { cprintln("copy", GREEN_ON_BLACK) }
+            else if act == ACT_PASTE { cprintln("paste", GREEN_ON_BLACK) }
+            else if act == ACT_CUT { cprintln("cut", GREEN_ON_BLACK) }
+            else if act == ACT_SAVE { cprintln("save", GREEN_ON_BLACK) }
+            else if act == ACT_UNDO { cprintln("undo", GREEN_ON_BLACK) }
+            else if act == ACT_FIND { cprintln("find", GREEN_ON_BLACK) }
+            else if act == ACT_LAUNCHER { cprintln("launcher", GREEN_ON_BLACK) }
+            else if act == ACT_FULLSCREEN { cprintln("fullscreen", GREEN_ON_BLACK) }
+            else if act == ACT_TILE_LEFT { cprintln("tile left", GREEN_ON_BLACK) }
+            else if act == ACT_TILE_RIGHT { cprintln("tile right", GREEN_ON_BLACK) }
+            else if act == ACT_SCREENSHOT { cprintln("screenshot", GREEN_ON_BLACK) }
+            else if act == ACT_TERMINAL { cprintln("terminal", GREEN_ON_BLACK) }
+            else { cprintln_decimal(act, WHITE_ON_BLACK) }
+        }
+        i = i + 1
+    }
+}

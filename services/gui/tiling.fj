@@ -17,20 +17,32 @@ const TILE_STATE_BASE: i64 = 0xC20000
 const TILE_CURRENT_LAYOUT: i64 = 0
 const TILE_GAP: i64 = 4            // Pixel gap between tiled windows
 
+// Scratch area for window ID list (16 × 8 bytes at TILE_STATE_BASE + 0x100)
+const TILE_WIN_IDS: i64 = 0xC20100
+
+// ── Helper: read/write window ID from scratch ──
+
+@kernel fn tile_set_win(idx: i64, val: i64) {
+    volatile_write_u64(TILE_WIN_IDS + idx * 8, val)
+}
+
+@kernel fn tile_get_win(idx: i64) -> i64 {
+    volatile_read_u64(TILE_WIN_IDS + idx * 8)
+}
+
 // ── Tiling operations ──
 
 @kernel fn tile_apply_layout(layout: i64) {
     volatile_write_u64(TILE_STATE_BASE + TILE_CURRENT_LAYOUT, layout)
 
-    // Collect visible window IDs
-    let mut win_ids: [i64; 16] = [0; 16]
+    // Collect visible window IDs into scratch area
     let mut count: i64 = 0
     let mut id: i64 = 0
     while id < COMP_MAX_WINDOWS {
         let addr = comp_window_addr(id)
         let flags = volatile_read_u64(addr + WIN_OFF_FLAGS)
         if (flags & WIN_FLAG_VISIBLE) != 0 {
-            win_ids[count] = id
+            tile_set_win(count, id)
             count = count + 1
         }
         id = id + 1
@@ -45,58 +57,68 @@ const TILE_GAP: i64 = 4            // Pixel gap between tiled windows
     if layout == LAYOUT_LEFT_RIGHT && count >= 2 {
         // First window: left half
         let half_w = (usable_w - TILE_GAP) / 2
-        comp_move_window(win_ids[0], TILE_GAP, usable_y)
-        let a0 = comp_window_addr(win_ids[0])
+        let w0 = tile_get_win(0)
+        comp_move_window(w0, TILE_GAP, usable_y)
+        let a0 = comp_window_addr(w0)
         volatile_write_u64(a0 + WIN_OFF_W, half_w)
         volatile_write_u64(a0 + WIN_OFF_H, usable_h)
 
         // Second window: right half
-        comp_move_window(win_ids[1], TILE_GAP + half_w + TILE_GAP, usable_y)
-        let a1 = comp_window_addr(win_ids[1])
+        let w1 = tile_get_win(1)
+        comp_move_window(w1, TILE_GAP + half_w + TILE_GAP, usable_y)
+        let a1 = comp_window_addr(w1)
         volatile_write_u64(a1 + WIN_OFF_W, half_w)
         volatile_write_u64(a1 + WIN_OFF_H, usable_h)
+    }
 
-    } else if layout == LAYOUT_QUADRANT && count >= 4 {
+    if layout == LAYOUT_QUADRANT && count >= 4 {
         let half_w = (usable_w - TILE_GAP) / 2
         let half_h = (usable_h - TILE_GAP) / 2
 
         // Top-left
-        comp_move_window(win_ids[0], TILE_GAP, usable_y)
-        let a0 = comp_window_addr(win_ids[0])
+        let w0 = tile_get_win(0)
+        comp_move_window(w0, TILE_GAP, usable_y)
+        let a0 = comp_window_addr(w0)
         volatile_write_u64(a0 + WIN_OFF_W, half_w)
         volatile_write_u64(a0 + WIN_OFF_H, half_h)
 
         // Top-right
-        comp_move_window(win_ids[1], TILE_GAP + half_w + TILE_GAP, usable_y)
-        let a1 = comp_window_addr(win_ids[1])
+        let w1 = tile_get_win(1)
+        comp_move_window(w1, TILE_GAP + half_w + TILE_GAP, usable_y)
+        let a1 = comp_window_addr(w1)
         volatile_write_u64(a1 + WIN_OFF_W, half_w)
         volatile_write_u64(a1 + WIN_OFF_H, half_h)
 
         // Bottom-left
-        comp_move_window(win_ids[2], TILE_GAP, usable_y + half_h + TILE_GAP)
-        let a2 = comp_window_addr(win_ids[2])
+        let w2 = tile_get_win(2)
+        comp_move_window(w2, TILE_GAP, usable_y + half_h + TILE_GAP)
+        let a2 = comp_window_addr(w2)
         volatile_write_u64(a2 + WIN_OFF_W, half_w)
         volatile_write_u64(a2 + WIN_OFF_H, half_h)
 
         // Bottom-right
-        comp_move_window(win_ids[3], TILE_GAP + half_w + TILE_GAP, usable_y + half_h + TILE_GAP)
-        let a3 = comp_window_addr(win_ids[3])
+        let w3 = tile_get_win(3)
+        comp_move_window(w3, TILE_GAP + half_w + TILE_GAP, usable_y + half_h + TILE_GAP)
+        let a3 = comp_window_addr(w3)
         volatile_write_u64(a3 + WIN_OFF_W, half_w)
         volatile_write_u64(a3 + WIN_OFF_H, half_h)
+    }
 
-    } else if layout == LAYOUT_CASCADE {
+    if layout == LAYOUT_CASCADE {
         let mut i: i64 = 0
         while i < count {
             let offset = i * 30
-            comp_move_window(win_ids[i], TILE_GAP + offset, usable_y + offset)
-            let a = comp_window_addr(win_ids[i])
+            let wi = tile_get_win(i)
+            comp_move_window(wi, TILE_GAP + offset, usable_y + offset)
+            let a = comp_window_addr(wi)
             volatile_write_u64(a + WIN_OFF_W, usable_w - offset * 2)
             volatile_write_u64(a + WIN_OFF_H, usable_h - offset * 2)
             i = i + 1
         }
+    }
 
-    } else if layout == LAYOUT_MAXIMIZE && count >= 1 {
-        comp_tile_maximize(win_ids[0])
+    if layout == LAYOUT_MAXIMIZE && count >= 1 {
+        comp_tile_maximize(tile_get_win(0))
     }
 
     volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)

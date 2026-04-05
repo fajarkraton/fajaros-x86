@@ -1,0 +1,112 @@
+// FajarOS Nova v3.0 "Nusantara" — Wallpaper
+// Desktop background rendering: solid color or gradient.
+// Drawn first in compositor before windows.
+
+// ═══════════════════════════════════════════════════════════════
+// Wallpaper State — at WALLPAPER_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const WALLPAPER_BASE: i64 = 0x980000
+// State layout (64 bytes):
+//   +0:  mode (0=gradient, 1=solid, 2=bitmap)
+//   +8:  color1 (gradient start / solid color)
+//   +16: color2 (gradient end)
+//   +24: direction (0=vertical, 1=horizontal, 2=diagonal)
+//   +32: bitmap_addr (for mode=2)
+//   +40: bitmap_w
+//   +48: bitmap_h
+//   +56: initialized (0/1)
+
+const WP_MODE: i64 = 0
+const WP_COLOR1: i64 = 8
+const WP_COLOR2: i64 = 16
+const WP_DIRECTION: i64 = 24
+const WP_BITMAP: i64 = 32
+const WP_BMP_W: i64 = 40
+const WP_BMP_H: i64 = 48
+const WP_INIT: i64 = 56
+
+const WP_MODE_GRADIENT: i64 = 0
+const WP_MODE_SOLID: i64 = 1
+const WP_MODE_BITMAP: i64 = 2
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn wp_read(off: i64) -> i64 { volatile_read_u64(WALLPAPER_BASE + off) }
+@kernel fn wp_write(off: i64, val: i64) { volatile_write_u64(WALLPAPER_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization — default dark gradient
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn wallpaper_init() {
+    let mut i: i64 = 0
+    while i < 64 {
+        volatile_write_u64(WALLPAPER_BASE + i, 0)
+        i = i + 8
+    }
+    wp_write(WP_MODE, WP_MODE_GRADIENT)
+    wp_write(WP_COLOR1, 0x0D1117)    // Dark top
+    wp_write(WP_COLOR2, 0x1A1A2E)    // Slightly lighter bottom
+    wp_write(WP_DIRECTION, 0)         // Vertical
+    wp_write(WP_INIT, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Rendering
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn wallpaper_draw() {
+    let sw = fb_state_read(FB_WIDTH)
+    let sh = fb_state_read(FB_HEIGHT)
+    if sw == 0 || sh == 0 { return }
+
+    let mode = wp_read(WP_MODE)
+    let c1 = wp_read(WP_COLOR1)
+    let c2 = wp_read(WP_COLOR2)
+    let dir = wp_read(WP_DIRECTION)
+
+    if mode == WP_MODE_SOLID {
+        fb_fill_rect(0, 0, sw, sh, c1)
+        return
+    }
+
+    if mode == WP_MODE_GRADIENT {
+        fb_gradient_rect(0, 0, sw, sh, c1, c2, dir)
+        return
+    }
+
+    if mode == WP_MODE_BITMAP {
+        let bmp = wp_read(WP_BITMAP)
+        let bw = wp_read(WP_BMP_W)
+        let bh = wp_read(WP_BMP_H)
+        if bmp != 0 && bw > 0 && bh > 0 {
+            // Center bitmap on screen
+            let ox = (sw - bw) / 2
+            let oy = (sh - bh) / 2
+            // Fill remaining area with color1
+            fb_fill_rect(0, 0, sw, sh, c1)
+            fb_draw_bitmap(ox, oy, bw, bh, bmp)
+        } else {
+            fb_fill_rect(0, 0, sw, sh, c1)
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Configuration
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn wallpaper_set_gradient(c1: i64, c2: i64, direction: i64) {
+    wp_write(WP_MODE, WP_MODE_GRADIENT)
+    wp_write(WP_COLOR1, c1)
+    wp_write(WP_COLOR2, c2)
+    wp_write(WP_DIRECTION, direction)
+}
+
+@kernel fn wallpaper_set_solid(color: i64) {
+    wp_write(WP_MODE, WP_MODE_SOLID)
+    wp_write(WP_COLOR1, color)
+}

@@ -1,0 +1,198 @@
+// FajarOS Nova v3.0 "Nusantara" — Accessibility
+// Screen reader output (serial), high contrast mode, large cursor.
+// Announces widget focus changes and provides navigation aids.
+
+// ═══════════════════════════════════════════════════════════════
+// Accessibility State — at A11Y_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const A11Y_BASE: i64 = 0x98A000
+// State layout (128 bytes):
+//   +0:  initialized (0/1)
+//   +8:  enabled (0/1) — master switch
+//   +16: high_contrast (0/1)
+//   +24: large_cursor (0/1)
+//   +32: screen_reader (0/1) — output to serial
+//   +40: sticky_keys (0/1) — modifier keys stay active
+//   +48: announce_count (number of announcements made)
+//   +56: focus_widget_type (last focused widget type)
+//   +64: last_announce_addr (pointer to last announced text)
+//   +72: cursor_scale (1=normal, 2=large, 3=extra-large)
+//   +80: reduce_motion (0/1) — disable animations
+
+const A11Y_INIT: i64 = 0
+const A11Y_ENABLED: i64 = 8
+const A11Y_HIGH_CONTRAST: i64 = 16
+const A11Y_LARGE_CURSOR: i64 = 24
+const A11Y_SCREEN_READER: i64 = 32
+const A11Y_STICKY_KEYS: i64 = 40
+const A11Y_ANNOUNCE_COUNT: i64 = 48
+const A11Y_FOCUS_TYPE: i64 = 56
+const A11Y_LAST_ADDR: i64 = 64
+const A11Y_CURSOR_SCALE: i64 = 72
+const A11Y_REDUCE_MOTION: i64 = 80
+
+// Widget type names for announcements
+const A11Y_WTYPE_WINDOW: i64 = 5
+const A11Y_WTYPE_BUTTON: i64 = 2
+const A11Y_WTYPE_LABEL: i64 = 1
+const A11Y_WTYPE_TEXTBOX: i64 = 3
+const A11Y_WTYPE_LIST: i64 = 4
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn a11y_read(off: i64) -> i64 { volatile_read_u64(A11Y_BASE + off) }
+@kernel fn a11y_write(off: i64, val: i64) { volatile_write_u64(A11Y_BASE + off, val) }
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn a11y_init() {
+    let mut i: i64 = 0
+    while i < 128 {
+        volatile_write_u64(A11Y_BASE + i, 0)
+        i = i + 8
+    }
+    a11y_write(A11Y_CURSOR_SCALE, 1)
+    a11y_write(A11Y_INIT, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Announcements — output widget info to serial for screen reader
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn a11y_serial_string(addr: i64, len: i64) {
+    let mut i: i64 = 0
+    while i < len {
+        let ch = volatile_read_u8(addr + i)
+        if ch == 0 { return }
+        serial_putchar(ch)
+        i = i + 1
+    }
+}
+
+@kernel fn a11y_announce(widget_type: i64, name_addr: i64, name_len: i64) {
+    if a11y_read(A11Y_ENABLED) == 0 { return }
+    if a11y_read(A11Y_SCREEN_READER) == 0 { return }
+
+    // Output: "[A11Y] <type>: <name>\n"
+    serial_putchar(91)  // [
+    serial_putchar(65)  // A
+    serial_putchar(49)  // 1
+    serial_putchar(49)  // 1
+    serial_putchar(89)  // Y
+    serial_putchar(93)  // ]
+    serial_putchar(32)  // ' '
+
+    // Widget type name
+    if widget_type == A11Y_WTYPE_WINDOW {
+        serial_putchar(87); serial_putchar(105); serial_putchar(110) // Win
+    }
+    if widget_type == A11Y_WTYPE_BUTTON {
+        serial_putchar(66); serial_putchar(116); serial_putchar(110) // Btn
+    }
+    if widget_type == A11Y_WTYPE_LABEL {
+        serial_putchar(76); serial_putchar(98); serial_putchar(108) // Lbl
+    }
+    if widget_type == A11Y_WTYPE_TEXTBOX {
+        serial_putchar(84); serial_putchar(120); serial_putchar(116) // Txt
+    }
+    if widget_type == A11Y_WTYPE_LIST {
+        serial_putchar(76); serial_putchar(115); serial_putchar(116) // Lst
+    }
+
+    serial_putchar(58)  // :
+    serial_putchar(32)  // ' '
+
+    // Name
+    if name_addr != 0 && name_len > 0 {
+        a11y_serial_string(name_addr, name_len)
+    }
+    serial_putchar(10) // newline
+
+    a11y_write(A11Y_FOCUS_TYPE, widget_type)
+    a11y_write(A11Y_LAST_ADDR, name_addr)
+    let count = a11y_read(A11Y_ANNOUNCE_COUNT) + 1
+    a11y_write(A11Y_ANNOUNCE_COUNT, count)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Feature Toggles
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn a11y_set_high_contrast(enable: i64) {
+    a11y_write(A11Y_HIGH_CONTRAST, enable)
+    if enable != 0 {
+        settings_apply_theme(THEME_HIGH_CONTRAST)
+    } else {
+        settings_apply_theme(THEME_DARK)
+    }
+}
+
+@kernel fn a11y_set_large_cursor(enable: i64) {
+    a11y_write(A11Y_LARGE_CURSOR, enable)
+    if enable != 0 {
+        a11y_write(A11Y_CURSOR_SCALE, 2)
+    } else {
+        a11y_write(A11Y_CURSOR_SCALE, 1)
+    }
+}
+
+@kernel fn a11y_set_screen_reader(enable: i64) {
+    a11y_write(A11Y_SCREEN_READER, enable)
+}
+
+@kernel fn a11y_set_reduce_motion(enable: i64) {
+    a11y_write(A11Y_REDUCE_MOTION, enable)
+}
+
+@kernel fn a11y_enable() {
+    a11y_write(A11Y_ENABLED, 1)
+}
+
+@kernel fn a11y_disable() {
+    a11y_write(A11Y_ENABLED, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_accessibility() {
+    cprintln("=== Accessibility ===", YELLOW_ON_BLACK)
+    if a11y_read(A11Y_INIT) == 0 { a11y_init() }
+
+    cprint("  Enabled:        ", WHITE_ON_BLACK)
+    if a11y_read(A11Y_ENABLED) != 0 { cprintln("yes", GREEN_ON_BLACK) }
+    else { cprintln("no", YELLOW_ON_BLACK) }
+
+    cprint("  High contrast:  ", WHITE_ON_BLACK)
+    if a11y_read(A11Y_HIGH_CONTRAST) != 0 { cprintln("on", GREEN_ON_BLACK) }
+    else { cprintln("off", WHITE_ON_BLACK) }
+
+    cprint("  Large cursor:   ", WHITE_ON_BLACK)
+    if a11y_read(A11Y_LARGE_CURSOR) != 0 { cprintln("on", GREEN_ON_BLACK) }
+    else { cprintln("off", WHITE_ON_BLACK) }
+
+    cprint("  Screen reader:  ", WHITE_ON_BLACK)
+    if a11y_read(A11Y_SCREEN_READER) != 0 { cprintln("on (serial)", GREEN_ON_BLACK) }
+    else { cprintln("off", WHITE_ON_BLACK) }
+
+    cprint("  Sticky keys:    ", WHITE_ON_BLACK)
+    if a11y_read(A11Y_STICKY_KEYS) != 0 { cprintln("on", GREEN_ON_BLACK) }
+    else { cprintln("off", WHITE_ON_BLACK) }
+
+    cprint("  Reduce motion:  ", WHITE_ON_BLACK)
+    if a11y_read(A11Y_REDUCE_MOTION) != 0 { cprintln("on", GREEN_ON_BLACK) }
+    else { cprintln("off", WHITE_ON_BLACK) }
+
+    cprint("  Cursor scale:   ", WHITE_ON_BLACK)
+    cprint_decimal(a11y_read(A11Y_CURSOR_SCALE), CYAN_ON_BLACK)
+    cprintln("x", WHITE_ON_BLACK)
+
+    cprint("  Announcements:  ", WHITE_ON_BLACK)
+    cprintln_decimal(a11y_read(A11Y_ANNOUNCE_COUNT), CYAN_ON_BLACK)
+}

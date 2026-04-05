@@ -1,0 +1,214 @@
+// FajarOS Nova v3.0 "Nusantara" — Notification Center
+// Right-side slide-in notification panel. Max 8 active notifications.
+// Each notification has message address, length, priority, and TTL.
+
+// ═════════════════════════��═════════════════════════════════════
+// Notification State — at NOTIFY_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const NOTIFY_BASE: i64 = 0x97C000
+const NOTIFY_MAX: i64 = 8
+const NOTIFY_ENTRY_SIZE: i64 = 64
+
+// Per-notification entry (64 bytes):
+//   +0:  active (0/1)
+//   +8:  msg_addr (pointer to message text)
+//   +16: msg_len
+//   +24: priority (0=low, 1=normal, 2=high, 3=urgent)
+//   +32: ttl_ticks (ticks remaining before auto-dismiss, 0=permanent)
+//   +40: created_tick (when this notification was pushed)
+//   +48: dismissed (0/1)
+//   +56: reserved
+
+const NOTIF_ACTIVE: i64 = 0
+const NOTIF_MSG_ADDR: i64 = 8
+const NOTIF_MSG_LEN: i64 = 16
+const NOTIF_PRIORITY: i64 = 24
+const NOTIF_TTL: i64 = 32
+const NOTIF_CREATED: i64 = 40
+const NOTIF_DISMISSED: i64 = 48
+
+// Global state (after entries)
+const NOTIFY_STATE: i64 = 0x97C400
+const NOTIFY_COUNT: i64 = 0
+const NOTIFY_TICK: i64 = 8
+const NOTIFY_VISIBLE: i64 = 16
+
+// Priority colors
+const NOTIF_COLOR_LOW: i64 = 0x6C7086
+const NOTIF_COLOR_NORMAL: i64 = 0xCDD6F4
+const NOTIF_COLOR_HIGH: i64 = 0xF9E2AF
+const NOTIF_COLOR_URGENT: i64 = 0xF38BA8
+const NOTIF_COLOR_BG: i64 = 0x313244
+const NOTIF_COLOR_BORDER: i64 = 0x585B70
+
+// Drawing
+const NOTIF_WIDTH: i64 = 250
+const NOTIF_HEIGHT: i64 = 48
+const NOTIF_MARGIN: i64 = 8
+const NOTIF_TOP: i64 = 30  // Below menubar
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn notif_addr(idx: i64) -> i64 { NOTIFY_BASE + idx * NOTIFY_ENTRY_SIZE }
+
+// ═════════════════════════════════════════════════════���═════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn notify_init() {
+    let mut i: i64 = 0
+    while i < NOTIFY_MAX * NOTIFY_ENTRY_SIZE {
+        volatile_write_u64(NOTIFY_BASE + i, 0)
+        i = i + 8
+    }
+    volatile_write_u64(NOTIFY_STATE + NOTIFY_COUNT, 0)
+    volatile_write_u64(NOTIFY_STATE + NOTIFY_TICK, 0)
+    volatile_write_u64(NOTIFY_STATE + NOTIFY_VISIBLE, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Push / Dismiss
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn notify_push(msg_addr: i64, msg_len: i64, priority: i64) {
+    // Find free slot
+    let mut slot: i64 = -1
+    let mut i: i64 = 0
+    while i < NOTIFY_MAX {
+        let addr = notif_addr(i)
+        if volatile_read_u64(addr + NOTIF_ACTIVE) == 0 {
+            slot = i
+            i = NOTIFY_MAX  // break
+        }
+        i = i + 1
+    }
+    if slot < 0 {
+        // Evict oldest (slot 0) by shifting everything down
+        let mut j: i64 = 0
+        while j < NOTIFY_MAX - 1 {
+            let dst = notif_addr(j)
+            let src = notif_addr(j + 1)
+            let mut k: i64 = 0
+            while k < NOTIFY_ENTRY_SIZE {
+                volatile_write_u8(dst + k, volatile_read_u8(src + k))
+                k = k + 1
+            }
+            j = j + 1
+        }
+        slot = NOTIFY_MAX - 1
+    }
+
+    let addr = notif_addr(slot)
+    volatile_write_u64(addr + NOTIF_ACTIVE, 1)
+    volatile_write_u64(addr + NOTIF_MSG_ADDR, msg_addr)
+    volatile_write_u64(addr + NOTIF_MSG_LEN, msg_len)
+    volatile_write_u64(addr + NOTIF_PRIORITY, priority)
+    // Auto-dismiss after 500 ticks (~5 seconds)
+    let ttl = if priority >= 3 { 0 } else { 500 }  // urgent = persistent
+    volatile_write_u64(addr + NOTIF_TTL, ttl)
+    volatile_write_u64(addr + NOTIF_CREATED, volatile_read_u64(NOTIFY_STATE + NOTIFY_TICK))
+    volatile_write_u64(addr + NOTIF_DISMISSED, 0)
+
+    let count = volatile_read_u64(NOTIFY_STATE + NOTIFY_COUNT) + 1
+    volatile_write_u64(NOTIFY_STATE + NOTIFY_COUNT, count)
+}
+
+@kernel fn notify_dismiss(idx: i64) {
+    if idx < 0 || idx >= NOTIFY_MAX { return }
+    let addr = notif_addr(idx)
+    if volatile_read_u64(addr + NOTIF_ACTIVE) == 0 { return }
+    volatile_write_u64(addr + NOTIF_ACTIVE, 0)
+    volatile_write_u64(addr + NOTIF_DISMISSED, 1)
+    let count = volatile_read_u64(NOTIFY_STATE + NOTIFY_COUNT)
+    if count > 0 {
+        volatile_write_u64(NOTIFY_STATE + NOTIFY_COUNT, count - 1)
+    }
+}
+
+// Tick: auto-dismiss expired notifications
+@kernel fn notify_tick() {
+    let tick = volatile_read_u64(NOTIFY_STATE + NOTIFY_TICK) + 1
+    volatile_write_u64(NOTIFY_STATE + NOTIFY_TICK, tick)
+    let mut i: i64 = 0
+    while i < NOTIFY_MAX {
+        let addr = notif_addr(i)
+        if volatile_read_u64(addr + NOTIF_ACTIVE) != 0 {
+            let ttl = volatile_read_u64(addr + NOTIF_TTL)
+            if ttl > 0 {
+                let age = tick - volatile_read_u64(addr + NOTIF_CREATED)
+                if age >= ttl { notify_dismiss(i) }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// ══════════════════════════════════��════════════════════════════
+// Rendering — right-side slide-in panel
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn notify_draw() {
+    if volatile_read_u64(NOTIFY_STATE + NOTIFY_VISIBLE) == 0 { return }
+    let sw = fb_state_read(FB_WIDTH)
+    let panel_x = sw - NOTIF_WIDTH - NOTIF_MARGIN
+    let mut ny = NOTIF_TOP
+    let mut i: i64 = 0
+    while i < NOTIFY_MAX {
+        let addr = notif_addr(i)
+        if volatile_read_u64(addr + NOTIF_ACTIVE) != 0 {
+            // Background
+            fb_fill_rect(panel_x, ny, NOTIF_WIDTH, NOTIF_HEIGHT, NOTIF_COLOR_BG)
+            fb_draw_rect(panel_x, ny, NOTIF_WIDTH, NOTIF_HEIGHT, NOTIF_COLOR_BORDER)
+
+            // Priority accent bar (left edge, 3px wide)
+            let prio = volatile_read_u64(addr + NOTIF_PRIORITY)
+            let accent = if prio == 0 { NOTIF_COLOR_LOW }
+                         else if prio == 1 { NOTIF_COLOR_NORMAL }
+                         else if prio == 2 { NOTIF_COLOR_HIGH }
+                         else { NOTIF_COLOR_URGENT }
+            fb_fill_rect(panel_x, ny, 3, NOTIF_HEIGHT, accent)
+
+            // Message text
+            let msg = volatile_read_u64(addr + NOTIF_MSG_ADDR)
+            if msg != 0 {
+                fb_draw_string(panel_x + 8, ny + 16, msg, accent, NOTIF_COLOR_BG)
+            }
+
+            ny = ny + NOTIF_HEIGHT + NOTIF_MARGIN
+        }
+        i = i + 1
+    }
+}
+
+// ══════════════════════════════════════════════════════��════════
+// Shell Command
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_notify() {
+    cprintln("=== Notification Center ===", YELLOW_ON_BLACK)
+    let count = volatile_read_u64(NOTIFY_STATE + NOTIFY_COUNT)
+    cprint("  Active: ", WHITE_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprintln_decimal(NOTIFY_MAX, WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < NOTIFY_MAX {
+        let addr = notif_addr(i)
+        if volatile_read_u64(addr + NOTIF_ACTIVE) != 0 {
+            cprint("  [", WHITE_ON_BLACK)
+            cprint_decimal(i, CYAN_ON_BLACK)
+            cprint("] prio=", WHITE_ON_BLACK)
+            let prio = volatile_read_u64(addr + NOTIF_PRIORITY)
+            if prio == 0 { cprint("low", WHITE_ON_BLACK) }
+            else if prio == 1 { cprint("normal", GREEN_ON_BLACK) }
+            else if prio == 2 { cprint("high", YELLOW_ON_BLACK) }
+            else { cprint("URGENT", RED_ON_BLACK) }
+            cprint(" ttl=", WHITE_ON_BLACK)
+            cprintln_decimal(volatile_read_u64(addr + NOTIF_TTL), WHITE_ON_BLACK)
+        }
+        i = i + 1
+    }
+}

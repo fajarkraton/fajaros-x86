@@ -1,0 +1,210 @@
+// FajarOS Nova v3.0 "Nusantara" — Settings App
+// System-wide configuration: font size, theme, cursor, hot corners.
+// Persisted in volatile memory at SETTINGS_BASE.
+
+// ═══════════════════════════════════════════════════════════════
+// Settings State — at SETTINGS_BASE
+// ═══════════════════════════════════════════════════════════════
+
+const SETTINGS_BASE: i64 = 0x976000
+// Settings slots (32 slots × 8 bytes = 256 bytes):
+//   Key 0: font_size (1-5, default 3)
+//   Key 1: theme (0=dark, 1=light, 2=high-contrast)
+//   Key 2: cursor_speed (1-10, default 5)
+//   Key 3: hot_corner_tl (action: 0-4)
+//   Key 4: hot_corner_tr (action: 0-4)
+//   Key 5: wallpaper_mode (0=gradient, 1=solid)
+//   Key 6: wallpaper_color1
+//   Key 7: wallpaper_color2
+//   Key 8: taskbar_height (30-60)
+//   Key 9: animations_enabled (0/1)
+//   Key 10: screen_timeout (seconds, 0=never)
+//   Key 11: sound_volume (0-100)
+
+const SETTINGS_MAX: i64 = 32
+const SETTINGS_INITIALIZED: i64 = 0x976100  // 8 bytes
+
+// Setting keys
+const SKEY_FONT_SIZE: i64 = 0
+const SKEY_THEME: i64 = 1
+const SKEY_CURSOR_SPEED: i64 = 2
+const SKEY_CORNER_TL: i64 = 3
+const SKEY_CORNER_TR: i64 = 4
+const SKEY_WALLPAPER_MODE: i64 = 5
+const SKEY_WALLPAPER_C1: i64 = 6
+const SKEY_WALLPAPER_C2: i64 = 7
+const SKEY_TASKBAR_H: i64 = 8
+const SKEY_ANIMATIONS: i64 = 9
+const SKEY_SCREEN_TIMEOUT: i64 = 10
+const SKEY_SOUND_VOLUME: i64 = 11
+
+// Theme IDs
+const THEME_DARK: i64 = 0
+const THEME_LIGHT: i64 = 1
+const THEME_HIGH_CONTRAST: i64 = 2
+
+// Theme color sets (bg, fg, accent, border)
+const THEME_DARK_BG: i64 = 0x1E1E2E
+const THEME_DARK_FG: i64 = 0xCDD6F4
+const THEME_DARK_ACCENT: i64 = 0x89B4FA
+const THEME_DARK_BORDER: i64 = 0x585B70
+
+const THEME_LIGHT_BG: i64 = 0xEFF1F5
+const THEME_LIGHT_FG: i64 = 0x4C4F69
+const THEME_LIGHT_ACCENT: i64 = 0x1E66F5
+const THEME_LIGHT_BORDER: i64 = 0x9CA0B0
+
+const THEME_HC_BG: i64 = 0x000000
+const THEME_HC_FG: i64 = 0xFFFFFF
+const THEME_HC_ACCENT: i64 = 0xFFFF00
+const THEME_HC_BORDER: i64 = 0xFFFFFF
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization — set defaults
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn settings_init() {
+    let mut i: i64 = 0
+    while i < SETTINGS_MAX {
+        volatile_write_u64(SETTINGS_BASE + i * 8, 0)
+        i = i + 1
+    }
+    // Defaults
+    settings_set(SKEY_FONT_SIZE, 3)
+    settings_set(SKEY_THEME, THEME_DARK)
+    settings_set(SKEY_CURSOR_SPEED, 5)
+    settings_set(SKEY_CORNER_TL, 1)      // show desktop
+    settings_set(SKEY_CORNER_TR, 3)      // app switcher
+    settings_set(SKEY_WALLPAPER_MODE, 0) // gradient
+    settings_set(SKEY_WALLPAPER_C1, 0x0D1117)
+    settings_set(SKEY_WALLPAPER_C2, 0x1A1A2E)
+    settings_set(SKEY_TASKBAR_H, 40)
+    settings_set(SKEY_ANIMATIONS, 1)
+    settings_set(SKEY_SCREEN_TIMEOUT, 0)
+    settings_set(SKEY_SOUND_VOLUME, 50)
+    volatile_write_u64(SETTINGS_INITIALIZED, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Get / Set
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn settings_get(key: i64) -> i64 {
+    if key < 0 || key >= SETTINGS_MAX { return 0 }
+    volatile_read_u64(SETTINGS_BASE + key * 8)
+}
+
+@kernel fn settings_set(key: i64, value: i64) {
+    if key < 0 || key >= SETTINGS_MAX { return }
+    volatile_write_u64(SETTINGS_BASE + key * 8, value)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Theme Application — update GUI theme colors
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn settings_apply_theme(theme_id: i64) {
+    settings_set(SKEY_THEME, theme_id)
+    if theme_id == THEME_DARK {
+        volatile_write_u64(THEME_BASE + THEME_BG, THEME_DARK_BG)
+        volatile_write_u64(THEME_BASE + THEME_FG, THEME_DARK_FG)
+        volatile_write_u64(THEME_BASE + THEME_FOCUS_BORDER, THEME_DARK_ACCENT)
+        volatile_write_u64(THEME_BASE + THEME_BORDER, THEME_DARK_BORDER)
+        volatile_write_u64(THEME_BASE + THEME_TITLE_BG, 0x313244)
+        volatile_write_u64(THEME_BASE + THEME_TITLE_FG, THEME_DARK_FG)
+        volatile_write_u64(THEME_BASE + THEME_BTN_BG, 0x45475A)
+        volatile_write_u64(THEME_BASE + THEME_BTN_FG, THEME_DARK_FG)
+        volatile_write_u64(THEME_BASE + THEME_INPUT_BG, 0x11111B)
+        volatile_write_u64(THEME_BASE + THEME_INPUT_FG, THEME_DARK_FG)
+    }
+    if theme_id == THEME_LIGHT {
+        volatile_write_u64(THEME_BASE + THEME_BG, THEME_LIGHT_BG)
+        volatile_write_u64(THEME_BASE + THEME_FG, THEME_LIGHT_FG)
+        volatile_write_u64(THEME_BASE + THEME_FOCUS_BORDER, THEME_LIGHT_ACCENT)
+        volatile_write_u64(THEME_BASE + THEME_BORDER, THEME_LIGHT_BORDER)
+        volatile_write_u64(THEME_BASE + THEME_TITLE_BG, 0xDCE0E8)
+        volatile_write_u64(THEME_BASE + THEME_TITLE_FG, THEME_LIGHT_FG)
+        volatile_write_u64(THEME_BASE + THEME_BTN_BG, 0xCCD0DA)
+        volatile_write_u64(THEME_BASE + THEME_BTN_FG, THEME_LIGHT_FG)
+        volatile_write_u64(THEME_BASE + THEME_INPUT_BG, 0xE6E9EF)
+        volatile_write_u64(THEME_BASE + THEME_INPUT_FG, THEME_LIGHT_FG)
+    }
+    if theme_id == THEME_HIGH_CONTRAST {
+        volatile_write_u64(THEME_BASE + THEME_BG, THEME_HC_BG)
+        volatile_write_u64(THEME_BASE + THEME_FG, THEME_HC_FG)
+        volatile_write_u64(THEME_BASE + THEME_FOCUS_BORDER, THEME_HC_ACCENT)
+        volatile_write_u64(THEME_BASE + THEME_BORDER, THEME_HC_BORDER)
+        volatile_write_u64(THEME_BASE + THEME_TITLE_BG, 0x222222)
+        volatile_write_u64(THEME_BASE + THEME_TITLE_FG, THEME_HC_FG)
+        volatile_write_u64(THEME_BASE + THEME_BTN_BG, 0x333333)
+        volatile_write_u64(THEME_BASE + THEME_BTN_FG, THEME_HC_FG)
+        volatile_write_u64(THEME_BASE + THEME_INPUT_BG, 0x111111)
+        volatile_write_u64(THEME_BASE + THEME_INPUT_FG, THEME_HC_FG)
+    }
+    // Mark compositor dirty
+    volatile_write_u64(COMP_STATE_BASE + COMP_STATE_DIRTY, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_settings() {
+    cprintln("=== System Settings ===", YELLOW_ON_BLACK)
+    if volatile_read_u64(SETTINGS_INITIALIZED) == 0 {
+        settings_init()
+    }
+
+    cprint("  Font size:     ", WHITE_ON_BLACK)
+    cprintln_decimal(settings_get(SKEY_FONT_SIZE), CYAN_ON_BLACK)
+
+    cprint("  Theme:         ", WHITE_ON_BLACK)
+    let theme = settings_get(SKEY_THEME)
+    if theme == THEME_DARK { cprintln("dark (Catppuccin Mocha)", CYAN_ON_BLACK) }
+    else if theme == THEME_LIGHT { cprintln("light (Catppuccin Latte)", CYAN_ON_BLACK) }
+    else if theme == THEME_HIGH_CONTRAST { cprintln("high-contrast", CYAN_ON_BLACK) }
+    else { cprintln("unknown", RED_ON_BLACK) }
+
+    cprint("  Cursor speed:  ", WHITE_ON_BLACK)
+    cprintln_decimal(settings_get(SKEY_CURSOR_SPEED), CYAN_ON_BLACK)
+
+    cprint("  Hot corner TL: ", WHITE_ON_BLACK)
+    let tl = settings_get(SKEY_CORNER_TL)
+    if tl == 0 { cprintln("none", WHITE_ON_BLACK) }
+    else if tl == 1 { cprintln("show desktop", GREEN_ON_BLACK) }
+    else if tl == 2 { cprintln("show spaces", GREEN_ON_BLACK) }
+    else if tl == 3 { cprintln("app switcher", GREEN_ON_BLACK) }
+    else { cprintln("screen lock", GREEN_ON_BLACK) }
+
+    cprint("  Hot corner TR: ", WHITE_ON_BLACK)
+    let tr = settings_get(SKEY_CORNER_TR)
+    if tr == 0 { cprintln("none", WHITE_ON_BLACK) }
+    else if tr == 1 { cprintln("show desktop", GREEN_ON_BLACK) }
+    else if tr == 2 { cprintln("show spaces", GREEN_ON_BLACK) }
+    else if tr == 3 { cprintln("app switcher", GREEN_ON_BLACK) }
+    else { cprintln("screen lock", GREEN_ON_BLACK) }
+
+    cprint("  Taskbar:       ", WHITE_ON_BLACK)
+    cprint_decimal(settings_get(SKEY_TASKBAR_H), CYAN_ON_BLACK)
+    cprintln("px", WHITE_ON_BLACK)
+
+    cprint("  Animations:    ", WHITE_ON_BLACK)
+    if settings_get(SKEY_ANIMATIONS) != 0 { cprintln("enabled", GREEN_ON_BLACK) }
+    else { cprintln("disabled", YELLOW_ON_BLACK) }
+
+    cprint("  Volume:        ", WHITE_ON_BLACK)
+    cprint_decimal(settings_get(SKEY_SOUND_VOLUME), CYAN_ON_BLACK)
+    cprintln("%", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_theme(theme_id: i64) {
+    if theme_id < 0 || theme_id > 2 {
+        cprintln("Usage: theme <0=dark|1=light|2=high-contrast>", YELLOW_ON_BLACK)
+        return
+    }
+    settings_apply_theme(theme_id)
+    cprint("Theme set to: ", WHITE_ON_BLACK)
+    if theme_id == THEME_DARK { cprintln("dark", GREEN_ON_BLACK) }
+    else if theme_id == THEME_LIGHT { cprintln("light", GREEN_ON_BLACK) }
+    else { cprintln("high-contrast", GREEN_ON_BLACK) }
+}
