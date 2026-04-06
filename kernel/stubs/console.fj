@@ -59,7 +59,7 @@ const LSR_TX_EMPTY: i64 = 0x20
 
 // ═══════════════════════════════════════════════════
 // VGA Text Mode Console (0xB8000)
-// 80x25 character display, cursor tracking at 0x6FA00/0x6FA08
+// 80x25 character display, cursor tracking at 0x6FB10/0x6FB18
 // ═══════════════════════════════════════════════════
 
 @kernel fn console_init() {
@@ -69,8 +69,8 @@ const LSR_TX_EMPTY: i64 = 0x20
         volatile_write(VGA_BASE + i * 2 + 1, WHITE_ON_BLACK)
         i = i + 1
     }
-    volatile_write(0x6FA00, 0)  // row = 0
-    volatile_write(0x6FA08, 0)  // col = 0
+    volatile_write(0x6FB10, 0)  // row = 0
+    volatile_write(0x6FB18, 0)  // col = 0
 }
 
 @kernel fn console_scroll() {
@@ -102,17 +102,17 @@ const LSR_TX_EMPTY: i64 = 0x20
 
 @kernel fn console_putchar(ch: i64, color: i64) {
     serial_mirror(ch)
-    let row = volatile_read(0x6FA00)
-    let col = volatile_read(0x6FA08)
+    let row = volatile_read(0x6FB10)
+    let col = volatile_read(0x6FB18)
     if ch == 10 {
-        volatile_write(0x6FA08, 0)
+        volatile_write(0x6FB18, 0)
         if row >= VGA_ROWS - 1 { console_scroll() }
-        else { volatile_write(0x6FA00, row + 1) }
+        else { volatile_write(0x6FB10, row + 1) }
         return
     }
     if ch == 8 {
         if col > 0 {
-            volatile_write(0x6FA08, col - 1)
+            volatile_write(0x6FB18, col - 1)
             let addr = VGA_BASE + (row * VGA_COLS + col - 1) * 2
             volatile_write(addr, 0x20)
             volatile_write(addr + 1, color)
@@ -123,11 +123,11 @@ const LSR_TX_EMPTY: i64 = 0x20
     volatile_write(addr, ch)
     volatile_write(addr + 1, color)
     if col >= VGA_COLS - 1 {
-        volatile_write(0x6FA08, 0)
+        volatile_write(0x6FB18, 0)
         if row >= VGA_ROWS - 1 { console_scroll() }
-        else { volatile_write(0x6FA00, row + 1) }
+        else { volatile_write(0x6FB10, row + 1) }
     } else {
-        volatile_write(0x6FA08, col + 1)
+        volatile_write(0x6FB18, col + 1)
     }
     vga_update_cursor()
 }
@@ -164,8 +164,8 @@ const LSR_TX_EMPTY: i64 = 0x20
 }
 
 @kernel fn vga_update_cursor() {
-    let row = volatile_read(0x6FA00)
-    let col = volatile_read(0x6FA08)
+    let row = volatile_read(0x6FB10)
+    let col = volatile_read(0x6FB18)
     let pos = row * VGA_COLS + col
     port_outb(0x3D4, 14)
     port_outb(0x3D5, (pos >> 8) & 0xFF)
