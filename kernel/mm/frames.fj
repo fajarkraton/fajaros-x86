@@ -13,7 +13,7 @@ const BITMAP_BASE: i64 = 0x580000
 const BITMAP_SIZE: i64 = 4096
 
 @kernel fn frames_init() {
-    // Clear bitmap (all free)
+    // Clear ALL bitmap bytes (4096 bytes = 32768 bits = 32768 frames)
     let mut i: i64 = 0
     while i < BITMAP_SIZE {
         volatile_write_u8(BITMAP_BASE + i, 0)
@@ -92,20 +92,26 @@ const BITMAP_SIZE: i64 = 4096
 
 @kernel fn bsf(value: i64) -> i64 {
     // Bit Scan Forward: find index of lowest set bit (0-63), or -1 if zero.
-    // Uses x86 BSF instruction via inline asm.
+    // Software implementation — avoids LLVM inline asm register allocation bug
     if value == 0 { return -1 }
-    asm("bsfq $1, $0",
-        in("r") value,
-        out("r") -> i64,
-        volatile)
+    let mut v = value
+    let mut pos: i64 = 0
+    // Check 32-bit halves first for speed
+    if (v & 0xFFFFFFFF) == 0 { v = v >> 32; pos = 32 }
+    if (v & 0xFFFF) == 0 { v = v >> 16; pos = pos + 16 }
+    if (v & 0xFF) == 0 { v = v >> 8; pos = pos + 8 }
+    if (v & 0xF) == 0 { v = v >> 4; pos = pos + 4 }
+    if (v & 0x3) == 0 { v = v >> 2; pos = pos + 2 }
+    if (v & 0x1) == 0 { pos = pos + 1 }
+    pos
 }
 
 @kernel fn popcnt(value: i64) -> i64 {
-    // Population count: number of set bits.
-    asm("popcntq $1, $0",
-        in("r") value,
-        out("r") -> i64,
-        volatile)
+    // Population count: number of set bits — software implementation
+    let mut v = value
+    let mut count: i64 = 0
+    while v != 0 { count = count + 1; v = v & (v - 1) }
+    count
 }
 
 @kernel fn frames_count_free() -> i64 {

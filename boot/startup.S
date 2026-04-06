@@ -223,6 +223,36 @@ _start64:
     mov     al, 0x0B
     out     dx, al              /* MCR: RTS + DTR + OUT2 */
 
+    /* --- Enable SSE (required for kernel code) --- */
+    /* CR0: clear EM (bit 2), set MP (bit 1) */
+    mov     rax, cr0
+    and     ax, 0xFFFB          /* clear EM */
+    or      ax, 0x0002          /* set MP */
+    mov     cr0, rax
+
+    /* CR4: set OSFXSR (bit 9) + OSXMMEXCPT (bit 10) */
+    mov     rax, cr4
+    or      eax, (1 << 9) | (1 << 10)
+    mov     cr4, rax
+
+    /* AVX/OSXSAVE: only enable if CPU supports XSAVE (CPUID.1:ECX bit 26) */
+    mov     eax, 1
+    cpuid
+    test    ecx, (1 << 26)      /* XSAVE supported? */
+    jz      .Lno_avx
+
+    /* Enable OSXSAVE in CR4 (bit 18) */
+    mov     rax, cr4
+    or      eax, (1 << 18)
+    mov     cr4, rax
+
+    /* Set XCR0: x87 (bit 0) + SSE (bit 1) + AVX (bit 2) */
+    xor     ecx, ecx
+    xgetbv
+    or      eax, 0x7
+    xsetbv
+
+.Lno_avx:
     /* --- Print boot banner --- */
     lea     rdi, [rip + .Lbanner]
     mov     rsi, .Lbanner_end - .Lbanner

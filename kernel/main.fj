@@ -37,29 +37,41 @@
 
 @kernel fn kernel_main() {
     x86_serial_init(0, 115200)
+    println(1)
 
     console_init()
+    println(2)
 
     // Init hardware
     sse_enable()
+    println(3)
     idt_init()
+    println(4)
     pic_remap()
+    println(5)
     pit_init(100)
+    println(6)
     tss_init()
+    println(7)
     syscall_init()
+    println(8)
 
     // Init process table + keyboard buffer
     let mut i: i64 = 0
     while i < 4096 { volatile_write(0x600000 + i, 0); i = i + 8 }
+    println(9)
     volatile_write(0x6FE08, 0)
     set_current_pid(0)
     volatile_write(0x600000 + 8, 2)
     volatile_write(0x6FBF0, 0)
     volatile_write(0x6FBF8, 0)
+    println(10)
 
     // Enable NX bit (EFER.NXE, MSR 0xC0000080 bit 11)
     let efer = read_msr(0xC0000080)
+    println(11)
     write_msr(0xC0000080, efer | (1 << 11))
+    println(12)
 
     // Parse Multiboot2 info (pointer saved at 0x6FF00 by trampoline)
     let mb2_ptr = volatile_read(0x6FF00)
@@ -94,81 +106,120 @@
     // expose SMEP before we can verify page table correctness.
     // TODO: Enable SMEP after verifying all kernel pages have U/S=0.
 
-    // Stack guard page: unmap bottom of stack to catch overflow
-    unmap_page(0x7F0000 - 4096)  // guard page below stack bottom
+    println(13)
+    // Stack guard page: SKIP — 2MB huge pages don't support 4KB unmap
+    // unmap_page(0x7F0000 - 4096)  // guard page below stack bottom
+    println(14)
 
+    println(15)
     // Init memory + SMP + IPC + ramfs + history + ML
-    smp_init_per_cpu()
+    // smp_init_per_cpu()  // SKIP: may corrupt page tables
+    println(16)
     frames_init()
+    println(17)
     heap_init()
+    println(18)
     slab_init()
+    println(19)
     ipc_init()
+    println(20)
     ipc2_init()
+    println(21)
     channel_init()
+    println(22)
     irq_notify_init()
+    println(23)
     shm_init()
+    println(24)
     ramfs_init()
+    println(25)
     font_init()
+    println(26)
 
     // GUI subsystem initialization
+    println(27)
     comp_init()
+    println(28)
     damage_init()
+    println(29)
     spaces_init()
+    println(30)
     switcher_init()
+    println(31)
     hot_corners_init()
+    println(32)
     anim_init()
+    println(33)
     cursor_init()
+    println(34)
     clipboard_init()
+    println(35)
     shortcuts_init()
+    println(36)
     a11y_init()
+    println(37)
     notify_init()
+    println(38)
     wallpaper_init()
+    println(39)
     dnd_init()
+    println(40)
     launcher_init()
+    println(41)
     settings_init()
+    println(42)
     menubar_init()
+    println(43)
     ctxmenu_init()
+    println(44)
     calc_init()
+    println(45)
     viewer_init()
+    println(46)
     sysmon_init()
+    println(47)
     filemgr_init()
+    println(48)
     // Detect Multiboot2 framebuffer (VBE/GOP mode from bootloader)
     fb_detect_multiboot()
+    println(49)
     let fb_addr = fb_state_read(FB_MAPPED)
+    println(50)
     if fb_addr != 0 {
-        let fb_w = fb_state_read(FB_WIDTH)
-        let fb_h = fb_state_read(FB_HEIGHT)
-        cprint("[FB] Framebuffer: ", WHITE_ON_BLACK)
-        cprint_decimal(fb_w, CYAN_ON_BLACK)
-        cprint("x", WHITE_ON_BLACK)
-        cprint_decimal(fb_h, CYAN_ON_BLACK)
-        cprint(" at 0x", WHITE_ON_BLACK)
-        cprint_hex(fb_addr, 16, CYAN_ON_BLACK)
-        cprintln("", WHITE_ON_BLACK)
-        // Draw wallpaper + menubar + compositor if framebuffer available
-        wallpaper_draw()
-        menubar_draw()
-        comp_composite()
+        println(51)
     }
     println("[GUI] Desktop compositor + 14 GUI modules initialized")
 
+    println(52)
     mnist_init_weights()
+    println(53)
 
     // Map LAPIC + IOAPIC MMIO pages (beyond 128MB identity region)
+    // These require allocating new PDPT/PD/PT entries for the 3-4GB range
+    println(54)
     map_page(0xFEE00000, 0xFEE00000, PAGE_PRESENT | PAGE_WRITABLE)  // LAPIC
+    println(55)
     map_page(0xFEC00000, 0xFEC00000, PAGE_PRESENT | PAGE_WRITABLE)  // IOAPIC
+    println(56)
 
-    // Initialize LAPIC
+    // Initialize LAPIC if present
     let apic_present = cpuid_edx(1) & (1 << 9)
+    println(57)
     if apic_present != 0 {
+        println(58)
         // Set spurious interrupt vector to 0xFF, enable APIC (bit 8)
         let svr = volatile_read_u32(0xFEE000F0)
+        println(59)
         volatile_write_u32(0xFEE000F0, svr | 0x1FF)  // vector 0xFF + enable
+        println(60)
     }
     history_init()
+    println(61)
 
-    // Initialize NVMe block device (or ramdisk fallback)
-    nvme_full_init()
+    // Initialize block device — use ramdisk (NVMe deferred: needs interrupt handler)
+    // nvme_full_init()  // TODO: enable after NVMe IRQ handler is wired
+    blk_register(0, 2, 1048576 / 512, 512)
+    println("[BLK] Ramdisk (1MB) registered")
 
     // Initialize VFS (mounts /, /dev, /proc, /mnt if FAT32 available)
     vfs_init()

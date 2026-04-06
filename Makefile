@@ -189,7 +189,7 @@ SOURCES := \
 QEMU := qemu-system-x86_64
 QEMU_COMMON := -serial stdio -no-reboot -no-shutdown
 QEMU_MEM := -m 512M
-QEMU_CPU := -cpu qemu64,+avx2,+sse4.2
+QEMU_CPU := -cpu Skylake-Client-v4
 QEMU_KVM := -enable-kvm -cpu host
 QEMU_SMP := -smp 4
 QEMU_NVME := -drive file=disk.img,if=none,id=nvme0 -device nvme,serial=fajaros,drive=nvme0 -boot d
