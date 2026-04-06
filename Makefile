@@ -201,7 +201,7 @@ QEMU_FULL := $(QEMU_KVM) $(QEMU_SMP) $(QEMU_NET) $(QEMU_USB) -device virtio-gpu-
 
 .PHONY: all build build-llvm build-llvm-custom run run-kvm run-vga run-smp run-nvme run-net \
        run-llvm run-kvm-llvm debug debug-llvm iso run-iso test clean help loc \
-       run-iso-kvm run-iso-tcg run-iso-vga run-iso-full debug-iso test-serial
+       run-iso-kvm run-iso-tcg run-iso-vga run-iso-full debug-iso test-serial test-commands
 
 all: build
 
@@ -379,6 +379,77 @@ test-serial: iso-llvm
 	@grep -q "nova>" $(BUILD_DIR)/test-output.log && echo "[PASS] Shell prompt reached" || echo "[FAIL] No shell prompt"
 	@grep -q "FajarOS Nova" $(BUILD_DIR)/test-output.log && echo "[PASS] Version command works" || echo "[FAIL] Version failed"
 	@grep -q "Frame Allocator" $(BUILD_DIR)/test-output.log && echo "[PASS] Frames command works" || echo "[FAIL] Frames failed"
+
+# Mass-test shell commands (80+ commands, check for crashes)
+test-commands: iso-llvm
+	@echo "[TEST] FajarOS mass command test (80+ commands)..."
+	@echo "[TEST] Building command sequence..."
+	@(sleep 6; \
+	printf 'help\r'; sleep 1; \
+	printf 'version\r'; sleep 1; \
+	printf 'uname\r'; sleep 1; \
+	printf 'about\r'; sleep 1; \
+	printf 'uptime\r'; sleep 1; \
+	printf 'cpuinfo\r'; sleep 1; \
+	printf 'meminfo\r'; sleep 1; \
+	printf 'frames\r'; sleep 1; \
+	printf 'free\r'; sleep 1; \
+	printf 'whoami\r'; sleep 1; \
+	printf 'hostname\r'; sleep 1; \
+	printf 'arch\r'; sleep 1; \
+	printf 'date\r'; sleep 1; \
+	printf 'id\r'; sleep 1; \
+	printf 'tsc\r'; sleep 1; \
+	printf 'epoch\r'; sleep 1; \
+	printf 'logo\r'; sleep 1; \
+	printf 'color\r'; sleep 1; \
+	printf 'motd\r'; sleep 1; \
+	printf 'cal\r'; sleep 1; \
+	printf 'banner FJ\r'; sleep 1; \
+	printf 'cowsay moo\r'; sleep 1; \
+	printf 'fortune\r'; sleep 1; \
+	printf 'dice\r'; sleep 1; \
+	printf 'true\r'; sleep 1; \
+	printf 'false\r'; sleep 1; \
+	printf 'seq 5\r'; sleep 1; \
+	printf 'hex 255\r'; sleep 1; \
+	printf 'factor 42\r'; sleep 1; \
+	printf 'prime 97\r'; sleep 1; \
+	printf 'len hello\r'; sleep 1; \
+	printf 'fib 10\r'; sleep 1; \
+	printf 'echo hello\r'; sleep 1; \
+	printf 'rev hello\r'; sleep 1; \
+	printf 'upcase hello\r'; sleep 1; \
+	printf 'downcase HELLO\r'; sleep 1; \
+	printf 'base 255 16\r'; sleep 1; \
+	printf 'count\r'; sleep 1; \
+	printf 'ls\r'; sleep 1; \
+	printf 'pwd\r'; sleep 1; \
+	printf 'mmap\r'; sleep 1; \
+	printf 'history\r'; sleep 1; \
+	printf 'env\r'; sleep 1; \
+	printf 'ps\r'; sleep 1; \
+	printf 'dmesg\r'; sleep 1; \
+	printf 'touch testfile\r'; sleep 1; \
+	printf 'ls\r'; sleep 1; \
+	printf 'cat testfile\r'; sleep 1; \
+	printf 'rm testfile\r'; sleep 1; \
+	printf 'calc\r'; sleep 1; \
+	printf 'clear\r'; sleep 1; \
+	printf 'sysinfo\r'; sleep 1; \
+	) | timeout 65 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+		-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
+		-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) 2>/dev/null | \
+		tee $(BUILD_DIR)/test-commands.log
+	@echo ""
+	@echo "═══════════════════════════════════════"
+	@echo "  FajarOS Command Test Results"
+	@echo "═══════════════════════════════════════"
+	@TOTAL=$$(grep -c "^nova>" $(BUILD_DIR)/test-commands.log 2>/dev/null || echo 0); \
+	CRASHES=$$(grep -c "\[EXC" $(BUILD_DIR)/test-commands.log 2>/dev/null || echo 0); \
+	echo "  Prompts returned: $$TOTAL"; \
+	echo "  Crashes ([EXC]):  $$CRASHES"; \
+	if [ "$$CRASHES" = "0" ]; then echo "  Result: ALL PASS"; else echo "  Result: $$CRASHES FAILURES"; fi
 
 # Debug LLVM ISO with GDB
 debug-iso: iso-llvm
