@@ -919,6 +919,16 @@ const FB_MULTIBOOT_INFO: i64 = 0x6FF00  // Multiboot2 info ptr (set by startup.S
             fb_state_write(FB_HEIGHT, height)
             fb_state_write(FB_PITCH, pitch)
             fb_state_write(FB_BPP, bpp)
+            let size = pitch * height
+            fb_state_write(FB_SIZE, size)
+            // Map framebuffer pages (outside 128MB identity map)
+            let pages = (size + 4095) / 4096
+            let mut pg: i64 = 0
+            while pg < pages {
+                map_page(addr + pg * 4096, addr + pg * 4096, PAGE_PRESENT | PAGE_WRITABLE)
+                pg = pg + 1
+            }
+            fb_state_write(FB_READY, 1)
             return
         }
         // Align to 8 bytes

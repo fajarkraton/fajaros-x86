@@ -172,6 +172,7 @@ const BORDER_WIDTH: i64 = 1
 // ── Compositing engine ──
 
 @kernel fn comp_composite() {
+    if fb_state_read(FB_MAPPED) == 0 { return }
     let dirty = volatile_read_u64(COMP_STATE_BASE + COMP_STATE_DIRTY)
     if dirty == 0 { return }
 
@@ -288,12 +289,14 @@ const BORDER_WIDTH: i64 = 1
 }
 
 @kernel fn comp_swap_buffers() {
-    // Copy back buffer to front buffer (simple memcpy)
+    // Copy back buffer to detected front buffer (from multiboot2 framebuffer)
+    let front = fb_state_read(FB_MAPPED)
+    if front == 0 { return }
     let size = SCREEN_WIDTH * SCREEN_HEIGHT * SCREEN_BPP
     let mut i: i64 = 0
     while i < size {
         let val = volatile_read_u32(FB_BACK + i)
-        volatile_write_u32(FB_FRONT + i, val)
+        volatile_write_u32(front + i, val)
         i = i + 4
     }
 }
