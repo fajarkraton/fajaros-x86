@@ -380,112 +380,128 @@ test-serial: iso-llvm
 	@grep -q "FajarOS Nova" $(BUILD_DIR)/test-output.log && echo "[PASS] Version command works" || echo "[FAIL] Version failed"
 	@grep -q "Frame Allocator" $(BUILD_DIR)/test-output.log && echo "[PASS] Frames command works" || echo "[FAIL] Frames failed"
 
-# Mass-test shell commands (80+ commands, check for crashes)
+# Mass-test shell commands — 2 batches × 45 commands = 90 total
 test-commands: iso-llvm
-	@echo "[TEST] FajarOS mass command test (80+ commands)..."
-	@echo "[TEST] Building command sequence..."
+	@echo "═══════════════════════════════════════"
+	@echo "  FajarOS Shell Command Test (90 cmds)"
+	@echo "═══════════════════════════════════════"
+	@echo "[BATCH 1/2] Info + Display + Math (45 commands)..."
 	@(sleep 6; \
-	printf 'help\r'; sleep 0.3; \
-	printf 'version\r'; sleep 0.3; \
-	printf 'uname\r'; sleep 0.3; \
-	printf 'about\r'; sleep 0.3; \
-	printf 'uptime\r'; sleep 0.3; \
-	printf 'cpuinfo\r'; sleep 0.3; \
-	printf 'meminfo\r'; sleep 0.3; \
-	printf 'frames\r'; sleep 0.3; \
-	printf 'free\r'; sleep 0.3; \
-	printf 'whoami\r'; sleep 0.3; \
-	printf 'hostname\r'; sleep 0.3; \
-	printf 'arch\r'; sleep 0.3; \
-	printf 'date\r'; sleep 0.3; \
-	printf 'id\r'; sleep 0.3; \
-	printf 'tsc\r'; sleep 0.3; \
-	printf 'epoch\r'; sleep 0.3; \
-	printf 'logo\r'; sleep 0.3; \
-	printf 'color\r'; sleep 0.3; \
-	printf 'motd\r'; sleep 0.3; \
-	printf 'cal\r'; sleep 0.3; \
-	printf 'banner FJ\r'; sleep 0.3; \
-	printf 'cowsay moo\r'; sleep 0.3; \
-	printf 'fortune\r'; sleep 0.3; \
-	printf 'dice\r'; sleep 0.3; \
-	printf 'true\r'; sleep 0.3; \
-	printf 'false\r'; sleep 0.3; \
-	printf 'seq 5\r'; sleep 0.3; \
-	printf 'hex 255\r'; sleep 0.3; \
-	printf 'factor 42\r'; sleep 0.3; \
-	printf 'prime 97\r'; sleep 0.3; \
-	printf 'len hello\r'; sleep 0.3; \
-	printf 'fib 10\r'; sleep 0.3; \
-	printf 'echo hello\r'; sleep 0.3; \
-	printf 'rev hello\r'; sleep 0.3; \
-	printf 'upcase hello\r'; sleep 0.3; \
-	printf 'downcase HELLO\r'; sleep 0.3; \
-	printf 'base 255 16\r'; sleep 0.3; \
-	printf 'count\r'; sleep 0.3; \
-	printf 'ls\r'; sleep 0.3; \
-	printf 'pwd\r'; sleep 0.3; \
-	printf 'mmap\r'; sleep 0.3; \
-	printf 'history\r'; sleep 0.3; \
-	printf 'env\r'; sleep 0.3; \
-	printf 'ps\r'; sleep 0.3; \
-	printf 'dmesg\r'; sleep 0.3; \
-	printf 'nproc\r'; sleep 0.3; \
-	printf 'acpi\r'; sleep 0.3; \
-	printf 'lspci\r'; sleep 0.3; \
-	printf 'touch testfile\r'; sleep 0.3; \
-	printf 'cat testfile\r'; sleep 0.3; \
-	printf 'stat testfile\r'; sleep 0.3; \
-	printf 'rm testfile\r'; sleep 0.3; \
-	printf 'df\r'; sleep 0.3; \
-	printf 'du\r'; sleep 0.3; \
-	printf 'head\r'; sleep 0.3; \
-	printf 'tail\r'; sleep 0.3; \
-	printf 'wc\r'; sleep 0.3; \
-	printf 'nl\r'; sleep 0.3; \
-	printf 'sort\r'; sleep 0.3; \
-	printf 'uniq\r'; sleep 0.3; \
-	printf 'xxd\r'; sleep 0.3; \
-	printf 'strings\r'; sleep 0.3; \
-	printf 'md5\r'; sleep 0.3; \
-	printf 'mkdir testdir\r'; sleep 0.3; \
-	printf 'rmdir testdir\r'; sleep 0.3; \
-	printf 'which help\r'; sleep 0.3; \
-	printf 'type help\r'; sleep 0.3; \
-	printf 'man help\r'; sleep 0.3; \
-	printf 'calc\r'; sleep 0.3; \
-	printf 'bench\r'; sleep 2; \
-	printf 'top\r'; sleep 0.3; \
-	printf 'kill 0\r'; sleep 0.3; \
-	printf 'tensor\r'; sleep 0.3; \
-	printf 'splash\r'; sleep 0.3; \
-	printf 'cls\r'; sleep 0.3; \
-	printf 'clear\r'; sleep 0.3; \
-	printf 'repeat 3 ok\r'; sleep 0.3; \
-	printf 'cut\r'; sleep 0.3; \
-	printf 'tr\r'; sleep 0.3; \
-	printf 'grep\r'; sleep 0.3; \
-	printf 'dd\r'; sleep 0.3; \
-	printf 'time\r'; sleep 0.3; \
-	printf 'nice\r'; sleep 0.3; \
-	printf 'set FOO bar\r'; sleep 0.3; \
-	printf 'alias\r'; sleep 0.3; \
-	printf 'printenv\r'; sleep 0.3; \
-	printf 'sysinfo\r'; sleep 0.3; \
-	printf 'neofetch\r'; sleep 1; \
-	) | timeout 180 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+	printf 'help\r'; sleep 0.5; \
+	printf 'version\r'; sleep 0.5; \
+	printf 'uname\r'; sleep 0.5; \
+	printf 'about\r'; sleep 0.5; \
+	printf 'uptime\r'; sleep 0.5; \
+	printf 'cpuinfo\r'; sleep 0.5; \
+	printf 'meminfo\r'; sleep 0.5; \
+	printf 'frames\r'; sleep 0.5; \
+	printf 'free\r'; sleep 0.5; \
+	printf 'whoami\r'; sleep 0.5; \
+	printf 'hostname\r'; sleep 0.5; \
+	printf 'arch\r'; sleep 0.5; \
+	printf 'date\r'; sleep 0.5; \
+	printf 'id\r'; sleep 0.5; \
+	printf 'tsc\r'; sleep 0.5; \
+	printf 'epoch\r'; sleep 0.5; \
+	printf 'nproc\r'; sleep 0.5; \
+	printf 'acpi\r'; sleep 0.5; \
+	printf 'logo\r'; sleep 0.5; \
+	printf 'color\r'; sleep 0.5; \
+	printf 'motd\r'; sleep 0.5; \
+	printf 'cal\r'; sleep 0.5; \
+	printf 'banner FJ\r'; sleep 0.5; \
+	printf 'cowsay moo\r'; sleep 0.5; \
+	printf 'fortune\r'; sleep 0.5; \
+	printf 'dice\r'; sleep 0.5; \
+	printf 'true\r'; sleep 0.5; \
+	printf 'false\r'; sleep 0.5; \
+	printf 'seq 5\r'; sleep 0.5; \
+	printf 'hex 255\r'; sleep 0.5; \
+	printf 'factor 42\r'; sleep 0.5; \
+	printf 'prime 97\r'; sleep 0.5; \
+	printf 'len hello\r'; sleep 0.5; \
+	printf 'fib 10\r'; sleep 0.5; \
+	printf 'echo hello\r'; sleep 0.5; \
+	printf 'rev hello\r'; sleep 0.5; \
+	printf 'upcase hello\r'; sleep 0.5; \
+	printf 'downcase HELLO\r'; sleep 0.5; \
+	printf 'base 255 16\r'; sleep 0.5; \
+	printf 'count\r'; sleep 0.5; \
+	printf 'calc\r'; sleep 0.5; \
+	printf 'env\r'; sleep 0.5; \
+	printf 'history\r'; sleep 0.5; \
+	printf 'dmesg\r'; sleep 0.5; \
+	printf 'clear\r'; sleep 1; \
+	) | timeout 60 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
 		-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
 		-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) 2>/dev/null | \
-		tee $(BUILD_DIR)/test-commands.log
+		tee $(BUILD_DIR)/test-batch1.log
 	@echo ""
+	@echo "[BATCH 2/2] FS + System + Advanced (45 commands)..."
+	@(sleep 6; \
+	printf 'ls\r'; sleep 0.5; \
+	printf 'pwd\r'; sleep 0.5; \
+	printf 'mmap\r'; sleep 0.5; \
+	printf 'lspci\r'; sleep 0.5; \
+	printf 'ps\r'; sleep 0.5; \
+	printf 'top\r'; sleep 0.5; \
+	printf 'df\r'; sleep 0.5; \
+	printf 'du\r'; sleep 0.5; \
+	printf 'touch testfile\r'; sleep 0.5; \
+	printf 'cat testfile\r'; sleep 0.5; \
+	printf 'stat testfile\r'; sleep 0.5; \
+	printf 'rm testfile\r'; sleep 0.5; \
+	printf 'mkdir testdir\r'; sleep 0.5; \
+	printf 'rmdir testdir\r'; sleep 0.5; \
+	printf 'head\r'; sleep 0.5; \
+	printf 'tail\r'; sleep 0.5; \
+	printf 'wc\r'; sleep 0.5; \
+	printf 'nl\r'; sleep 0.5; \
+	printf 'sort\r'; sleep 0.5; \
+	printf 'uniq\r'; sleep 0.5; \
+	printf 'xxd\r'; sleep 0.5; \
+	printf 'strings\r'; sleep 0.5; \
+	printf 'md5\r'; sleep 0.5; \
+	printf 'cut\r'; sleep 0.5; \
+	printf 'tr\r'; sleep 0.5; \
+	printf 'grep\r'; sleep 0.5; \
+	printf 'which help\r'; sleep 0.5; \
+	printf 'type help\r'; sleep 0.5; \
+	printf 'man help\r'; sleep 0.5; \
+	printf 'printenv\r'; sleep 0.5; \
+	printf 'set FOO bar\r'; sleep 0.5; \
+	printf 'alias\r'; sleep 0.5; \
+	printf 'kill 0\r'; sleep 0.5; \
+	printf 'tensor\r'; sleep 0.5; \
+	printf 'bench\r'; sleep 2; \
+	printf 'repeat 3 ok\r'; sleep 0.5; \
+	printf 'splash\r'; sleep 0.5; \
+	printf 'dd\r'; sleep 0.5; \
+	printf 'time\r'; sleep 0.5; \
+	printf 'nice\r'; sleep 0.5; \
+	printf 'cls\r'; sleep 0.5; \
+	printf 'sysinfo\r'; sleep 0.5; \
+	printf 'neofetch\r'; sleep 0.5; \
+	printf 'clear\r'; sleep 1; \
+	) | timeout 60 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+		-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
+		-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) 2>/dev/null | \
+		tee $(BUILD_DIR)/test-batch2.log
+	@echo ""
+	@cat $(BUILD_DIR)/test-batch1.log $(BUILD_DIR)/test-batch2.log > $(BUILD_DIR)/test-commands.log
 	@echo "═══════════════════════════════════════"
 	@echo "  FajarOS Command Test Results"
 	@echo "═══════════════════════════════════════"
-	@TOTAL=$$(grep -c "^nova>" $(BUILD_DIR)/test-commands.log 2>/dev/null || echo 0); \
-	CRASHES=$$(grep -c "\[EXC" $(BUILD_DIR)/test-commands.log 2>/dev/null || echo 0); \
-	echo "  Prompts returned: $$TOTAL"; \
-	echo "  Crashes ([EXC]):  $$CRASHES"; \
-	if [ "$$CRASHES" = "0" ]; then echo "  Result: ALL PASS"; else echo "  Result: $$CRASHES FAILURES"; fi
+	@B1=$$(grep -c "^nova>" $(BUILD_DIR)/test-batch1.log 2>/dev/null || echo 0); \
+	B2=$$(grep -c "^nova>" $(BUILD_DIR)/test-batch2.log 2>/dev/null || echo 0); \
+	TOTAL=$$((B1 + B2)); \
+	C1=$$(grep -c "\[EXC" $(BUILD_DIR)/test-batch1.log 2>/dev/null || echo 0); \
+	C2=$$(grep -c "\[EXC" $(BUILD_DIR)/test-batch2.log 2>/dev/null || echo 0); \
+	CRASHES=$$((C1 + C2)); \
+	echo "  Batch 1: $$B1 prompts, $$C1 crashes"; \
+	echo "  Batch 2: $$B2 prompts, $$C2 crashes"; \
+	echo "  Total:   $$TOTAL prompts, $$CRASHES crashes"; \
+	if [ "$$CRASHES" = "0" ]; then echo "  Result:  ALL PASS"; else echo "  Result:  $$CRASHES FAILURES"; fi
 
 # Debug LLVM ISO with GDB
 debug-iso: iso-llvm
