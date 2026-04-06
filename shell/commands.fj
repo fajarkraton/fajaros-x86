@@ -2992,6 +2992,9 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     // r3test = 114,51,116,101,115,116
     if handled == 0 && len == 6 && volatile_read_u8(0x6F800) == 114 && volatile_read_u8(0x6F801) == 51 && volatile_read_u8(0x6F802) == 116 && volatile_read_u8(0x6F803) == 101 { cmd_ring3_exit_test(); handled = 1 }
 
+    // gpu-info (103,112,117,45,105,110,102,111) — detailed GPU info
+    if handled == 0 && len == 8 && buf_eq4(103, 112, 117, 45) == 1 && volatile_read_u8(0x6F804) == 105 { cmd_gpu_info(); handled = 1 }
+
     // quant (113,117,97,110,116) — FajarQuant kernel quantization demo
     if handled == 0 && len == 5 && buf_eq4(113, 117, 97, 110) == 1 && volatile_read_u8(0x6F804) == 116 { cmd_quant_demo(); handled = 1 }
 

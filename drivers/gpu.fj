@@ -58,3 +58,65 @@
     else if subclass == 2 { cprintln("3D controller", WHITE_ON_BLACK) }
     else { cprintln("Display controller", WHITE_ON_BLACK) }
 }
+
+@kernel fn cmd_gpu_info() {
+    cprintln("=== GPU Information ===", YELLOW_ON_BLACK)
+    let mut dev: i64 = 0
+    let mut gpu_count: i64 = 0
+    while dev < 32 {
+        let id = pci_read32(0, dev, 0, 0)
+        if id != 0xFFFFFFFF && id != 0 {
+            let cl = pci_read32(0, dev, 0, 8)
+            let class = (cl >> 24) & 0xFF
+            if class == 3 {
+                gpu_count = gpu_count + 1
+                let vendor = id & 0xFFFF
+                let device = (id >> 16) & 0xFFFF
+                let subclass = (cl >> 16) & 0xFF
+                cprint("  GPU ", WHITE_ON_BLACK)
+                cprint_decimal(gpu_count, CYAN_ON_BLACK)
+                cprint(": ", WHITE_ON_BLACK)
+                if vendor == 0x10DE {
+                    cprint("NVIDIA", GREEN_ON_BLACK)
+                    // Known NVIDIA device IDs
+                    if device == 0x2684 { cprint(" RTX 4090", GREEN_ON_BLACK) }
+                    else if device == 0x2704 { cprint(" RTX 4080", GREEN_ON_BLACK) }
+                    else if device == 0x2783 { cprint(" RTX 4070", GREEN_ON_BLACK) }
+                } else if vendor == 0x8086 { cprint("Intel", CYAN_ON_BLACK) }
+                else if vendor == 0x1002 { cprint("AMD", CYAN_ON_BLACK) }
+                else if vendor == 0x1AF4 { cprint("VirtIO-GPU", CYAN_ON_BLACK) }
+                console_putchar(10, WHITE_ON_BLACK)
+                cprint("    Vendor: 0x", WHITE_ON_BLACK)
+                cprint_hex(vendor, 4, CYAN_ON_BLACK)
+                cprint("  Device: 0x", WHITE_ON_BLACK)
+                cprint_hex(device, 4, CYAN_ON_BLACK)
+                console_putchar(10, WHITE_ON_BLACK)
+                if subclass == 0 { cprintln("    Type: VGA controller", WHITE_ON_BLACK) }
+                else if subclass == 2 { cprintln("    Type: 3D controller", WHITE_ON_BLACK) }
+                else { cprintln("    Type: Display controller", WHITE_ON_BLACK) }
+                // BAR info
+                let bar0 = pci_read32(0, dev, 0, 0x10)
+                let bar1 = pci_read32(0, dev, 0, 0x14)
+                cprint("    BAR0: 0x", WHITE_ON_BLACK)
+                cprint_hex(bar0, 8, CYAN_ON_BLACK)
+                if bar1 != 0 {
+                    cprint("  BAR1: 0x", WHITE_ON_BLACK)
+                    cprint_hex(bar1, 8, CYAN_ON_BLACK)
+                }
+                console_putchar(10, WHITE_ON_BLACK)
+            }
+        }
+        dev = dev + 1
+    }
+    if gpu_count == 0 { cprintln("  No GPU found", RED_ON_BLACK) }
+    else {
+        cprint("  Total: ", WHITE_ON_BLACK)
+        cprint_decimal(gpu_count, GREEN_ON_BLACK)
+        cprintln(" GPU(s) detected", GREEN_ON_BLACK)
+    }
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("Fajar Lang compiler supports:", WHITE_ON_BLACK)
+    cprintln("  PTX codegen: sm_70 - sm_89 (Volta → Ada Lovelace)", CYAN_ON_BLACK)
+    cprintln("  CUDA FFI: libcuda.so dynamic loading", CYAN_ON_BLACK)
+    cprintln("  Types: FP32, FP16, BF16, FP8 (E4M3/E5M2)", CYAN_ON_BLACK)
+}
