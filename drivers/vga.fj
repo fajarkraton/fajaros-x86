@@ -88,8 +88,7 @@
 @kernel fn cprint_decimal(val: i64, color: i64) {
     if val < 0 { console_putchar(45, color); cprint_decimal(0 - val, color); return }
     if val == 0 { console_putchar(48, color); return }
-    // Recursive digit extraction — no stack arrays needed
-    // Print digits left-to-right by recursing first, then printing
+    // Divisor-based digit extraction — avoids stack array codegen issues
     let mut divisor: i64 = 1
     let mut tmp = val
     while tmp >= 10 { divisor = divisor * 10; tmp = tmp / 10 }
