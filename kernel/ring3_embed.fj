@@ -754,6 +754,19 @@ const RING3_HELLO_ADDR: i64 = 0x962000  // After HW_INFO (0x960000-0x960400)
         sp_pg = sp_pg + 1
     }
 
+    // Write SYS_EXIT trampoline at user stack top area (0x2FFF000)
+    // When main() returns, `ret` pops this address → executes: mov eax,0; syscall
+    let trampoline = user_stack_top - FRAME_SIZE  // 0x2FFF000
+    volatile_write_u8(trampoline, 0xB8)       // mov eax, 0 (SYS_EXIT)
+    volatile_write_u32(trampoline + 1, 0)
+    volatile_write_u8(trampoline + 5, 0x0F)   // syscall
+    volatile_write_u8(trampoline + 6, 0x05)
+    volatile_write_u8(trampoline + 7, 0xF4)   // hlt (safety)
+
+    // Set user stack: push trampoline address as return address for main()
+    let user_sp = user_stack_top - 16  // below trampoline, space for return addr
+    volatile_write_u64(user_sp, trampoline)  // return address → SYS_EXIT trampoline
+
     // Flush TLB
     let cr3 = read_cr3()
     write_cr3(cr3)
@@ -769,7 +782,7 @@ const RING3_HELLO_ADDR: i64 = 0x962000  // After HW_INFO (0x960000-0x960400)
 
     // IRETQ to Ring 3 — when user calls SYS_EXIT, kernel resumes here
     println("[R3] IRETQ...")
-    iretq_to_user(entry, user_stack_top - 8, 0x002)
+    iretq_to_user(entry, user_sp, 0x002)
     // Volatile barrier prevents LLVM tail-call optimization (TCO)
     // SYS_EXIT restores kernel RSP and does `ret` to return here
     volatile_write(0x652038, 0)

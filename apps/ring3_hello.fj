@@ -6,4 +6,6 @@ fn main() {
     let pid = getpid()
     println(pid)
     println("Exiting cleanly...")
+    // Exit: call exit(0) which the compiler runtime provides
+    exit(0)
 }

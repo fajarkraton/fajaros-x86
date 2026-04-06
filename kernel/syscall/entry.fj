@@ -22,10 +22,10 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
     // We need to: save user RSP, switch to kernel stack, call handler, SYSRETQ
     let b = SYSCALL_ENTRY_ADDR
 
-    // swapgs (switch GS base to kernel per-CPU area)
-    volatile_write_u8(b, 0x0F)
-    volatile_write_u8(b + 1, 0x01)
-    volatile_write_u8(b + 2, 0xF8)
+    // NOP (swapgs disabled — kernel GS base not configured)
+    volatile_write_u8(b, 0x90)
+    volatile_write_u8(b + 1, 0x90)
+    volatile_write_u8(b + 2, 0x90)
 
     // mov [USER_RSP_SAVE], rsp (save user RSP to fixed address)
     volatile_write_u8(b + 3, 0x48)
@@ -86,9 +86,9 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
     volatile_write_u8(b + 42, 0x48)
     volatile_write_u8(b + 43, 0x31)
     volatile_write_u8(b + 44, 0xC0) // xor rax, rax (return 0 = success)
-    // jmp sysret_path (offset 95) → rel8 = 95 - 47 = 48
+    // jmp sysret_path (offset 88) → rel8 = 88 - 47 = 41
     volatile_write_u8(b + 45, 0xEB)
-    volatile_write_u8(b + 46, 48)
+    volatile_write_u8(b + 46, 41)
 
     // skip_write: (offset 51)
     // cmp rax, 0 (SYS_EXIT = 0 in FajarOS, not 60 like Linux)
@@ -96,69 +96,64 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
     volatile_write_u8(b + 52, 0x83)
     volatile_write_u8(b + 53, 0xF8)
     volatile_write_u8(b + 54, 0)
-    // jne check_getpid (offset 73) → rel8 = 73 - 57 = 16
+    // jne check_getpid (offset 66) → rel8 = 66 - 57 = 9
     volatile_write_u8(b + 55, 0x75)
-    volatile_write_u8(b + 56, 16)
+    volatile_write_u8(b + 56, 9)
 
-    // SYS_EXIT (offset 57): debug 'E' + restore kernel RSP + ret
-    volatile_write_u8(b + 57, 0x66)   // mov dx, 0x3F8
-    volatile_write_u8(b + 58, 0xBA)
-    volatile_write_u8(b + 59, 0xF8)
-    volatile_write_u8(b + 60, 0x03)
-    volatile_write_u8(b + 61, 0xB0)   // mov al, 'E'
-    volatile_write_u8(b + 62, 0x45)
-    volatile_write_u8(b + 63, 0xEE)   // out dx, al
-    volatile_write_u8(b + 64, 0x48)   // mov rsp, [0x652020]
-    volatile_write_u8(b + 65, 0x8B)
-    volatile_write_u8(b + 66, 0x24)
-    volatile_write_u8(b + 67, 0x25)
-    volatile_write_u32(b + 68, 0x652020)
-    volatile_write_u8(b + 72, 0xC3)   // ret
+    // SYS_EXIT (offset 57): restore kernel RSP and ret to shell
+    // mov rsp, [0x652020] = 48 8B 24 25 20 20 65 00 (8 bytes)
+    volatile_write_u8(b + 57, 0x48)
+    volatile_write_u8(b + 58, 0x8B)
+    volatile_write_u8(b + 59, 0x24)
+    volatile_write_u8(b + 60, 0x25)
+    volatile_write_u32(b + 61, 0x652020)
+    // ret = C3 (1 byte) → total 9 bytes (offset 57-65)
+    volatile_write_u8(b + 65, 0xC3)
 
-    // check_getpid (offset 73): cmp rax, 3
-    volatile_write_u8(b + 73, 0x48)
-    volatile_write_u8(b + 74, 0x83)
-    volatile_write_u8(b + 75, 0xF8)
-    volatile_write_u8(b + 76, 3)
-    // jne unknown_syscall (offset 89) → rel8 = 89 - 79 = 10
-    volatile_write_u8(b + 77, 0x75)
-    volatile_write_u8(b + 78, 10)
+    // check_getpid (offset 66): cmp rax, 3
+    volatile_write_u8(b + 66, 0x48)
+    volatile_write_u8(b + 67, 0x83)
+    volatile_write_u8(b + 68, 0xF8)
+    volatile_write_u8(b + 69, 3)
+    // jne unknown_syscall (offset 82) → rel8 = 82 - 72 = 10
+    volatile_write_u8(b + 70, 0x75)
+    volatile_write_u8(b + 71, 10)
 
-    // SYS_GETPID (offset 79): mov rax, [0x6FE00]
-    volatile_write_u8(b + 79, 0x48)
-    volatile_write_u8(b + 80, 0x8B)
-    volatile_write_u8(b + 81, 0x04)
-    volatile_write_u8(b + 82, 0x25)
-    volatile_write_u32(b + 83, 0x6FE00)
-    // jmp sysret_path (offset 95) → rel8 = 95 - 89 = 6
-    volatile_write_u8(b + 87, 0xEB)
-    volatile_write_u8(b + 88, 6)
+    // SYS_GETPID (offset 72): mov rax, [0x6FE00]
+    volatile_write_u8(b + 72, 0x48)
+    volatile_write_u8(b + 73, 0x8B)
+    volatile_write_u8(b + 74, 0x04)
+    volatile_write_u8(b + 75, 0x25)
+    volatile_write_u32(b + 76, 0x6FE00)
+    // jmp sysret_path (offset 88) → rel8 = 88 - 82 = 6
+    volatile_write_u8(b + 80, 0xEB)
+    volatile_write_u8(b + 81, 6)
 
-    // unknown_syscall (offset 89): return -1
-    volatile_write_u8(b + 89, 0x48)
-    volatile_write_u8(b + 90, 0x31)
-    volatile_write_u8(b + 91, 0xC0)
-    volatile_write_u8(b + 92, 0x48)
-    volatile_write_u8(b + 93, 0xFF)
-    volatile_write_u8(b + 94, 0xC8)
+    // unknown_syscall (offset 82): return -1
+    volatile_write_u8(b + 82, 0x48)
+    volatile_write_u8(b + 83, 0x31)
+    volatile_write_u8(b + 84, 0xC0)
+    volatile_write_u8(b + 85, 0x48)
+    volatile_write_u8(b + 86, 0xFF)
+    volatile_write_u8(b + 87, 0xC8)
 
-    // sysret_path (offset 95): pop regs + sysretq
-    volatile_write_u8(b + 95, 0x5A)   // pop rdx
-    volatile_write_u8(b + 96, 0x5E)   // pop rsi
-    volatile_write_u8(b + 97, 0x5F)   // pop rdi
-    volatile_write_u8(b + 98, 0x41)   // pop r11
-    volatile_write_u8(b + 99, 0x5B)
-    volatile_write_u8(b + 100, 0x59)  // pop rcx
+    // sysret_path (offset 88): pop regs + sysretq
+    volatile_write_u8(b + 88, 0x5A)   // pop rdx
+    volatile_write_u8(b + 89, 0x5E)   // pop rsi
+    volatile_write_u8(b + 90, 0x5F)   // pop rdi
+    volatile_write_u8(b + 91, 0x41)   // pop r11
+    volatile_write_u8(b + 92, 0x5B)
+    volatile_write_u8(b + 93, 0x59)   // pop rcx
     // mov rsp, [USER_RSP_SAVE]
-    volatile_write_u8(b + 101, 0x48)
-    volatile_write_u8(b + 102, 0x8B)
-    volatile_write_u8(b + 103, 0x24)
-    volatile_write_u8(b + 104, 0x25)
-    volatile_write_u32(b + 105, USER_RSP_SAVE)
+    volatile_write_u8(b + 94, 0x48)
+    volatile_write_u8(b + 95, 0x8B)
+    volatile_write_u8(b + 96, 0x24)
+    volatile_write_u8(b + 97, 0x25)
+    volatile_write_u32(b + 98, USER_RSP_SAVE)
     // sysretq
-    volatile_write_u8(b + 109, 0x48)
-    volatile_write_u8(b + 110, 0x0F)
-    volatile_write_u8(b + 111, 0x07)
+    volatile_write_u8(b + 102, 0x48)
+    volatile_write_u8(b + 103, 0x0F)
+    volatile_write_u8(b + 104, 0x07)
 }
 
 @kernel fn syscall_configure_msrs() {
