@@ -86,14 +86,15 @@
 }
 
 @kernel fn cprint_decimal(val: i64, color: i64) {
-    if val < 0 { console_putchar(45, color); cprint_decimal(0 - val, color); return }
     if val == 0 { console_putchar(48, color); return }
-    // Divisor-based digit extraction — avoids stack array codegen issues
+    let mut v = val
+    if v < 0 { console_putchar(45, color); v = 0 - v }
+    // Divisor-based digit extraction (stable under LLVM inlining)
     let mut divisor: i64 = 1
-    let mut tmp = val
+    let mut tmp = v
     while tmp >= 10 { divisor = divisor * 10; tmp = tmp / 10 }
     while divisor > 0 {
-        let digit = (val / divisor) % 10
+        let digit = (v / divisor) % 10
         console_putchar(48 + digit, color)
         divisor = divisor / 10
     }
