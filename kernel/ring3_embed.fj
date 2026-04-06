@@ -767,9 +767,12 @@ const RING3_HELLO_ADDR: i64 = 0x962000  // After HW_INFO (0x960000-0x960400)
     set_current_pid(1)
     volatile_write_u64(KERNEL_RSP_SAVE, 0x7F0000)
 
-    // IRETQ to Ring 3 (IF=0 to prevent timer interrupt during test)
+    // IRETQ to Ring 3 — when user calls SYS_EXIT, kernel resumes here
     println("[R3] IRETQ...")
     iretq_to_user(entry, user_stack_top - 8, 0x002)
-
-    println("[R3] User program completed")
+    // Volatile barrier prevents LLVM tail-call optimization (TCO)
+    // SYS_EXIT restores kernel RSP and does `ret` to return here
+    volatile_write(0x652038, 0)
+    set_current_pid(0)
+    println("[R3] User program exited")
 }
