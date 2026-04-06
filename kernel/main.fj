@@ -219,10 +219,8 @@
     history_init()
     println(61)
 
-    // Initialize block device — use ramdisk (NVMe deferred: needs interrupt handler)
-    // nvme_full_init()  // TODO: enable after NVMe IRQ handler is wired
-    blk_register(0, 2, 1048576 / 512, 512)
-    println("[BLK] Ramdisk (1MB) registered")
+    // Initialize NVMe block device (falls back to ramdisk if no NVMe)
+    nvme_full_init()
 
     // Initialize VFS (mounts /, /dev, /proc, /mnt if FAT32 available)
     vfs_init()

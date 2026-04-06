@@ -110,6 +110,9 @@ const NVME_STATE: i64 = 0x804000
     // Store BAR address
     nvme_state_write(0, bar_addr)
 
+    // Mask ALL NVMe interrupts — driver uses polling, not IRQ
+    volatile_write_u32(bar_addr + NVME_REG_INTMS, 0x7FFFFFFF)
+
     // Read CAP for doorbell stride and max queue entries
     let cap_lo = volatile_read_u32(bar_addr + NVME_REG_CAP)
     let cap_hi = volatile_read_u32(bar_addr + NVME_REG_CAP + 4)
@@ -180,6 +183,9 @@ const NVME_STATE: i64 = 0x804000
         timeout = timeout - 1
     }
     if timeout == 0 { return -4 }
+
+    // Re-mask interrupts after controller enable (belt-and-suspenders)
+    volatile_write_u32(bar_addr + NVME_REG_INTMS, 0x7FFFFFFF)
 
     nvme_state_write(96, 1) // initialized = 1
     0
