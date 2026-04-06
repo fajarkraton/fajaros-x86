@@ -13,8 +13,9 @@
 // ═══════════════════════════════════════════════
 
 const SYSCALL_ENTRY_ADDR: i64 = 0x8200
-const KERNEL_RSP_SAVE: i64 = 0x652008  // per-CPU kernel RSP
+const KERNEL_RSP_SAVE: i64 = 0x652008  // per-CPU kernel RSP (for syscall handler)
 const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
+const SYSCALL_STACK_TOP: i64 = 0x7EF000  // dedicated 4KB stack for syscall handler
 
 @kernel fn syscall_install_stub() {
     // Install SYSCALL entry stub at 0x8200
@@ -173,8 +174,9 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
     let efer = rdmsr(0xC0000080)
     wrmsr(0xC0000080, efer | 1)
 
-    // Set kernel RSP for syscall entry
-    volatile_write_u64(KERNEL_RSP_SAVE, 0x7F0000) // kernel stack top
+    // Set dedicated kernel stack for syscall handler (separate from main kernel stack)
+    // This prevents the syscall handler from corrupting the shell's stack frame
+    volatile_write_u64(KERNEL_RSP_SAVE, SYSCALL_STACK_TOP)
 }
 
 @kernel fn syscall_setup() {

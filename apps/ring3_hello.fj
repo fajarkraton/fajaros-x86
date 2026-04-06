@@ -1,7 +1,6 @@
-// FajarOS Ring 3 Test — minimal user-mode program
-// _start wrapper calls main() then SYS_EXIT(0)
+// FajarOS Ring 3 Test — single println then exit
+// _start: call main → syscall(0) for SYS_EXIT
 
 fn main() {
     println("Hello from Ring 3!")
-    println("User mode works!")
 }

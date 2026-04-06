@@ -261,9 +261,7 @@
     journal_init()
     println("[P2] SMP + memory + security + fast IPC + journal ready")
 
-    // Configure SYSCALL/SYSRET for Ring 3
-    // Uses the manual stub at 0x8200 (supports SYS_WRITE, SYS_GETPID, SYS_EXIT)
-    // Note: SYS_EXIT currently halts — ring3 return needs separate stack mgmt
+    // Configure SYSCALL/SYSRET — stub at 0x8200 with dedicated syscall stack
     syscall_setup()
     println("[SYSCALL] Entry stub + MSRs configured")
 
