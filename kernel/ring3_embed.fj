@@ -754,38 +754,64 @@ const RING3_HELLO_ADDR: i64 = 0x962000  // After HW_INFO (0x960000-0x960400)
         sp_pg = sp_pg + 1
     }
 
-    // Write SYS_EXIT trampoline at user stack top area (0x2FFF000)
-    // When main() returns, `ret` pops this address → executes: mov eax,0; syscall
-    let trampoline = user_stack_top - FRAME_SIZE  // 0x2FFF000
-    volatile_write_u8(trampoline, 0xB8)       // mov eax, 0 (SYS_EXIT)
-    volatile_write_u32(trampoline + 1, 0)
-    volatile_write_u8(trampoline + 5, 0x0F)   // syscall
-    volatile_write_u8(trampoline + 6, 0x05)
-    volatile_write_u8(trampoline + 7, 0xF4)   // hlt (safety)
+    // Write entry wrapper at 0x2FFF000 that calls entry then SYS_EXIT
+    // wrapper: call entry; xor eax,eax; syscall; hlt
+    let wrapper = user_stack_top - FRAME_SIZE  // 0x2FFF000
+    map_page(wrapper, wrapper, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+    // call rel32 (E8 xx xx xx xx) — relative to next instruction
+    let call_target = entry - (wrapper + 5)  // relative offset
+    volatile_write_u8(wrapper, 0xE8)          // call rel32
+    volatile_write_u32(wrapper + 1, call_target & 0xFFFFFFFF)
+    // xor eax, eax (31 C0)
+    volatile_write_u8(wrapper + 5, 0x31)
+    volatile_write_u8(wrapper + 6, 0xC0)
+    // syscall (0F 05)
+    volatile_write_u8(wrapper + 7, 0x0F)
+    volatile_write_u8(wrapper + 8, 0x05)
+    // hlt (F4) — safety
+    volatile_write_u8(wrapper + 9, 0xF4)
 
-    // Set user stack: push trampoline address as return address for main()
-    let user_sp = user_stack_top - 16  // below trampoline, space for return addr
-    volatile_write_u64(user_sp, trampoline)  // return address → SYS_EXIT trampoline
+    // User stack below the wrapper
+    let user_sp = user_stack_top - 2 * FRAME_SIZE  // 0x2FFE000
 
     // Flush TLB
-    let cr3 = read_cr3()
-    write_cr3(cr3)
-
-    // Verify entry byte
-    let test_byte = volatile_read_u8(entry)
-    if test_byte == 0x55 { println("[R3] Entry OK") }
-    else { println("[R3] Entry byte wrong") }
+    write_cr3(read_cr3())
 
     // Set PID 1 and save kernel RSP
     set_current_pid(1)
     volatile_write_u64(KERNEL_RSP_SAVE, 0x7F0000)
 
-    // IRETQ to Ring 3 — when user calls SYS_EXIT, kernel resumes here
-    println("[R3] IRETQ...")
-    iretq_to_user(entry, user_sp, 0x002)
+    // IRETQ to Ring 3 — enter wrapper (which calls entry then SYS_EXIT)
+    iretq_to_user(wrapper, user_sp, 0x002)
     // Volatile barrier prevents LLVM tail-call optimization (TCO)
     // SYS_EXIT restores kernel RSP and does `ret` to return here
     volatile_write(0x652038, 0)
     set_current_pid(0)
     println("[R3] User program exited")
+}
+
+// Minimal ring3 SYS_EXIT test — just executes "xor eax,eax; syscall" in user mode
+@kernel fn cmd_ring3_exit_test() {
+    // Write minimal user program at 0x2800000: xor eax,eax; syscall; hlt
+    let code_addr: i64 = 0x2800000
+    map_page(code_addr, code_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+    volatile_write_u8(code_addr, 0x31)     // xor eax, eax
+    volatile_write_u8(code_addr + 1, 0xC0)
+    volatile_write_u8(code_addr + 2, 0x0F) // syscall
+    volatile_write_u8(code_addr + 3, 0x05)
+    volatile_write_u8(code_addr + 4, 0xF4) // hlt (safety)
+
+    // User stack
+    let user_sp: i64 = 0x2FFF000
+    map_page(user_sp, user_sp, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+
+    // Flush TLB
+    write_cr3(read_cr3())
+
+    set_current_pid(1)
+    println("[R3-TEST] IRETQ to minimal SYS_EXIT program...")
+    iretq_to_user(code_addr, user_sp, 0x002)
+    volatile_write(0x652038, 0)
+    set_current_pid(0)
+    println("[R3-TEST] Returned from user mode!")
 }
