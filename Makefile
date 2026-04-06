@@ -97,6 +97,7 @@ SOURCES := \
 	drivers/virtio_gpu.fj \
 	kernel/compute/buffers.fj \
 	kernel/compute/kernels.fj \
+	kernel/compute/quantize.fj \
 	fs/ramfs.fj \
 	fs/directory.fj \
 	fs/links.fj \

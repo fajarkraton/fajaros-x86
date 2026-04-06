@@ -102,42 +102,6 @@ const Q4_C15: i64 = 924
     volatile_read_u64(base + idx * 8)
 }
 
-// ── Tensor quantization (operates on tensor slots) ──
-
-@kernel fn tensor_quantize_2bit(src_slot: i64, dst_slot: i64, len: i64) {
-    // Quantize tensor to 2-bit: pack 4 values per i64
-    let src_addr = tensor_slot_addr(src_slot)
-    let dst_addr = tensor_slot_addr(dst_slot)
-
-    let mut i: i64 = 0
-    while i < len {
-        let val = volatile_read_u64(src_addr + TENSOR_DATA_OFF + i * 8)
-        let idx = quant2_encode(val)
-        // Store indices packed (4 per word for simplicity, using byte offsets)
-        volatile_write_u64(dst_addr + TENSOR_DATA_OFF + i * 8, idx)
-        i = i + 1
-    }
-
-    // Mark as quantized
-    volatile_write_u64(dst_addr + TENSOR_HDR_FLAGS, TENSOR_FLAG_QUANTIZED)
-    volatile_write_u64(dst_addr + TENSOR_HDR_QUANT_BITS, 2)
-}
-
-@kernel fn tensor_dequantize(src_slot: i64, dst_slot: i64, len: i64) {
-    let src_addr = tensor_slot_addr(src_slot)
-    let dst_addr = tensor_slot_addr(dst_slot)
-    let bits = volatile_read_u64(src_addr + TENSOR_HDR_QUANT_BITS)
-
-    let mut i: i64 = 0
-    while i < len {
-        let idx = volatile_read_u64(src_addr + TENSOR_DATA_OFF + i * 8)
-        let val = if bits == 2 { quant2_decode(idx) }
-                  else { quant4_decode(idx) }
-        volatile_write_u64(dst_addr + TENSOR_DATA_OFF + i * 8, val)
-        i = i + 1
-    }
-}
-
 // ── Initialization ──
 
 @kernel fn quant_init() {
@@ -169,30 +133,35 @@ const Q4_C15: i64 = 924
 
 // ── Shell command ──
 
+@kernel fn quant_demo_one(val: i64) {
+    let idx = quant2_encode(val)
+    let decoded = quant2_decode(idx)
+    let error = abs_i64(val - decoded)
+    cprint("  ", WHITE_ON_BLACK)
+    cprint_decimal(val, CYAN_ON_BLACK)
+    cprint(" -> idx=", WHITE_ON_BLACK)
+    cprint_decimal(idx, GREEN_ON_BLACK)
+    cprint(" -> ", WHITE_ON_BLACK)
+    cprint_decimal(decoded, CYAN_ON_BLACK)
+    cprint(" (err=", WHITE_ON_BLACK)
+    cprint_decimal(error, YELLOW_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+}
+
 @kernel fn cmd_quant_demo() {
     cprintln("=== FajarQuant Kernel Demo ===", YELLOW_ON_BLACK)
-    cprintln("2-bit quantization (4 centroids):", WHITE_ON_BLACK)
-
-    // Demo: quantize a small vector
-    let values = [500, -300, 100, -700, 250, -100, 800, -500]
-    let mut i: i64 = 0
-    while i < 8 {
-        let val = values[i]
-        let idx = quant2_encode(val)
-        let decoded = quant2_decode(idx)
-        let error = abs_i64(val - decoded)
-        cprint("  ", WHITE_ON_BLACK)
-        cprint_decimal(val, CYAN_ON_BLACK)
-        cprint(" -> idx=", WHITE_ON_BLACK)
-        cprint_decimal(idx, GREEN_ON_BLACK)
-        cprint(" -> ", WHITE_ON_BLACK)
-        cprint_decimal(decoded, CYAN_ON_BLACK)
-        cprint(" (err=", WHITE_ON_BLACK)
-        cprint_decimal(error, YELLOW_ON_BLACK)
-        cprintln(")", WHITE_ON_BLACK)
-        i = i + 1
-    }
+    cprintln("Lloyd-Max 2-bit quantization (4 centroids, fixed-point x1000):", WHITE_ON_BLACK)
+    cprintln("Codebook: [-707, -236, 236, 707]", WHITE_ON_BLACK)
     cprintln("", WHITE_ON_BLACK)
-    cprintln("NOTE: All ops ran in @kernel — no heap, no GC", GREEN_ON_BLACK)
-    cprintln("macOS Core ML: userspace only. FajarOS: kernel-native.", GREEN_ON_BLACK)
+    quant_demo_one(500)
+    quant_demo_one(-300)
+    quant_demo_one(100)
+    quant_demo_one(-700)
+    quant_demo_one(250)
+    quant_demo_one(-100)
+    quant_demo_one(800)
+    quant_demo_one(-500)
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("All ops ran in @kernel context — no heap, no float, no GC.", GREEN_ON_BLACK)
+    cprintln("Paper: FajarQuant (Putranto, 2026) — Hardware-Aware AVQ", GREEN_ON_BLACK)
 }

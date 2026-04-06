@@ -2988,6 +2988,9 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     // neofetch (110,101,111,102,101,116,99,104)
     if handled == 0 && len == 8 && buf_eq4(110, 101, 111, 102) == 1 { cmd_neofetch(); handled = 1 }
 
+    // quant (113,117,97,110,116) — FajarQuant kernel quantization demo
+    if handled == 0 && len == 5 && buf_eq4(113, 117, 97, 110) == 1 && volatile_read_u8(0x6F804) == 116 { cmd_quant_demo(); handled = 1 }
+
     // === Memory management commands ===
     // frames
     if handled == 0 && len == 6 && buf_eq4(102, 114, 97, 109) == 1 && volatile_read_u8(0x6F804) == 101 { cmd_frames(); handled = 1 }

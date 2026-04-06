@@ -376,7 +376,7 @@ const CPU_FREQ_GHZ: i64 = 2
 // cpu_matmul at different sizes, report cycles and GFLOPS estimate
 // ═══════════════════════════════════════════════════════════════
 
-@kernel fn bench_matmul_size(n: i64, slot: i64) {
+@kernel fn bench_matmul_size(n: i64, _slot: i64) {
     // Allocate A, B, C in scratch area
     let a_addr = BENCH_SCRATCH
     let b_addr = BENCH_SCRATCH + n * n * 8

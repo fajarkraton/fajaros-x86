@@ -20,7 +20,7 @@ const TEST_SCRATCH: i64 = 0x900000  // 4KB scratch area (was 0x8FC000 — overla
 @kernel fn blk_write_sector(dev: i64, lba: i64, buf: i64) -> i64 { blk_svc_raw_write(dev, lba, 1, buf) }
 // blk_sync is now defined in services/blk/journal.fj
 @kernel fn blk_read_sector(dev: i64, lba: i64, buf: i64) -> i64 { blk_svc_raw_read(dev, lba, 1, buf) }
-@kernel fn net_socket_alloc(proto: i64) -> i64 { sock_alloc() }
+@kernel fn net_socket_alloc(_proto: i64) -> i64 { sock_alloc() }
 @kernel fn net_socket_state(sock: i64) -> i64 { sock_read(sock, 0) }
 @kernel fn vfs_read(fd: i64, buf: i64, len: i64) -> i64 {
     // Bridge: VFS read via IPC
@@ -50,7 +50,7 @@ const TEST_SCRATCH: i64 = 0x900000  // 4KB scratch area (was 0x8FC000 — overla
     ipc_msg_clear(reply)
     vfs_svc_handle_msg(0, msg, reply)
 }
-@kernel fn vfs_open(path: i64, flags: i64) -> i64 {
+@kernel fn vfs_open(path: i64, _flags: i64) -> i64 {
     // Bridge: build VFS IPC message, call handler, return fd
     let msg: i64 = 0x901000
     let reply: i64 = 0x901100
