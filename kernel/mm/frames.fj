@@ -92,11 +92,10 @@ const BITMAP_SIZE: i64 = 4096
 
 @kernel fn bsf(value: i64) -> i64 {
     // Bit Scan Forward: find index of lowest set bit (0-63), or -1 if zero.
-    // Software implementation — avoids LLVM inline asm register allocation bug
+    // Software implementation — LLVM inline asm has register allocation issues
     if value == 0 { return -1 }
     let mut v = value
     let mut pos: i64 = 0
-    // Check 32-bit halves first for speed
     if (v & 0xFFFFFFFF) == 0 { v = v >> 32; pos = 32 }
     if (v & 0xFFFF) == 0 { v = v >> 16; pos = pos + 16 }
     if (v & 0xFF) == 0 { v = v >> 8; pos = pos + 8 }
@@ -107,7 +106,7 @@ const BITMAP_SIZE: i64 = 4096
 }
 
 @kernel fn popcnt(value: i64) -> i64 {
-    // Population count: number of set bits — software implementation
+    // Population count: software implementation
     let mut v = value
     let mut count: i64 = 0
     while v != 0 { count = count + 1; v = v & (v - 1) }
