@@ -385,59 +385,95 @@ test-commands: iso-llvm
 	@echo "[TEST] FajarOS mass command test (80+ commands)..."
 	@echo "[TEST] Building command sequence..."
 	@(sleep 6; \
-	printf 'help\r'; sleep 1; \
-	printf 'version\r'; sleep 1; \
-	printf 'uname\r'; sleep 1; \
-	printf 'about\r'; sleep 1; \
-	printf 'uptime\r'; sleep 1; \
-	printf 'cpuinfo\r'; sleep 1; \
-	printf 'meminfo\r'; sleep 1; \
-	printf 'frames\r'; sleep 1; \
-	printf 'free\r'; sleep 1; \
-	printf 'whoami\r'; sleep 1; \
-	printf 'hostname\r'; sleep 1; \
-	printf 'arch\r'; sleep 1; \
-	printf 'date\r'; sleep 1; \
-	printf 'id\r'; sleep 1; \
-	printf 'tsc\r'; sleep 1; \
-	printf 'epoch\r'; sleep 1; \
-	printf 'logo\r'; sleep 1; \
-	printf 'color\r'; sleep 1; \
-	printf 'motd\r'; sleep 1; \
-	printf 'cal\r'; sleep 1; \
-	printf 'banner FJ\r'; sleep 1; \
-	printf 'cowsay moo\r'; sleep 1; \
-	printf 'fortune\r'; sleep 1; \
-	printf 'dice\r'; sleep 1; \
-	printf 'true\r'; sleep 1; \
-	printf 'false\r'; sleep 1; \
-	printf 'seq 5\r'; sleep 1; \
-	printf 'hex 255\r'; sleep 1; \
-	printf 'factor 42\r'; sleep 1; \
-	printf 'prime 97\r'; sleep 1; \
-	printf 'len hello\r'; sleep 1; \
-	printf 'fib 10\r'; sleep 1; \
-	printf 'echo hello\r'; sleep 1; \
-	printf 'rev hello\r'; sleep 1; \
-	printf 'upcase hello\r'; sleep 1; \
-	printf 'downcase HELLO\r'; sleep 1; \
-	printf 'base 255 16\r'; sleep 1; \
-	printf 'count\r'; sleep 1; \
-	printf 'ls\r'; sleep 1; \
-	printf 'pwd\r'; sleep 1; \
-	printf 'mmap\r'; sleep 1; \
-	printf 'history\r'; sleep 1; \
-	printf 'env\r'; sleep 1; \
-	printf 'ps\r'; sleep 1; \
-	printf 'dmesg\r'; sleep 1; \
-	printf 'touch testfile\r'; sleep 1; \
-	printf 'ls\r'; sleep 1; \
-	printf 'cat testfile\r'; sleep 1; \
-	printf 'rm testfile\r'; sleep 1; \
-	printf 'calc\r'; sleep 1; \
-	printf 'clear\r'; sleep 1; \
-	printf 'sysinfo\r'; sleep 1; \
-	) | timeout 65 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+	printf 'help\r'; sleep 0.3; \
+	printf 'version\r'; sleep 0.3; \
+	printf 'uname\r'; sleep 0.3; \
+	printf 'about\r'; sleep 0.3; \
+	printf 'uptime\r'; sleep 0.3; \
+	printf 'cpuinfo\r'; sleep 0.3; \
+	printf 'meminfo\r'; sleep 0.3; \
+	printf 'frames\r'; sleep 0.3; \
+	printf 'free\r'; sleep 0.3; \
+	printf 'whoami\r'; sleep 0.3; \
+	printf 'hostname\r'; sleep 0.3; \
+	printf 'arch\r'; sleep 0.3; \
+	printf 'date\r'; sleep 0.3; \
+	printf 'id\r'; sleep 0.3; \
+	printf 'tsc\r'; sleep 0.3; \
+	printf 'epoch\r'; sleep 0.3; \
+	printf 'logo\r'; sleep 0.3; \
+	printf 'color\r'; sleep 0.3; \
+	printf 'motd\r'; sleep 0.3; \
+	printf 'cal\r'; sleep 0.3; \
+	printf 'banner FJ\r'; sleep 0.3; \
+	printf 'cowsay moo\r'; sleep 0.3; \
+	printf 'fortune\r'; sleep 0.3; \
+	printf 'dice\r'; sleep 0.3; \
+	printf 'true\r'; sleep 0.3; \
+	printf 'false\r'; sleep 0.3; \
+	printf 'seq 5\r'; sleep 0.3; \
+	printf 'hex 255\r'; sleep 0.3; \
+	printf 'factor 42\r'; sleep 0.3; \
+	printf 'prime 97\r'; sleep 0.3; \
+	printf 'len hello\r'; sleep 0.3; \
+	printf 'fib 10\r'; sleep 0.3; \
+	printf 'echo hello\r'; sleep 0.3; \
+	printf 'rev hello\r'; sleep 0.3; \
+	printf 'upcase hello\r'; sleep 0.3; \
+	printf 'downcase HELLO\r'; sleep 0.3; \
+	printf 'base 255 16\r'; sleep 0.3; \
+	printf 'count\r'; sleep 0.3; \
+	printf 'ls\r'; sleep 0.3; \
+	printf 'pwd\r'; sleep 0.3; \
+	printf 'mmap\r'; sleep 0.3; \
+	printf 'history\r'; sleep 0.3; \
+	printf 'env\r'; sleep 0.3; \
+	printf 'ps\r'; sleep 0.3; \
+	printf 'dmesg\r'; sleep 0.3; \
+	printf 'nproc\r'; sleep 0.3; \
+	printf 'acpi\r'; sleep 0.3; \
+	printf 'lspci\r'; sleep 0.3; \
+	printf 'touch testfile\r'; sleep 0.3; \
+	printf 'cat testfile\r'; sleep 0.3; \
+	printf 'stat testfile\r'; sleep 0.3; \
+	printf 'rm testfile\r'; sleep 0.3; \
+	printf 'df\r'; sleep 0.3; \
+	printf 'du\r'; sleep 0.3; \
+	printf 'head\r'; sleep 0.3; \
+	printf 'tail\r'; sleep 0.3; \
+	printf 'wc\r'; sleep 0.3; \
+	printf 'nl\r'; sleep 0.3; \
+	printf 'sort\r'; sleep 0.3; \
+	printf 'uniq\r'; sleep 0.3; \
+	printf 'xxd\r'; sleep 0.3; \
+	printf 'strings\r'; sleep 0.3; \
+	printf 'md5\r'; sleep 0.3; \
+	printf 'mkdir testdir\r'; sleep 0.3; \
+	printf 'rmdir testdir\r'; sleep 0.3; \
+	printf 'which help\r'; sleep 0.3; \
+	printf 'type help\r'; sleep 0.3; \
+	printf 'man help\r'; sleep 0.3; \
+	printf 'calc\r'; sleep 0.3; \
+	printf 'bench\r'; sleep 2; \
+	printf 'top\r'; sleep 0.3; \
+	printf 'kill 0\r'; sleep 0.3; \
+	printf 'tensor\r'; sleep 0.3; \
+	printf 'splash\r'; sleep 0.3; \
+	printf 'cls\r'; sleep 0.3; \
+	printf 'clear\r'; sleep 0.3; \
+	printf 'repeat 3 ok\r'; sleep 0.3; \
+	printf 'cut\r'; sleep 0.3; \
+	printf 'tr\r'; sleep 0.3; \
+	printf 'grep\r'; sleep 0.3; \
+	printf 'dd\r'; sleep 0.3; \
+	printf 'time\r'; sleep 0.3; \
+	printf 'nice\r'; sleep 0.3; \
+	printf 'set FOO bar\r'; sleep 0.3; \
+	printf 'alias\r'; sleep 0.3; \
+	printf 'printenv\r'; sleep 0.3; \
+	printf 'sysinfo\r'; sleep 0.3; \
+	printf 'neofetch\r'; sleep 1; \
+	) | timeout 180 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
 		-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
 		-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) 2>/dev/null | \
 		tee $(BUILD_DIR)/test-commands.log

@@ -32,6 +32,25 @@ const RSDP_SIG_LO: i64 = 0x20445352
 const RSDP_SIG_HI: i64 = 0x20525450
 
 // ═══════════════════════════════════════════════════════════════
+// ACPI Page Mapping — ensure ACPI table addresses are accessible
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn acpi_ensure_mapped(addr: i64, size: i64) {
+    // Map pages for ACPI tables that may be outside the 128MB identity map
+    if addr == 0 || addr == -1 { return }
+    let page_start = addr & (~4095)
+    let page_end = (addr + size + 4095) & (~4095)
+    let mut pg = page_start
+    while pg < page_end {
+        // Only map if outside identity-mapped region (0-128MB)
+        if pg >= 0x8000000 {
+            map_page(pg, pg, PAGE_PRESENT | PAGE_WRITABLE)
+        }
+        pg = pg + 4096
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // RSDP Search — scan 0xE0000-0xFFFFF for signature
 // ═══════════════════════════════════════════════════════════════
 
@@ -55,9 +74,14 @@ const RSDP_SIG_HI: i64 = 0x20525450
     volatile_write_u64(ACPI_DATA + ACPI_RSDP_ADDR, rsdp_addr)
     let revision = volatile_read_u8(rsdp_addr + 15)
     volatile_write_u64(ACPI_DATA + ACPI_RSDP_REV, revision)
-    volatile_write_u64(ACPI_DATA + ACPI_RSDT_ADDR, volatile_read_u32(rsdp_addr + 16))
+    let rsdt = volatile_read_u32(rsdp_addr + 16)
+    volatile_write_u64(ACPI_DATA + ACPI_RSDT_ADDR, rsdt)
+    // Map RSDT pages before we try to read them
+    if rsdt != 0 { acpi_ensure_mapped(rsdt, 4096) }
     if revision >= 2 {
-        volatile_write_u64(ACPI_DATA + ACPI_XSDT_ADDR, volatile_read_u64(rsdp_addr + 24))
+        let xsdt = volatile_read_u64(rsdp_addr + 24)
+        volatile_write_u64(ACPI_DATA + ACPI_XSDT_ADDR, xsdt)
+        if xsdt != 0 { acpi_ensure_mapped(xsdt, 4096) }
     } else {
         volatile_write_u64(ACPI_DATA + ACPI_XSDT_ADDR, 0)
     }
@@ -86,7 +110,10 @@ const RSDP_SIG_HI: i64 = 0x20525450
     let mut ptr = xsdt + 36
     while ptr + 8 <= end {
         let entry = volatile_read_u64(ptr)
-        if entry != 0 && acpi_table_sig(entry) == signature { return entry }
+        if entry != 0 {
+            acpi_ensure_mapped(entry, 64)
+            if acpi_table_sig(entry) == signature { return entry }
+        }
         ptr = ptr + 8
     }
     -1
@@ -97,7 +124,10 @@ const RSDP_SIG_HI: i64 = 0x20525450
     let mut ptr = rsdt + 36
     while ptr + 4 <= end {
         let entry = volatile_read_u32(ptr)
-        if entry != 0 && acpi_table_sig(entry) == signature { return entry }
+        if entry != 0 {
+            acpi_ensure_mapped(entry, 64)
+            if acpi_table_sig(entry) == signature { return entry }
+        }
         ptr = ptr + 4
     }
     -1
@@ -110,6 +140,8 @@ const RSDP_SIG_HI: i64 = 0x20525450
 @kernel fn madt_parse() {
     let madt = acpi_find_table(0x43495041)
     if madt == -1 { return }
+    // Map full MADT table before parsing entries
+    acpi_ensure_mapped(madt, 4096)
     volatile_write_u64(ACPI_DATA + ACPI_MADT_ADDR, madt)
     volatile_write_u64(ACPI_DATA + ACPI_HAS_MADT, 1)
     let length = acpi_table_length(madt)
