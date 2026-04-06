@@ -192,13 +192,16 @@ QEMU_MEM := -m 512M
 QEMU_CPU := -cpu Skylake-Client-v4
 QEMU_KVM := -enable-kvm -cpu host
 QEMU_SMP := -smp 4
-QEMU_NVME := -drive file=disk.img,if=none,id=nvme0 -device nvme,serial=fajaros,drive=nvme0 -boot d
-QEMU_NET := -netdev user,id=net0 -device virtio-net-pci,netdev=net0
+QEMU_NVME := -drive file=disk.img,if=none,id=nvme0 -device nvme,serial=fajaros,drive=nvme0
+QEMU_NET := -netdev user,id=net0,hostfwd=tcp::8080-:80 -device virtio-net-pci,netdev=net0
 QEMU_GPU := -device virtio-gpu-pci -display gtk
-QEMU_FULL := $(QEMU_KVM) $(QEMU_SMP) $(QEMU_NET) -device virtio-gpu-pci
+QEMU_USB := -device qemu-xhci
+QEMU_SOUND := -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0
+QEMU_FULL := $(QEMU_KVM) $(QEMU_SMP) $(QEMU_NET) $(QEMU_USB) -device virtio-gpu-pci
 
 .PHONY: all build build-llvm build-llvm-custom run run-kvm run-vga run-smp run-nvme run-net \
-       run-llvm run-kvm-llvm debug debug-llvm iso run-iso test clean help loc
+       run-llvm run-kvm-llvm debug debug-llvm iso run-iso test clean help loc \
+       run-iso-kvm run-iso-tcg run-iso-vga run-iso-full debug-iso test-serial
 
 all: build
 
@@ -342,6 +345,48 @@ iso: build
 run-iso: iso
 	$(QEMU) -cdrom $(ISO_FILE) $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_CPU)
 
+# --- ISO-based run targets (GRUB2 + Multiboot2) ---
+
+# Run LLVM ISO with KVM (recommended for development)
+run-iso-kvm: iso-llvm
+	$(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_KVM) -nographic
+
+# Run LLVM ISO with TCG (no KVM needed)
+run-iso-tcg: iso-llvm
+	$(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_CPU) -nographic
+
+# Run LLVM ISO with VGA display (GUI desktop mode)
+run-iso-vga: iso-llvm
+	$(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso -serial stdio -no-reboot \
+		$(QEMU_MEM) $(QEMU_KVM) -vga std
+
+# Run LLVM ISO with full hardware: KVM + SMP + NVMe + Net + USB
+run-iso-full: iso-llvm
+	@test -f disk.img || qemu-img create -f raw disk.img 64M
+	$(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso -serial stdio -no-reboot \
+		$(QEMU_MEM) $(QEMU_KVM) $(QEMU_SMP) $(QEMU_NET) $(QEMU_USB) \
+		$(QEMU_NVME) -vga std
+
+# Automated serial test: boot + send commands + check output
+test-serial: iso-llvm
+	@echo "[TEST] FajarOS serial boot test..."
+	@(sleep 6; printf 'version\r'; sleep 2; printf 'frames\r'; sleep 2; printf 'uname\r'; sleep 2) | \
+		timeout 15 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+		-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
+		-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) 2>/dev/null | \
+		tee $(BUILD_DIR)/test-output.log
+	@echo ""
+	@grep -q "nova>" $(BUILD_DIR)/test-output.log && echo "[PASS] Shell prompt reached" || echo "[FAIL] No shell prompt"
+	@grep -q "FajarOS Nova" $(BUILD_DIR)/test-output.log && echo "[PASS] Version command works" || echo "[FAIL] Version failed"
+	@grep -q "Frame Allocator" $(BUILD_DIR)/test-output.log && echo "[PASS] Frames command works" || echo "[FAIL] Frames failed"
+
+# Debug LLVM ISO with GDB
+debug-iso: iso-llvm
+	@echo "GDB: target remote :1234"
+	@echo "     symbol-file $(KERNEL_LLVM)"
+	$(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso $(QEMU_COMMON) $(QEMU_MEM) $(QEMU_CPU) \
+		-s -S -nographic
+
 # Run tests in QEMU (auto-exit)
 test: build
 	@echo "Running FajarOS tests in QEMU..."
@@ -434,13 +479,21 @@ help:
 	@echo ""
 	@echo "  LLVM (optimized, AVX2/AES/FMA):"
 	@echo "  make build-llvm      LLVM O2 kernel with hardware features"
-	@echo "  make run-llvm        Run LLVM kernel in QEMU"
+	@echo "  make run-llvm        Run LLVM kernel in QEMU (TCG)"
 	@echo "  make run-kvm-llvm    Run LLVM kernel with KVM (near-native)"
 	@echo "  make run-smp-llvm    Run LLVM kernel with KVM + 4 cores"
 	@echo "  make debug-llvm      Debug LLVM kernel with GDB"
-	@echo "  make run-gpu-llvm    Run LLVM kernel with VirtIO-GPU (GTK window)"
-	@echo "  make run-full-llvm   Run with KVM+SMP+GPU+NVMe+Net (full hardware)"
-	@echo "  make iso-llvm        Create bootable GRUB2 ISO (LLVM kernel)"
+	@echo "  make run-gpu-llvm    Run LLVM kernel with VirtIO-GPU"
+	@echo "  make run-full-llvm   Run with KVM+SMP+GPU+NVMe+Net"
+	@echo "  make iso-llvm        Create bootable GRUB2 ISO"
+	@echo ""
+	@echo "  ISO-based (GRUB2 multiboot2):"
+	@echo "  make run-iso-kvm     Boot ISO with KVM (recommended)"
+	@echo "  make run-iso-tcg     Boot ISO with TCG (no KVM needed)"
+	@echo "  make run-iso-vga     Boot ISO with VGA display"
+	@echo "  make run-iso-full    Boot ISO with full hardware"
+	@echo "  make debug-iso       Debug ISO kernel with GDB"
+	@echo "  make test-serial     Automated boot + command test"
 	@echo ""
 	@echo "  Other:"
 	@echo "  make iso             Create bootable GRUB2 ISO"
