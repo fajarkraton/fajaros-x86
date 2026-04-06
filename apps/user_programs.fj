@@ -168,14 +168,14 @@ const USER_HELLO_SIZE: i64 = 48         // minimal hello program bytes
     cprintln("  Stack: 4KB at 0x2FF0000", WHITE_ON_BLACK)
     cprintln("  Entry: 0x2000000", WHITE_ON_BLACK)
     cprintln("  Transitioning to Ring 3...", YELLOW_ON_BLACK)
-    println("[RING3] Entering user mode")
+    cprintln("[RING3] Entering user mode", WHITE_ON_BLACK)
 
     // Transition to Ring 3 via IRETQ
     // User code will SYSCALL(SYS_WRITE) → serial output → SYSCALL(SYS_EXIT) → halt
     iretq_to_user(USER_CODE_BASE, USER_STACK_BASE + 0xFF0, 0x202)
 
     // We reach here only if user program returns (SYS_EXIT halts, so we won't)
-    println("[RING3] User program returned")
+    cprintln("[RING3] User program returned", WHITE_ON_BLACK)
     cprintln("  User program completed", GREEN_ON_BLACK)
 }
 
@@ -202,7 +202,7 @@ const USER_HELLO_SIZE: i64 = 48         // minimal hello program bytes
     user_install_program(0x2001000, msg_buf, 14)
     map_page(0x2F00000, 0, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
     volatile_write_u64(0x6FC04, 0x7F0000)
-    println("[RING3] Running program 2: FajarOS Nova!")
+    cprintln("[RING3] Running program 2: FajarOS Nova!", WHITE_ON_BLACK)
     iretq_to_user(0x2001000, 0x2F00FF0, 0x202)
 }
 

@@ -305,29 +305,29 @@ const NVME_STATE: i64 = 0x804000
     // CDW11: PC(0)=1 (physically contiguous) | IEN(1)=0 | IV(31:16)=0
     let cdw10_cq = ((NVME_QUEUE_ENTRIES - 1) << 16) | 1
     let cdw11_cq = 1 // PC=1, no interrupt
-    println("[NVMe] Submit Create I/O CQ...")
+    cprintln("[NVMe] Submit Create I/O CQ...", WHITE_ON_BLACK)
     nvme_admin_submit(0x05, 0, cdw10_cq, cdw11_cq, NVME_ICQ, 0)
-    println("[NVMe] Waiting CQ completion...")
+    cprintln("[NVMe] Waiting CQ completion...", WHITE_ON_BLACK)
     let status = nvme_admin_wait_completion()
-    println("[NVMe] CQ status received")
+    cprintln("[NVMe] CQ status received", WHITE_ON_BLACK)
     if status != 0 {
-        println("[NVMe] Create I/O CQ failed")
+        cprintln("[NVMe] Create I/O CQ failed", WHITE_ON_BLACK)
         return -1
     }
-    println("[NVMe] I/O CQ created")
+    cprintln("[NVMe] I/O CQ created", WHITE_ON_BLACK)
 
     // Create I/O Submission Queue: admin opcode 0x01
     // CDW10: QSIZE(31:16) | QID(15:0) = (entries-1)<<16 | 1
     // CDW11: PC(0)=1 | QPRIO(2:1)=0 | CQID(31:16)=1
     let cdw10_sq = ((NVME_QUEUE_ENTRIES - 1) << 16) | 1
     let cdw11_sq = 1 | (1 << 16) // PC=1, CQID=1
-    println("[NVMe] Submit Create I/O SQ...")
+    cprintln("[NVMe] Submit Create I/O SQ...", WHITE_ON_BLACK)
     nvme_admin_submit(0x01, 0, cdw10_sq, cdw11_sq, NVME_ISQ, 0)
-    println("[NVMe] Waiting SQ completion...")
+    cprintln("[NVMe] Waiting SQ completion...", WHITE_ON_BLACK)
     let status2 = nvme_admin_wait_completion()
-    println("[NVMe] SQ status received")
+    cprintln("[NVMe] SQ status received", WHITE_ON_BLACK)
     if status2 != 0 {
-        println("[NVMe] Create I/O SQ failed")
+        cprintln("[NVMe] Create I/O SQ failed", WHITE_ON_BLACK)
         return -2
     }
     0
@@ -472,25 +472,25 @@ const BLK_MAX_DEVS: i64 = 4
 }
 
 @kernel fn nvme_full_init() -> i64 {
-    println("[NVMe] Initializing controller...")
+    cprintln("[NVMe] Initializing controller...", WHITE_ON_BLACK)
     cprintln("[NVMe] Initializing controller...", CYAN_ON_BLACK)
     let result = nvme_init()
     if result != 0 {
-        println("[NVMe] Init failed")
+        cprintln("[NVMe] Init failed", WHITE_ON_BLACK)
         cprint("[NVMe] Init failed: ", RED_ON_BLACK)
         cprint_decimal(result, RED_ON_BLACK)
         console_putchar(10, WHITE_ON_BLACK)
         // Fallback: register ramdisk
         blk_register(0, 2, RAMDISK_SIZE / 512, 512)
-        println("[NVMe] Using ramdisk fallback (1MB)")
+        cprintln("[NVMe] Using ramdisk fallback (1MB)", WHITE_ON_BLACK)
         cprintln("[NVMe] Using ramdisk fallback (1MB)", YELLOW_ON_BLACK)
         return -1
     }
-    println("[NVMe] Controller enabled")
+    cprintln("[NVMe] Controller enabled", WHITE_ON_BLACK)
     cprintln("[NVMe] Controller enabled", GREEN_ON_BLACK)
 
     // Identify Controller
-    println("[NVMe] Identify Controller...")
+    cprintln("[NVMe] Identify Controller...", WHITE_ON_BLACK)
     let idc = nvme_identify_controller()
     if idc == 0 {
         // Print model string (bytes 24-63 of identify data)
@@ -505,7 +505,7 @@ const BLK_MAX_DEVS: i64 = 4
     }
 
     // Identify Namespace
-    println("[NVMe] Identify Namespace...")
+    cprintln("[NVMe] Identify Namespace...", WHITE_ON_BLACK)
     let idn = nvme_identify_namespace()
     if idn == 0 {
         let ns_size = nvme_state_read(80)
@@ -516,7 +516,7 @@ const BLK_MAX_DEVS: i64 = 4
     }
 
     // Create I/O queues
-    println("[NVMe] Creating I/O queues...")
+    cprintln("[NVMe] Creating I/O queues...", WHITE_ON_BLACK)
     let ioq = nvme_create_io_queues()
     if ioq != 0 {
         cprint("[NVMe] I/O queue creation failed: ", RED_ON_BLACK)
@@ -525,7 +525,7 @@ const BLK_MAX_DEVS: i64 = 4
         blk_register(0, 2, RAMDISK_SIZE / 512, 512)
         return -2
     }
-    println("[NVMe] I/O queues ready")
+    cprintln("[NVMe] I/O queues ready", WHITE_ON_BLACK)
     cprintln("[NVMe] I/O queues ready", GREEN_ON_BLACK)
 
     // Register as block device 0
@@ -540,27 +540,27 @@ const BLK_MAX_DEVS: i64 = 4
     while f < (RAMDISK_BASE + RAMDISK_SIZE) / FRAME_SIZE { frame_mark_used(f); f = f + 1 }
 
     // Quick sector 0 read test
-    println("[NVMe] Testing sector read...")
+    cprintln("[NVMe] Testing sector read...", WHITE_ON_BLACK)
     nvme_clear_queue(NVME_DMA, 512)
     let rs = nvme_read_sectors(0, 1, NVME_DMA)
     if rs == 0 {
         let b510 = volatile_read_u8(NVME_DMA + 510)
         let b511 = volatile_read_u8(NVME_DMA + 511)
         if b510 == 0x55 && b511 == 0xAA {
-            println("[NVMe] Sector 0 read OK — boot signature found (0x55AA)")
+            cprintln("[NVMe] Sector 0 read OK — boot signature found (0x55AA)", WHITE_ON_BLACK)
         } else {
-            println("[NVMe] Sector 0 read OK — no boot signature")
+            cprintln("[NVMe] Sector 0 read OK — no boot signature", WHITE_ON_BLACK)
         }
     } else {
-        println("[NVMe] Sector read FAILED")
+        cprintln("[NVMe] Sector read FAILED", WHITE_ON_BLACK)
     }
 
     // Auto-mount FAT32
     let mnt = fat32_mount(0)
     if mnt == 0 {
-        println("[FAT32] Mounted successfully")
+        cprintln("[FAT32] Mounted successfully", WHITE_ON_BLACK)
     } else {
-        println("[FAT32] Mount failed or no FAT32 partition")
+        cprintln("[FAT32] Mount failed or no FAT32 partition", WHITE_ON_BLACK)
     }
 
     0

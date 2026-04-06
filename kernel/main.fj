@@ -191,7 +191,7 @@
     if fb_addr != 0 {
         println(51)
     }
-    println("[GUI] Desktop compositor + 14 GUI modules initialized")
+    cprintln("[GUI] Desktop compositor + 14 GUI modules initialized", WHITE_ON_BLACK)
 
     println(52)
     mnist_init_weights()
@@ -224,31 +224,31 @@
 
     // Initialize VFS (mounts /, /dev, /proc, /mnt if FAT32 available)
     vfs_init()
-    println("[VFS] Initialized")
+    cprintln("[VFS] Initialized", WHITE_ON_BLACK)
 
     // Initialize network stack
     net_init()
-    println("[NET] Initialized")
+    cprintln("[NET] Initialized", WHITE_ON_BLACK)
 
     // Initialize syscall dispatch table
     syscall_init()
-    println("[ELF] Syscall table ready")
+    cprintln("[ELF] Syscall table ready", WHITE_ON_BLACK)
 
     // Initialize process table v2 + keyboard buffer
     proc_v2_init()
     kb_init()
     fd_init(0) // FDs for kernel process
-    println("[PROC] Process table v2 ready")
-    println("[KB] Keyboard buffer ready")
+    cprintln("[PROC] Process table v2 ready", WHITE_ON_BLACK)
+    cprintln("[KB] Keyboard buffer ready", WHITE_ON_BLACK)
 
     // Initialize IPC v2 capabilities + channels
     cap_set(0, -1)  // Kernel gets all capabilities
     channel_register_builtin_services()
-    println("[IPC2] Endpoints + channels + capabilities ready")
+    cprintln("[IPC2] Endpoints + channels + capabilities ready", WHITE_ON_BLACK)
 
     // Phase 4: ELF loader for Ring 3 services
     svc_elf_init()
-    println("[ELF] Service loader ready")
+    cprintln("[ELF] Service loader ready", WHITE_ON_BLACK)
 
     // Phase 2: Production Hardening subsystems
     smp_sched_init()
@@ -259,34 +259,34 @@
     batch_init()
     perf_init()
     journal_init()
-    println("[P2] SMP + memory + security + fast IPC + journal ready")
+    cprintln("[P2] SMP + memory + security + fast IPC + journal ready", WHITE_ON_BLACK)
 
     // Configure SYSCALL/SYSRET — stub at 0x8200 with dedicated syscall stack
     syscall_setup()
-    println("[SYSCALL] Entry stub + MSRs configured")
+    cprintln("[SYSCALL] Entry stub + MSRs configured", WHITE_ON_BLACK)
 
     // Sprint 5.1: Ring 3 ELF via 'ring3' shell command
     // VERIFIED: "Hello from Ring 3!" + PID=1 + SYS_EXIT on QEMU serial
 
     // Initialize VFS service (Sprint 1.4)
     vfs_svc_init()
-    println("[VFS] VFS service initialized")
+    cprintln("[VFS] VFS service initialized", WHITE_ON_BLACK)
 
     // Sprint 5.3: HTTP + DNS tests
     tcp_init()
     dns_init()
 
     // Test 1: HTTP GET via TCP
-    println("[TEST] 5.3.5: HTTP GET http://10.0.2.2:8080/...")
+    cprintln("[TEST] 5.3.5: HTTP GET http://10.0.2.2:8080/...", WHITE_ON_BLACK)
     volatile_write_u8(HTTP_SCRATCH, 47)
     volatile_write_u8(HTTP_SCRATCH + 1, 0)
     let http_status = http_get(ip_pack(10, 0, 2, 2), 8080, HTTP_SCRATCH, 1)
-    if http_status == 200 { println("[TEST] 5.3.5: HTTP 200 OK!") }
-    else if http_status > 0 { println("[TEST] 5.3.5: HTTP non-200 response") }
-    else { println("[TEST] 5.3.5: HTTP failed") }
+    if http_status == 200 { cprintln("[TEST] 5.3.5: HTTP 200 OK!", WHITE_ON_BLACK) }
+    else if http_status > 0 { cprintln("[TEST] 5.3.5: HTTP non-200 response", WHITE_ON_BLACK) }
+    else { cprintln("[TEST] 5.3.5: HTTP failed", WHITE_ON_BLACK) }
 
     // Test 2: DNS query via UDP
-    println("[TEST] 5.3.8: DNS resolve example.com...")
+    cprintln("[TEST] 5.3.8: DNS resolve example.com...", WHITE_ON_BLACK)
     let dnb: i64 = DNS_FBUF + 900
     // "example.com"
     volatile_write_u8(dnb,101); volatile_write_u8(dnb+1,120); volatile_write_u8(dnb+2,97)
@@ -294,37 +294,37 @@
     volatile_write_u8(dnb+6,101); volatile_write_u8(dnb+7,46); volatile_write_u8(dnb+8,99)
     volatile_write_u8(dnb+9,111); volatile_write_u8(dnb+10,109); volatile_write_u8(dnb+11,0)
     let dns_ip = dns_query(dnb, 11)
-    if dns_ip > 0 { println("[TEST] 5.3.8: DNS resolved!") }
-    else { println("[TEST] 5.3.8: DNS timeout (expected without DNS server)") }
+    if dns_ip > 0 { cprintln("[TEST] 5.3.8: DNS resolved!", WHITE_ON_BLACK) }
+    else { cprintln("[TEST] 5.3.8: DNS timeout (expected without DNS server)", WHITE_ON_BLACK) }
 
-    println("[TEST] 5.3 done")
+    cprintln("[TEST] 5.3 done", WHITE_ON_BLACK)
 
     // Sprint 5.4: Process lifecycle test
-    println("[TEST] 5.4: Process lifecycle...")
+    cprintln("[TEST] 5.4: Process lifecycle...", WHITE_ON_BLACK)
     cmd_proc_lifecycle()
-    println("[TEST] 5.4 done")
+    cprintln("[TEST] 5.4 done", WHITE_ON_BLACK)
 
     // Ring 3 user program is pre-installed but NOT auto-run
     // Use 'runhello' command to test Ring 3 execution
     // (Auto-running Ring 3 halts the kernel because SYS_EXIT does hlt)
     prog_install_all()
-    println("[RING3] 3 user programs installed (type 'programs' to list)")
+    cprintln("[RING3] 3 user programs installed (type 'programs' to list)", WHITE_ON_BLACK)
 
-    println("[SEC] Security commands ready")
-    println("[INIT] Script engine ready")
+    cprintln("[SEC] Security commands ready", WHITE_ON_BLACK)
+    cprintln("[INIT] Script engine ready", WHITE_ON_BLACK)
 
     // Enable interrupts
     irq_enable()
 
     // Serial confirmation
-    println("[NOVA] FajarOS Nova v3.0 Nusantara booted")
-    println("[NOVA] 42600+ LOC | 250+ commands | Preemptive | 100% Fajar Lang")
-    println("[NOVA] Frame allocator: 32768 frames (128MB)")
-    println("[NOVA] RamFS: 64 entries, 832KB data")
+    cprintln("[NOVA] FajarOS Nova v3.0 Nusantara booted", WHITE_ON_BLACK)
+    cprintln("[NOVA] 42600+ LOC | 250+ commands | Preemptive | 100% Fajar Lang", WHITE_ON_BLACK)
+    cprintln("[NOVA] Frame allocator: 32768 frames (128MB)", WHITE_ON_BLACK)
+    cprintln("[NOVA] RamFS: 64 entries, 832KB data", WHITE_ON_BLACK)
     if fb_state_read(FB_MAPPED) != 0 {
-        println("[NOVA] Graphics mode: framebuffer active")
+        cprintln("[NOVA] Graphics mode: framebuffer active", WHITE_ON_BLACK)
     } else {
-        println("[NOVA] VGA text console at 0xB8000")
+        cprintln("[NOVA] VGA text console at 0xB8000", WHITE_ON_BLACK)
     }
 
     // Boot banner

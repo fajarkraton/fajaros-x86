@@ -444,7 +444,7 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     pause() // memory fence — ensure all descriptor writes are visible
     port_outw(io_base + 0x10, 0) // notify queue 0 (RX)
 
-    println("[NET] Virtqueues configured (RX=0, TX=1)")
+    cprintln("[NET] Virtqueues configured (RX=0, TX=1)", WHITE_ON_BLACK)
 
     // Default IP config (QEMU user-mode networking)
     net_state_write(16, 0x0A00020F) // 10.0.2.15

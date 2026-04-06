@@ -369,7 +369,7 @@ const CSW_SIGNATURE: i64 = 0x53425355
         p = p + 1
     }
 
-    println("[XHCI] Controller running")
+    cprintln("[XHCI] Controller running", WHITE_ON_BLACK)
     if connected2 > connected { connected2 } else { connected }
 }
 
