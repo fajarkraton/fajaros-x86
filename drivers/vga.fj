@@ -86,13 +86,18 @@
 }
 
 @kernel fn cprint_decimal(val: i64, color: i64) {
+    if val < 0 { console_putchar(45, color); cprint_decimal(0 - val, color); return }
     if val == 0 { console_putchar(48, color); return }
-    let mut buf: [i64; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    let mut v = val
-    let mut len: i64 = 0
-    while v > 0 { buf[len] = 48 + (v % 10); v = v / 10; len = len + 1 }
-    let mut i: i64 = 0
-    while i < len { console_putchar(buf[len - 1 - i], color); i = i + 1 }
+    // Recursive digit extraction — no stack arrays needed
+    // Print digits left-to-right by recursing first, then printing
+    let mut divisor: i64 = 1
+    let mut tmp = val
+    while tmp >= 10 { divisor = divisor * 10; tmp = tmp / 10 }
+    while divisor > 0 {
+        let digit = (val / divisor) % 10
+        console_putchar(48 + digit, color)
+        divisor = divisor / 10
+    }
 }
 
 @kernel fn cprint_hex(val: i64, digits: i64, color: i64) {

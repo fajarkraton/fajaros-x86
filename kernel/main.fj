@@ -180,6 +180,9 @@
     println(47)
     filemgr_init()
     println(48)
+    // Clear framebuffer state before detection (prevent stale data)
+    let mut fbi: i64 = 0
+    while fbi < 64 { fb_state_write(fbi, 0); fbi = fbi + 8 }
     // Detect Multiboot2 framebuffer (VBE/GOP mode from bootloader)
     fb_detect_multiboot()
     println(49)
@@ -355,6 +358,17 @@
     volatile_write(0x6FBE8, 0)  // caps = 0
     volatile_write(0x6FBF0, 0)  // ctrl = 0 (Sprint 5.4.7)
 
+    // Flush stale keyboard data (phantom scan codes from boot/BIOS)
+    let mut kb_flush: i64 = 0
+    while kb_flush < 64 {
+        let kb_status = port_inb(0x64)
+        if (kb_status & 1) == 0 { kb_flush = 64 }
+        else { let _ = port_inb(0x60); kb_flush = kb_flush + 1 }
+    }
+    // Clear keyboard ring buffer (head = tail = 0)
+    volatile_write_u64(0x892000, 0)
+    volatile_write_u64(0x892008, 0)
+
     // Main shell loop — shift, caps lock, ctrl, arrow history
     // Also polls serial port (COM1) for automated testing
     let mut running: i64 = 1
@@ -424,23 +438,24 @@
             else if sc > 0 && sc < 128 {
                 // Sprint 5.4.7: Ctrl+C — send SIGINT to foreground process
                 let ctrl = volatile_read(0x6FBF0)
-                // Ctrl+1/2/3/4: switch virtual desktops
-                if ctrl == 1 && sc == 0x02 { spaces_switch(0); cprint("[Space 1]", GREEN_ON_BLACK) }
-                else if ctrl == 1 && sc == 0x03 { spaces_switch(1); cprint("[Space 2]", GREEN_ON_BLACK) }
-                else if ctrl == 1 && sc == 0x04 { spaces_switch(2); cprint("[Space 3]", GREEN_ON_BLACK) }
-                else if ctrl == 1 && sc == 0x05 { spaces_switch(3); cprint("[Space 4]", GREEN_ON_BLACK) }
-                // Ctrl+Space: toggle launcher
-                else if ctrl == 1 && sc == 0x39 { launcher_show() }
+                // Ctrl+1/2/3/4: switch virtual desktops (GUI mode with real FB)
+                let fb_bpp = fb_state_read(32)
+                if ctrl == 1 && sc == 0x02 && fb_bpp >= 16 { spaces_switch(0) }
+                else if ctrl == 1 && sc == 0x03 && fb_bpp >= 16 { spaces_switch(1) }
+                else if ctrl == 1 && sc == 0x04 && fb_bpp >= 16 { spaces_switch(2) }
+                else if ctrl == 1 && sc == 0x05 && fb_bpp >= 16 { spaces_switch(3) }
+                // Ctrl+Space: toggle launcher (GUI mode only)
+                else if ctrl == 1 && sc == 0x39 && fb_bpp >= 16 { launcher_show() }
                 // F11: toggle fullscreen
                 else if sc == 0x57 {
                     let focused = comp_focused_window()
                     if focused >= 0 { comp_toggle_fullscreen(focused) }
                 }
                 else if ctrl == 1 && sc == 0x2E { // 0x2E = scancode for 'C'
-                    cprintln("^C", RED_ON_BLACK)
                     // Send SIGINT to current foreground PID (if not kernel)
                     let fg_pid = volatile_read_u64(0x6FE00)
                     if fg_pid > 0 && fg_pid < PROC_V2_MAX {
+                        cprint("^C", RED_ON_BLACK)
                         sig_send(fg_pid, SIG_INT)
                     }
                     cmdbuf_clear()
