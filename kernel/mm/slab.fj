@@ -10,15 +10,24 @@
 const SLAB_BASE: i64 = 0x590000
 const SLAB_SIZES: i64 = 6  // 32, 64, 128, 256, 512, 1024
 
+// Helper: return slab object size for index (avoids stack array literal)
+@kernel fn slab_obj_size(idx: i64) -> i64 {
+    if idx == 0 { return 32 }
+    if idx == 1 { return 64 }
+    if idx == 2 { return 128 }
+    if idx == 3 { return 256 }
+    if idx == 4 { return 512 }
+    1024
+}
+
 @kernel fn slab_init() {
     // Initialize slab metadata at SLAB_BASE
     // Each slab: offset +0: object_size, +8: capacity, +16: used, +24: bitmap_addr, +32: data_addr
     let mut i: i64 = 0
-    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
     let mut data_off: i64 = SLAB_BASE + 256  // data starts after metadata
     while i < SLAB_SIZES {
         let meta = SLAB_BASE + i * 40
-        let obj_size = sizes[i]
+        let obj_size = slab_obj_size(i)
         let capacity = 4096 / obj_size  // one page worth
         volatile_write(meta, obj_size)
         volatile_write(meta + 8, capacity)
@@ -35,10 +44,10 @@ const SLAB_SIZES: i64 = 6  // 32, 64, 128, 256, 512, 1024
 
 @kernel fn slab_alloc(size: i64) -> i64 {
     // Find smallest slab that fits
-    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
     let mut i: i64 = 0
     while i < SLAB_SIZES {
-        if sizes[i] >= size {
+        let obj_size = slab_obj_size(i)
+        if obj_size >= size {
             let meta = SLAB_BASE + i * 40
             let capacity = volatile_read(meta + 8)
             let used = volatile_read(meta + 16)
@@ -51,7 +60,7 @@ const SLAB_SIZES: i64 = 6  // 32, 64, 128, 256, 512, 1024
                     if volatile_read_u8(bitmap + j) == 0 {
                         volatile_write_u8(bitmap + j, 1)
                         volatile_write(meta + 16, used + 1)
-                        return data + j * sizes[i]
+                        return data + j * obj_size
                     }
                     j = j + 1
                 }
@@ -63,14 +72,14 @@ const SLAB_SIZES: i64 = 6  // 32, 64, 128, 256, 512, 1024
 }
 
 @kernel fn slab_free(ptr: i64, size: i64) {
-    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
     let mut i: i64 = 0
     while i < SLAB_SIZES {
-        if sizes[i] >= size {
+        let obj_size = slab_obj_size(i)
+        if obj_size >= size {
             let meta = SLAB_BASE + i * 40
             let data = volatile_read(meta + 32)
             let bitmap = volatile_read(meta + 24)
-            let slot = (ptr - data) / sizes[i]
+            let slot = (ptr - data) / obj_size
             if slot >= 0 && slot < volatile_read(meta + 8) {
                 volatile_write_u8(bitmap + slot, 0)
                 let used = volatile_read(meta + 16)
@@ -84,7 +93,6 @@ const SLAB_SIZES: i64 = 6  // 32, 64, 128, 256, 512, 1024
 
 @kernel fn cmd_slab() {
     cprintln("Slab Allocator:", YELLOW_ON_BLACK)
-    let sizes: [i64; 6] = [32, 64, 128, 256, 512, 1024]
     let mut i: i64 = 0
     while i < SLAB_SIZES {
         let meta = SLAB_BASE + i * 40

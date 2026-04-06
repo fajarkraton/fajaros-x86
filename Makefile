@@ -236,7 +236,7 @@ $(RUNTIME_O): $(RUNTIME_S)
 # Build kernel with LLVM backend (optimized, uses hardware features)
 # Auto-generates startup.S + linker script internally
 build-llvm: $(COMBINED) $(RUNTIME_O)
-	$(FJ) build --no-std --backend llvm \
+	@$(FJ) build --no-std --backend llvm \
 		--opt-level $(LLVM_OPT) \
 		--target-cpu $(LLVM_CPU) \
 		--target-features "$(LLVM_FEATURES)" \
@@ -244,7 +244,7 @@ build-llvm: $(COMBINED) $(RUNTIME_O)
 		--code-model kernel \
 		--reloc static \
 		--extra-objects $(RUNTIME_O) \
-		$(COMBINED) -o $(KERNEL_LLVM)
+		$(COMBINED) -o $(KERNEL_LLVM) 2>&1 | { grep -v "SE009\|SE010\|prefix with underscore\|unused variable\|^  " || true; }
 	@echo "[OK] LLVM kernel built: $(KERNEL_LLVM) (O$(LLVM_OPT), $(LLVM_CPU))"
 	@size $(KERNEL_LLVM) 2>/dev/null || true
 
