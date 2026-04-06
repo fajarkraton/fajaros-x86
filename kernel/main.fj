@@ -356,16 +356,26 @@
     volatile_write(0x6FBE8, 0)  // caps = 0
     volatile_write(0x6FBF0, 0)  // ctrl = 0 (Sprint 5.4.7)
 
-    // Flush stale keyboard data (phantom scan codes from boot/BIOS)
+    // Mask keyboard IRQ1 in PIC during flush to prevent re-filling
+    let pic_mask = port_inb(0x21)
+    port_outb(0x21, pic_mask | 2)     // Set bit 1 = mask IRQ1
+    // Disable keyboard interface and flush controller buffer
+    port_outb(0x64, 0xAD)
     let mut kb_flush: i64 = 0
-    while kb_flush < 64 {
+    while kb_flush < 256 {
         let kb_status = port_inb(0x64)
-        if (kb_status & 1) == 0 { kb_flush = 64 }
+        if (kb_status & 1) == 0 { kb_flush = 256 }
         else { let _ = port_inb(0x60); kb_flush = kb_flush + 1 }
     }
-    // Clear keyboard ring buffer (head = tail = 0)
-    volatile_write_u64(0x892000, 0)
-    volatile_write_u64(0x892008, 0)
+    port_outb(0x64, 0xAE)            // Re-enable keyboard interface
+    // Clear keyboard ring buffer + reset modifier state
+    volatile_write_u64(0x892000, 0)   // head = 0
+    volatile_write_u64(0x892008, 0)   // tail = 0
+    volatile_write(0x6FBE0, 0)        // shift = 0
+    volatile_write(0x6FBE8, 0)        // caps = 0
+    volatile_write(0x6FBF0, 0)        // ctrl = 0
+    // Unmask keyboard IRQ1
+    port_outb(0x21, pic_mask & (~2))
 
     // Main shell loop — shift, caps lock, ctrl, arrow history
     // Also polls serial port (COM1) for automated testing
@@ -455,9 +465,10 @@
                     if fg_pid > 0 && fg_pid < PROC_V2_MAX {
                         cprint("^C", RED_ON_BLACK)
                         sig_send(fg_pid, SIG_INT)
+                        cmdbuf_clear()
+                        cprint("nova> ", GREEN_ON_BLACK)
                     }
-                    cmdbuf_clear()
-                    cprint("nova> ", GREEN_ON_BLACK)
+                    // If no foreground process, silently ignore Ctrl+C
                 }
                 else {
                 let ascii = sc2ascii(sc)
