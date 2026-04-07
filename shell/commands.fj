@@ -2931,16 +2931,16 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len >= 3 && volatile_read_u8(0x6F800) == 99 && volatile_read_u8(0x6F801) == 97 && volatile_read_u8(0x6F802) == 116 && (len == 3 || volatile_read_u8(0x6F803) == 32) { cmd_cat(); handled = 1 }
     // echo (101,99,104,111) — "echo <text>"
     if handled == 0 && len >= 4 && buf_eq4(101, 99, 104, 111) == 1 && (len == 4 || volatile_read_u8(0x6F804) == 32) { cmd_echo(); handled = 1 }
-    // touch (116,111,117,99,104) — "touch <file>"
-    if handled == 0 && len >= 5 && buf_eq4(116, 111, 117, 99) == 1 && volatile_read_u8(0x6F804) == 104 { cmd_touch(); handled = 1 }
+    // touch (116,111,117,99,104) — "touch <file>" (not "touch-ipc")
+    if handled == 0 && len >= 5 && buf_eq4(116, 111, 117, 99) == 1 && volatile_read_u8(0x6F804) == 104 && (len == 5 || volatile_read_u8(0x6F805) == 32) { cmd_touch(); handled = 1 }
     // rm (114,109) — "rm <file>"
     if handled == 0 && len >= 2 && volatile_read_u8(0x6F800) == 114 && volatile_read_u8(0x6F801) == 109 && (len == 2 || volatile_read_u8(0x6F802) == 32) { cmd_rm(); handled = 1 }
     // mkdir (109,107,100,105,114) — "mkdir <dir>"
     if handled == 0 && len >= 5 && volatile_read_u8(0x6F800) == 109 && volatile_read_u8(0x6F801) == 107 && volatile_read_u8(0x6F802) == 100 { cmd_mkdir(); handled = 1 }
     // pwd (112,119,100)
     if handled == 0 && len == 3 && volatile_read_u8(0x6F800) == 112 && volatile_read_u8(0x6F801) == 119 && volatile_read_u8(0x6F802) == 100 { cmd_pwd(); handled = 1 }
-    // write (119,114,105,116,101) — "write <file> <text>"
-    if handled == 0 && len >= 5 && buf_eq4(119, 114, 105, 116) == 1 && volatile_read_u8(0x6F804) == 101 { cmd_write(); handled = 1 }
+    // write (119,114,105,116,101) — "write <file> <text>" (not "write-ipc")
+    if handled == 0 && len >= 5 && buf_eq4(119, 114, 105, 116) == 1 && volatile_read_u8(0x6F804) == 101 && (len == 5 || volatile_read_u8(0x6F805) == 32) { cmd_write(); handled = 1 }
     // head (104,101,97,100) — "head <file>"
     if handled == 0 && len >= 4 && buf_eq4(104, 101, 97, 100) == 1 && (len == 4 || volatile_read_u8(0x6F804) == 32) { cmd_head(); handled = 1 }
     // wc (119,99) — "wc <file>"
