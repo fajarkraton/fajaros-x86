@@ -318,9 +318,14 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
 
 @kernel fn net_check_icmp_reply() -> i64 {
     // Poll for ICMP echo reply. Returns RTT in TSC cycles or -1.
+    // Ack any pending VirtIO ISR (needed for device to advance used ring)
+    let io_base = net_state_read(56)
+    if io_base > 0 { let _ = port_inb(io_base + 0x13) }
     let t0 = rdtsc()
     let mut attempts: i64 = 0
     while attempts < 50000000 {  // ~5 second timeout
+        // Periodically ack ISR to let device advance
+        if (attempts & 0xFFFFF) == 0 && io_base > 0 { let _ = port_inb(io_base + 0x13) }
         let fl = net_process_rx() // handles ARP + learns MAC
         if fl > 0 {
             let eth_off = VIRTIO_NET_HDR_SIZE
