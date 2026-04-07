@@ -2929,6 +2929,8 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 2 && volatile_read_u8(0x6F800) == 108 && volatile_read_u8(0x6F801) == 115 { cmd_ls(); handled = 1 }
     // cat (99,97,116) — "cat <file>"
     if handled == 0 && len >= 3 && volatile_read_u8(0x6F800) == 99 && volatile_read_u8(0x6F801) == 97 && volatile_read_u8(0x6F802) == 116 && (len == 3 || volatile_read_u8(0x6F803) == 32) { cmd_cat(); handled = 1 }
+    // echo (101,99,104,111) — "echo <text>"
+    if handled == 0 && len >= 4 && buf_eq4(101, 99, 104, 111) == 1 && (len == 4 || volatile_read_u8(0x6F804) == 32) { cmd_echo(); handled = 1 }
     // touch (116,111,117,99,104) — "touch <file>"
     if handled == 0 && len >= 5 && buf_eq4(116, 111, 117, 99) == 1 && volatile_read_u8(0x6F804) == 104 { cmd_touch(); handled = 1 }
     // rm (114,109) — "rm <file>"
