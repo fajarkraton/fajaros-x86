@@ -2702,6 +2702,10 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
         i = i + 1
     }
     volatile_write_u8(path_addr + i, 0)
+    // Lazy embed: if target is "hello", embed the ELF data now
+    if i == 5 && volatile_read_u8(path_addr) == 104 && volatile_read_u8(path_addr + 1) == 101 && volatile_read_u8(path_addr + 4) == 111 {
+        ring3_hello_embed()
+    }
     let result = sys_exec(path_addr, 0)
     if result != 0 {
         cprint("exec: failed to load '", RED_ON_BLACK)
