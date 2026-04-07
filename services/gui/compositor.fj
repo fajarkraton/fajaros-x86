@@ -20,8 +20,7 @@ const SCREEN_HEIGHT: i64 = 768
 const SCREEN_BPP: i64 = 4             // Bytes per pixel (32-bit ARGB)
 const SCREEN_PITCH: i64 = 4096        // Bytes per row (1024 * 4)
 
-// Framebuffers
-const FB_FRONT: i64 = 0xFD000000      // VGA framebuffer (displayed)
+// Framebuffers — front buffer from fb_state_read(FB_MAPPED) at runtime
 const FB_BACK: i64 = 0xE00000         // Back buffer (composited)
 
 // Window descriptor offsets

@@ -35,11 +35,11 @@
 
 // Mirror console output to serial (COM1) for automated QEMU testing
 @kernel fn serial_putchar(ch: i64) {
-    // Non-blocking: send only if TX ready (LSR bit 5 at 0x3FD)
-    let lsr = port_inb(0x3FD)
-    if lsr >= 32 {
-        port_outb(0x3F8, ch)
-    }
+    // Blocking: spin until TX holding register empty (LSR bit 5 at 0x3FD)
+    let mut lsr = port_inb(0x3FD)
+    let mut wait: i64 = 0
+    while (lsr & 32) == 0 && wait < 100000 { lsr = port_inb(0x3FD); wait = wait + 1 }
+    port_outb(0x3F8, ch)
 }
 
 @kernel fn console_putchar(ch: i64, color: i64) {

@@ -67,13 +67,28 @@ const TEST_SCRATCH: i64 = 0x900000  // 4KB scratch area (was 0x8FC000 — overla
     volatile_read_u64(reply + 16)
 }
 
+// Serial-only print for clean test harness output (bypasses VGA to avoid interleaving)
+@kernel fn serial_print_str(s: str) {
+    let len = str_len(s)
+    let mut i: i64 = 0
+    while i < len { serial_putchar(str_byte_at(s, i)); i = i + 1 }
+}
+
 @kernel fn test_pass(name: str) {
     cprint("  [PASS] ", GREEN_ON_BLACK)
     cprintln(name, WHITE_ON_BLACK)
+    // Also emit clean serial-only line for test harness
+    serial_print_str("RESULT:PASS:")
+    serial_print_str(name)
+    serial_putchar(10)
 }
 @kernel fn test_fail(name: str) {
     cprint("  [FAIL] ", RED_ON_BLACK)
     cprintln(name, WHITE_ON_BLACK)
+    // Also emit clean serial-only line for test harness
+    serial_print_str("RESULT:FAIL:")
+    serial_print_str(name)
+    serial_putchar(10)
 }
 
 // ═══════════════════════════════════════════════════════════════
