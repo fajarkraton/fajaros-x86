@@ -18,6 +18,7 @@ const HEAP_MAGIC: i64 = 0xABCD1234
     // Initialize free list: one big free block
     volatile_write(HEAP_START, HEAP_END - HEAP_START - HEAP_HDR)  // size of free block
     volatile_write(HEAP_START + 8, 0)  // next = null
+    volatile_write(0x581008, HEAP_START)     // free list head
     // Stats at 0x581010
     volatile_write(0x581010, 0)              // total allocated bytes
     volatile_write(0x581018, HEAP_END - HEAP_START) // total heap size
@@ -28,7 +29,7 @@ const HEAP_MAGIC: i64 = 0xABCD1234
     // First-fit allocation from free list
     let aligned_size = ((size + 7) / 8) * 8  // 8-byte align
     let mut prev: i64 = 0
-    let mut curr = HEAP_START
+    let mut curr = volatile_read(0x581008)
     while curr != 0 {
         let blk_size = volatile_read(curr)
         if blk_size >= aligned_size {

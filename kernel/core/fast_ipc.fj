@@ -20,30 +20,38 @@ const FP_RECV_SCRATCH: i64 = 0x8FA200  // 16 bytes (was 0x8FA1F0 which overlappe
 
 @kernel fn fastpath_init() {
     let mut i: i64 = 0
-    while i < FASTPATH_MAX * FASTPATH_ENTRY { volatile_write_u64(FASTPATH_BASE + i, 0); i = i + 8 }
+    while i < FASTPATH_MAX {
+        let entry = FASTPATH_BASE + i * FASTPATH_ENTRY
+        volatile_write_u64(entry + FP_SENDER, -1)
+        volatile_write_u64(entry + FP_RECEIVER, -1)
+        volatile_write_u64(entry + FP_DATA0, 0)
+        volatile_write_u64(entry + FP_DATA1, 0)
+        i = i + 1
+    }
+    volatile_write_u64(FP_RECV_SCRATCH, 0)
+    volatile_write_u64(FP_RECV_SCRATCH + 8, 0)
 }
 
 @kernel fn ipc_fast_send(dst_pid: i64, val0: i64, val1: i64) -> i64 {
-    if dst_pid < 0 || dst_pid >= FASTPATH_MAX { return -1 }
+    if dst_pid < 0 || dst_pid >= FASTPATH_MAX { return -2 }
     let src_pid = volatile_read_u64(0x6FE00)
-    // Check if receiver is waiting
+    // Check if receiver is waiting (receiver == dst_pid, sender == -1 means "waiting")
     let mut slot: i64 = 0
     while slot < FASTPATH_MAX {
         let entry = FASTPATH_BASE + slot * FASTPATH_ENTRY
-        if volatile_read_u64(entry + FP_RECEIVER) == dst_pid && volatile_read_u64(entry + FP_SENDER) == 0 {
+        if volatile_read_u64(entry + FP_RECEIVER) == dst_pid && volatile_read_u64(entry + FP_SENDER) == -1 {
             volatile_write_u64(entry + FP_SENDER, src_pid)
             volatile_write_u64(entry + FP_DATA0, val0)
             volatile_write_u64(entry + FP_DATA1, val1)
-            // Note: IPC latency is measured externally by callers using rdtsc()
             return 0
         }
         slot = slot + 1
     }
-    // No waiting receiver — deposit in empty slot
+    // No waiting receiver — deposit in empty slot (sender == -1 && receiver == -1)
     slot = 0
     while slot < FASTPATH_MAX {
         let entry = FASTPATH_BASE + slot * FASTPATH_ENTRY
-        if volatile_read_u64(entry + FP_SENDER) == 0 && volatile_read_u64(entry + FP_RECEIVER) == 0 {
+        if volatile_read_u64(entry + FP_SENDER) == -1 && volatile_read_u64(entry + FP_RECEIVER) == -1 {
             volatile_write_u64(entry + FP_SENDER, src_pid)
             volatile_write_u64(entry + FP_RECEIVER, dst_pid)
             volatile_write_u64(entry + FP_DATA0, val0)
@@ -62,12 +70,12 @@ const FP_RECV_SCRATCH: i64 = 0x8FA200  // 16 bytes (was 0x8FA1F0 which overlappe
         let entry = FASTPATH_BASE + slot * FASTPATH_ENTRY
         let recv = volatile_read_u64(entry + FP_RECEIVER)
         let sender = volatile_read_u64(entry + FP_SENDER)
-        if recv == my_pid && sender != 0 {
+        if recv == my_pid && sender != -1 {
             let s = sender
             volatile_write_u64(FP_RECV_SCRATCH, volatile_read_u64(entry + FP_DATA0))
             volatile_write_u64(FP_RECV_SCRATCH + 8, volatile_read_u64(entry + FP_DATA1))
-            volatile_write_u64(entry + FP_SENDER, 0)
-            volatile_write_u64(entry + FP_RECEIVER, 0)
+            volatile_write_u64(entry + FP_SENDER, -1)
+            volatile_write_u64(entry + FP_RECEIVER, -1)
             volatile_write_u64(entry + FP_DATA0, 0)
             volatile_write_u64(entry + FP_DATA1, 0)
             return s

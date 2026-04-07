@@ -94,7 +94,7 @@ const SHM_ERR_NO_MEMORY: i64 = -5
             let num_pages = aligned / FRAME_SIZE
             let first_frame = frame_alloc()
             if first_frame == -1 { return SHM_ERR_NO_MEMORY }
-            let phys_base = first_frame * FRAME_SIZE
+            let phys_base = first_frame
 
             // Allocate remaining frames (contiguous)
             let mut pg: i64 = 1
@@ -104,7 +104,7 @@ const SHM_ERR_NO_MEMORY: i64 = -5
                     // Rollback: free already allocated frames
                     let mut j: i64 = 0
                     while j < pg {
-                        frame_free(first_frame + j)
+                        frame_free(phys_base + j * FRAME_SIZE)
                         j = j + 1
                     }
                     return SHM_ERR_NO_MEMORY
