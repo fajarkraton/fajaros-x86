@@ -205,6 +205,19 @@
     map_page(0xFEC00000, 0xFEC00000, PAGE_PRESENT | PAGE_WRITABLE)  // IOAPIC
     println(56)
 
+    // Mask ALL IOAPIC redirection entries (24 pins)
+    // Prevents unhandled IOAPIC-routed interrupts from PCI devices (VirtIO-Net etc.)
+    // IOREGSEL at 0xFEC00000, IOWIN at 0xFEC00010
+    let mut ioapic_pin: i64 = 0
+    while ioapic_pin < 24 {
+        let reg = 0x10 + ioapic_pin * 2  // low 32 bits of redirection entry
+        volatile_write_u32(0xFEC00000, reg)
+        let val = volatile_read_u32(0xFEC00010)
+        volatile_write_u32(0xFEC00000, reg)
+        volatile_write_u32(0xFEC00010, val | (1 << 16))  // set mask bit
+        ioapic_pin = ioapic_pin + 1
+    }
+
     // Initialize LAPIC if present
     let apic_present = cpuid_edx(1) & (1 << 9)
     println(57)

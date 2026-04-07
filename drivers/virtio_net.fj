@@ -35,7 +35,8 @@ const NET_PKT_BUF: i64 = 0x87C000  // Temp packet build buffer (4KB)
 // (PROC_TABLE_V2=0x890000, FD_TABLE=0x894000, PIPE_POOL=0x898000)
 const VQ_RX_BASE: i64 = 0xA00000     // RX queue (16KB: desc+avail+used for 256 entries)
 const VQ_TX_BASE: i64 = 0xA04000     // TX queue (16KB)
-const VQ_RX_BUFS: i64 = 0xA08000    // RX packet buffers: 256 × 2KB = 512KB (to 0xA88000)
+const VQ_RX_BUFS: i64 = 0xA60000    // RX packet buffers: 256 × 2KB = 512KB (to 0xAE0000)
+// (Moved from 0xA08000 — was overlapping IDT at 0xA50000 and TSS at 0xA52000!)
 const VQ_RXBUF_COUNT: i64 = 256     // Must match vq_num() for 1:1 desc→buffer mapping
 // Actual queue size stored at NET_STATE+96
 const NET_QSIZE_OFF: i64 = 96       // Queue size (from device)
@@ -175,6 +176,15 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     net_state_write(48, net_state_read(48) + 1)
 
     0
+}
+
+// Called from PIC IRQ handler to acknowledge VirtIO-Net interrupt.
+// Reads ISR status (BAR0+0x13) which deasserts the IRQ line.
+@kernel fn net_irq_ack() {
+    let io_base = net_state_read(56)
+    if io_base > 0 {
+        let _ = port_inb(io_base + 0x13)
+    }
 }
 
 @kernel fn net_rx_poll() -> i64 {
@@ -495,6 +505,27 @@ const VRING_DESC_F_WRITE: i64 = 2  // buffer is write-only (for device → drive
     gi = 42
     while gi < 60 { volatile_write_u8(garp + gi, 0); gi = gi + 1 }
     net_send_frame(garp, 60)
+
+    // Acknowledge any pending VirtIO interrupt (ISR status at BAR0 + 0x13)
+    let _ = port_inb(io_base + 0x13)
+
+    // Disable INTx at PCI command register level (bit 10) — we use polling
+    let cmd2 = pci_read32(0, dev, 0, 0x04)
+    pci_write32(0, dev, 0, 0x04, cmd2 | (1 << 10))
+
+    // Also mask in PIC for belt-and-suspenders
+    let irq_line = pci_read32(0, dev, 0, 0x3C) & 0xFF
+    net_state_write(88, irq_line)
+    if irq_line < 8 {
+        let mask = port_inb(0x21)
+        port_outb(0x21, mask | (1 << irq_line))
+    } else if irq_line < 16 {
+        let mask = port_inb(0xA1)
+        port_outb(0xA1, mask | (1 << (irq_line - 8)))
+    }
+    // And suppress via virtqueue avail ring NO_INTERRUPT flags
+    volatile_write_u16(VQ_RX_BASE + 4096 * 1, 1)  // VRING_AVAIL_F_NO_INTERRUPT
+    volatile_write_u16(VQ_TX_BASE + 4096 * 1, 1)
 
     0
 }
