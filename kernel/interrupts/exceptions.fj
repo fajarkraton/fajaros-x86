@@ -1,0 +1,114 @@
+// FajarOS Nova v3.0 — Exception Dispatch (IDT → handler routing)
+// kernel/interrupts/exceptions.fj — Ring 0 ONLY
+// Called from __isr_common in boot/runtime_stubs.S
+
+// ═══════════════════════════════════════════════════
+// exception_dispatch — route CPU exceptions to handler
+//
+// Frame layout (15 GPR pushes = 120 bytes, then stub pushes):
+//   frame_ptr + 0   : r15
+//   frame_ptr + 8   : r14  ...  frame_ptr + 112 : rax
+//   frame_ptr + 120 : vector number
+//   frame_ptr + 128 : error code (real or dummy 0)
+//   frame_ptr + 136 : RIP  (faulting instruction)
+//   frame_ptr + 144 : CS
+//   frame_ptr + 152 : RFLAGS
+//   frame_ptr + 160 : RSP  (Ring 3 only)
+//   frame_ptr + 168 : SS   (Ring 3 only)
+// ═══════════════════════════════════════════════════
+
+@kernel fn exception_dispatch(frame_ptr: i64) {
+    let vector = volatile_read(frame_ptr + 120)
+    let error_code = volatile_read(frame_ptr + 128)
+    let faulting_rip = volatile_read(frame_ptr + 136)
+    let cs = volatile_read(frame_ptr + 144)
+
+    // Serial debug: "EXC:<vector>\n"
+    port_outb(0x3F8, 69)  // 'E'
+    port_outb(0x3F8, 88)  // 'X'
+    port_outb(0x3F8, 67)  // 'C'
+    port_outb(0x3F8, 58)  // ':'
+    println(vector)
+
+    // CS & 3 != 0 → fault from Ring 3 (user mode)
+    let from_user = cs & 3
+
+    if vector == 14 {
+        // #PF — Page Fault
+        let fault_addr = read_cr2()
+        if from_user != 0 {
+            // Kill user process
+            let pid = volatile_read_u64(0x6FE00)
+            if pid > 0 {
+                proc_v2_set(pid, 0, PROC_STATE_ZOMBIE)
+                proc_v2_set(pid, 7, -14)
+                volatile_write_u64(0x6FE00, 0)
+            }
+        } else {
+            // Kernel #PF — dump CR2/CR3 and halt
+            exc_serial_hex(read_cr2())
+            exc_serial_hex(read_cr3())
+            exc_panic(14)
+        }
+    } else if vector == 13 {
+        // #GP — General Protection Fault
+        if from_user != 0 {
+            let pid = volatile_read_u64(0x6FE00)
+            if pid > 0 {
+                proc_v2_set(pid, 0, PROC_STATE_ZOMBIE)
+                proc_v2_set(pid, 7, -13)
+                volatile_write_u64(0x6FE00, 0)
+            }
+        } else {
+            exc_serial_hex(faulting_rip)
+            exc_panic(13)
+        }
+    } else if vector == 8 {
+        // #DF — Double Fault (always fatal)
+        exc_panic(8)
+    } else if from_user != 0 {
+        // Other exception from user — kill process
+        let pid = volatile_read_u64(0x6FE00)
+        if pid > 0 {
+            proc_v2_set(pid, 0, PROC_STATE_ZOMBIE)
+            proc_v2_set(pid, 7, 0 - vector)
+            volatile_write_u64(0x6FE00, 0)
+        }
+    } else {
+        // Other exception from kernel — panic
+        exc_serial_hex(faulting_rip)
+        exc_panic(vector)
+    }
+}
+
+// ═══════════════════════════════════════════════════
+// Helper: kernel panic — print vector code, halt CPU
+// ═══════════════════════════════════════════════════
+
+@kernel fn exc_panic(code: i64) {
+    port_outb(0x3F8, 80)  // 'P'
+    port_outb(0x3F8, 65)  // 'A'
+    port_outb(0x3F8, 78)  // 'N'
+    port_outb(0x3F8, 73)  // 'I'
+    port_outb(0x3F8, 67)  // 'C'
+    port_outb(0x3F8, 58)  // ':'
+    println(code)
+    // Exit QEMU via debug port, then spin
+    port_outb(0xF4, code & 0xFF)
+    while true {}
+}
+
+// ═══════════════════════════════════════════════════
+// Helper: print 64-bit hex to serial (for RIP/CR2)
+// ═══════════════════════════════════════════════════
+
+@kernel fn exc_serial_hex(val: i64) {
+    let mut shift: i64 = 60
+    while shift >= 0 {
+        let nibble = (val >> shift) & 0xF
+        if nibble < 10 { port_outb(0x3F8, 0x30 + nibble) }
+        else { port_outb(0x3F8, 0x37 + nibble) }
+        shift = shift - 4
+    }
+    port_outb(0x3F8, 10)  // newline
+}

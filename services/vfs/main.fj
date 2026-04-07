@@ -413,7 +413,7 @@ const PROC_BUF: i64 = 0x8B5000  // 4KB buffer for /proc responses
 // ═══════════════════════════════════════════════════════════════
 
 @kernel fn vfs_svc_handle_msg(sender: i64, msg_buf: i64, reply_buf: i64) -> i64 {
-    let msg_type = volatile_read_u32(msg_buf + 8)
+    let msg_type = volatile_read_u64(msg_buf + 8)
 
     if msg_type == MSG_VFS_OPEN {
         // Payload: path[40] (null-terminated string)
@@ -1008,117 +1008,81 @@ const VFS_IPC_REPLY: i64 = 0x8B7300  // IPC reply buffer
     }
 }
 
-// write-ipc <name> <text> — write text to file via VFS IPC (open + write + close)
+// write-ipc <name> <text> — write text to file via VFS IPC (uses shell IPC buffers)
 @kernel fn cmd_write_ipc() {
-    let my_pid = volatile_read_u64(0x6FE00)
     // Parse: "write-ipc <name> <text>"
-    // Find first space after "write-ipc " (offset 10)
     let len = cmdbuf_len()
     let mut name_end: i64 = 10
     while name_end < len && volatile_read_u8(0x6F800 + name_end) != 32 { name_end = name_end + 1 }
     let name_len = name_end - 10
     if name_len <= 0 { cprintln("Usage: write-ipc <name> <text>", RED_ON_BLACK); return }
 
-    // Create file if it doesn't exist
-    ipc_msg_clear(VFS_IPC_MSG)
-    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_CREATE, 0)
-    vfs_ipc_set_name(VFS_IPC_MSG, 10)
-    // Null-terminate just the name (overwrite space with 0)
-    volatile_write_u8(VFS_IPC_MSG + 16 + name_len, 0)
-    ipc_msg_clear(VFS_IPC_REPLY)
-    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
-    // Ignore EEXIST — file may already exist
+    // Create file if it doesn't exist (via VFS CREATE)
+    ipc_msg_clear(SHELL_MSG_BUF)
+    let mut ci: i64 = 0
+    while ci < name_len && ci < 31 {
+        volatile_write_u8(SHELL_MSG_BUF + 16 + ci, volatile_read_u8(0x6F800 + 10 + ci))
+        ci = ci + 1
+    }
+    volatile_write_u8(SHELL_MSG_BUF + 16 + ci, 0)
+    shell_ipc_call_vfs(MSG_VFS_CREATE)
+    // Ignore EEXIST
 
-    // Open file
-    ipc_msg_clear(VFS_IPC_MSG)
-    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_OPEN, 0)
-    // Copy name to payload, strip leading / if not present
+    // Open file (prepend "/" for VFS mount matching)
+    ipc_msg_clear(SHELL_MSG_BUF)
+    volatile_write_u8(SHELL_MSG_BUF + 16, 47)  // '/'
     let mut ni: i64 = 0
-    while ni < name_len && ni < 31 {
-        volatile_write_u8(VFS_IPC_MSG + 16 + ni, volatile_read_u8(0x6F800 + 10 + ni))
+    while ni < name_len && ni < 30 {
+        volatile_write_u8(SHELL_MSG_BUF + 17 + ni, volatile_read_u8(0x6F800 + 10 + ni))
         ni = ni + 1
     }
-    volatile_write_u8(VFS_IPC_MSG + 16 + ni, 0)
-    ipc_msg_clear(VFS_IPC_REPLY)
-    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
-    let fd = volatile_read_u64(VFS_IPC_REPLY + 16)
-    if fd < 0 { cprintln("Error: cannot open file", RED_ON_BLACK); return }
+    volatile_write_u8(SHELL_MSG_BUF + 17 + ni, 0)
+    shell_ipc_call_vfs(MSG_VFS_OPEN)
+    let fd = volatile_read_u64(SHELL_REPLY_BUF + 16)
+    if fd > 15 || fd < 0 { cprintln("Error: cannot open file", RED_ON_BLACK); return }
 
     // Write data (text after "<name> ")
     let data_start = name_end + 1
     let data_len = if data_start < len { len - data_start } else { 0 }
     if data_len > 0 {
-        ipc_msg_clear(VFS_IPC_MSG)
-        ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_WRITE, 0)
-        volatile_write_u64(VFS_IPC_MSG + 16, fd)
-        volatile_write_u64(VFS_IPC_MSG + 24, 0) // offset
-        // Copy data inline (max 24 bytes)
+        ipc_msg_clear(SHELL_MSG_BUF)
+        volatile_write_u64(SHELL_MSG_BUF + 16, fd)
+        volatile_write_u64(SHELL_MSG_BUF + 24, 0)
         let copy_len = if data_len > 24 { 24 } else { data_len }
         let mut di: i64 = 0
         while di < copy_len {
-            volatile_write_u8(VFS_IPC_MSG + 32 + di, volatile_read_u8(0x6F800 + data_start + di))
+            volatile_write_u8(SHELL_MSG_BUF + 32 + di, volatile_read_u8(0x6F800 + data_start + di))
             di = di + 1
         }
-        volatile_write_u64(VFS_IPC_MSG + 56, copy_len)
-        ipc_msg_clear(VFS_IPC_REPLY)
-        vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
-        let written = volatile_read_u64(VFS_IPC_REPLY + 48)
+        volatile_write_u64(SHELL_MSG_BUF + 56, copy_len)
+        shell_ipc_call_vfs(MSG_VFS_WRITE)
+        let written = volatile_read_u64(SHELL_REPLY_BUF + 48)
         cprint("Wrote ", GREEN_ON_BLACK)
         cprint_decimal(written, CYAN_ON_BLACK)
         cprintln(" bytes", GREEN_ON_BLACK)
     }
 
     // Close
-    ipc_msg_clear(VFS_IPC_MSG)
-    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_CLOSE, 0)
-    volatile_write_u64(VFS_IPC_MSG + 16, fd)
-    ipc_msg_clear(VFS_IPC_REPLY)
-    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+    ipc_msg_clear(SHELL_MSG_BUF)
+    volatile_write_u64(SHELL_MSG_BUF + 16, fd)
+    shell_ipc_call_vfs(MSG_VFS_CLOSE)
 }
 
-// cat-ipc <name> — read file via VFS IPC (open + read + close)
+// cat-ipc <name> — read file via VFS IPC (uses shell IPC buffers)
 @kernel fn cmd_cat_ipc() {
-    let my_pid = volatile_read_u64(0x6FE00)
-    // Open
-    ipc_msg_clear(VFS_IPC_MSG)
-    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_OPEN, 0)
-    vfs_ipc_set_name(VFS_IPC_MSG, 8) // "cat-ipc " = 8 chars
-    ipc_msg_clear(VFS_IPC_REPLY)
-    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
-    let fd = volatile_read_u64(VFS_IPC_REPLY + 16)
-    let file_size = volatile_read_u64(VFS_IPC_REPLY + 24)
-    if fd < 0 { cprintln("Error: file not found", RED_ON_BLACK); return }
-
-    // Read in chunks of 32 bytes
-    let mut offset: i64 = 0
-    while offset < file_size {
-        ipc_msg_clear(VFS_IPC_MSG)
-        ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_READ, 0)
-        volatile_write_u64(VFS_IPC_MSG + 16, fd)
-        volatile_write_u64(VFS_IPC_MSG + 24, offset)
-        volatile_write_u64(VFS_IPC_MSG + 32, 32)
-        ipc_msg_clear(VFS_IPC_REPLY)
-        vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
-        let bytes_read = volatile_read_u64(VFS_IPC_REPLY + 48)
-        if bytes_read <= 0 { offset = file_size }
-        else {
-            let mut i: i64 = 0
-            while i < bytes_read {
-                let ch = volatile_read_u8(VFS_IPC_REPLY + 16 + i)
-                console_putchar(ch, WHITE_ON_BLACK)
-                i = i + 1
-            }
-            offset = offset + bytes_read
-        }
+    // Use shell's IPC buffers (same as working cmd_cat/shell_cmd_vfs_cat)
+    let path_scratch: i64 = SHELL_DATA_BUF  // 0x8F1200
+    // Build path: "/" + filename from cmdbuf[8..]
+    volatile_write_u8(path_scratch, 47)  // '/'
+    let len_cat = cmdbuf_len()
+    let mut ci: i64 = 0
+    while ci < 30 && 8 + ci < len_cat {
+        volatile_write_u8(path_scratch + 1 + ci, volatile_read_u8(0x6F800 + 8 + ci))
+        ci = ci + 1
     }
-    console_putchar(10, WHITE_ON_BLACK)
-
-    // Close
-    ipc_msg_clear(VFS_IPC_MSG)
-    ipc_msg_set_header(VFS_IPC_MSG, my_pid, MSG_VFS_CLOSE, 0)
-    volatile_write_u64(VFS_IPC_MSG + 16, fd)
-    ipc_msg_clear(VFS_IPC_REPLY)
-    vfs_svc_handle_msg(my_pid, VFS_IPC_MSG, VFS_IPC_REPLY)
+    volatile_write_u8(path_scratch + 1 + ci, 0)
+    // Delegate to shell's VFS cat which works reliably
+    shell_cmd_vfs_cat(path_scratch)
 }
 
 // vfs-lifecycle — Sprint 5.2 full test: create + write + read + delete

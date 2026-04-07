@@ -123,6 +123,61 @@ const IOAPIC_BASE: i64 = 0xFEC00000
     lapic_write(LAPIC_TIMER_INIT, count)
 }
 
+// ── LAPIC Timer Calibration + Start ──
+
+@kernel fn lapic_timer_start() {
+    // Calibrate LAPIC timer frequency using TSC busy-wait.
+    // Result: periodic interrupt at ~100Hz on vector 32.
+
+    // Step 1: Set divisor to 16 (register value 3)
+    lapic_write(LAPIC_TIMER_DIV, 3)
+
+    // Step 2: Start one-shot countdown from max, masked (no interrupt)
+    // LVT bits: [16]=mask, [17]=periodic, [7:0]=vector
+    lapic_write(LAPIC_TIMER_LVT, 0x10000 | 32)   // masked one-shot
+    lapic_write(LAPIC_TIMER_INIT, 0x0FFFFFFF)     // start counting
+
+    // Step 3: Wait 10ms using TSC
+    delay_us(10000)
+
+    // Step 4: Read remaining count, compute ticks per 10ms
+    let remaining = lapic_read(LAPIC_TIMER_CUR)
+    let ticks_10ms = 0x0FFFFFFF - remaining
+
+    // Step 5: Stop timer
+    lapic_write(LAPIC_TIMER_LVT, 0x10000)  // masked
+    lapic_write(LAPIC_TIMER_INIT, 0)
+
+    // Guard: if calibration failed (ticks_10ms <= 0), skip
+    if ticks_10ms <= 0 {
+        // Serial: calibration failed
+        port_outb(0x3F8, 76)  // 'L'
+        port_outb(0x3F8, 65)  // 'A'
+        port_outb(0x3F8, 80)  // 'P'
+        port_outb(0x3F8, 73)  // 'I'
+        port_outb(0x3F8, 67)  // 'C'
+        port_outb(0x3F8, 33)  // '!'
+        port_outb(0x3F8, 10)  // '\n'
+        return
+    }
+
+    // Step 6: Start periodic timer — 100Hz = one tick per 10ms
+    lapic_write(LAPIC_TIMER_DIV, 3)                // divisor 16
+    lapic_write(LAPIC_TIMER_LVT, 0x20000 | 32)    // periodic + vector 32
+    lapic_write(LAPIC_TIMER_INIT, ticks_10ms)
+
+    // Serial: "[LAPIC] Timer 100Hz, ticks=N\n"
+    port_outb(0x3F8, 91)   // '['
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 65)   // 'A'
+    port_outb(0x3F8, 80)   // 'P'
+    port_outb(0x3F8, 73)   // 'I'
+    port_outb(0x3F8, 67)   // 'C'
+    port_outb(0x3F8, 93)   // ']'
+    port_outb(0x3F8, 32)   // ' '
+    println(ticks_10ms)
+}
+
 // ── Shell command ──
 
 @kernel fn cmd_lapic() {

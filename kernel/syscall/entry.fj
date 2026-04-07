@@ -101,15 +101,16 @@ const SYSCALL_STACK_TOP: i64 = 0x7EF000  // dedicated 4KB stack for syscall hand
     volatile_write_u8(b + 55, 0x75)
     volatile_write_u8(b + 56, 9)
 
-    // SYS_EXIT (offset 57): restore kernel RSP and ret to shell
-    // mov rsp, [0x652020] = 48 8B 24 25 20 20 65 00 (8 bytes)
-    volatile_write_u8(b + 57, 0x48)
-    volatile_write_u8(b + 58, 0x8B)
-    volatile_write_u8(b + 59, 0x24)
-    volatile_write_u8(b + 60, 0x25)
-    volatile_write_u32(b + 61, 0x652020)
-    // ret = C3 (1 byte) → total 9 bytes (offset 57-65)
-    volatile_write_u8(b + 65, 0xC3)
+    // SYS_EXIT (offset 57): jump to scheduler exit trampoline
+    // Address of __sched_exit stored at 0xA54010 by idt_init
+    // jmp QWORD PTR [0xA54010] = FF 24 25 10 40 A5 00 (7 bytes)
+    volatile_write_u8(b + 57, 0xFF)
+    volatile_write_u8(b + 58, 0x24)
+    volatile_write_u8(b + 59, 0x25)
+    volatile_write_u32(b + 60, 0xA54010)
+    // 2 NOP padding (total 9 bytes: offset 57-65)
+    volatile_write_u8(b + 64, 0x90)
+    volatile_write_u8(b + 65, 0x90)
 
     // check_getpid (offset 66): cmp rax, 3
     volatile_write_u8(b + 66, 0x48)

@@ -2531,26 +2531,8 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 // Phase 8 — Process Demo + Interactive Features
 // ═══════════════════════════════════════════════
 
-@kernel fn cmd_spawn() {
-    // spawn <name> — create process via proc_v2 + ramfs (Sprint 5.4)
-    let len = cmdbuf_len()
-    if len <= 6 { cprintln("Usage: spawn <name>", YELLOW_ON_BLACK); return }
-    let name_addr = 0x6F800 + 6
-    volatile_write_u8(0x6F800 + len, 0) // null-terminate
-    let pid = sc_spawn(name_addr, len - 6)
-    if pid >= 0 {
-        cprint("Spawned PID ", GREEN_ON_BLACK)
-        cprint_decimal(pid, CYAN_ON_BLACK)
-        cprint(" (", WHITE_ON_BLACK)
-        let mut k: i64 = 6
-        while k < len { console_putchar(volatile_read_u8(0x6F800 + k), WHITE_ON_BLACK); k = k + 1 }
-        cprintln(")", WHITE_ON_BLACK)
-    } else {
-        cprint("spawn: error ", RED_ON_BLACK)
-        cprint_decimal(pid, RED_ON_BLACK)
-        cprintln(" (-1=not found, -3=no PIDs, -4=ELF load fail)", WHITE_ON_BLACK)
-    }
-}
+// cmd_spawn() — old syscall-based version removed in favor of
+// preemptive version below (at line ~2728)
 
 @kernel fn cmd_wait() {
     // wait <pid> — wait/reap child process (Sprint 5.4)
@@ -2726,7 +2708,8 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 }
 
 @kernel fn cmd_spawn() {
-    // spawn <file> — queue an ELF for batch execution
+    // spawn <file> — preemptive: allocate PID, load ELF, set READY
+    // Scheduler picks it up on next timer tick
     let len = cmdbuf_len()
     if len <= 6 { cprintln("Usage: spawn <file>", YELLOW_ON_BLACK); return }
     let path_addr: i64 = 0x6FA80
@@ -2740,19 +2723,37 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if i == 5 && volatile_read_u8(path_addr) == 104 && volatile_read_u8(path_addr + 1) == 101 && volatile_read_u8(path_addr + 4) == 111 {
         ring3_hello_embed()
     }
+
+    // Allocate a new PID
+    let new_pid = proc_v2_alloc()
+    if new_pid < 0 { cprintln("spawn: no free PIDs", RED_ON_BLACK); return }
+
+    // Critical section: disable interrupts while current PID is changed
+    // (timer ISR must not see partial state)
+    irq_disable()
+
+    // Temporarily set current PID to new process so sys_exec targets it
+    let saved_pid = volatile_read_u64(0x6FE00)
+    volatile_write_u64(0x6FE00, new_pid)
+
     let result = sys_exec(path_addr, 0)
-    if result != 0 { cprintln("spawn: failed to load", RED_ON_BLACK); return }
-    let pid = volatile_read_u64(0x6FE00)
-    let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
-    let entry = volatile_read(base + 24)
-    let user_rsp = volatile_read(base + 32)
-    if user_rsp == 0 { let ur = 0x3000000 - 16; batch_enqueue(entry, ur, pid) }
-    else { batch_enqueue(entry, user_rsp, pid) }
+
+    // Restore kernel PID
+    volatile_write_u64(0x6FE00, saved_pid)
+
+    irq_enable()
+
+    if result != 0 {
+        proc_v2_set(new_pid, 0, PROC_STATE_FREE)
+        cprintln("spawn: failed to load ELF", RED_ON_BLACK)
+        return
+    }
+
+    // sys_exec already set state=READY, RSP, CR3, entry
+    // Scheduler will pick it up on next timer tick
     cprint("Spawned PID ", GREEN_ON_BLACK)
-    cprint_decimal(pid, CYAN_ON_BLACK)
-    cprint(" (queue: ", WHITE_ON_BLACK)
-    cprint_decimal(batch_count(), CYAN_ON_BLACK)
-    cprintln(")", WHITE_ON_BLACK)
+    cprint_decimal(new_pid, CYAN_ON_BLACK)
+    cprintln(" (scheduler will run it)", WHITE_ON_BLACK)
 }
 
 @kernel fn cmd_runall() {

@@ -263,11 +263,12 @@ const USER_HELLO_SIZE: i64 = 48         // minimal hello program bytes
 
 // ═══════════════════════════════════════════════
 // Phase E: User Program Registry + Multiple Ring 3 Programs
-// Registry at 0x8B0000: up to 8 programs × 64 bytes
+// Registry at 0x8B9000: up to 8 programs × 64 bytes
 // Per entry: +0=name[16], +16=code_addr, +24=code_size, +32=installed
+// (Moved from 0x8B0000 — was colliding with VFS_SVC_BASE)
 // ═══════════════════════════════════════════════
 
-const PROG_REGISTRY: i64 = 0x8B0000
+const PROG_REGISTRY: i64 = 0x8B9000
 const PROG_MAX: i64 = 8
 const PROG_ENTRY_SIZE: i64 = 64
 

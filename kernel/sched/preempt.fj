@@ -1,0 +1,84 @@
+// FajarOS Nova v3.0 — Preemptive Scheduler
+// kernel/sched/preempt.fj — Timer tick handler + round-robin picker
+// Called from __isr_32_timer (boot/runtime_stubs.S)
+
+// ═══════════════════════════════════════════════════
+// timer_tick_handler — called every ~10ms from timer ISR
+//
+// arg: saved_rsp = current process's stack pointer (after 15 GPR pushes)
+// ret: new_rsp   = next process's stack pointer (may be same or different)
+//
+// Stack frame at saved_rsp:
+//   +0:r15 +8:r14 ... +112:rax  +120:RIP +128:CS +136:RFLAGS +144:RSP +152:SS
+// ═══════════════════════════════════════════════════
+
+@kernel fn timer_tick_handler(saved_rsp: i64) -> i64 {
+    // 1. LAPIC EOI + PIC EOI + tick counter
+    lapic_eoi()
+    let ticks = volatile_read_u64(0xA54008) + 1
+    volatile_write_u64(0xA54008, ticks)
+
+    // 2. Save current process state
+    let current_pid = volatile_read_u64(0x6FE00)
+    let cur_base = PROC_TABLE + current_pid * PROC_ENTRY_SIZE
+    volatile_write(cur_base + PROC_OFF_RSP, saved_rsp)
+    volatile_write(cur_base + 48, read_cr3())  // PROC_OFF_CR3
+
+    // Increment per-process tick counter
+    let old_ticks = volatile_read(cur_base + PROC_OFF_TICKS)
+    volatile_write(cur_base + PROC_OFF_TICKS, old_ticks + 1)
+
+    // 3. Mark current RUNNING → READY (if still running)
+    let cur_state = volatile_read(cur_base + PROC_OFF_STATE)
+    if cur_state == PROC_STATE_RUNNING {
+        volatile_write(cur_base + PROC_OFF_STATE, PROC_STATE_READY)
+    }
+
+    // 4. Pick next READY process
+    let next_pid = sched_pick_next(current_pid)
+
+    // 5. If same process, just mark RUNNING and return
+    if next_pid == current_pid {
+        volatile_write(cur_base + PROC_OFF_STATE, PROC_STATE_RUNNING)
+        return saved_rsp
+    }
+
+    // 6. Context switch to next process
+    let next_base = PROC_TABLE + next_pid * PROC_ENTRY_SIZE
+    volatile_write(next_base + PROC_OFF_STATE, PROC_STATE_RUNNING)
+    volatile_write_u64(0x6FE00, next_pid)
+
+    // 7. Switch page table if different
+    let next_cr3 = volatile_read(next_base + 48)
+    if next_cr3 != 0 && next_cr3 != read_cr3() {
+        write_cr3(next_cr3)
+    }
+
+    // 8. Update TSS RSP0 for Ring 3→0 transitions on new process
+    let next_kstack_top = KSTACK_BASE + (next_pid + 1) * KSTACK_SIZE
+    volatile_write_u64(0xA52004, next_kstack_top)
+
+    // 9. Return next process's saved RSP
+    volatile_read(next_base + PROC_OFF_RSP)
+}
+
+// ═══════════════════════════════════════════════════
+// sched_pick_next — round-robin scheduler
+//
+// Scans from current_pid+1, wraps around, finds first READY process.
+// Returns current_pid if no other READY process exists.
+// ═══════════════════════════════════════════════════
+
+@kernel fn sched_pick_next(current_pid: i64) -> i64 {
+    let mut i: i64 = 1
+    while i < PROC_V2_MAX {
+        let pid = (current_pid + i) % PROC_V2_MAX
+        let state = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+        if state == PROC_STATE_READY {
+            return pid
+        }
+        i = i + 1
+    }
+    // No READY process found — stay on current
+    current_pid
+}

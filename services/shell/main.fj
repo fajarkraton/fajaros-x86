@@ -118,7 +118,7 @@ const SHELL_DATA_BUF: i64 = 0x8F1200  // 4KB for file data
     let fsize = volatile_read_u64(SHELL_REPLY_BUF + 24)
     let status = volatile_read_u64(SHELL_REPLY_BUF + 32)
 
-    if fd < 0 || status != VFS_OK {
+    if fd > 15 || status != VFS_OK {
         cprintln("cat: file not found", RED_ON_BLACK)
         return
     }
@@ -181,7 +181,7 @@ const SHELL_DATA_BUF: i64 = 0x8F1200  // 4KB for file data
     let fsize = volatile_read_u64(SHELL_REPLY_BUF + 24)
     let status = volatile_read_u64(SHELL_REPLY_BUF + 32)
 
-    if fd < 0 || status != VFS_OK {
+    if fd > 15 || status != VFS_OK {
         cprintln("stat: not found", RED_ON_BLACK)
         return
     }

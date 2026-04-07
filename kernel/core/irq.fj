@@ -47,3 +47,62 @@ const IOAPIC_BASE: i64 = 0xFEC00000
     let start = rdtsc()
     while rdtsc() - start < cycles {}
 }
+
+// ═══════════════════════════════════════════════════
+// Exception Dispatch — called from __isr_common (asm)
+// frame_ptr points to saved GPRs on interrupt stack:
+//   +0   r15   +8   r14  ... +112 rax
+//   +120 vector  +128 error_code
+//   +136 RIP     +144 CS    +152 RFLAGS
+//   +160 RSP (Ring3)  +168 SS (Ring3)
+// ═══════════════════════════════════════════════════
+
+@kernel fn exception_dispatch(frame_ptr: i64) {
+    let vector = volatile_read(frame_ptr + 120)
+    let error_code = volatile_read(frame_ptr + 128)
+    let cs = volatile_read(frame_ptr + 144)
+
+    // Debug: print vector to serial
+    port_outb(0x3F8, 69)  // 'E'
+    port_outb(0x3F8, 88)  // 'X'
+    port_outb(0x3F8, 67)  // 'C'
+    port_outb(0x3F8, 58)  // ':'
+    println(vector)
+
+    // CS & 3 != 0 means fault originated in Ring 3 (user mode)
+    let from_user = cs & 3
+
+    if vector == 14 {
+        // #PF — Page Fault
+        let fault_addr = read_cr2()
+        if from_user != 0 {
+            exception_handler_page_fault(error_code, fault_addr)
+        } else {
+            kernel_panic_dump()
+            kernel_panic_reason(14)
+        }
+    } else if vector == 13 {
+        // #GP — General Protection Fault
+        if from_user != 0 {
+            exception_handler_gp_fault(error_code)
+        } else {
+            kernel_panic_dump()
+            kernel_panic_reason(13)
+        }
+    } else if vector == 8 {
+        // #DF — Double Fault (always fatal)
+        exception_handler_double_fault()
+    } else if from_user != 0 {
+        // Other exception from user process — kill it
+        let current_pid = volatile_read_u64(0x6FE00)
+        if current_pid > 0 {
+            proc_v2_set(current_pid, 0, PROC_STATE_ZOMBIE)
+            proc_v2_set(current_pid, 7, 0 - vector)
+            volatile_write_u64(0x6FE00, 0)
+        }
+    } else {
+        // Other exception from kernel — panic
+        kernel_panic_dump()
+        kernel_panic_reason(vector)
+    }
+}

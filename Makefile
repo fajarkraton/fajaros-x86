@@ -57,6 +57,7 @@ SOURCES := \
 	kernel/sched/signals.fj \
 	kernel/sched/scheduler.fj \
 	kernel/sched/batch.fj \
+	kernel/sched/preempt.fj \
 	kernel/sched/smp.fj \
 	kernel/sched/spinlock.fj \
 	kernel/sched/pcpu.fj \
@@ -65,6 +66,7 @@ SOURCES := \
 	kernel/sched/loadbalance.fj \
 	kernel/interrupts/lapic.fj \
 	kernel/interrupts/timer.fj \
+	kernel/interrupts/exceptions.fj \
 	kernel/syscall/entry.fj \
 	kernel/syscall/dispatch.fj \
 	kernel/syscall/elf.fj \

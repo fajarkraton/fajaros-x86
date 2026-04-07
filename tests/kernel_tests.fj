@@ -323,7 +323,7 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     // (Full IPC roundtrip crashes due to deep call chain — needs IDT for stack guard)
     let base = 0x8B0000 + 2 * 64  // VFS_SVC_BASE + slot 2 * VFS_MNT_SIZE
     let fstype = volatile_read_u64(base)
-    if fstype == 3 { 1 } else { 0 }  // FSTYPE_PROCFS = 3
+    if fstype == 4 { 1 } else { 0 }  // FSTYPE_PROCFS = 4
 }
 
 @kernel fn test_blk_ramdisk_rw() -> i64 {

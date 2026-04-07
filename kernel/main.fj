@@ -215,12 +215,17 @@
         println(59)
         volatile_write_u32(0xFEE000F0, svr | 0x1FF)  // vector 0xFF + enable
         println(60)
+        // Start LAPIC periodic timer at ~100Hz on vector 32
+        lapic_timer_start()
     }
     history_init()
     println(61)
 
     // Initialize NVMe block device (falls back to ramdisk if no NVMe)
     nvme_full_init()
+
+    // Initialize block device service (registers ramdisk + NVMe if available)
+    blk_svc_init()
 
     // Initialize VFS (mounts /, /dev, /proc, /mnt if FAT32 available)
     vfs_init()
@@ -238,6 +243,9 @@
     proc_v2_init()
     kb_init()
     fd_init(0) // FDs for kernel process
+    // Store PID 0's CR3 and kernel stack in proc table (for scheduler)
+    volatile_write(PROC_TABLE + 48, read_cr3())  // PID 0 CR3
+    volatile_write(PROC_TABLE + PROC_OFF_RSP, 0) // PID 0 RSP (updated by timer ISR)
     cprintln("[PROC] Process table v2 ready", WHITE_ON_BLACK)
     cprintln("[KB] Keyboard buffer ready", WHITE_ON_BLACK)
 
@@ -271,6 +279,12 @@
     // Initialize VFS service (Sprint 1.4)
     vfs_svc_init()
     cprintln("[VFS] VFS service initialized", WHITE_ON_BLACK)
+
+    // Populate init service table (services are already running in monolithic mode)
+    init_svc_set(0, VFS_PID, SVC_RUNNING)
+    init_svc_set(1, BLK_PID, SVC_RUNNING)
+    init_svc_set(2, NET_PID_DEFAULT, SVC_RUNNING)
+    init_svc_set(3, SHELL_PID, SVC_RUNNING)
 
     // Sprint 5.3: HTTP + DNS tests
     tcp_init()
