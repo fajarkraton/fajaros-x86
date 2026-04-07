@@ -161,6 +161,24 @@ const FS_ENTRY_SIZE: i64 = 128
     count
 }
 
+// Register an ELF binary in ramfs (zero-copy — points to existing memory)
+@kernel fn ramfs_register_elf(name: str, addr: i64, size: i64) {
+    let count = volatile_read(FS_BASE)
+    if count >= FS_MAX_FILES { return }
+    let entry = ramfs_entry_addr(count)
+    let nlen = str_len(name)
+    let mut i: i64 = 0
+    while i < nlen && i < 31 {
+        volatile_write_u8(entry + i, str_byte_at(name, i))
+        i = i + 1
+    }
+    volatile_write_u8(entry + i, 0)
+    volatile_write(entry + 32, size)
+    volatile_write(entry + 40, addr)
+    volatile_write(entry + 48, 1)
+    volatile_write(FS_BASE, count + 1)
+}
+
 // Delete file by index (shift entries down)
 @kernel fn ramfs_delete_at(index: i64) -> i64 {
     let count = volatile_read(FS_BASE)

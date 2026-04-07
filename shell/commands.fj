@@ -2691,7 +2691,7 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 // ═══════════════════════════════════════════════
 
 @kernel fn cmd_exec() {
-    // exec <file> — execute an ELF binary from ramfs
+    // exec <file> — execute an ELF binary from ramfs, run in Ring 3
     let len = cmdbuf_len()
     if len <= 5 { cprintln("Usage: exec <file>", YELLOW_ON_BLACK); return }
     // Build path in a scratch buffer from cmdbuf starting at offset 5
@@ -2708,7 +2708,15 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
         let mut j: i64 = 0
         while j < i { console_putchar(volatile_read_u8(path_addr + j), RED_ON_BLACK); j = j + 1 }
         cprintln("'", RED_ON_BLACK)
+        return
     }
+    // Directly dispatch: read entry + user_rsp from process table, transition to Ring 3
+    let pid = volatile_read_u64(0x6FE00)
+    let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+    let entry = volatile_read(base + 24)
+    let user_rsp = volatile_read(base + 32)
+    if user_rsp == 0 { let user_rsp2 = 0x3000000 - 16; iretq_to_user(entry, user_rsp2, 0x202) }
+    else { iretq_to_user(entry, user_rsp, 0x202) }
 }
 
 @kernel fn cmd_readelf() {

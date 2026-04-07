@@ -61,7 +61,7 @@ const ARGV_STR_SIZE: i64 = 256
     let mut pg: i64 = user_stack_base
     while pg < ELF_STACK_TOP {
         let frame = frame_alloc()
-        if frame != -1 { map_page(pg, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) }
+        if frame != -1 { map_page(pg, frame, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) }
         pg = pg + FRAME_SIZE
     }
 
@@ -82,6 +82,7 @@ const ARGV_STR_SIZE: i64 = 256
     while r < 15 { sp = sp - 8; volatile_write_u64(sp, 0); r = r + 1 }
 
     volatile_write(base + PROC_OFF_RSP, sp)
+    volatile_write(base + 32, user_rsp)        // Store user RSP at +32 for direct dispatch
     volatile_write(base + PROC_OFF_ENTRY, entry)
     volatile_write(base + PROC_OFF_TICKS, 0)
     volatile_write(base + PROC_OFF_STATE, PROC_STATE_READY)
