@@ -308,7 +308,8 @@
     // Use 'runhello' command to test Ring 3 execution
     // (Auto-running Ring 3 halts the kernel because SYS_EXIT does hlt)
     prog_install_all()
-    cprintln("[RING3] User programs ready (type 'ring3' to run)", WHITE_ON_BLACK)
+    ramfs_register_elf("hello", RING3_HELLO_ADDR, RING3_HELLO_SIZE)
+    cprintln("[RING3] User programs ready (type 'exec hello' to run)", WHITE_ON_BLACK)
 
     cprintln("[SEC] Security commands ready", WHITE_ON_BLACK)
     cprintln("[INIT] Script engine ready", WHITE_ON_BLACK)

@@ -193,7 +193,7 @@ QEMU_MEM := -m 512M
 QEMU_CPU := -cpu Skylake-Client-v4
 QEMU_KVM := -enable-kvm -cpu host
 QEMU_SMP := -smp 4
-QEMU_NVME := -drive file=disk.img,if=none,id=nvme0 -device nvme,serial=fajaros,drive=nvme0
+QEMU_NVME := -boot order=d -drive file=disk.img,if=none,id=nvme0,format=raw -device nvme,serial=fajaros,drive=nvme0
 QEMU_NET := -netdev user,id=net0,hostfwd=tcp::8080-:80 -device virtio-net-pci,netdev=net0
 QEMU_GPU := -device virtio-gpu-pci -display gtk
 QEMU_USB := -device qemu-xhci
