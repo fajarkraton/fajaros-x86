@@ -459,6 +459,29 @@ const PROG_ENTRY_SIZE: i64 = 64
     prog_register(2, 102, 97, 106, 97, 0x2020000, 48) // "faja"(r)
 }
 
+// Look up program by name prefix (up to 4 bytes) in PROG_REGISTRY
+// Returns slot index or -1 if not found
+@kernel fn prog_find(name_addr: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < PROG_MAX {
+        let base = PROG_REGISTRY + i * PROG_ENTRY_SIZE
+        if volatile_read_u64(base + 32) == 1 {
+            let mut match_ok: i64 = 1
+            let mut j: i64 = 0
+            while j < 4 && match_ok == 1 {
+                let a = volatile_read_u8(base + j)
+                let b = volatile_read_u8(name_addr + j)
+                if a == 0 && b == 0 { return i }
+                if a != b { match_ok = 0 }
+                j = j + 1
+            }
+            if match_ok == 1 { return i }
+        }
+        i = i + 1
+    }
+    -1
+}
+
 @kernel fn cmd_run_program(slot: i64) {
     if slot < 0 || slot >= PROG_MAX { return }
     let base = PROG_REGISTRY + slot * PROG_ENTRY_SIZE

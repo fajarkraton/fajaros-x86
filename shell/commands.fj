@@ -2744,9 +2744,37 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     irq_enable()
 
     if result != 0 {
-        proc_v2_set(new_pid, 0, PROC_STATE_FREE)
-        cprintln("spawn: failed to load ELF", RED_ON_BLACK)
-        return
+        // Fallback: try PROG_REGISTRY (raw code programs from prog_install_all)
+        let prog_slot = prog_find(path_addr)
+        if prog_slot >= 0 {
+            let prog_base = PROG_REGISTRY + prog_slot * PROG_ENTRY_SIZE
+            let code_addr = volatile_read_u64(prog_base + 16)
+            let proc_base = 0x890000 + new_pid * 256
+            // Map user pages for code + stack
+            map_page(code_addr, code_addr, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+            map_page(code_addr + 0xF00000, code_addr + 0xF00000, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+            let user_rsp = code_addr + 0xF00FF0
+            // Build context frame on kernel stack
+            let kstack_top = 0x900000 + new_pid * 16384 + 16384 - 16
+            let mut sp = kstack_top
+            sp = sp - 8; volatile_write_u64(sp, 0x1B)         // SS
+            sp = sp - 8; volatile_write_u64(sp, user_rsp)     // RSP
+            sp = sp - 8; volatile_write_u64(sp, 0x202)        // RFLAGS
+            sp = sp - 8; volatile_write_u64(sp, 0x23)         // CS
+            sp = sp - 8; volatile_write_u64(sp, code_addr)    // RIP
+            let mut r: i64 = 0
+            while r < 15 { sp = sp - 8; volatile_write_u64(sp, 0); r = r + 1 }
+            volatile_write(proc_base + 40, sp)               // kernel_rsp
+            volatile_write(proc_base + 32, user_rsp)         // user_rsp
+            volatile_write(proc_base + 24, code_addr)        // entry
+            volatile_write(proc_base + 48, read_cr3())       // cr3
+            volatile_write(proc_base + 160, 0)               // ticks
+            volatile_write(proc_base + 0, 1)                 // READY
+        } else {
+            proc_v2_set(new_pid, 0, PROC_STATE_FREE)
+            cprintln("spawn: program not found", RED_ON_BLACK)
+            return
+        }
     }
 
     // sys_exec already set state=READY, RSP, CR3, entry
