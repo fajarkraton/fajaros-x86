@@ -2714,13 +2714,15 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
         cprintln("'", RED_ON_BLACK)
         return
     }
-    // Directly dispatch: read entry + user_rsp from process table, transition to Ring 3
+    // Directly dispatch: read entry + user_rsp from process table
     let pid = volatile_read_u64(0x6FE00)
     let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
     let entry = volatile_read(base + 24)
     let user_rsp = volatile_read(base + 32)
     if user_rsp == 0 { let user_rsp2 = 0x3000000 - 16; iretq_to_user(entry, user_rsp2, 0x202) }
     else { iretq_to_user(entry, user_rsp, 0x202) }
+    // SYS_EXIT returns here
+    volatile_write_u64(0x6FE00, 0)
 }
 
 @kernel fn cmd_spawn() {

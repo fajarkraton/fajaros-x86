@@ -82,6 +82,54 @@ const PAGE_NX: i64 = -9223372036854775808  // Bit 63 = 0x8000000000000000 (i64 m
     invlpg(virt)
 }
 
+// map_page_in: same as map_page but into a specified PML4 (for per-process page tables)
+@kernel fn map_page_in(pml4_base: i64, virt: i64, phys: i64, flags: i64) {
+    let pml4_idx = (virt >> 39) & 0x1FF
+    let pdpt_idx = (virt >> 30) & 0x1FF
+    let pd_idx = (virt >> 21) & 0x1FF
+    let pt_idx = (virt >> 12) & 0x1FF
+    let user_flag = flags & PAGE_USER
+
+    let mut pdpt_addr: i64 = 0
+    let pml4_entry = page_table_entry(pml4_base, pml4_idx)
+    if (pml4_entry & PAGE_PRESENT) != 0 {
+        pdpt_addr = pml4_entry & 0xFFFFF000
+    } else {
+        pdpt_addr = frame_alloc()
+        if pdpt_addr == -1 { return }
+        let mut i: i64 = 0
+        while i < 4096 { volatile_write_u8(pdpt_addr + i, 0); i = i + 1 }
+        page_table_set(pml4_base, pml4_idx, pdpt_addr | PAGE_PRESENT | PAGE_WRITABLE | user_flag)
+    }
+
+    let mut pd_addr: i64 = 0
+    let pdpt_entry = page_table_entry(pdpt_addr, pdpt_idx)
+    if (pdpt_entry & PAGE_PRESENT) != 0 {
+        pd_addr = pdpt_entry & 0xFFFFF000
+    } else {
+        pd_addr = frame_alloc()
+        if pd_addr == -1 { return }
+        let mut i: i64 = 0
+        while i < 4096 { volatile_write_u8(pd_addr + i, 0); i = i + 1 }
+        page_table_set(pdpt_addr, pdpt_idx, pd_addr | PAGE_PRESENT | PAGE_WRITABLE | user_flag)
+    }
+    let pd_entry = page_table_entry(pd_addr, pd_idx)
+    if (pd_entry & PAGE_HUGE) != 0 { return }
+
+    let mut pt_addr: i64 = 0
+    if (pd_entry & PAGE_PRESENT) != 0 {
+        pt_addr = pd_entry & 0xFFFFF000
+    } else {
+        pt_addr = frame_alloc()
+        if pt_addr == -1 { return }
+        let mut i: i64 = 0
+        while i < 4096 { volatile_write_u8(pt_addr + i, 0); i = i + 1 }
+        page_table_set(pd_addr, pd_idx, pt_addr | PAGE_PRESENT | PAGE_WRITABLE | user_flag)
+    }
+
+    page_table_set(pt_addr, pt_idx, phys | flags)
+}
+
 @kernel fn unmap_page(virt: i64) {
     // Unmap a 4KB page
     let pml4_idx = (virt >> 39) & 0x1FF

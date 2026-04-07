@@ -51,7 +51,8 @@ const ARGV_STR_SIZE: i64 = 256
     let valid = elf_validate(ELF_BUF)
     if valid != 0 { return -1 }
 
-    // Load ELF segments
+    // Load ELF segments into the CURRENT page table
+    // (ring3_hello uses 0x100000 which is identity-mapped kernel area)
     let loaded = elf_load_segments(ELF_BUF, elf_loaded)
     if loaded == 0 { return -1 }
     let entry = elf_get_entry(ELF_BUF)
@@ -82,8 +83,9 @@ const ARGV_STR_SIZE: i64 = 256
     while r < 15 { sp = sp - 8; volatile_write_u64(sp, 0); r = r + 1 }
 
     volatile_write(base + PROC_OFF_RSP, sp)
-    volatile_write(base + 32, user_rsp)        // Store user RSP at +32 for direct dispatch
+    volatile_write(base + 32, user_rsp)
     volatile_write(base + PROC_OFF_ENTRY, entry)
+    volatile_write(base + 48, read_cr3())           // Store current CR3 in process table
     volatile_write(base + PROC_OFF_TICKS, 0)
     volatile_write(base + PROC_OFF_STATE, PROC_STATE_READY)
     volatile_write_u64(base + PROC_OFF_BRK, 0)

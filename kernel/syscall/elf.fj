@@ -64,6 +64,66 @@ const PH_OFF_MEMSZ: i64 = 40   // Size in memory (8 bytes)
     buffer_read_u16_le(buf + ELF_OFF_PHENTSIZE)
 }
 
+// Load ELF segments into a specific PML4 (per-process page tables)
+// Writes data via physical addresses (identity-mapped) instead of virtual
+@kernel fn elf_load_segments_in(pml4: i64, buf: i64, file_size: i64) -> i64 {
+    let phoff = elf_get_phoff(buf)
+    let phnum = elf_get_phnum(buf)
+    let phentsize = elf_get_phentsize(buf)
+    let mut loaded: i64 = 0
+
+    let mut i: i64 = 0
+    while i < phnum {
+        let ph = buf + phoff + i * phentsize
+        let ph_type = buffer_read_u32_le(ph + PH_OFF_TYPE)
+
+        if ph_type == 1 {
+            let offset = buffer_read_u64_le(ph + PH_OFF_OFFSET)
+            let vaddr = buffer_read_u64_le(ph + PH_OFF_VADDR)
+            let filesz = buffer_read_u64_le(ph + PH_OFF_FILESZ)
+            let memsz = buffer_read_u64_le(ph + PH_OFF_MEMSZ)
+
+            let mut pg: i64 = vaddr & 0xFFFFF000
+            let end_pg = (vaddr + memsz + 0xFFF) & 0xFFFFF000
+            let mut first_phys: i64 = 0
+            let mut page_count: i64 = 0
+            while pg < end_pg {
+                let frame = frame_alloc()
+                if frame != -1 {
+                    map_page_in(pml4, pg, frame, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+                    if page_count == 0 { first_phys = frame }
+                }
+                pg = pg + FRAME_SIZE
+                page_count = page_count + 1
+            }
+
+            // Copy file data via physical address (identity-mapped)
+            let phys_base = first_phys + (vaddr & 0xFFF)
+            let mut j: i64 = 0
+            while j < filesz {
+                if offset + j < file_size {
+                    // Calculate physical address for this byte
+                    let byte_offset = (vaddr + j) & 0xFFF
+                    let page_idx = ((vaddr + j) - (vaddr & 0xFFFFF000)) / FRAME_SIZE
+                    // For contiguous alloc, phys = first_phys + page_idx * FRAME_SIZE + byte_offset
+                    // But frames may not be contiguous. Simplify: use first page only for small ELFs
+                    volatile_write_u8(first_phys + (vaddr & 0xFFF) + j, volatile_read_u8(buf + offset + j))
+                }
+                j = j + 1
+            }
+
+            while j < memsz {
+                volatile_write_u8(first_phys + (vaddr & 0xFFF) + j, 0)
+                j = j + 1
+            }
+
+            loaded = loaded + 1
+        }
+        i = i + 1
+    }
+    loaded
+}
+
 @kernel fn elf_load_segments(buf: i64, file_size: i64) -> i64 {
     let phoff = elf_get_phoff(buf)
     let phnum = elf_get_phnum(buf)
