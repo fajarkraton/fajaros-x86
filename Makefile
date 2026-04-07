@@ -56,6 +56,7 @@ SOURCES := \
 	kernel/sched/process.fj \
 	kernel/sched/signals.fj \
 	kernel/sched/scheduler.fj \
+	kernel/sched/batch.fj \
 	kernel/sched/smp.fj \
 	kernel/sched/spinlock.fj \
 	kernel/sched/pcpu.fj \

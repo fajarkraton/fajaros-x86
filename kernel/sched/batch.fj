@@ -1,0 +1,94 @@
+// FajarOS Nova v3.0 — Batch Process Scheduler
+// kernel/sched/batch.fj
+// Simple run queue: spawn queues programs, SYS_EXIT runs next
+//
+// Run queue at 0x5B0000: 8 entries × 32 bytes
+//   +0: state (0=free, 1=queued, 2=running)
+//   +8: entry (RIP)
+//   +16: user_rsp
+//   +24: pid
+
+const BATCH_QUEUE: i64 = 0x5B0000
+const BATCH_MAX: i64 = 8
+const BATCH_ENTRY_SIZE: i64 = 32
+const BATCH_STATE_FREE: i64 = 0
+const BATCH_STATE_QUEUED: i64 = 1
+const BATCH_STATE_RUNNING: i64 = 2
+// Next-to-run flag at 0x5B0100
+const BATCH_NEXT_FLAG: i64 = 0x5B0100
+
+@kernel fn batch_init() {
+    let mut i: i64 = 0
+    while i < BATCH_MAX * BATCH_ENTRY_SIZE {
+        volatile_write_u64(BATCH_QUEUE + i, 0)
+        i = i + 8
+    }
+    volatile_write_u64(BATCH_NEXT_FLAG, 0)
+}
+
+// Queue a program for execution (entry=RIP, rsp=user stack, pid=process ID)
+@kernel fn batch_enqueue(entry: i64, user_rsp: i64, pid: i64) -> i64 {
+    let mut i: i64 = 0
+    while i < BATCH_MAX {
+        let base = BATCH_QUEUE + i * BATCH_ENTRY_SIZE
+        if volatile_read_u64(base) == BATCH_STATE_FREE {
+            volatile_write_u64(base, BATCH_STATE_QUEUED)
+            volatile_write_u64(base + 8, entry)
+            volatile_write_u64(base + 16, user_rsp)
+            volatile_write_u64(base + 24, pid)
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// Dequeue next queued program (returns slot index or -1)
+@kernel fn batch_dequeue() -> i64 {
+    let mut i: i64 = 0
+    while i < BATCH_MAX {
+        let base = BATCH_QUEUE + i * BATCH_ENTRY_SIZE
+        if volatile_read_u64(base) == BATCH_STATE_QUEUED {
+            volatile_write_u64(base, BATCH_STATE_RUNNING)
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// Get entry/rsp/pid from a queue slot
+@kernel fn batch_get_entry(slot: i64) -> i64 { volatile_read_u64(BATCH_QUEUE + slot * BATCH_ENTRY_SIZE + 8) }
+@kernel fn batch_get_rsp(slot: i64) -> i64 { volatile_read_u64(BATCH_QUEUE + slot * BATCH_ENTRY_SIZE + 16) }
+@kernel fn batch_get_pid(slot: i64) -> i64 { volatile_read_u64(BATCH_QUEUE + slot * BATCH_ENTRY_SIZE + 24) }
+
+// Mark slot as free after process exits
+@kernel fn batch_complete(slot: i64) {
+    volatile_write_u64(BATCH_QUEUE + slot * BATCH_ENTRY_SIZE, BATCH_STATE_FREE)
+}
+
+// Count queued processes
+@kernel fn batch_count() -> i64 {
+    let mut count: i64 = 0
+    let mut i: i64 = 0
+    while i < BATCH_MAX {
+        let state = volatile_read_u64(BATCH_QUEUE + i * BATCH_ENTRY_SIZE)
+        if state != BATCH_STATE_FREE { count = count + 1 }
+        i = i + 1
+    }
+    count
+}
+
+// Called by SYS_EXIT: run next queued program or return to shell
+@kernel fn batch_run_next() -> i64 {
+    let slot = batch_dequeue()
+    if slot < 0 { return 0 }  // No more — return to shell
+    let entry = batch_get_entry(slot)
+    let user_rsp = batch_get_rsp(slot)
+    let pid = batch_get_pid(slot)
+    volatile_write_u64(0x6FE00, pid)  // Set current PID
+    batch_complete(slot)
+    // Transition to Ring 3
+    iretq_to_user(entry, user_rsp, 0x202)
+    0
+}

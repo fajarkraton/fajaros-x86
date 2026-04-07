@@ -2723,6 +2723,80 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     else { iretq_to_user(entry, user_rsp, 0x202) }
 }
 
+@kernel fn cmd_spawn() {
+    // spawn <file> — queue an ELF for batch execution
+    let len = cmdbuf_len()
+    if len <= 6 { cprintln("Usage: spawn <file>", YELLOW_ON_BLACK); return }
+    let path_addr: i64 = 0x6FA80
+    let mut i: i64 = 0
+    while i < len - 6 && i < 63 {
+        volatile_write_u8(path_addr + i, volatile_read_u8(0x6F800 + 6 + i))
+        i = i + 1
+    }
+    volatile_write_u8(path_addr + i, 0)
+    // Lazy embed for "hello"
+    if i == 5 && volatile_read_u8(path_addr) == 104 && volatile_read_u8(path_addr + 1) == 101 && volatile_read_u8(path_addr + 4) == 111 {
+        ring3_hello_embed()
+    }
+    let result = sys_exec(path_addr, 0)
+    if result != 0 { cprintln("spawn: failed to load", RED_ON_BLACK); return }
+    let pid = volatile_read_u64(0x6FE00)
+    let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+    let entry = volatile_read(base + 24)
+    let user_rsp = volatile_read(base + 32)
+    if user_rsp == 0 { let ur = 0x3000000 - 16; batch_enqueue(entry, ur, pid) }
+    else { batch_enqueue(entry, user_rsp, pid) }
+    cprint("Spawned PID ", GREEN_ON_BLACK)
+    cprint_decimal(pid, CYAN_ON_BLACK)
+    cprint(" (queue: ", WHITE_ON_BLACK)
+    cprint_decimal(batch_count(), CYAN_ON_BLACK)
+    cprintln(")", WHITE_ON_BLACK)
+}
+
+@kernel fn cmd_runall() {
+    // runall — run all queued programs sequentially via exec
+    let count = batch_count()
+    if count == 0 { cprintln("No processes queued. Use 'spawn hello' first.", YELLOW_ON_BLACK); return }
+    cprint("Running ", WHITE_ON_BLACK)
+    cprint_decimal(count, CYAN_ON_BLACK)
+    cprintln(" process(es)...", WHITE_ON_BLACK)
+    // Use cmdbuf to simulate "exec hello" for each queued slot
+    let mut ran: i64 = 0
+    let mut slot = batch_dequeue()
+    while slot >= 0 {
+        ran = ran + 1
+        cprint("  Process ", WHITE_ON_BLACK)
+        cprint_decimal(ran, CYAN_ON_BLACK)
+        cprint(": ", WHITE_ON_BLACK)
+        batch_complete(slot)
+        // Directly exec — same pattern as cmd_exec
+        cmd_exec_hello()
+        slot = batch_dequeue()
+    }
+    cprint("Done: ", GREEN_ON_BLACK)
+    cprint_decimal(ran, CYAN_ON_BLACK)
+    cprintln(" processes completed", GREEN_ON_BLACK)
+}
+
+// Internal: exec the embedded hello program (used by spawn/runall)
+@kernel fn cmd_exec_hello() {
+    ring3_hello_embed()
+    let path_addr: i64 = 0x6FA80
+    volatile_write_u8(path_addr, 104); volatile_write_u8(path_addr+1, 101)
+    volatile_write_u8(path_addr+2, 108); volatile_write_u8(path_addr+3, 108)
+    volatile_write_u8(path_addr+4, 111); volatile_write_u8(path_addr+5, 0)
+    let result = sys_exec(path_addr, 0)
+    if result != 0 { cprintln("exec failed", RED_ON_BLACK); return }
+    let pid = volatile_read_u64(0x6FE00)
+    let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+    let entry = volatile_read(base + 24)
+    let user_rsp = volatile_read(base + 32)
+    if user_rsp == 0 { let ur = 0x3000000 - 16; iretq_to_user(entry, ur, 0x202) }
+    else { iretq_to_user(entry, user_rsp, 0x202) }
+    // SYS_EXIT returns here
+    volatile_write_u64(0x6FE00, 0)
+}
+
 @kernel fn cmd_readelf() {
     // readelf <file> — display ELF header info from ramfs
     let len = cmdbuf_len()
@@ -3117,6 +3191,10 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len >= 9 && buf_eq4(114, 101, 97, 100) == 1 && volatile_read_u8(0x6F804) == 101 && volatile_read_u8(0x6F805) == 108 && volatile_read_u8(0x6F806) == 102 { cmd_readelf(); handled = 1 }
     // exec — "exec ..." (101,120,101,99)
     if handled == 0 && len >= 6 && buf_eq4(101, 120, 101, 99) == 1 && volatile_read_u8(0x6F804) == 32 { cmd_exec(); handled = 1 }
+    // spawn — "spawn ..." (115,112,97,119,110,32)
+    if handled == 0 && len >= 7 && buf_eq4(115, 112, 97, 119) == 1 && volatile_read_u8(0x6F804) == 110 && volatile_read_u8(0x6F805) == 32 { cmd_spawn(); handled = 1 }
+    // runall — "runall" (114,117,110,97,108,108)
+    if handled == 0 && len == 6 && buf_eq4(114, 117, 110, 97) == 1 && volatile_read_u8(0x6F804) == 108 && volatile_read_u8(0x6F805) == 108 { cmd_runall(); handled = 1 }
     // procs — "procs" (112,114,111,99,115)
     if handled == 0 && len == 5 && buf_eq4(112, 114, 111, 99) == 1 && volatile_read_u8(0x6F804) == 115 { cmd_proc_v2(); handled = 1 }
     // forktest — "forktest" (102,111,114,107)
