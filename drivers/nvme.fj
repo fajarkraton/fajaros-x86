@@ -18,6 +18,7 @@ const NVME_ACQ: i64 = 0x801000
 const NVME_ISQ: i64 = 0x802000
 const NVME_ICQ: i64 = 0x803000
 const NVME_DMA: i64 = 0x810000
+const NVME_PRP_LIST: i64 = 0x820000   // 4KB page for PRP list entries (multi-page I/O)
 const NVME_QUEUE_ENTRIES: i64 = 64
 const NVME_SQE_SIZE: i64 = 64
 const NVME_CQE_SIZE: i64 = 16
@@ -410,13 +411,76 @@ const NVME_STATE: i64 = 0x804000
 
 @kernel fn nvme_read_sectors(lba: i64, count: i64, buf: i64) -> i64 {
     if nvme_state_read(96) != 1 { return -1 }
-    nvme_io_submit(0x02, lba, count, buf)
+    let total_bytes = count * 512
+    let pages = (total_bytes + 4095) / 4096
+    if pages <= 1 {
+        // Single page: PRP1 only, PRP2=0
+        nvme_io_submit(0x02, lba, count, buf)
+        return nvme_io_wait_completion()
+    }
+    // Multi-page: need PRP2
+    // Build PRP list at NVME_PRP_LIST (pages 2..N addresses)
+    let mut i: i64 = 1
+    while i < pages {
+        volatile_write_u64(NVME_PRP_LIST + (i - 1) * 8, buf + i * 4096)
+        i = i + 1
+    }
+    let prp2 = if pages == 2 { buf + 4096 } else { NVME_PRP_LIST }
+    nvme_io_submit_prp2(0x02, lba, count, buf, prp2)
     nvme_io_wait_completion()
+}
+
+// IO submit with explicit PRP2 for multi-page transfers
+@kernel fn nvme_io_submit_prp2(opcode: i64, lba: i64, count: i64, prp1: i64, prp2: i64) -> i64 {
+    let sq_tail = nvme_state_read(48)
+    let cmd_id = nvme_state_read(32)
+    let nsid = nvme_state_read(72)
+    let slot = sq_tail
+
+    nvme_io_sq_write(slot, 0, opcode | ((cmd_id & 0xFFFF) << 16))
+    nvme_io_sq_write(slot, 1, nsid)
+    nvme_io_sq_write(slot, 2, 0)
+    nvme_io_sq_write(slot, 3, 0)
+    nvme_io_sq_write(slot, 4, 0)
+    nvme_io_sq_write(slot, 5, 0)
+    nvme_io_sq_write(slot, 6, prp1 & 0xFFFFFFFF)
+    nvme_io_sq_write(slot, 7, (prp1 >> 32) & 0xFFFFFFFF)
+    nvme_io_sq_write(slot, 8, prp2 & 0xFFFFFFFF)
+    nvme_io_sq_write(slot, 9, (prp2 >> 32) & 0xFFFFFFFF)
+    nvme_io_sq_write(slot, 10, lba & 0xFFFFFFFF)
+    nvme_io_sq_write(slot, 11, (lba >> 32) & 0xFFFFFFFF)
+    nvme_io_sq_write(slot, 12, (count - 1) & 0xFFFF)
+    nvme_io_sq_write(slot, 13, 0)
+    nvme_io_sq_write(slot, 14, 0)
+    nvme_io_sq_write(slot, 15, 0)
+
+    let new_tail = (sq_tail + 1) % NVME_QUEUE_ENTRIES
+    nvme_state_write(48, new_tail)
+    nvme_state_write(32, cmd_id + 1)
+
+    let bar = nvme_state_read(0)
+    let dstride = nvme_state_read(40)
+    let sq_db = 0x1000 + 2 * 1 * (4 << dstride)
+    memory_fence()
+    volatile_write_u32(bar + sq_db, new_tail)
+    cmd_id
 }
 
 @kernel fn nvme_write_sectors(lba: i64, count: i64, buf: i64) -> i64 {
     if nvme_state_read(96) != 1 { return -1 }
-    nvme_io_submit(0x01, lba, count, buf)
+    let total_bytes = count * 512
+    let pages = (total_bytes + 4095) / 4096
+    if pages <= 1 {
+        nvme_io_submit(0x01, lba, count, buf)
+        return nvme_io_wait_completion()
+    }
+    let mut i: i64 = 1
+    while i < pages {
+        volatile_write_u64(NVME_PRP_LIST + (i - 1) * 8, buf + i * 4096)
+        i = i + 1
+    }
+    let prp2 = if pages == 2 { buf + 4096 } else { NVME_PRP_LIST }
+    nvme_io_submit_prp2(0x01, lba, count, buf, prp2)
     nvme_io_wait_completion()
 }
 

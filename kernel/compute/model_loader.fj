@@ -10,13 +10,18 @@
 //        Putranto (2026), PrimeCore.id
 //
 // Memory layout for loaded model:
-//   0xC00000   MODEL_HDR        .fjm header (64 bytes)
-//   0xC00040   MODEL_STATE      Loader state (64 bytes)
-//   0xC00080   MODEL_CODEBOOKS  Per-layer codebooks (12 layers x 64B = 768B)
-//   0xC00400   MODEL_LN_PARAMS  LayerNorm gamma/beta (12 layers x 2 x 768 x 8B)
-//   0xC30000   MODEL_EMBED      Embedding table (quantized)
-//   0x1200000  MODEL_LAYERS     Layer weights (quantized, layer-by-layer)
+//   0xC00000   MODEL_HDR        .fjm header (96 bytes for v2)
+//   0xC00060   MODEL_STATE      Loader state (64 bytes)
+//   0xC000A0   MODEL_CODEBOOKS  Per-layer codebooks (32 layers x 32B = 1KB)
+//   0xC00500   MODEL_LN_PARAMS  LayerNorm gamma/beta
+//   0xC30000   MODEL_EMBED      Embedding table (small models, RamFS)
+//   0x1200000  MODEL_LAYERS     Layer weights (small models, RamFS)
 //   0x4000000  MODEL_KV_CACHE   Quantized KV cache (hierarchical)
+//
+// Streaming mode (large models like Gemma 3 1B from NVMe):
+//   0x8000000  STREAM_EMBED     Embedding table (up to 128 MB)
+//   0xCC00000  STREAM_LAYER     Layer buffer (8 MB, reused per layer)
+//   0xD400000  STREAM_LMHEAD    LM head chunk buffer (1 MB)
 
 // ═══════════════════════════════════════════════════════════════
 // .fjm Binary Format Constants
@@ -62,10 +67,10 @@ const FJM_LAYER_HDR_SIZE: i64 = 16
 // Memory Layout for Loaded Model
 // ═══════════════════════════════════════════════════════════════
 
-const MDL_HDR_BASE: i64 = 0xC00000     // Parsed header copy (64 bytes)
-const MDL_STATE_BASE: i64 = 0xC00040   // Loader state
-const MDL_CODEBOOK_BASE: i64 = 0xC00080 // Per-layer codebooks
-const MDL_LN_BASE: i64 = 0xC00400     // LayerNorm parameters
+const MDL_HDR_BASE: i64 = 0xC00000       // Parsed header copy (96 bytes for v2)
+const MDL_STATE_BASE: i64 = 0xC00060     // Loader state (64 bytes)
+const MDL_CODEBOOK_BASE: i64 = 0xC000A0 // Per-layer codebooks (32 × 32B = 1KB)
+const MDL_LN_BASE: i64 = 0xC00500       // LayerNorm parameters
 
 const MDL_EMBED_BASE: i64 = 0xC30000   // Embedding table start
 const MDL_LAYER_BASE: i64 = 0x1200000  // Layer weights start
@@ -94,12 +99,14 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 // ═══════════════════════════════════════════════════════════════
 
 @kernel fn mdl_init() {
-    // Clear loader state
+    // Clear loader state (64 bytes)
     let mut i: i64 = 0
-    while i < 48 {
+    while i < 64 {
         volatile_write_u8(MDL_STATE_BASE + i, 0)
         i = i + 1
     }
+    // Initialize stream layer to -1 (none loaded)
+    volatile_write_u64(MDL_STATE_BASE + 48, -1)
     // Clear header area
     i = 0
     while i < FJM_HEADER_SIZE {
@@ -304,6 +311,9 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_LAYERS_LOADED, 0)
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 0)
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_LMHEAD_LOADED, 0)
+    // Reset streaming state
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_STREAM_LAYER, -1)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED, 0)
 
     0
 }
@@ -961,8 +971,525 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 @kernel fn mdl_print_error(code: i64) {
     // Use error code numbers to avoid LLVM string interleave
     // E1=bad magic, E2=bad version, E3=invalid params, E4=too small, E5=NVMe
+    // E6=not NVMe source, E7=layer too large, E8=bad chunk size
     cprint("E", RED_ON_BLACK)
     let abs_code = 0 - code
     cprint_decimal(abs_code, RED_ON_BLACK)
     console_putchar(10, RED_ON_BLACK)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Layer-Streaming Weight Loader (for Gemma 3 1B and large models)
+// ═══════════════════════════════════════════════════════════════
+//
+// Strategy for 303 MB model with 256 MB mapped RAM:
+//   1. Load embedding ONCE (75 MB) → stays resident at 0x8000000
+//   2. Stream layers 1-by-1 from NVMe → reusable buffer at 0xCC00000
+//   3. LM head: streaming argmax → 1 MB chunk buffer at 0xD400000
+//
+// Peak memory: ~85 MB (embedding + 1 layer + KV cache)
+// This is how real embedded LLM systems work.
+//
+// Requires: extend_identity_mapping_512() called during boot
+
+// Memory layout (streaming mode)
+const STREAM_EMBED_BASE: i64 = 0x8000000    // 128 MB mark
+const STREAM_LAYER_BUF: i64 = 0xCC00000     // 204 MB mark
+const STREAM_LAYER_SIZE: i64 = 0x800000      // 8 MB buffer (fits any layer)
+const STREAM_LMHEAD_BUF: i64 = 0xD400000    // 212 MB mark
+const STREAM_LMHEAD_CHUNK: i64 = 0x100000   // 1 MB per LM head chunk
+
+// State extensions (at MDL_STATE_BASE + offset)
+const MDL_ST_STREAM_LAYER: i64 = 48  // Current streaming layer (-1 = none)
+const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
+
+// ── Per-layer block size (computed from header offsets) ──
+// Exact for uniform-layer models: (lmhead_off - layer0_off) / n_layers
+@kernel fn mdl_layer_block_size() -> i64 {
+    let lmhead_off = mdl_get_lmhead_offset()
+    let layer0_off = mdl_get_layer0_offset()
+    let n_layers = mdl_get_n_layers()
+    if n_layers <= 0 { return 0 }
+    (lmhead_off - layer0_off) / n_layers
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Streaming Embedding Loader
+// ═══════════════════════════════════════════════════════════════
+
+// Load full embedding table from NVMe into STREAM_EMBED_BASE (0x8000000).
+// For Gemma 3 1B: 262K vocab × 1152 dims × 2-bit = 75 MB.
+// Shows progress dots during load.
+// Returns: 0=success, -1=no model, -3=NVMe error, -6=not NVMe source
+@kernel fn mdl_stream_load_embed() -> i64 {
+    if mdl_is_loaded() != 1 { return -1 }
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    if src_type != 2 { return -6 }
+
+    let embed_off = mdl_get_embed_offset()
+    let layer0_off = mdl_get_layer0_offset()
+    let embed_size = layer0_off - embed_off
+    let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+
+    let lba_start = src_lba + embed_off / 512
+    let total_sectors = (embed_size + 511) / 512
+    let mut sect_done: i64 = 0
+    let mut last_dot: i64 = -1
+
+    // Progress: print a '#' every 10%
+    cprint("  [", WHITE_ON_BLACK)
+
+    while sect_done < total_sectors {
+        let remaining = total_sectors - sect_done
+        let read_count = if remaining > 128 { 128 } else { remaining }
+        let rc = nvme_read_sectors(lba_start + sect_done, read_count, NVME_DMA)
+        if rc != 0 {
+            cprintln("] NVMe error", RED_ON_BLACK)
+            return -3
+        }
+        mdl_memcpy(STREAM_EMBED_BASE + sect_done * 512, NVME_DMA, read_count * 512)
+        sect_done = sect_done + read_count
+
+        // Print progress dot every 10%
+        let pct = sect_done * 10 / total_sectors
+        if pct > last_dot {
+            console_putchar(35, GREEN_ON_BLACK)  // '#'
+            last_dot = pct
+        }
+    }
+
+    cprintln("]", WHITE_ON_BLACK)
+
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED, 1)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 1)
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Streaming Layer Loader
+// ═══════════════════════════════════════════════════════════════
+
+// Load a single layer's weights from NVMe into STREAM_LAYER_BUF.
+// The buffer is reused — only ONE layer in memory at a time.
+// For Gemma 3 1B: ~6.1 MB per layer, 26 layers total.
+// Returns: 0=success, -1=no model, -2=bad layer, -3=NVMe error,
+//          -6=not NVMe, -7=layer too large for buffer
+@kernel fn mdl_stream_load_layer(layer_n: i64) -> i64 {
+    if mdl_is_loaded() != 1 { return -1 }
+    let n_layers = mdl_get_n_layers()
+    if layer_n < 0 || layer_n >= n_layers { return -2 }
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    if src_type != 2 { return -6 }
+
+    let layer0_off = mdl_get_layer0_offset()
+    let block_size = mdl_layer_block_size()
+    let data_size = block_size - FJM_LAYER_HDR_SIZE
+    if data_size > STREAM_LAYER_SIZE { return -7 }
+
+    let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+    let byte_off = layer0_off + layer_n * block_size + FJM_LAYER_HDR_SIZE
+    let lba_start = src_lba + byte_off / 512
+    let total_sectors = (data_size + 511) / 512
+    let mut sect_done: i64 = 0
+
+    while sect_done < total_sectors {
+        let remaining = total_sectors - sect_done
+        let read_count = if remaining > 128 { 128 } else { remaining }
+        let rc = nvme_read_sectors(lba_start + sect_done, read_count, NVME_DMA)
+        if rc != 0 { return -3 }
+        mdl_memcpy(STREAM_LAYER_BUF + sect_done * 512, NVME_DMA, read_count * 512)
+        sect_done = sect_done + read_count
+    }
+
+    // Also read layer block header (16 bytes) to extract sizes
+    let hdr_lba = src_lba + (layer0_off + layer_n * block_size) / 512
+    let rc2 = nvme_read_sectors(hdr_lba, 1, NVME_DMA)
+    if rc2 != 0 { return -3 }
+    let hdr_offset = (layer0_off + layer_n * block_size) % 512
+    let qkv_size_from_hdr = mdl_read_u32(NVME_DMA + hdr_offset + FJM_LAYER_OFF_QKV_SIZE)
+    let ffn_size_from_hdr = mdl_read_u32(NVME_DMA + hdr_offset + FJM_LAYER_OFF_FFN_SIZE)
+
+    // Store layer block info for weight access
+    // Layout at STREAM_LAYER_BUF: [QKV weights][FFN weights][Norm params][Codebook]
+    // Sizes stored at end of state for accessor functions
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_STREAM_LAYER, layer_n)
+
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Streaming Weight Accessors
+// ═══════════════════════════════════════════════════════════════
+
+// Get QKV weight address in streaming buffer
+@kernel fn mdl_stream_qkv_addr() -> i64 {
+    STREAM_LAYER_BUF
+}
+
+// Get Q weight size for GQA: d_model × (n_heads × d_head) × bits/8
+@kernel fn mdl_stream_q_size() -> i64 {
+    let d_model = mdl_get_d_model()
+    let n_heads = mdl_get_n_heads()
+    let d_head = mdl_get_d_head()
+    let bits = mdl_get_quant_bits()
+    d_model * n_heads * d_head * bits / 8
+}
+
+// Get K/V weight size for GQA: d_model × (n_kv_heads × d_head) × bits/8
+@kernel fn mdl_stream_kv_size() -> i64 {
+    let d_model = mdl_get_d_model()
+    let n_kv = mdl_get_n_kv_heads()
+    let d_head = mdl_get_d_head()
+    let bits = mdl_get_quant_bits()
+    d_model * n_kv * d_head * bits / 8
+}
+
+// QKV total packed size
+@kernel fn mdl_stream_qkv_total() -> i64 {
+    mdl_stream_q_size() + mdl_stream_kv_size() * 2
+}
+
+// Get FFN weight address in streaming buffer
+@kernel fn mdl_stream_ffn_addr() -> i64 {
+    STREAM_LAYER_BUF + mdl_stream_qkv_total()
+}
+
+// Get FFN total size for gated: 3 × d_model × ffn_dim × bits/8
+@kernel fn mdl_stream_ffn_total() -> i64 {
+    let d_model = mdl_get_d_model()
+    let ffn_dim = mdl_get_ffn_dim()
+    let bits = mdl_get_quant_bits()
+    let ffn_type = mdl_get_ffn_type()
+    let matrices = if ffn_type == 1 { 3 } else { 2 }  // gated=3, standard=2
+    matrices * d_model * ffn_dim * bits / 8
+}
+
+// Get norm params address in streaming buffer (after QKV + FFN)
+@kernel fn mdl_stream_norm_addr() -> i64 {
+    STREAM_LAYER_BUF + mdl_stream_qkv_total() + mdl_stream_ffn_total()
+}
+
+// Get codebook address in streaming buffer
+@kernel fn mdl_stream_codebook_addr() -> i64 {
+    let d_model = mdl_get_d_model()
+    let norm_size = 2 * d_model * 8  // 2 norms × d_model × i64
+    mdl_stream_norm_addr() + norm_size
+}
+
+// Get currently loaded streaming layer (-1 = none)
+@kernel fn mdl_stream_current_layer() -> i64 {
+    volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_LAYER)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Streaming Embedding Lookup
+// ═══════════════════════════════════════════════════════════════
+
+// Look up token embedding from streaming region (STREAM_EMBED_BASE).
+// Dequantizes packed 2-bit indices into km_ large slot via codebook.
+// Returns: slot index on success, -1/-2 on error
+@kernel fn mdl_stream_embed_lookup(token_id: i64, out_slot: i64) -> i64 {
+    if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 { return -1 }
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let bits = mdl_get_quant_bits()
+    if token_id < 0 || token_id >= vocab_size { return -2 }
+
+    let bytes_per_row = d_model * bits / 8
+    let src = STREAM_EMBED_BASE + token_id * bytes_per_row
+    let dst = km_large_addr(out_slot)
+    volatile_write_u64(dst + KM_HDR_ROWS, 1)
+    volatile_write_u64(dst + KM_HDR_COLS, d_model)
+    volatile_write_u64(dst + KM_HDR_BITS, bits)
+
+    let elems_per_byte = 8 / bits
+    let mask = (1 << bits) - 1
+    let cb_addr = MDL_CODEBOOK_BASE
+
+    let mut i: i64 = 0
+    while i < d_model {
+        let byte_idx = i / elems_per_byte
+        let bit_off = (i % elems_per_byte) * bits
+        let raw = volatile_read_u8(src + byte_idx)
+        let idx = (raw >> bit_off) & mask
+        let centroid = volatile_read_u64(cb_addr + idx * 8)
+        volatile_write_u64(dst + KM_DATA_OFF + i * 8, centroid)
+        i = i + 1
+    }
+    out_slot
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Streaming LM Head Argmax
+// ═══════════════════════════════════════════════════════════════
+
+// Compute argmax(x @ LM_head^T) by streaming LM head from NVMe.
+// Reads 1 MB chunks, computes dot products, tracks running argmax.
+// Never loads the full 75 MB LM head into memory.
+//
+// x_addr: address of hidden state vector (d_model i64 values)
+// Returns: token_id with highest logit, or negative on error
+@kernel fn mdl_stream_lmhead_argmax(x_addr: i64) -> i64 {
+    if mdl_is_loaded() != 1 { return -1 }
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    if src_type != 2 { return -6 }
+
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let bits = mdl_get_quant_bits()
+    let lmhead_off = mdl_get_lmhead_offset()
+    let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+    let cb_addr = MDL_CODEBOOK_BASE
+
+    let row_bytes = d_model * bits / 8
+    if row_bytes <= 0 { return -8 }
+    let rows_per_chunk = STREAM_LMHEAD_CHUNK / row_bytes
+    if rows_per_chunk <= 0 { return -8 }
+
+    let elems_per_byte = 8 / bits
+    let mask = (1 << bits) - 1
+
+    let mut best_token: i64 = 0
+    let mut best_score: i64 = -999999999
+    let mut vocab_done: i64 = 0
+
+    while vocab_done < vocab_size {
+        let rows_left = vocab_size - vocab_done
+        let rows_this = if rows_left > rows_per_chunk { rows_per_chunk } else { rows_left }
+        let chunk_bytes = rows_this * row_bytes
+
+        // Read chunk from NVMe into STREAM_LMHEAD_BUF
+        let byte_off = lmhead_off + vocab_done * row_bytes
+        let lba = src_lba + byte_off / 512
+        let sectors = (chunk_bytes + 511) / 512
+        let mut sect_done: i64 = 0
+        while sect_done < sectors {
+            let remaining = sectors - sect_done
+            let rc_count = if remaining > 128 { 128 } else { remaining }
+            let rc = nvme_read_sectors(lba + sect_done, rc_count, NVME_DMA)
+            if rc != 0 { return -3 }
+            mdl_memcpy(STREAM_LMHEAD_BUF + sect_done * 512, NVME_DMA, rc_count * 512)
+            sect_done = sect_done + rc_count
+        }
+
+        // Dot product for each vocab row in this chunk
+        let mut r: i64 = 0
+        while r < rows_this {
+            let row_addr = STREAM_LMHEAD_BUF + r * row_bytes
+            let mut sum: i64 = 0
+            let mut j: i64 = 0
+            while j < d_model {
+                let x_val = volatile_read_u64(x_addr + j * 8)
+                let byte_idx = j / elems_per_byte
+                let bit_off = (j % elems_per_byte) * bits
+                let raw = volatile_read_u8(row_addr + byte_idx)
+                let idx = (raw >> bit_off) & mask
+                let w = volatile_read_u64(cb_addr + idx * 8)
+                sum = sum + (x_val * w) / 1000
+                j = j + 1
+            }
+            if sum > best_score {
+                best_score = sum
+                best_token = vocab_done + r
+            }
+            r = r + 1
+        }
+        vocab_done = vocab_done + rows_this
+    }
+
+    best_token
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Streaming Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+// embed-load — load embedding from NVMe to streaming region
+@kernel fn cmd_embed_load() {
+    if mdl_is_loaded() != 1 {
+        cprintln("No model loaded. Use: model-load nvme 0", YELLOW_ON_BLACK)
+        return
+    }
+    let embed_size = mdl_get_layer0_offset() - mdl_get_embed_offset()
+    cprint("Loading embedding (", WHITE_ON_BLACK)
+    mdl_print_size(embed_size)
+    cprintln(") from NVMe...", WHITE_ON_BLACK)
+
+    let rc = mdl_stream_load_embed()
+    if rc == 0 {
+        cprint("[OK] Embedding loaded at 0x", GREEN_ON_BLACK)
+        mdl_print_hex(STREAM_EMBED_BASE)
+        cprint(" (", GREEN_ON_BLACK)
+        mdl_print_size(embed_size)
+        cprintln(")", GREEN_ON_BLACK)
+    } else {
+        cprint("[ERR] Embed load failed: ", RED_ON_BLACK)
+        mdl_print_error(rc)
+    }
+}
+
+// layer-load <n> — load a single layer into streaming buffer
+@kernel fn cmd_layer_load() {
+    if mdl_is_loaded() != 1 {
+        cprintln("No model loaded.", YELLOW_ON_BLACK)
+        return
+    }
+    let len = cmdbuf_len()
+    if len <= 11 {
+        cprintln("Usage: layer-load <number>", YELLOW_ON_BLACK)
+        cprint("  Layers: 0-", WHITE_ON_BLACK)
+        cprint_decimal(mdl_get_n_layers() - 1, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        return
+    }
+
+    // Parse layer number from "layer-load N"
+    let mut layer_n: i64 = 0
+    let mut i: i64 = 11
+    while i < len {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch >= 48 && ch <= 57 { layer_n = layer_n * 10 + (ch - 48) }
+        i = i + 1
+    }
+
+    let n_layers = mdl_get_n_layers()
+    if layer_n >= n_layers {
+        cprint("Invalid layer (max ", YELLOW_ON_BLACK)
+        cprint_decimal(n_layers - 1, YELLOW_ON_BLACK)
+        cprintln(")", YELLOW_ON_BLACK)
+        return
+    }
+
+    let block_size = mdl_layer_block_size()
+    cprint("Loading layer ", WHITE_ON_BLACK)
+    cprint_decimal(layer_n, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(n_layers - 1, WHITE_ON_BLACK)
+    cprint(" (", WHITE_ON_BLACK)
+    mdl_print_size(block_size)
+    cprintln(") from NVMe...", WHITE_ON_BLACK)
+
+    let rc = mdl_stream_load_layer(layer_n)
+    if rc == 0 {
+        cprint("[OK] Layer ", GREEN_ON_BLACK)
+        cprint_decimal(layer_n, GREEN_ON_BLACK)
+        cprint(" loaded at 0x", GREEN_ON_BLACK)
+        mdl_print_hex(STREAM_LAYER_BUF)
+        console_putchar(10, GREEN_ON_BLACK)
+
+        // Print weight layout
+        cprint("  QKV: ", WHITE_ON_BLACK)
+        mdl_print_size(mdl_stream_qkv_total())
+        cprint("  FFN: ", WHITE_ON_BLACK)
+        mdl_print_size(mdl_stream_ffn_total())
+        console_putchar(10, WHITE_ON_BLACK)
+    } else {
+        cprint("[ERR] Layer load failed: ", RED_ON_BLACK)
+        mdl_print_error(rc)
+    }
+}
+
+// weight-status — show streaming weight loading status
+@kernel fn cmd_weight_status() {
+    if mdl_is_loaded() != 1 {
+        cprintln("No model loaded.", YELLOW_ON_BLACK)
+        return
+    }
+
+    cprintln("Weight Streaming Status:", YELLOW_ON_BLACK)
+
+    // Model summary
+    cprint("  Model:      ", WHITE_ON_BLACK)
+    mdl_print_model_type(mdl_get_model_type())
+    cprint(" (", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_n_layers(), CYAN_ON_BLACK)
+    cprint("L, d=", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_d_model(), CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    mdl_print_size(mdl_get_total_size())
+    cprintln(")", WHITE_ON_BLACK)
+
+    // Embedding status
+    let embed_loaded = volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED)
+    cprint("  Embedding:  ", WHITE_ON_BLACK)
+    if embed_loaded == 1 {
+        cprint("LOADED ", GREEN_ON_BLACK)
+        mdl_print_size(mdl_get_layer0_offset() - mdl_get_embed_offset())
+        cprint(" at 0x", GREEN_ON_BLACK)
+        mdl_print_hex(STREAM_EMBED_BASE)
+        console_putchar(10, GREEN_ON_BLACK)
+    } else {
+        cprintln("not loaded (use: embed-load)", YELLOW_ON_BLACK)
+    }
+
+    // Layer streaming status
+    let cur_layer = volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_LAYER)
+    cprint("  Layer buf:  ", WHITE_ON_BLACK)
+    let n_layers = mdl_get_n_layers()
+    if cur_layer < n_layers {
+        cprint("layer ", GREEN_ON_BLACK)
+        cprint_decimal(cur_layer, GREEN_ON_BLACK)
+        cprint("/", GREEN_ON_BLACK)
+        cprint_decimal(n_layers - 1, GREEN_ON_BLACK)
+        cprint(" at 0x", GREEN_ON_BLACK)
+        mdl_print_hex(STREAM_LAYER_BUF)
+        console_putchar(10, GREEN_ON_BLACK)
+    } else {
+        cprintln("empty (use: layer-load N)", YELLOW_ON_BLACK)
+    }
+
+    // LM Head
+    cprint("  LM Head:    ", WHITE_ON_BLACK)
+    // s(115)t(116)r(114)e(101)a(97)m(109)
+    console_putchar(115, CYAN_ON_BLACK); console_putchar(116, CYAN_ON_BLACK)
+    console_putchar(114, CYAN_ON_BLACK); console_putchar(101, CYAN_ON_BLACK)
+    console_putchar(97, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK)
+    // " on-demand"
+    cprintln(" (on-demand argmax)", CYAN_ON_BLACK)
+
+    // Memory map
+    cprintln("Memory Map:", YELLOW_ON_BLACK)
+    cprint("  0x8000000   Embedding  ", WHITE_ON_BLACK)
+    mdl_print_size(mdl_get_layer0_offset() - mdl_get_embed_offset())
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  0xCC00000   Layer buf  ", WHITE_ON_BLACK)
+    mdl_print_size(mdl_layer_block_size())
+    cprint("/layer", WHITE_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  0xD400000   LM chunk   ", WHITE_ON_BLACK)
+    mdl_print_size(STREAM_LMHEAD_CHUNK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Per-layer breakdown
+    cprintln("Per-Layer Weights:", YELLOW_ON_BLACK)
+    cprint("  QKV:  ", WHITE_ON_BLACK)
+    cprint("Q=", CYAN_ON_BLACK)
+    mdl_print_size(mdl_stream_q_size())
+    cprint(" K=", CYAN_ON_BLACK)
+    mdl_print_size(mdl_stream_kv_size())
+    cprint(" V=", CYAN_ON_BLACK)
+    mdl_print_size(mdl_stream_kv_size())
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  FFN:  ", WHITE_ON_BLACK)
+    mdl_print_size(mdl_stream_ffn_total())
+    if mdl_get_ffn_type() == 1 {
+        cprint(" (gated: 3 matrices)", WHITE_ON_BLACK)
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+// ── Hex printer for addresses ──
+@kernel fn mdl_print_hex(val: i64) {
+    let hex_chars: [i64; 16] = [48, 49, 50, 51, 52, 53, 54, 55,
+                                 56, 57, 65, 66, 67, 68, 69, 70]
+    // Print 7 hex digits (enough for addresses up to 0xFFFFFFF = 268 MB)
+    let mut shift: i64 = 24
+    while shift >= 0 {
+        let nibble = (val >> shift) & 0xF
+        console_putchar(hex_chars[nibble], CYAN_ON_BLACK)
+        shift = shift - 4
+    }
 }

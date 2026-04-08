@@ -116,7 +116,8 @@
     // smp_init_per_cpu()  // SKIP: may corrupt page tables
     println(16)
     frames_init()
-    extend_identity_mapping()  // map 128-256 MB for Gemma 3 model weights
+    extend_identity_mapping()      // map 128-256 MB
+    extend_identity_mapping_512()  // map 256-512 MB for Gemma 3 1B weights
     println(17)
     heap_init()
     println(18)
