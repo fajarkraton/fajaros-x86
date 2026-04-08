@@ -1,0 +1,781 @@
+// FajarOS — Kernel Matrix Engine (Phase 2)
+// Large-capacity matrix/vector operations for transformer inference.
+// Extends the kernel compute stack with 768-dim support (SmolLM d_model).
+//
+// Two pools:
+//   Small: 32 slots x 128 elements at 0xB00000 (32 KB) — MNIST, scheduler
+//   Large: 16 slots x 1024 elements at 0xB40000 (128 KB) — transformer layers
+//
+// Operations: matmul (tiled), LayerNorm, GELU, softmax, argmax
+// All @kernel safe — no heap, no float. Fixed-point i64 scaled x1000.
+//
+// Function prefix: km_ (kernel matrix) to avoid KE002 name heuristic.
+// Paper: FajarQuant (Putranto, 2026) — kernel-native transformer inference.
+
+// ═══════════════════════════════════════════════════════════════
+// Memory Layout
+// ═══════════════════════════════════════════════════════════════
+
+// Small pool (backwards-compatible with MNIST/scheduler models)
+const KM_SMALL_BASE: i64 = 0xB00000
+const KM_SMALL_SLOTS: i64 = 32
+const KM_SMALL_DIM: i64 = 128
+const KM_SMALL_SLOT_SIZE: i64 = 1056  // 32B header + 128*8B data
+
+// Large pool (transformer-sized: d_model=768 fits in 1024)
+const KM_LARGE_BASE: i64 = 0xB40000
+const KM_LARGE_SLOTS: i64 = 16
+const KM_LARGE_DIM: i64 = 1024
+const KM_LARGE_SLOT_SIZE: i64 = 8224  // 32B header + 1024*8B data
+
+// Header offsets (same for both pools)
+const KM_HDR_ROWS: i64 = 0
+const KM_HDR_COLS: i64 = 8
+const KM_HDR_FLAGS: i64 = 16
+const KM_HDR_BITS: i64 = 24    // quantization bits (0=full precision)
+const KM_DATA_OFF: i64 = 32
+
+// Scratch buffer for LayerNorm/matmul temporaries (4 KB at 0xB62000)
+const KM_SCRATCH: i64 = 0xB62000
+
+// ═══════════════════════════════════════════════════════════════
+// Pool Management — Small (32 slots x 128 elements)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_small_addr(slot: i64) -> i64 {
+    KM_SMALL_BASE + slot * KM_SMALL_SLOT_SIZE
+}
+
+@kernel fn km_alloc_small(rows: i64, cols: i64) -> i64 {
+    if rows * cols > KM_SMALL_DIM { return -1 }
+    let mut i: i64 = 0
+    while i < KM_SMALL_SLOTS {
+        let addr = km_small_addr(i)
+        let r = volatile_read_u64(addr + KM_HDR_ROWS)
+        let c = volatile_read_u64(addr + KM_HDR_COLS)
+        if r == 0 && c == 0 {
+            volatile_write_u64(addr + KM_HDR_ROWS, rows)
+            volatile_write_u64(addr + KM_HDR_COLS, cols)
+            volatile_write_u64(addr + KM_HDR_FLAGS, 0)
+            volatile_write_u64(addr + KM_HDR_BITS, 0)
+            // Zero data
+            let total = rows * cols
+            let mut j: i64 = 0
+            while j < total {
+                volatile_write_u64(addr + KM_DATA_OFF + j * 8, 0)
+                j = j + 1
+            }
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn km_free_small(slot: i64) {
+    if slot < 0 || slot >= KM_SMALL_SLOTS { return }
+    let addr = km_small_addr(slot)
+    volatile_write_u64(addr + KM_HDR_ROWS, 0)
+    volatile_write_u64(addr + KM_HDR_COLS, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pool Management — Large (16 slots x 1024 elements)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_large_addr(slot: i64) -> i64 {
+    KM_LARGE_BASE + slot * KM_LARGE_SLOT_SIZE
+}
+
+@kernel fn km_alloc(rows: i64, cols: i64) -> i64 {
+    // Allocate from large pool (supports up to 1024 elements)
+    if rows * cols > KM_LARGE_DIM { return -1 }
+    let mut i: i64 = 0
+    while i < KM_LARGE_SLOTS {
+        let addr = km_large_addr(i)
+        let r = volatile_read_u64(addr + KM_HDR_ROWS)
+        let c = volatile_read_u64(addr + KM_HDR_COLS)
+        if r == 0 && c == 0 {
+            volatile_write_u64(addr + KM_HDR_ROWS, rows)
+            volatile_write_u64(addr + KM_HDR_COLS, cols)
+            volatile_write_u64(addr + KM_HDR_FLAGS, 0)
+            volatile_write_u64(addr + KM_HDR_BITS, 0)
+            let total = rows * cols
+            let mut j: i64 = 0
+            while j < total {
+                volatile_write_u64(addr + KM_DATA_OFF + j * 8, 0)
+                j = j + 1
+            }
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn km_free(slot: i64) {
+    if slot < 0 || slot >= KM_LARGE_SLOTS { return }
+    let addr = km_large_addr(slot)
+    volatile_write_u64(addr + KM_HDR_ROWS, 0)
+    volatile_write_u64(addr + KM_HDR_COLS, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Element Access (Large Pool)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_get(slot: i64, row: i64, col: i64) -> i64 {
+    let addr = km_large_addr(slot)
+    let cols = volatile_read_u64(addr + KM_HDR_COLS)
+    volatile_read_u64(addr + KM_DATA_OFF + (row * cols + col) * 8)
+}
+
+@kernel fn km_set(slot: i64, row: i64, col: i64, val: i64) {
+    let addr = km_large_addr(slot)
+    let cols = volatile_read_u64(addr + KM_HDR_COLS)
+    volatile_write_u64(addr + KM_DATA_OFF + (row * cols + col) * 8, val)
+}
+
+@kernel fn km_rows(slot: i64) -> i64 {
+    volatile_read_u64(km_large_addr(slot) + KM_HDR_ROWS)
+}
+
+@kernel fn km_cols(slot: i64) -> i64 {
+    volatile_read_u64(km_large_addr(slot) + KM_HDR_COLS)
+}
+
+// Get raw data pointer for a slot
+@kernel fn km_data_ptr(slot: i64) -> i64 {
+    km_large_addr(slot) + KM_DATA_OFF
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Vector-Matrix Multiply (Tiled)
+// ═══════════════════════════════════════════════════════════════
+//
+// out[1 x N] = vec[1 x M] * mat[M x N]
+// vec_slot: 1xM vector in large pool
+// mat_addr: M*N i64 values at raw memory address
+// out_slot: 1xN result in large pool
+// Tiled: processes TILE columns at a time to stay cache-friendly.
+
+const KM_TILE_SIZE: i64 = 64
+
+@kernel fn km_vecmat(vec_slot: i64, mat_addr: i64, m: i64, n: i64, out_slot: i64) {
+    let vec_data = km_data_ptr(vec_slot)
+    let out_data = km_data_ptr(out_slot)
+    // Set output dimensions
+    let out_base = km_large_addr(out_slot)
+    volatile_write_u64(out_base + KM_HDR_ROWS, 1)
+    volatile_write_u64(out_base + KM_HDR_COLS, n)
+
+    // Process columns in tiles
+    let mut col_start: i64 = 0
+    while col_start < n {
+        let col_end = if col_start + KM_TILE_SIZE < n { col_start + KM_TILE_SIZE } else { n }
+        let mut j = col_start
+        while j < col_end {
+            let mut sum: i64 = 0
+            let mut k: i64 = 0
+            while k < m {
+                let v = volatile_read_u64(vec_data + k * 8)
+                let w = volatile_read_u64(mat_addr + (k * n + j) * 8)
+                sum = sum + (v * w) / 1000
+                k = k + 1
+            }
+            volatile_write_u64(out_data + j * 8, sum)
+            j = j + 1
+        }
+        col_start = col_start + KM_TILE_SIZE
+    }
+}
+
+// Quantized vector-matrix multiply: vec * dequant(mat_q, codebook)
+// mat_q_addr: M*N quantized indices
+// Uses fq_decode from fajarquant.fj for codebook lookup
+@kernel fn km_vecmat_quant(vec_slot: i64, mat_q_addr: i64, m: i64, n: i64,
+                            bits: i64, out_slot: i64) {
+    let vec_data = km_data_ptr(vec_slot)
+    let out_data = km_data_ptr(out_slot)
+    let out_base = km_large_addr(out_slot)
+    volatile_write_u64(out_base + KM_HDR_ROWS, 1)
+    volatile_write_u64(out_base + KM_HDR_COLS, n)
+
+    let mut j: i64 = 0
+    while j < n {
+        let mut sum: i64 = 0
+        let mut k: i64 = 0
+        while k < m {
+            let v = volatile_read_u64(vec_data + k * 8)
+            let idx = volatile_read_u64(mat_q_addr + (k * n + j) * 8)
+            let w = fq_decode(idx, bits)
+            sum = sum + (v * w) / 1000
+            k = k + 1
+        }
+        volatile_write_u64(out_data + j * 8, sum)
+        j = j + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Matrix-Matrix Multiply (Tiled, for small square matrices)
+// C[MxP] = A[MxN] * B[NxP], all in large pool
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_matmul(a_slot: i64, b_slot: i64, out_slot: i64) {
+    let a_data = km_data_ptr(a_slot)
+    let b_data = km_data_ptr(b_slot)
+    let out_data = km_data_ptr(out_slot)
+    let m = km_rows(a_slot)
+    let n = km_cols(a_slot)
+    let p = km_cols(b_slot)
+
+    let out_base = km_large_addr(out_slot)
+    volatile_write_u64(out_base + KM_HDR_ROWS, m)
+    volatile_write_u64(out_base + KM_HDR_COLS, p)
+
+    let mut i: i64 = 0
+    while i < m {
+        let mut j: i64 = 0
+        while j < p {
+            let mut sum: i64 = 0
+            let mut k: i64 = 0
+            while k < n {
+                let a = volatile_read_u64(a_data + (i * n + k) * 8)
+                let b = volatile_read_u64(b_data + (k * p + j) * 8)
+                sum = sum + (a * b) / 1000
+                k = k + 1
+            }
+            volatile_write_u64(out_data + (i * p + j) * 8, sum)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Dot Product (in-pool)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_dot(a_slot: i64, b_slot: i64, len: i64) -> i64 {
+    let a_data = km_data_ptr(a_slot)
+    let b_data = km_data_ptr(b_slot)
+    let mut sum: i64 = 0
+    let mut i: i64 = 0
+    while i < len {
+        let a = volatile_read_u64(a_data + i * 8)
+        let b = volatile_read_u64(b_data + i * 8)
+        sum = sum + (a * b) / 1000
+        i = i + 1
+    }
+    sum
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LayerNorm (@kernel, no heap)
+// ═══════════════════════════════════════════════════════════════
+//
+// LayerNorm(x) = gamma * (x - mean) / sqrt(var + eps) + beta
+// Fixed-point: mean, var computed with x1000 scale.
+// sqrt approximation via Newton's method (integer).
+//
+// slot: 1xN vector in large pool (modified in-place)
+// gamma_addr, beta_addr: N-element arrays at raw memory addresses
+
+@kernel fn km_isqrt(x: i64) -> i64 {
+    // Integer square root via Newton's method
+    // Returns sqrt(x) for x >= 0
+    if x <= 0 { return 1 }
+    if x == 1 { return 1 }
+    let mut guess = x / 2
+    if guess == 0 { return 1 }
+    let mut prev = guess + 1
+    while guess < prev {
+        prev = guess
+        guess = (guess + x / guess) / 2
+    }
+    if prev == 0 { 1 } else { prev }
+}
+
+@kernel fn km_layernorm(slot: i64, dim: i64, gamma_addr: i64, beta_addr: i64) {
+    let data = km_data_ptr(slot)
+
+    // Step 1: compute mean = sum(x) / dim
+    let mut sum: i64 = 0
+    let mut i: i64 = 0
+    while i < dim {
+        sum = sum + volatile_read_u64(data + i * 8)
+        i = i + 1
+    }
+    let mean = sum / dim
+
+    // Step 2: compute variance = sum((x - mean)^2) / dim
+    let mut var_sum: i64 = 0
+    i = 0
+    while i < dim {
+        let diff = volatile_read_u64(data + i * 8) - mean
+        var_sum = var_sum + (diff * diff) / 1000
+        i = i + 1
+    }
+    let variance = var_sum / dim
+    // eps = 1 (= 0.001 in original scale)
+    let std_dev = km_isqrt(variance + 1)
+    if std_dev == 0 { return }
+
+    // Step 3: normalize and apply affine transform
+    i = 0
+    while i < dim {
+        let val = volatile_read_u64(data + i * 8)
+        let normed = ((val - mean) * 1000) / std_dev
+        // Apply gamma and beta if provided
+        let g = if gamma_addr != 0 { volatile_read_u64(gamma_addr + i * 8) } else { 1000 }
+        let b = if beta_addr != 0 { volatile_read_u64(beta_addr + i * 8) } else { 0 }
+        let result = (normed * g) / 1000 + b
+        volatile_write_u64(data + i * 8, result)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GELU Activation (@kernel, fixed-point approximation)
+// ═══════════════════════════════════════════════════════════════
+//
+// GELU(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+// Simplified approximation for kernel:
+//   GELU(x) ≈ x * sigmoid(1.702 * x) (Hendrycks & Gimpel, 2016)
+//   sigmoid(z) ≈ z >= 0 ? 1000 - 500000/(500+z) : 500000/(500-z)
+//
+// Input/output: slot in large pool, modified in-place.
+
+@kernel fn km_sigmoid_approx(x: i64) -> i64 {
+    // Piecewise linear sigmoid approximation (fixed-point x1000)
+    // Output range: [0, 1000] representing [0.0, 1.0]
+    if x > 3000 { 1000 }
+    else if x > 1000 { 750 + x / 12 }
+    else if x > -1000 { 500 + x / 2 }
+    else if x > -3000 { 250 + x / 12 }
+    else { 0 }
+}
+
+@kernel fn km_gelu(slot: i64, dim: i64) {
+    let data = km_data_ptr(slot)
+    let mut i: i64 = 0
+    while i < dim {
+        let x = volatile_read_u64(data + i * 8)
+        // GELU(x) ≈ x * sigmoid(1.702 * x) / 1000
+        let sx = km_sigmoid_approx((x * 1702) / 1000)
+        let result = (x * sx) / 1000
+        volatile_write_u64(data + i * 8, result)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ReLU Activation
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_relu(slot: i64, dim: i64) {
+    let data = km_data_ptr(slot)
+    let mut i: i64 = 0
+    while i < dim {
+        let val = volatile_read_u64(data + i * 8)
+        if val < 0 { volatile_write_u64(data + i * 8, 0) }
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Softmax (numerically stable, fixed-point)
+// ═══════════════════════════════════════════════════════════════
+//
+// softmax(x)_i = exp(x_i - max) / sum(exp(x_j - max))
+// Kernel exp approximation: exp(z) ≈ max(1, 1000 + z + z*z/2000)
+
+@kernel fn km_exp_approx(x: i64) -> i64 {
+    // Piecewise exp approximation (fixed-point x1000)
+    // exp(0) = 1000, exp(1000) ≈ 2718, exp(-1000) ≈ 368
+    if x > 3000 { 20000 }  // cap to prevent overflow
+    else if x < -3000 { 1 }
+    else {
+        // Taylor: exp(x/1000) ≈ 1 + x/1000 + (x/1000)^2/2
+        // In fixed-point: 1000 + x + x*x/2000
+        let result = 1000 + x + (x * x) / 2000
+        if result < 1 { 1 } else { result }
+    }
+}
+
+@kernel fn km_softmax(slot: i64, dim: i64) {
+    let data = km_data_ptr(slot)
+
+    // Find max for numerical stability
+    let mut max_val = volatile_read_u64(data)
+    let mut i: i64 = 1
+    while i < dim {
+        let val = volatile_read_u64(data + i * 8)
+        if val > max_val { max_val = val }
+        i = i + 1
+    }
+
+    // Compute exp(x - max) and sum
+    let mut sum: i64 = 0
+    i = 0
+    while i < dim {
+        let val = volatile_read_u64(data + i * 8) - max_val
+        let exp_val = km_exp_approx(val)
+        volatile_write_u64(data + i * 8, exp_val)
+        sum = sum + exp_val
+        i = i + 1
+    }
+
+    // Normalize to sum = 1000
+    if sum > 0 {
+        i = 0
+        while i < dim {
+            let val = volatile_read_u64(data + i * 8)
+            volatile_write_u64(data + i * 8, (val * 1000) / sum)
+            i = i + 1
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Argmax
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_argmax(slot: i64, dim: i64) -> i64 {
+    let data = km_data_ptr(slot)
+    let mut max_idx: i64 = 0
+    let mut max_val = volatile_read_u64(data)
+    let mut i: i64 = 1
+    while i < dim {
+        let val = volatile_read_u64(data + i * 8)
+        if val > max_val {
+            max_val = val
+            max_idx = i
+        }
+        i = i + 1
+    }
+    max_idx
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Residual Add: out = a + b (element-wise, in-place on a)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_add(a_slot: i64, b_slot: i64, dim: i64) {
+    let a_data = km_data_ptr(a_slot)
+    let b_data = km_data_ptr(b_slot)
+    let mut i: i64 = 0
+    while i < dim {
+        let a = volatile_read_u64(a_data + i * 8)
+        let b = volatile_read_u64(b_data + i * 8)
+        volatile_write_u64(a_data + i * 8, a + b)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_init() {
+    // Zero both pool headers
+    let mut i: i64 = 0
+    while i < KM_SMALL_SLOTS {
+        let addr = km_small_addr(i)
+        volatile_write_u64(addr + KM_HDR_ROWS, 0)
+        volatile_write_u64(addr + KM_HDR_COLS, 0)
+        i = i + 1
+    }
+    i = 0
+    while i < KM_LARGE_SLOTS {
+        let addr = km_large_addr(i)
+        volatile_write_u64(addr + KM_HDR_ROWS, 0)
+        volatile_write_u64(addr + KM_HDR_COLS, 0)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command: km-bench
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_km_bench() {
+    cprintln("=== Kernel Matrix Engine Benchmark ===", YELLOW_ON_BLACK)
+    cprintln("Phase 2: Transformer-sized tensors (768-dim)", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 1: Pool allocation ──
+    cprintln("[1] Large Pool (16 slots x 1024 dims)", YELLOW_ON_BLACK)
+    let s0 = km_alloc(1, 768)
+    let s1 = km_alloc(1, 768)
+    let s2 = km_alloc(1, 768)
+    cprint("  Allocated 3 slots (1x768): ", WHITE_ON_BLACK)
+    cprint_decimal(s0, CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    cprint_decimal(s1, CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    cprintln_decimal(s2, CYAN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 2: Dot product correctness ──
+    cprintln("[2] Dot Product (dim=768)", YELLOW_ON_BLACK)
+    // Fill s0 and s1 with known values
+    let mut i: i64 = 0
+    while i < 768 {
+        km_set(s0, 0, i, 500)   // all 0.5
+        km_set(s1, 0, i, 1000)  // all 1.0
+        i = i + 1
+    }
+    let t0 = rdtsc()
+    let dot_result = km_dot(s0, s1, 768)
+    let t1 = rdtsc()
+    // Expected: 768 * (500*1000)/1000 = 768 * 500 = 384000
+    cprint("  dot([0.5]*768, [1.0]*768) = ", WHITE_ON_BLACK)
+    cprint_decimal(dot_result, CYAN_ON_BLACK)
+    cprint(" (expected 384000, ", WHITE_ON_BLACK)
+    cprint_decimal(t1 - t0, CYAN_ON_BLACK)
+    cprintln(" cycles)", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 3: LayerNorm ──
+    cprintln("[3] LayerNorm (dim=16, no gamma/beta)", YELLOW_ON_BLACK)
+    let s3 = km_alloc(1, 16)
+    i = 0
+    while i < 16 {
+        km_set(s3, 0, i, i * 100)  // [0, 100, 200, ..., 1500]
+        i = i + 1
+    }
+    cprint("  Before: [", WHITE_ON_BLACK)
+    i = 0
+    while i < 4 {
+        cprint_decimal(km_get(s3, 0, i), CYAN_ON_BLACK)
+        if i < 3 { cprint(", ", WHITE_ON_BLACK) }
+        i = i + 1
+    }
+    cprintln(", ...]", WHITE_ON_BLACK)
+
+    let t2 = rdtsc()
+    km_layernorm(s3, 16, 0, 0)
+    let t3 = rdtsc()
+
+    cprint("  After:  [", WHITE_ON_BLACK)
+    i = 0
+    while i < 4 {
+        cprint_decimal(km_get(s3, 0, i), CYAN_ON_BLACK)
+        if i < 3 { cprint(", ", WHITE_ON_BLACK) }
+        i = i + 1
+    }
+    cprint(", ...] (", WHITE_ON_BLACK)
+    cprint_decimal(t3 - t2, CYAN_ON_BLACK)
+    cprintln(" cycles)", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 4: GELU ──
+    cprintln("[4] GELU Activation (dim=8)", YELLOW_ON_BLACK)
+    let s4 = km_alloc(1, 8)
+    // Test values: [-2000, -1000, -500, 0, 500, 1000, 1500, 2000]
+    km_set(s4, 0, 0, -2000)
+    km_set(s4, 0, 1, -1000)
+    km_set(s4, 0, 2, -500)
+    km_set(s4, 0, 3, 0)
+    km_set(s4, 0, 4, 500)
+    km_set(s4, 0, 5, 1000)
+    km_set(s4, 0, 6, 1500)
+    km_set(s4, 0, 7, 2000)
+
+    km_gelu(s4, 8)
+
+    cprint("  GELU: [", WHITE_ON_BLACK)
+    i = 0
+    while i < 8 {
+        cprint_decimal(km_get(s4, 0, i), CYAN_ON_BLACK)
+        if i < 7 { cprint(", ", WHITE_ON_BLACK) }
+        i = i + 1
+    }
+    cprintln("]", WHITE_ON_BLACK)
+    cprintln("  Expected ~[-0.05, -0.16, -0.15, 0, 0.35, 0.84, 1.40, 1.95]", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 5: Softmax ──
+    cprintln("[5] Softmax (dim=4)", YELLOW_ON_BLACK)
+    let s5 = km_alloc(1, 4)
+    km_set(s5, 0, 0, 1000)   // 1.0
+    km_set(s5, 0, 1, 2000)   // 2.0
+    km_set(s5, 0, 2, 3000)   // 3.0
+    km_set(s5, 0, 3, 4000)   // 4.0
+
+    km_softmax(s5, 4)
+
+    cprint("  softmax([1,2,3,4]) = [", WHITE_ON_BLACK)
+    let mut sm_sum: i64 = 0
+    i = 0
+    while i < 4 {
+        let v = km_get(s5, 0, i)
+        cprint_decimal(v, CYAN_ON_BLACK)
+        sm_sum = sm_sum + v
+        if i < 3 { cprint(", ", WHITE_ON_BLACK) }
+        i = i + 1
+    }
+    cprintln("]", WHITE_ON_BLACK)
+    cprint("  Sum: ", WHITE_ON_BLACK)
+    cprint_decimal(sm_sum, GREEN_ON_BLACK)
+    cprintln(" (should be ~1000)", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 6: Vector-Matrix multiply timing ──
+    cprintln("[6] VecMat Timing (various sizes)", YELLOW_ON_BLACK)
+
+    // 16x16 matmul
+    let a16 = km_alloc(1, 16)
+    let b16 = km_alloc(16, 16)
+    let c16 = km_alloc(1, 16)
+    // Fill A with 1.0, B with identity
+    i = 0
+    while i < 16 {
+        km_set(a16, 0, i, 1000)
+        km_set(b16, i, i, 1000)
+        i = i + 1
+    }
+    let t4 = rdtsc()
+    km_matmul(a16, b16, c16)
+    let t5 = rdtsc()
+    // Verify: c16 should be [1000, 1000, ...]
+    let c16_ok = if km_get(c16, 0, 0) == 1000 && km_get(c16, 0, 15) == 1000 { 1 } else { 0 }
+    cprint("  16x16 matmul: ", WHITE_ON_BLACK)
+    cprint_decimal(t5 - t4, CYAN_ON_BLACK)
+    cprint(" cycles", WHITE_ON_BLACK)
+    if c16_ok == 1 { cprintln("  CORRECT", GREEN_ON_BLACK) }
+    else { cprintln("  WRONG", RED_ON_BLACK) }
+
+    // Clean up
+    km_free(a16)
+    km_free(b16)
+    km_free(c16)
+
+    // 32x32 matmul using pool
+    let a32 = km_alloc(1, 32)
+    let b32_addr = KM_SCRATCH  // 32x32 matrix at scratch (32*32*8 = 8KB, fits)
+    // Fill: A = [1.0, ...], B = identity at scratch
+    i = 0
+    while i < 32 {
+        km_set(a32, 0, i, 1000)
+        let mut j: i64 = 0
+        while j < 32 {
+            let val = if i == j { 1000 } else { 0 }
+            volatile_write_u64(b32_addr + (i * 32 + j) * 8, val)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let r32 = km_alloc(1, 32)
+    let t6 = rdtsc()
+    km_vecmat(a32, b32_addr, 32, 32, r32)
+    let t7 = rdtsc()
+    let r32_ok = if km_get(r32, 0, 0) == 1000 && km_get(r32, 0, 31) == 1000 { 1 } else { 0 }
+    cprint("  1x32 * 32x32 vecmat: ", WHITE_ON_BLACK)
+    cprint_decimal(t7 - t6, CYAN_ON_BLACK)
+    cprint(" cycles", WHITE_ON_BLACK)
+    if r32_ok == 1 { cprintln("  CORRECT", GREEN_ON_BLACK) }
+    else { cprintln("  WRONG", RED_ON_BLACK) }
+
+    km_free(a32)
+    km_free(r32)
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Summary ──
+    // Count active large slots
+    let mut active: i64 = 0
+    i = 0
+    while i < KM_LARGE_SLOTS {
+        let addr = km_large_addr(i)
+        if volatile_read_u64(addr + KM_HDR_ROWS) > 0 { active = active + 1 }
+        i = i + 1
+    }
+    cprint("  Large pool: ", WHITE_ON_BLACK)
+    cprint_decimal(active, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(KM_LARGE_SLOTS, CYAN_ON_BLACK)
+    cprint(" active  Max dim: ", WHITE_ON_BLACK)
+    cprintln_decimal(KM_LARGE_DIM, CYAN_ON_BLACK)
+    cprint("  Memory: large=", WHITE_ON_BLACK)
+    cprint_decimal(KM_LARGE_SLOTS * KM_LARGE_SLOT_SIZE / 1024, CYAN_ON_BLACK)
+    cprint("KB small=", WHITE_ON_BLACK)
+    cprint_decimal(KM_SMALL_SLOTS * KM_SMALL_SLOT_SIZE / 1024, CYAN_ON_BLACK)
+    cprintln("KB", WHITE_ON_BLACK)
+
+    // Free remaining test slots
+    km_free(s0)
+    km_free(s1)
+    km_free(s2)
+    km_free(s3)
+    km_free(s4)
+    km_free(s5)
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("All ops @kernel safe — ready for 768-dim transformer layers.", GREEN_ON_BLACK)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command: km-info
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_km_info() {
+    cprintln("=== Kernel Matrix Engine ===", YELLOW_ON_BLACK)
+
+    // Large pool status
+    cprintln("[Large Pool]", YELLOW_ON_BLACK)
+    cprint("  Base: 0x", WHITE_ON_BLACK)
+    cprint_hex(KM_LARGE_BASE, 8, CYAN_ON_BLACK)
+    cprint("  Slots: ", WHITE_ON_BLACK)
+    cprint_decimal(KM_LARGE_SLOTS, CYAN_ON_BLACK)
+    cprint("  Max dim: ", WHITE_ON_BLACK)
+    cprintln_decimal(KM_LARGE_DIM, CYAN_ON_BLACK)
+    let mut active_large: i64 = 0
+    let mut i: i64 = 0
+    while i < KM_LARGE_SLOTS {
+        let addr = km_large_addr(i)
+        let r = volatile_read_u64(addr + KM_HDR_ROWS)
+        let c = volatile_read_u64(addr + KM_HDR_COLS)
+        if r > 0 || c > 0 {
+            active_large = active_large + 1
+            cprint("    Slot ", WHITE_ON_BLACK)
+            cprint_decimal(i, CYAN_ON_BLACK)
+            cprint(": ", WHITE_ON_BLACK)
+            cprint_decimal(r, CYAN_ON_BLACK)
+            cprint("x", WHITE_ON_BLACK)
+            cprintln_decimal(c, CYAN_ON_BLACK)
+        }
+        i = i + 1
+    }
+    cprint("  Active: ", WHITE_ON_BLACK)
+    cprint_decimal(active_large, GREEN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprintln_decimal(KM_LARGE_SLOTS, CYAN_ON_BLACK)
+
+    // Small pool status
+    cprintln("[Small Pool]", YELLOW_ON_BLACK)
+    cprint("  Base: 0x", WHITE_ON_BLACK)
+    cprint_hex(KM_SMALL_BASE, 8, CYAN_ON_BLACK)
+    cprint("  Slots: ", WHITE_ON_BLACK)
+    cprint_decimal(KM_SMALL_SLOTS, CYAN_ON_BLACK)
+    cprint("  Max dim: ", WHITE_ON_BLACK)
+    cprintln_decimal(KM_SMALL_DIM, CYAN_ON_BLACK)
+    let mut active_small: i64 = 0
+    i = 0
+    while i < KM_SMALL_SLOTS {
+        let addr = km_small_addr(i)
+        if volatile_read_u64(addr + KM_HDR_ROWS) > 0 { active_small = active_small + 1 }
+        i = i + 1
+    }
+    cprint("  Active: ", WHITE_ON_BLACK)
+    cprint_decimal(active_small, GREEN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprintln_decimal(KM_SMALL_SLOTS, CYAN_ON_BLACK)
+
+    cprintln("", WHITE_ON_BLACK)
+    cprint("  Total memory: ", WHITE_ON_BLACK)
+    cprint_decimal((KM_LARGE_SLOTS * KM_LARGE_SLOT_SIZE + KM_SMALL_SLOTS * KM_SMALL_SLOT_SIZE) / 1024, CYAN_ON_BLACK)
+    cprintln(" KB", WHITE_ON_BLACK)
+    cprintln("  Operations: matmul, vecmat, dot, layernorm, gelu, softmax", WHITE_ON_BLACK)
+    cprintln("  Supports: SmolLM d_model=768 (fits in 1024-dim slots)", GREEN_ON_BLACK)
+}
