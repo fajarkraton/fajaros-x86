@@ -1241,19 +1241,32 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let q_dim = n_heads * d_head
     let kv_d = n_kv * d_head
 
-    // Load layer weights from NVMe if needed
-    if mdl_stream_current_layer() != layer {
-        mdl_stream_load_layer(layer)
+    // Get weight addresses (RAM-resident or NVMe streaming)
+    let ram_mode = mdl_ram_active()
+    let mut qkv_addr: i64 = 0
+    let mut ffn_addr: i64 = 0
+    let mut norm_addr: i64 = 0
+    let mut cb_addr: i64 = 0
+
+    if ram_mode == 1 {
+        // RAM-resident: direct memory access (no NVMe I/O)
+        qkv_addr = mdl_ram_layer_qkv(layer)
+        ffn_addr = mdl_ram_layer_ffn(layer)
+        norm_addr = mdl_ram_layer_norm(layer)
+        cb_addr = mdl_ram_layer_codebook(layer)
+    } else {
+        // Streaming: load from NVMe
+        if mdl_stream_current_layer() != layer {
+            mdl_stream_load_layer(layer)
+        }
+        qkv_addr = mdl_stream_qkv_addr()
+        ffn_addr = mdl_stream_ffn_addr()
+        norm_addr = mdl_stream_norm_addr()
+        cb_addr = mdl_stream_codebook_addr()
     }
 
-    // Streaming weight addresses
-    let qkv_addr = mdl_stream_qkv_addr()
-    let ffn_addr = mdl_stream_ffn_addr()
-    let norm_addr = mdl_stream_norm_addr()
-    let cb_addr = mdl_stream_codebook_addr()
-
-    // Copy per-layer codebook to MDL_CODEBOOK_BASE (used by embed lookup + LM head)
-    let cb_size = (1 << bits) * 8  // 2-bit: 4 centroids × 8 bytes = 32 bytes
+    // Copy per-layer codebook to MDL_CODEBOOK_BASE
+    let cb_size = (1 << bits) * 8
     mdl_memcpy(MDL_CODEBOOK_BASE, cb_addr, cb_size)
 
     // === Pre-attention RMSNorm ===
@@ -1323,13 +1336,16 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let n_layers = mdl_get_n_layers()
 
     // Pre-load layer 0 codebook for embedding dequantization
-    // (codebook at MDL_CODEBOOK_BASE is used by embed_lookup_raw)
-    if mdl_stream_current_layer() != 0 {
-        mdl_stream_load_layer(0)
-    }
     let bits = mdl_get_quant_bits()
     let cb_size = (1 << bits) * 8
-    mdl_memcpy(MDL_CODEBOOK_BASE, mdl_stream_codebook_addr(), cb_size)
+    if mdl_ram_active() == 1 {
+        mdl_memcpy(MDL_CODEBOOK_BASE, mdl_ram_layer_codebook(0), cb_size)
+    } else {
+        if mdl_stream_current_layer() != 0 {
+            mdl_stream_load_layer(0)
+        }
+        mdl_memcpy(MDL_CODEBOOK_BASE, mdl_stream_codebook_addr(), cb_size)
+    }
 
     // Step 1: Embedding lookup → STFM_X (raw address, supports d > 1024)
     mdl_stream_embed_lookup_raw(token_id, STFM_X)
@@ -1347,8 +1363,12 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
         km_rmsnorm(STFM_X, d_model, STREAM_FINAL_NORM)
     }
 
-    // Step 3: LM head argmax (streamed from NVMe, 1 MB chunks)
-    let next_token = mdl_stream_lmhead_argmax(STFM_X)
+    // Step 3: LM head argmax
+    let next_token = if mdl_ram_active() == 1 {
+        mdl_ram_lmhead_argmax(STFM_X)  // RAM: direct memory (fast)
+    } else {
+        mdl_stream_lmhead_argmax(STFM_X)  // NVMe: 1 MB chunks (slow)
+    }
 
     // Update state
     volatile_write_u64(TFM_STATE + TFM_ST_LAST_TOKEN, next_token)

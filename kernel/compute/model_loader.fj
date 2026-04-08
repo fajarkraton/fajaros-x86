@@ -1042,6 +1042,13 @@ const STREAM_LMHEAD_BUF: i64 = 0xD400000    // 212 MB mark
 const STREAM_LMHEAD_CHUNK: i64 = 0x100000   // 1 MB per LM head chunk
 const STREAM_FINAL_NORM: i64 = 0xD530000    // Final RMSNorm gamma (d_model × 8 bytes)
 
+// RAM-resident mode: load ALL weights to RAM (no NVMe per-token)
+const RAM_LAYERS_BASE: i64 = 0x10000000    // 256 MB — 26 layers contiguous
+const RAM_LMHEAD_BASE: i64 = 0x1AF00000   // ~431 MB — LM head (adjusted at load time)
+const MDL_RAM_STATE: i64 = 0xC004E0       // RAM-resident state (16 bytes)
+const MDL_RAM_ACTIVE: i64 = 0             // offset: 1 if RAM mode active
+const MDL_RAM_LMHEAD: i64 = 8             // offset: actual LM head address in RAM
+
 // State extensions (at MDL_STATE_BASE + offset)
 const MDL_ST_STREAM_LAYER: i64 = 48  // Current streaming layer (-1 = none)
 const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
@@ -1434,6 +1441,190 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     }
 
     best_token
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RAM-Resident Mode (load ALL weights to RAM — 397x faster)
+// ═══════════════════════════════════════════════════════════════
+
+// Check if RAM-resident mode is active
+@kernel fn mdl_ram_active() -> i64 {
+    volatile_read_u64(MDL_RAM_STATE + MDL_RAM_ACTIVE)
+}
+
+// Load entire model from NVMe into RAM. After this, inference uses direct
+// memory access instead of per-layer NVMe reads.
+// Layout: layers at RAM_LAYERS_BASE (256 MB), LM head after layers.
+// Embedding already at STREAM_EMBED_BASE (loaded by embed-load).
+// Returns: 0=success, negative=error
+@kernel fn mdl_ram_load_all() -> i64 {
+    if mdl_is_loaded() != 1 { return -1 }
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    if src_type != 2 { return -6 }
+
+    let n_layers = mdl_get_n_layers()
+    let layer0_off = mdl_get_layer0_offset()
+    let lmhead_off = mdl_get_lmhead_offset()
+    let block_size = mdl_layer_block_size()
+    let total_layer_bytes = n_layers * block_size
+    let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+
+    // Calculate LM head size and actual address
+    let total_size = mdl_get_total_size()
+    let lmhead_size = total_size - lmhead_off
+    let actual_lmhead_addr = RAM_LAYERS_BASE + total_layer_bytes
+
+    // Total to load: all layers + LM head
+    let total_load = total_layer_bytes + lmhead_size
+
+    cprint("Loading ", WHITE_ON_BLACK)
+    mdl_print_size(total_load)
+    cprintln(" to RAM...", WHITE_ON_BLACK)
+
+    // Load all layers contiguously
+    cprint("  Layers: [", WHITE_ON_BLACK)
+    let layer_lba = src_lba + layer0_off / 512
+    let layer_intra = layer0_off % 512
+    let layer_sectors = (total_layer_bytes + layer_intra + 511) / 512
+    let mut sect_done: i64 = 0
+    let mut bytes_written: i64 = 0
+    let mut last_dot: i64 = -1
+
+    while sect_done < layer_sectors {
+        let remaining = layer_sectors - sect_done
+        let read_count = if remaining > 128 { 128 } else { remaining }
+        let rc = nvme_read_sectors(layer_lba + sect_done, read_count, NVME_DMA)
+        if rc != 0 { return -3 }
+        let copy_src = if sect_done == 0 { NVME_DMA + layer_intra } else { NVME_DMA }
+        let copy_raw = if sect_done == 0 { read_count * 512 - layer_intra } else { read_count * 512 }
+        let copy_len = if bytes_written + copy_raw > total_layer_bytes { total_layer_bytes - bytes_written } else { copy_raw }
+        mdl_memcpy(RAM_LAYERS_BASE + bytes_written, copy_src, copy_len)
+        bytes_written = bytes_written + copy_len
+        sect_done = sect_done + read_count
+        let pct = sect_done * 10 / layer_sectors
+        if pct > last_dot { console_putchar(35, GREEN_ON_BLACK); last_dot = pct }
+    }
+    cprintln("]", WHITE_ON_BLACK)
+
+    // Load LM head
+    cprint("  LM head: [", WHITE_ON_BLACK)
+    let lm_lba = src_lba + lmhead_off / 512
+    let lm_intra = lmhead_off % 512
+    let lm_sectors = (lmhead_size + lm_intra + 511) / 512
+    sect_done = 0
+    bytes_written = 0
+    last_dot = -1
+
+    while sect_done < lm_sectors {
+        let remaining = lm_sectors - sect_done
+        let read_count = if remaining > 128 { 128 } else { remaining }
+        let rc = nvme_read_sectors(lm_lba + sect_done, read_count, NVME_DMA)
+        if rc != 0 { return -3 }
+        let copy_src = if sect_done == 0 { NVME_DMA + lm_intra } else { NVME_DMA }
+        let copy_raw = if sect_done == 0 { read_count * 512 - lm_intra } else { read_count * 512 }
+        let copy_len = if bytes_written + copy_raw > lmhead_size { lmhead_size - bytes_written } else { copy_raw }
+        mdl_memcpy(actual_lmhead_addr + bytes_written, copy_src, copy_len)
+        bytes_written = bytes_written + copy_len
+        sect_done = sect_done + read_count
+        let pct = sect_done * 10 / lm_sectors
+        if pct > last_dot { console_putchar(35, GREEN_ON_BLACK); last_dot = pct }
+    }
+    cprintln("]", WHITE_ON_BLACK)
+
+    // Activate RAM-resident mode
+    volatile_write_u64(MDL_RAM_STATE + MDL_RAM_ACTIVE, 1)
+    volatile_write_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD, actual_lmhead_addr)
+    0
+}
+
+// Get layer weight base address in RAM (layer header skipped)
+@kernel fn mdl_ram_layer_addr(layer_n: i64) -> i64 {
+    RAM_LAYERS_BASE + layer_n * mdl_layer_block_size() + FJM_LAYER_HDR_SIZE
+}
+
+// Get QKV weight address for RAM-resident layer
+@kernel fn mdl_ram_layer_qkv(layer_n: i64) -> i64 {
+    mdl_ram_layer_addr(layer_n)
+}
+
+// Get FFN weight address for RAM-resident layer
+@kernel fn mdl_ram_layer_ffn(layer_n: i64) -> i64 {
+    mdl_ram_layer_addr(layer_n) + mdl_stream_qkv_total()
+}
+
+// Get norm params address for RAM-resident layer
+@kernel fn mdl_ram_layer_norm(layer_n: i64) -> i64 {
+    mdl_ram_layer_addr(layer_n) + mdl_stream_qkv_total() + mdl_stream_ffn_total()
+}
+
+// Get codebook address for RAM-resident layer
+@kernel fn mdl_ram_layer_codebook(layer_n: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    let norm_size = 2 * d_model * 8
+    mdl_ram_layer_norm(layer_n) + norm_size
+}
+
+// RAM-resident LM head argmax (direct memory access, no NVMe)
+@kernel fn mdl_ram_lmhead_argmax(x_addr: i64) -> i64 {
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let bits = mdl_get_quant_bits()
+    let lmhead_addr = volatile_read_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD)
+    let cb_addr = MDL_LMHEAD_CB
+
+    let row_bytes = d_model * bits / 8
+    let elems_per_byte = 8 / bits
+    let mask = (1 << bits) - 1
+
+    let mut best_token: i64 = 0
+    let mut best_score: i64 = -999999999
+    let mut v: i64 = 0
+
+    while v < vocab_size {
+        let row_addr = lmhead_addr + v * row_bytes
+        let mut sum: i64 = 0
+        let mut j: i64 = 0
+        while j < d_model {
+            let x_val = volatile_read_u64(x_addr + j * 8)
+            let byte_idx = j / elems_per_byte
+            let bit_off = (j % elems_per_byte) * bits
+            let raw = volatile_read_u8(row_addr + byte_idx)
+            let idx = (raw >> bit_off) & mask
+            let w = volatile_read_u64(cb_addr + idx * 8)
+            sum = sum + (x_val * w) / 1000
+            j = j + 1
+        }
+        if sum > best_score {
+            best_score = sum
+            best_token = v
+        }
+        v = v + 1
+    }
+    best_token
+}
+
+// Shell command: ram-load
+@kernel fn cmd_ram_load() {
+    if mdl_is_loaded() != 1 {
+        cprintln("No model loaded. Use: model-load nvme 0", YELLOW_ON_BLACK)
+        return
+    }
+    if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 {
+        cprintln("Embedding not loaded. Use: embed-load first", YELLOW_ON_BLACK)
+        return
+    }
+
+    let rc = mdl_ram_load_all()
+    if rc == 0 {
+        cprint("[OK] RAM-resident mode active (", GREEN_ON_BLACK)
+        let total = mdl_get_total_size() - mdl_get_embed_offset()
+        mdl_print_size(total)
+        cprintln(" in RAM)", GREEN_ON_BLACK)
+        cprintln("  Inference uses direct memory — no NVMe per token", GREEN_ON_BLACK)
+    } else {
+        cprint("[ERR] RAM load failed: ", RED_ON_BLACK)
+        mdl_print_error(rc)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════

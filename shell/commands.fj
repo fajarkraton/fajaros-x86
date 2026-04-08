@@ -176,7 +176,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  tensor mnist bench fib compute cbench", WHITE_ON_BLACK)
     cprintln("  quant quant-bench quant-info classify", WHITE_ON_BLACK)
     cprintln("  km-bench km-info model-load model-info", WHITE_ON_BLACK)
-    cprintln("  embed-load layer-load weight-status", WHITE_ON_BLACK)
+    cprintln("  embed-load layer-load ram-load weight-status", WHITE_ON_BLACK)
     cprintln("  tokenize tok-info tok-load tok-reset", WHITE_ON_BLACK)
     cprintln("  infer ask gen tfm-info", WHITE_ON_BLACK)
     cprintln("  sched-mode sched-info", WHITE_ON_BLACK)
@@ -3165,6 +3165,9 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
     // layer-load — l(108) a(97) y(121) e(101) r(114) -(45) l(108) o(111) a(97) d(100) — len>=10
     if handled == 0 && len >= 10 && volatile_read_u8(0x6F800) == 108 && volatile_read_u8(0x6F801) == 97 && volatile_read_u8(0x6F802) == 121 && volatile_read_u8(0x6F803) == 101 && volatile_read_u8(0x6F804) == 114 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 108 { cmd_layer_load(); handled = 1 }
+
+    // ram-load — r(114) a(97) m(109) -(45) l(108) o(111) a(97) d(100) — len=8
+    if handled == 0 && len == 8 && volatile_read_u8(0x6F800) == 114 && volatile_read_u8(0x6F801) == 97 && volatile_read_u8(0x6F802) == 109 && volatile_read_u8(0x6F803) == 45 && volatile_read_u8(0x6F804) == 108 { cmd_ram_load(); handled = 1 }
 
     // weight-status — w(119) e(101) i(105) g(103) h(104) t(116) -(45) s(115) — len=13
     if handled == 0 && len == 13 && volatile_read_u8(0x6F800) == 119 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 105 && volatile_read_u8(0x6F803) == 103 && volatile_read_u8(0x6F804) == 104 && volatile_read_u8(0x6F805) == 116 && volatile_read_u8(0x6F806) == 45 && volatile_read_u8(0x6F807) == 115 { cmd_weight_status(); handled = 1 }
