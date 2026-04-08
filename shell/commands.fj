@@ -2672,6 +2672,22 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 // exec / readelf shell commands
 // ═══════════════════════════════════════════════
 
+// Called by __sched_exit when user process exits and PID 0 is next.
+// Re-enters the shell polling loop (called with clean kernel stack).
+@kernel fn fj_exec_exit_handler() {
+    volatile_write_u64(0x6FE00, 0)
+    cmdbuf_clear()
+    cprint("nova> ", GREEN_ON_BLACK)
+    // Re-enter shell polling loop (same as kernel_main's main loop)
+    let mut running: i64 = 1
+    while running == 1 {
+        shell_poll_serial()
+        // GUI tick (if framebuffer active)
+        let gui_fb = fb_state_read(FB_MAPPED)
+        if gui_fb != 0 { anim_tick(16); anim_cleanup() }
+    }
+}
+
 @kernel fn cmd_exec() {
     // exec <file> — execute an ELF binary from ramfs, run in Ring 3
     let len = cmdbuf_len()
@@ -2701,10 +2717,11 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     let base = PROC_TABLE + pid * PROC_ENTRY_SIZE
     let entry = volatile_read(base + 24)
     let user_rsp = volatile_read(base + 32)
-    if user_rsp == 0 { let user_rsp2 = 0x3000000 - 16; iretq_to_user(entry, user_rsp2, 0x202) }
-    else { iretq_to_user(entry, user_rsp, 0x202) }
-    // SYS_EXIT returns here
-    volatile_write_u64(0x6FE00, 0)
+    let final_rsp = if user_rsp == 0 { 0x3000000 - 16 } else { user_rsp }
+    irq_disable()
+    iretq_to_user(entry, final_rsp, 0x202)
+    // NOTE: iretq_to_user does not return.
+    // SYS_EXIT → __sched_exit → fj_exec_exit_handler (re-enters shell loop)
 }
 
 @kernel fn cmd_spawn() {

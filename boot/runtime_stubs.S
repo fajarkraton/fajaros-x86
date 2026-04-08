@@ -534,19 +534,54 @@ __isr_32_timer:
 /* Called via jmp [0xA54010].  Marks process ZOMBIE, switches to next */
 .global __sched_exit
 __sched_exit:
-    /* Current PID → ZOMBIE */
+    /* Current PID → FREE (for reuse) */
     mov     rax, QWORD PTR [0x6FE00]
     mov     rcx, rax
     shl     rcx, 8                  /* pid * 256 */
     add     rcx, 0x890000           /* PROC_TABLE base */
-    mov     QWORD PTR [rcx], 4     /* PROC_STATE_ZOMBIE */
+    mov     QWORD PTR [rcx], 0     /* PROC_STATE_FREE */
 
-    /* sched_pick_next(current_pid) → next_pid */
-    mov     rdi, rax
-    call    sched_pick_next
-    /* rax = next_pid */
+    /* Set PID = 0 (kernel) */
+    mov     QWORD PTR [0x6FE00], 0
 
-    /* Activate next process */
+    /* Restore kernel page table (PML4 at 0x70000) */
+    mov     rax, 0x70000
+    mov     cr3, rax
+
+    /* Load kernel stack (top of PID 0's kernel stack area) */
+    /* KSTACK_BASE(0x900000) + (0+1)*KSTACK_SIZE(0x4000) = 0x904000 */
+    mov     rsp, 0x904000
+
+    /* Print "\nnova> " directly via serial */
+    mov     dx, 0x3F8
+    mov     al, 10
+    out     dx, al
+    mov     al, 110             /* 'n' */
+    out     dx, al
+    mov     al, 111             /* 'o' */
+    out     dx, al
+    mov     al, 118             /* 'v' */
+    out     dx, al
+    mov     al, 97              /* 'a' */
+    out     dx, al
+    mov     al, 62              /* '>' */
+    out     dx, al
+    mov     al, 32              /* ' ' */
+    out     dx, al
+
+    /* Reset cmdbuf: clear len at 0x6F7F8 */
+    mov     QWORD PTR [0x6F7F8], 0
+
+    /* Re-enable interrupts */
+    sti
+
+    /* Call Fajar Lang shell loop handler (never returns) */
+    call    fj_exec_exit_handler
+    cli
+    hlt
+
+.Lse_switch_to_process:
+    /* Activate next process (PID > 0) */
     mov     QWORD PTR [0x6FE00], rax
     mov     rcx, rax
     shl     rcx, 8

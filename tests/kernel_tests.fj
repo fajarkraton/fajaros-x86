@@ -75,18 +75,18 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 }
 
 @kernel fn test_pass(name: str) {
-    cprint("  [PASS] ", GREEN_ON_BLACK)
-    cprintln(name, WHITE_ON_BLACK)
-    // Also emit clean serial-only line for test harness
-    serial_print_str("RESULT:PASS:")
+    // Write "OK:" byte-by-byte to avoid LLVM string literal issues
+    serial_putchar(79)   // 'O'
+    serial_putchar(75)   // 'K'
+    serial_putchar(58)   // ':'
     serial_print_str(name)
     serial_putchar(10)
 }
 @kernel fn test_fail(name: str) {
-    cprint("  [FAIL] ", RED_ON_BLACK)
-    cprintln(name, WHITE_ON_BLACK)
-    // Also emit clean serial-only line for test harness
-    serial_print_str("RESULT:FAIL:")
+    // Write "NG:" byte-by-byte
+    serial_putchar(78)   // 'N'
+    serial_putchar(71)   // 'G'
+    serial_putchar(58)   // ':'
     serial_print_str(name)
     serial_putchar(10)
 }
@@ -389,9 +389,12 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 
 @kernel fn run_test(result: i64, name: str, p: i64, f: i64) -> i64 {
     // Returns packed: high 32 = new_passed, low 32 = new_failed
-    if result == 1 { test_pass(name); return (p + 1) * 0x100000000 + f }
-    test_fail(name)
-    p * 0x100000000 + f + 1
+    let pass = result == 1
+    let mut np = p
+    let mut nf = f
+    if pass { test_pass(name); np = p + 1 }
+    if pass == false { test_fail(name); nf = f + 1 }
+    np * 0x100000000 + nf
 }
 
 @kernel fn cmd_test_all() {
