@@ -1,0 +1,885 @@
+// FajarOS — Model Weight Loader (Phase 3)
+// Loads quantized LLM weights from RamFS or NVMe into kernel memory.
+// Supports .fjm (Fajar Model) binary format.
+//
+// Target: SmolLM-135M at 2-bit (34 MB) — loaded layer-by-layer.
+// Smaller test models can be loaded entirely from RamFS.
+//
+// All operations: @kernel safe — no heap, no float.
+// Paper: "FajarQuant: Hardware-Aware Adaptive Vector Quantization"
+//        Putranto (2026), PrimeCore.id
+//
+// Memory layout for loaded model:
+//   0xC00000   MODEL_HDR        .fjm header (64 bytes)
+//   0xC00040   MODEL_STATE      Loader state (64 bytes)
+//   0xC00080   MODEL_CODEBOOKS  Per-layer codebooks (12 layers x 64B = 768B)
+//   0xC00400   MODEL_LN_PARAMS  LayerNorm gamma/beta (12 layers x 2 x 768 x 8B)
+//   0xC30000   MODEL_EMBED      Embedding table (quantized)
+//   0x1200000  MODEL_LAYERS     Layer weights (quantized, layer-by-layer)
+//   0x4000000  MODEL_KV_CACHE   Quantized KV cache (hierarchical)
+
+// ═══════════════════════════════════════════════════════════════
+// .fjm Binary Format Constants
+// ═══════════════════════════════════════════════════════════════
+
+// Header (64 bytes, all i64 little-endian)
+const FJM_MAGIC: i64 = 0x314D4A46   // "FJM1" in little-endian
+const FJM_VERSION: i64 = 1
+
+// Header field offsets (each 4 bytes = i32, but we read as i64 pairs)
+const FJM_OFF_MAGIC: i64 = 0        // 4B: "FJM1"
+const FJM_OFF_VERSION: i64 = 4      // 4B: format version
+const FJM_OFF_MODEL_TYPE: i64 = 8   // 4B: 1=SmolLM-135M, 2=TinyLlama
+const FJM_OFF_N_LAYERS: i64 = 12    // 4B: number of transformer layers
+const FJM_OFF_D_MODEL: i64 = 16     // 4B: model dimension
+const FJM_OFF_N_HEADS: i64 = 20     // 4B: number of attention heads
+const FJM_OFF_D_HEAD: i64 = 24      // 4B: head dimension (d_model / n_heads)
+const FJM_OFF_VOCAB_SIZE: i64 = 28  // 4B: vocabulary size
+const FJM_OFF_QUANT_BITS: i64 = 32  // 4B: quantization bit width
+const FJM_OFF_TOTAL_SIZE: i64 = 36  // 4B: total file size in bytes
+const FJM_OFF_EMBED_OFF: i64 = 40   // 4B: byte offset to embedding table
+const FJM_OFF_LAYER0_OFF: i64 = 44  // 4B: byte offset to first layer block
+const FJM_OFF_LMHEAD_OFF: i64 = 48  // 4B: byte offset to LM head weights
+const FJM_OFF_RESERVED: i64 = 52    // 12B: reserved (zero)
+const FJM_HEADER_SIZE: i64 = 64
+
+// Per-layer block header (16 bytes before weight data)
+const FJM_LAYER_OFF_ID: i64 = 0       // 4B: layer index
+const FJM_LAYER_OFF_SIZE: i64 = 4     // 4B: total block size (including header)
+const FJM_LAYER_OFF_QKV_SIZE: i64 = 8 // 4B: QKV weight size in bytes
+const FJM_LAYER_OFF_FFN_SIZE: i64 = 12 // 4B: FFN weight size in bytes
+const FJM_LAYER_HDR_SIZE: i64 = 16
+
+// ═══════════════════════════════════════════════════════════════
+// Memory Layout for Loaded Model
+// ═══════════════════════════════════════════════════════════════
+
+const MDL_HDR_BASE: i64 = 0xC00000     // Parsed header copy (64 bytes)
+const MDL_STATE_BASE: i64 = 0xC00040   // Loader state
+const MDL_CODEBOOK_BASE: i64 = 0xC00080 // Per-layer codebooks
+const MDL_LN_BASE: i64 = 0xC00400     // LayerNorm parameters
+
+const MDL_EMBED_BASE: i64 = 0xC30000   // Embedding table start
+const MDL_LAYER_BASE: i64 = 0x1200000  // Layer weights start
+const MDL_KV_BASE: i64 = 0x4000000    // KV cache start
+
+// State offsets (at MDL_STATE_BASE)
+const MDL_ST_LOADED: i64 = 0        // 1 if model loaded successfully
+const MDL_ST_SRC_TYPE: i64 = 8      // 0=none, 1=ramfs, 2=nvme
+const MDL_ST_SRC_ADDR: i64 = 16     // Source address (ramfs data_ptr or nvme LBA)
+const MDL_ST_LAYERS_LOADED: i64 = 24 // Bitmask of loaded layers (bits 0-11)
+const MDL_ST_EMBED_LOADED: i64 = 32 // 1 if embedding table loaded
+const MDL_ST_LMHEAD_LOADED: i64 = 40 // 1 if LM head loaded
+
+// Maximum supported model size
+const MDL_MAX_LAYERS: i64 = 32
+const MDL_MAX_D_MODEL: i64 = 2048
+const MDL_MAX_VOCAB: i64 = 65536
+
+// Per-layer memory budget (how much space per layer at MDL_LAYER_BASE)
+// SmolLM-135M at 2-bit: QKV=768*3*768*2/8 = 442KB, FFN=768*3072*2*2/8 = 1.18MB
+// Total per layer ~1.6 MB, round up to 2 MB per layer slot
+const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
+
+// ═══════════════════════════════════════════════════════════════
+// Model Loader Init
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn mdl_init() {
+    // Clear loader state
+    let mut i: i64 = 0
+    while i < 48 {
+        volatile_write_u8(MDL_STATE_BASE + i, 0)
+        i = i + 1
+    }
+    // Clear header area
+    i = 0
+    while i < FJM_HEADER_SIZE {
+        volatile_write_u8(MDL_HDR_BASE + i, 0)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// .fjm Header Parsing
+// ═══════════════════════════════════════════════════════════════
+
+// Read a 32-bit little-endian integer from memory
+@kernel fn mdl_read_u32(addr: i64) -> i64 {
+    let b0 = volatile_read_u8(addr)
+    let b1 = volatile_read_u8(addr + 1)
+    let b2 = volatile_read_u8(addr + 2)
+    let b3 = volatile_read_u8(addr + 3)
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+// Write a 32-bit little-endian integer to memory
+@kernel fn mdl_write_u32(addr: i64, val: i64) {
+    volatile_write_u8(addr, val & 0xFF)
+    volatile_write_u8(addr + 1, (val >> 8) & 0xFF)
+    volatile_write_u8(addr + 2, (val >> 16) & 0xFF)
+    volatile_write_u8(addr + 3, (val >> 24) & 0xFF)
+}
+
+// Parse .fjm header from source address, store parsed values at MDL_HDR_BASE
+// Returns: 0=success, -1=bad magic, -2=bad version, -3=invalid params
+@kernel fn mdl_parse_header(src_addr: i64) -> i64 {
+    // Check magic: "FJM1" = 0x46, 0x4A, 0x4D, 0x31
+    let magic = mdl_read_u32(src_addr + FJM_OFF_MAGIC)
+    if magic != FJM_MAGIC {
+        return -1  // Bad magic
+    }
+
+    // Check version
+    let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
+    if version != FJM_VERSION {
+        return -2  // Unsupported version
+    }
+
+    // Read all header fields
+    let model_type = mdl_read_u32(src_addr + FJM_OFF_MODEL_TYPE)
+    let n_layers = mdl_read_u32(src_addr + FJM_OFF_N_LAYERS)
+    let d_model = mdl_read_u32(src_addr + FJM_OFF_D_MODEL)
+    let n_heads = mdl_read_u32(src_addr + FJM_OFF_N_HEADS)
+    let d_head = mdl_read_u32(src_addr + FJM_OFF_D_HEAD)
+    let vocab_size = mdl_read_u32(src_addr + FJM_OFF_VOCAB_SIZE)
+    let quant_bits = mdl_read_u32(src_addr + FJM_OFF_QUANT_BITS)
+    let total_size = mdl_read_u32(src_addr + FJM_OFF_TOTAL_SIZE)
+    let embed_off = mdl_read_u32(src_addr + FJM_OFF_EMBED_OFF)
+    let layer0_off = mdl_read_u32(src_addr + FJM_OFF_LAYER0_OFF)
+    let lmhead_off = mdl_read_u32(src_addr + FJM_OFF_LMHEAD_OFF)
+
+    // Validate parameters
+    if n_layers <= 0 || n_layers > MDL_MAX_LAYERS { return -3 }
+    if d_model <= 0 || d_model > MDL_MAX_D_MODEL { return -3 }
+    if n_heads <= 0 || n_heads > 64 { return -3 }
+    if vocab_size <= 0 || vocab_size > MDL_MAX_VOCAB { return -3 }
+    if quant_bits < 1 || quant_bits > 8 { return -3 }
+
+    // Copy validated header to MDL_HDR_BASE
+    let mut i: i64 = 0
+    while i < FJM_HEADER_SIZE {
+        volatile_write_u8(MDL_HDR_BASE + i, volatile_read_u8(src_addr + i))
+        i = i + 1
+    }
+
+    0  // Success
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Header Field Accessors (read from parsed header at MDL_HDR_BASE)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn mdl_get_model_type() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_MODEL_TYPE) }
+@kernel fn mdl_get_n_layers() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_N_LAYERS) }
+@kernel fn mdl_get_d_model() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_D_MODEL) }
+@kernel fn mdl_get_n_heads() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_N_HEADS) }
+@kernel fn mdl_get_d_head() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_D_HEAD) }
+@kernel fn mdl_get_vocab_size() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_VOCAB_SIZE) }
+@kernel fn mdl_get_quant_bits() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_QUANT_BITS) }
+@kernel fn mdl_get_total_size() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_TOTAL_SIZE) }
+@kernel fn mdl_get_embed_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_EMBED_OFF) }
+@kernel fn mdl_get_layer0_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LAYER0_OFF) }
+@kernel fn mdl_get_lmhead_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LMHEAD_OFF) }
+
+@kernel fn mdl_is_loaded() -> i64 {
+    volatile_read_u64(MDL_STATE_BASE + MDL_ST_LOADED)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Memory Copy (bulk copy for weight loading)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn mdl_memcpy(dst: i64, src: i64, len: i64) {
+    // Copy 8 bytes at a time where possible, then byte-by-byte remainder
+    let qwords = len / 8
+    let remain = len % 8
+    let mut i: i64 = 0
+    while i < qwords {
+        volatile_write_u64(dst + i * 8, volatile_read_u64(src + i * 8))
+        i = i + 1
+    }
+    let base = qwords * 8
+    i = 0
+    while i < remain {
+        volatile_write_u8(dst + base + i, volatile_read_u8(src + base + i))
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Load from RamFS
+// ═══════════════════════════════════════════════════════════════
+
+// Load .fjm model from a RamFS file by name (in cmdbuf at offset prefix_len)
+// Returns: 0=success, -1=file not found, -2..=parse errors
+@kernel fn mdl_load_from_ramfs(prefix_len: i64) -> i64 {
+    let file_idx = ramfs_find_buf(prefix_len)
+    if file_idx < 0 { return -1 }  // File not found
+
+    // Get file data address and size
+    let entry_addr = ramfs_entry_addr(file_idx)
+    let file_size = volatile_read(entry_addr + 32)
+    let data_ptr = volatile_read(entry_addr + 40)
+
+    if file_size < FJM_HEADER_SIZE { return -4 }  // Too small
+
+    // Parse header
+    let rc = mdl_parse_header(data_ptr)
+    if rc != 0 { return rc }
+
+    // Store source info
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE, 1)  // ramfs
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR, data_ptr)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_LOADED, 1)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_LAYERS_LOADED, 0)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 0)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_LMHEAD_LOADED, 0)
+
+    0
+}
+
+// Load .fjm model from NVMe disk starting at given LBA
+// Reads header first, then allocates frames for weight storage
+// Returns: 0=success, negative=error
+@kernel fn mdl_load_from_nvme(start_lba: i64) -> i64 {
+    // Read first sector (512 bytes) containing the header
+    let rc = nvme_read_sectors(start_lba, 1, NVME_DMA)
+    if rc != 0 { return -5 }  // NVMe read error
+
+    // Parse header from DMA buffer
+    let parse_rc = mdl_parse_header(NVME_DMA)
+    if parse_rc != 0 { return parse_rc }
+
+    // Store source info
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE, 2)  // nvme
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR, start_lba)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_LOADED, 1)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_LAYERS_LOADED, 0)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 0)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_LMHEAD_LOADED, 0)
+
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Layer Loading
+// ═══════════════════════════════════════════════════════════════
+
+// Calculate the source address of layer N's data
+@kernel fn mdl_layer_src_addr(layer_n: i64) -> i64 {
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    let src_base = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+    let layer0_off = mdl_get_layer0_offset()
+    let d_model = mdl_get_d_model()
+    let quant_bits = mdl_get_quant_bits()
+
+    // Calculate per-layer size in the .fjm file:
+    // QKV weight: d_model * 3 * d_model * quant_bits / 8
+    // FFN W1: d_model * 4 * d_model * quant_bits / 8
+    // FFN W2: 4 * d_model * d_model * quant_bits / 8
+    // LN params: 2 * d_model * 8 * 2 (gamma+beta for 2 LNs, full precision i64)
+    // Codebook: 2^quant_bits * 8
+    // Layer header: 16 bytes
+    let qkv_size = d_model * 3 * d_model * quant_bits / 8
+    let ffn1_size = d_model * 4 * d_model * quant_bits / 8
+    let ffn2_size = 4 * d_model * d_model * quant_bits / 8
+    let ln_size = 2 * d_model * 8 * 2  // 2 LayerNorms, gamma+beta, i64 each
+    let cb_size = (1 << quant_bits) * 8  // codebook centroids
+    let layer_file_size = FJM_LAYER_HDR_SIZE + qkv_size + ffn1_size + ffn2_size + ln_size + cb_size
+
+    if src_type == 1 {
+        // RamFS: direct memory address
+        src_base + layer0_off + layer_n * layer_file_size
+    } else {
+        // NVMe: return byte offset (caller converts to LBA)
+        layer0_off + layer_n * layer_file_size
+    }
+}
+
+// Load layer N weights from source into kernel memory at MDL_LAYER_BASE + N*slot
+// Returns: 0=success, -1=not loaded, -2=invalid layer, -3=read error
+@kernel fn mdl_load_layer(layer_n: i64) -> i64 {
+    if mdl_is_loaded() != 1 { return -1 }
+    let n_layers = mdl_get_n_layers()
+    if layer_n < 0 || layer_n >= n_layers { return -2 }
+
+    let d_model = mdl_get_d_model()
+    let quant_bits = mdl_get_quant_bits()
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+
+    // Calculate sizes
+    let qkv_size = d_model * 3 * d_model * quant_bits / 8
+    let ffn1_size = d_model * 4 * d_model * quant_bits / 8
+    let ffn2_size = 4 * d_model * d_model * quant_bits / 8
+    let ln_size = 2 * d_model * 8 * 2
+    let cb_size = (1 << quant_bits) * 8
+    let data_size = qkv_size + ffn1_size + ffn2_size + ln_size + cb_size
+
+    let dst_base = MDL_LAYER_BASE + layer_n * MDL_LAYER_SLOT_SIZE
+
+    if src_type == 1 {
+        // RamFS: direct memcpy
+        let src = mdl_layer_src_addr(layer_n)
+        // Skip layer header, copy weight data
+        mdl_memcpy(dst_base, src + FJM_LAYER_HDR_SIZE, data_size)
+    } else if src_type == 2 {
+        // NVMe: read sectors into destination
+        let byte_off = mdl_layer_src_addr(layer_n) + FJM_LAYER_HDR_SIZE
+        let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+        let lba = src_lba + byte_off / 512
+        let sectors = (data_size + 511) / 512
+
+        // Read in chunks via DMA buffer (DMA buffer is 64KB = 128 sectors)
+        let mut sect_done: i64 = 0
+        while sect_done < sectors {
+            let chunk = sectors - sect_done
+            let read_count = if chunk > 128 { 128 } else { chunk }
+            let rc = nvme_read_sectors(lba + sect_done, read_count, NVME_DMA)
+            if rc != 0 { return -3 }
+            mdl_memcpy(dst_base + sect_done * 512, NVME_DMA, read_count * 512)
+            sect_done = sect_done + read_count
+        }
+    } else {
+        return -1
+    }
+
+    // Extract LayerNorm params to dedicated area
+    let ln_dst = MDL_LN_BASE + layer_n * d_model * 8 * 4
+    let ln_src = dst_base + qkv_size + ffn1_size + ffn2_size
+    mdl_memcpy(ln_dst, ln_src, ln_size)
+
+    // Extract codebook to dedicated area
+    let cb_dst = MDL_CODEBOOK_BASE + layer_n * 64
+    let cb_src = dst_base + qkv_size + ffn1_size + ffn2_size + ln_size
+    let cb_actual = if cb_size > 64 { 64 } else { cb_size }
+    mdl_memcpy(cb_dst, cb_src, cb_actual)
+
+    // Mark layer as loaded in bitmask
+    let mask = volatile_read_u64(MDL_STATE_BASE + MDL_ST_LAYERS_LOADED)
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_LAYERS_LOADED, mask | (1 << layer_n))
+
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Embedding Table Loading
+// ═══════════════════════════════════════════════════════════════
+
+// Load embedding table from source into MDL_EMBED_BASE
+// Returns: 0=success, negative=error
+@kernel fn mdl_load_embed() -> i64 {
+    if mdl_is_loaded() != 1 { return -1 }
+
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let quant_bits = mdl_get_quant_bits()
+    let embed_off = mdl_get_embed_offset()
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+
+    // Embedding size: vocab_size * d_model * quant_bits / 8
+    let embed_size = vocab_size * d_model * quant_bits / 8
+
+    if src_type == 1 {
+        // RamFS
+        let src_base = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+        mdl_memcpy(MDL_EMBED_BASE, src_base + embed_off, embed_size)
+    } else if src_type == 2 {
+        // NVMe
+        let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+        let lba = src_lba + embed_off / 512
+        let sectors = (embed_size + 511) / 512
+        let mut sect_done: i64 = 0
+        while sect_done < sectors {
+            let chunk = sectors - sect_done
+            let read_count = if chunk > 128 { 128 } else { chunk }
+            let rc = nvme_read_sectors(lba + sect_done, read_count, NVME_DMA)
+            if rc != 0 { return -3 }
+            mdl_memcpy(MDL_EMBED_BASE + sect_done * 512, NVME_DMA, read_count * 512)
+            sect_done = sect_done + read_count
+        }
+    } else {
+        return -1
+    }
+
+    volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 1)
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Embedding Lookup
+// ═══════════════════════════════════════════════════════════════
+
+// Look up embedding vector for a token ID, dequantize into km_ large slot
+// Returns: slot index (>= 0) or -1 on error
+@kernel fn mdl_embed_lookup(token_id: i64, out_slot: i64) -> i64 {
+    if volatile_read_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED) != 1 { return -1 }
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let quant_bits = mdl_get_quant_bits()
+    if token_id < 0 || token_id >= vocab_size { return -2 }
+
+    // Calculate byte offset into embedding table
+    let bits_per_row = d_model * quant_bits
+    let bytes_per_row = bits_per_row / 8
+    let src = MDL_EMBED_BASE + token_id * bytes_per_row
+
+    // Dequantize into km_ large slot
+    // Each quantized element is quant_bits wide, maps to codebook centroid
+    let dst = km_large_addr(out_slot)
+    volatile_write_u64(dst + KM_HDR_ROWS, 1)
+    volatile_write_u64(dst + KM_HDR_COLS, d_model)
+    volatile_write_u64(dst + KM_HDR_BITS, quant_bits)
+
+    // For 2-bit: 4 elements per byte
+    // For 4-bit: 2 elements per byte
+    let elems_per_byte = 8 / quant_bits
+    let mask = (1 << quant_bits) - 1
+
+    let mut i: i64 = 0
+    while i < d_model {
+        let byte_idx = i / elems_per_byte
+        let bit_off = (i % elems_per_byte) * quant_bits
+        let raw_byte = volatile_read_u8(src + byte_idx)
+        let idx = (raw_byte >> bit_off) & mask
+
+        // Look up codebook centroid (layer 0 codebook, or global codebook)
+        let centroid = volatile_read_u64(MDL_CODEBOOK_BASE + idx * 8)
+        volatile_write_u64(dst + KM_DATA_OFF + i * 8, centroid)
+        i = i + 1
+    }
+
+    out_slot
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Weight Access (for transformer forward pass)
+// ═══════════════════════════════════════════════════════════════
+
+// Get the memory address of layer N's QKV weights (quantized)
+@kernel fn mdl_layer_qkv_addr(layer_n: i64) -> i64 {
+    MDL_LAYER_BASE + layer_n * MDL_LAYER_SLOT_SIZE
+}
+
+// Get the memory address of layer N's FFN W1 weights (quantized)
+@kernel fn mdl_layer_ffn1_addr(layer_n: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    let quant_bits = mdl_get_quant_bits()
+    let qkv_size = d_model * 3 * d_model * quant_bits / 8
+    MDL_LAYER_BASE + layer_n * MDL_LAYER_SLOT_SIZE + qkv_size
+}
+
+// Get the memory address of layer N's FFN W2 weights (quantized)
+@kernel fn mdl_layer_ffn2_addr(layer_n: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    let quant_bits = mdl_get_quant_bits()
+    let qkv_size = d_model * 3 * d_model * quant_bits / 8
+    let ffn1_size = d_model * 4 * d_model * quant_bits / 8
+    MDL_LAYER_BASE + layer_n * MDL_LAYER_SLOT_SIZE + qkv_size + ffn1_size
+}
+
+// Get LayerNorm gamma for layer N, norm index (0=pre-attn, 1=pre-ffn)
+@kernel fn mdl_layer_ln_gamma(layer_n: i64, norm_idx: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    MDL_LN_BASE + layer_n * d_model * 8 * 4 + norm_idx * d_model * 8 * 2
+}
+
+// Get LayerNorm beta for layer N, norm index
+@kernel fn mdl_layer_ln_beta(layer_n: i64, norm_idx: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    MDL_LN_BASE + layer_n * d_model * 8 * 4 + norm_idx * d_model * 8 * 2 + d_model * 8
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Test Model Generator (synthetic, for RamFS testing)
+// ═══════════════════════════════════════════════════════════════
+
+// Generate a tiny test .fjm model in RamFS for validation
+// Model: 2 layers, d=16, 2 heads, d_head=8, vocab=64, 2-bit
+// Total size: ~100 bytes — fits easily in RamFS
+@kernel fn mdl_create_test_model() {
+    // Calculate sizes
+    let n_layers: i64 = 2
+    let d_model: i64 = 16
+    let n_heads: i64 = 2
+    let d_head: i64 = 8
+    let vocab_size: i64 = 64
+    let quant_bits: i64 = 2
+
+    // Per-layer data size (quantized)
+    let qkv_size = d_model * 3 * d_model * quant_bits / 8    // 16*3*16*2/8 = 192
+    let ffn1_size = d_model * 4 * d_model * quant_bits / 8   // 16*4*16*2/8 = 256
+    let ffn2_size = 4 * d_model * d_model * quant_bits / 8   // 4*16*16*2/8 = 256
+    let ln_size = 2 * d_model * 8 * 2                        // 2*16*8*2 = 512
+    let cb_size = (1 << quant_bits) * 8                       // 4*8 = 32
+    let layer_data_size = FJM_LAYER_HDR_SIZE + qkv_size + ffn1_size + ffn2_size + ln_size + cb_size
+    // = 16 + 192 + 256 + 256 + 512 + 32 = 1264 per layer
+
+    // Embedding size
+    let embed_size = vocab_size * d_model * quant_bits / 8    // 64*16*2/8 = 256
+    // LM head size (same as embed)
+    let lmhead_size = embed_size
+
+    // Offsets
+    let embed_off = FJM_HEADER_SIZE                                  // 64
+    let layer0_off = embed_off + embed_size                          // 320
+    let lmhead_off = layer0_off + n_layers * layer_data_size         // 320 + 2*1264 = 2848
+    let total_size = lmhead_off + lmhead_size                        // 3104
+
+    // Write to a scratch buffer at 0xBF0000 (safe area before 0xC00000)
+    let buf: i64 = 0xBF0000
+
+    // Write header
+    mdl_write_u32(buf + FJM_OFF_MAGIC, FJM_MAGIC)
+    mdl_write_u32(buf + FJM_OFF_VERSION, FJM_VERSION)
+    mdl_write_u32(buf + FJM_OFF_MODEL_TYPE, 0)  // 0 = test model
+    mdl_write_u32(buf + FJM_OFF_N_LAYERS, n_layers)
+    mdl_write_u32(buf + FJM_OFF_D_MODEL, d_model)
+    mdl_write_u32(buf + FJM_OFF_N_HEADS, n_heads)
+    mdl_write_u32(buf + FJM_OFF_D_HEAD, d_head)
+    mdl_write_u32(buf + FJM_OFF_VOCAB_SIZE, vocab_size)
+    mdl_write_u32(buf + FJM_OFF_QUANT_BITS, quant_bits)
+    mdl_write_u32(buf + FJM_OFF_TOTAL_SIZE, total_size)
+    mdl_write_u32(buf + FJM_OFF_EMBED_OFF, embed_off)
+    mdl_write_u32(buf + FJM_OFF_LAYER0_OFF, layer0_off)
+    mdl_write_u32(buf + FJM_OFF_LMHEAD_OFF, lmhead_off)
+    // Zero reserved bytes
+    mdl_write_u32(buf + 52, 0)
+    mdl_write_u32(buf + 56, 0)
+    mdl_write_u32(buf + 60, 0)
+
+    // Fill embedding table with sequential pattern (quantized indices)
+    let mut i: i64 = 0
+    while i < embed_size {
+        // Alternating 2-bit patterns: 00 01 10 11 = 0x1B repeated
+        volatile_write_u8(buf + embed_off + i, 0x1B)
+        i = i + 1
+    }
+
+    // Fill layer data
+    let mut layer: i64 = 0
+    while layer < n_layers {
+        let layer_off = layer0_off + layer * layer_data_size
+
+        // Layer header
+        mdl_write_u32(buf + layer_off + FJM_LAYER_OFF_ID, layer)
+        mdl_write_u32(buf + layer_off + FJM_LAYER_OFF_SIZE, layer_data_size)
+        mdl_write_u32(buf + layer_off + FJM_LAYER_OFF_QKV_SIZE, qkv_size)
+        mdl_write_u32(buf + layer_off + FJM_LAYER_OFF_FFN_SIZE, ffn1_size + ffn2_size)
+
+        // Fill weights with pattern (all indices = 01 repeated = 0x55)
+        let weight_start = layer_off + FJM_LAYER_HDR_SIZE
+        let weight_size = qkv_size + ffn1_size + ffn2_size
+        i = 0
+        while i < weight_size {
+            volatile_write_u8(buf + weight_start + i, 0x55)
+            i = i + 1
+        }
+
+        // LayerNorm gamma = 1000 (x1000 fixed point for 1.0)
+        let ln_start = weight_start + weight_size
+        i = 0
+        while i < d_model * 2 {
+            volatile_write_u64(buf + ln_start + i * 8, 1000)
+            i = i + 1
+        }
+        // LayerNorm beta = 0
+        i = d_model * 2
+        while i < d_model * 4 {
+            volatile_write_u64(buf + ln_start + i * 8, 0)
+            i = i + 1
+        }
+
+        // Codebook: 4 centroids for 2-bit [-750, -250, 250, 750]
+        let cb_start = ln_start + ln_size
+        volatile_write_u64(buf + cb_start, -750)
+        volatile_write_u64(buf + cb_start + 8, -250)
+        volatile_write_u64(buf + cb_start + 16, 250)
+        volatile_write_u64(buf + cb_start + 24, 750)
+
+        layer = layer + 1
+    }
+
+    // Fill LM head with pattern
+    i = 0
+    while i < lmhead_size {
+        volatile_write_u8(buf + lmhead_off + i, 0xAA)
+        i = i + 1
+    }
+
+    // Write to RamFS
+    ramfs_write_at_addr("test.fjm", buf, total_size)
+}
+
+// Helper: write raw bytes from memory to ramfs by name
+@kernel fn ramfs_write_at_addr(name: str, data_addr: i64, dlen: i64) {
+    let mut idx = ramfs_find(name)
+    if idx == -1 { idx = ramfs_create_entry(name, 1) }
+    if idx == -1 { return }
+    ramfs_write_at(idx, data_addr, dlen)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+// model-load <file> — load .fjm model from RamFS
+// model-load nvme <lba> — load from NVMe at sector LBA
+@kernel fn cmd_model_load() {
+    let len = cmdbuf_len()
+
+    // Check for "model-load nvme <lba>"
+    // "model-load " = 11 chars
+    if len > 16 && volatile_read_u8(0x6F80B) == 110 && volatile_read_u8(0x6F80C) == 118 {
+        // Parse LBA after "model-load nvme "
+        let mut lba: i64 = 0
+        let mut i: i64 = 16
+        while i < len {
+            let ch = volatile_read_u8(0x6F800 + i)
+            if ch >= 48 && ch <= 57 { lba = lba * 10 + (ch - 48) }
+            i = i + 1
+        }
+        cprint("Loading model from NVMe LBA ", WHITE_ON_BLACK)
+        cprint_decimal(lba, CYAN_ON_BLACK)
+        cprintln("...", WHITE_ON_BLACK)
+        let rc = mdl_load_from_nvme(lba)
+        if rc == 0 {
+            cprintln("[OK] Model header loaded from NVMe", GREEN_ON_BLACK)
+            mdl_print_header()
+        } else {
+            cprint("[ERR] Load failed: ", RED_ON_BLACK)
+            mdl_print_error(rc)
+        }
+        return
+    }
+
+    // Otherwise: "model-load <filename>"
+    if len <= 11 {
+        cprintln("Usage: model-load <file.fjm>", YELLOW_ON_BLACK)
+        cprintln("       model-load nvme <lba>", YELLOW_ON_BLACK)
+        cprintln("       model-load test", YELLOW_ON_BLACK)
+        return
+    }
+
+    // Check for "model-load test" — generate + load test model
+    if len == 15 && volatile_read_u8(0x6F80B) == 116 && volatile_read_u8(0x6F80C) == 101 && volatile_read_u8(0x6F80D) == 115 && volatile_read_u8(0x6F80E) == 116 {
+        cprintln("Generating test model...", CYAN_ON_BLACK)
+        mdl_create_test_model()
+        cprintln("[OK] test.fjm created in RamFS", GREEN_ON_BLACK)
+
+        // Now load it
+        let idx = ramfs_find("test.fjm")
+        if idx < 0 {
+            cprintln("[ERR] test.fjm not found after creation", RED_ON_BLACK)
+            return
+        }
+        let entry_addr = ramfs_entry_addr(idx)
+        let data_ptr = volatile_read(entry_addr + 40)
+        let rc = mdl_parse_header(data_ptr)
+        if rc != 0 {
+            cprint("[ERR] Parse failed: ", RED_ON_BLACK)
+            mdl_print_error(rc)
+            return
+        }
+        volatile_write_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE, 1)
+        volatile_write_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR, data_ptr)
+        volatile_write_u64(MDL_STATE_BASE + MDL_ST_LOADED, 1)
+        volatile_write_u64(MDL_STATE_BASE + MDL_ST_LAYERS_LOADED, 0)
+        volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 0)
+        volatile_write_u64(MDL_STATE_BASE + MDL_ST_LMHEAD_LOADED, 0)
+
+        // Load all layers + embedding for test model (small enough)
+        let n = mdl_get_n_layers()
+        let mut i: i64 = 0
+        while i < n {
+            mdl_load_layer(i)
+            i = i + 1
+        }
+        mdl_load_embed()
+
+        cprintln("[OK] Test model loaded:", GREEN_ON_BLACK)
+        mdl_print_header()
+        return
+    }
+
+    // Load from RamFS file
+    cprint("Loading from RamFS: ", WHITE_ON_BLACK)
+    // Print filename
+    let mut i: i64 = 11
+    while i < len {
+        console_putchar(volatile_read_u8(0x6F800 + i), CYAN_ON_BLACK)
+        i = i + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let rc = mdl_load_from_ramfs(11)
+    if rc == 0 {
+        cprintln("[OK] Model header loaded", GREEN_ON_BLACK)
+        mdl_print_header()
+    } else {
+        cprint("[ERR] Load failed: ", RED_ON_BLACK)
+        mdl_print_error(rc)
+    }
+}
+
+// model-info — show loaded model information
+@kernel fn cmd_model_info() {
+    if mdl_is_loaded() != 1 {
+        cprintln("No model loaded.", YELLOW_ON_BLACK)
+        cprintln("Use: model-load <file.fjm>", WHITE_ON_BLACK)
+        cprintln("     model-load test", WHITE_ON_BLACK)
+        return
+    }
+    mdl_print_header()
+    mdl_print_layer_status()
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Display Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn mdl_print_header() {
+    cprintln("Model Info (.fjm):", YELLOW_ON_BLACK)
+
+    let model_type = mdl_get_model_type()
+    cprint("  Type:       ", WHITE_ON_BLACK)
+    mdl_print_model_type(model_type)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Layers:     ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_n_layers(), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  d_model:    ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_d_model(), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Heads:      ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_n_heads(), CYAN_ON_BLACK)
+    cprint(" x d_head=", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_d_head(), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Vocab:      ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_vocab_size(), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Quant:      ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_quant_bits(), CYAN_ON_BLACK)
+    cprintln("-bit", CYAN_ON_BLACK)
+
+    cprint("  Total size: ", WHITE_ON_BLACK)
+    mdl_print_size(mdl_get_total_size())
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Source:     ", WHITE_ON_BLACK)
+    mdl_print_source()
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+// Separate functions to avoid LLVM string interleave in if/else chains
+@kernel fn mdl_print_model_type(t: i64) {
+    // t(116) e(101) s(115) t(116)
+    if t == 0 { console_putchar(116, CYAN_ON_BLACK); console_putchar(101, CYAN_ON_BLACK); console_putchar(115, CYAN_ON_BLACK); console_putchar(116, CYAN_ON_BLACK) }
+    // S(83) m(109) o(111) l(108) L(76) M(77) -(45) 1(49) 3(51) 5(53) M(77)
+    if t == 1 { console_putchar(83, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK); console_putchar(111, CYAN_ON_BLACK); console_putchar(108, CYAN_ON_BLACK); console_putchar(76, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK); console_putchar(45, CYAN_ON_BLACK); console_putchar(49, CYAN_ON_BLACK); console_putchar(51, CYAN_ON_BLACK); console_putchar(53, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK) }
+    if t == 2 { console_putchar(84, CYAN_ON_BLACK); console_putchar(105, CYAN_ON_BLACK); console_putchar(110, CYAN_ON_BLACK); console_putchar(121, CYAN_ON_BLACK); console_putchar(76, CYAN_ON_BLACK); console_putchar(108, CYAN_ON_BLACK); console_putchar(97, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK); console_putchar(97, CYAN_ON_BLACK) }
+    if t == 3 { console_putchar(83, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK); console_putchar(111, CYAN_ON_BLACK); console_putchar(108, CYAN_ON_BLACK); console_putchar(76, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK); console_putchar(45, CYAN_ON_BLACK); console_putchar(51, CYAN_ON_BLACK); console_putchar(54, CYAN_ON_BLACK); console_putchar(48, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK) }
+    if t > 3 { console_putchar(63, YELLOW_ON_BLACK) }
+}
+
+@kernel fn mdl_print_size(total: i64) {
+    if total >= 1048576 {
+        cprint_decimal(total / 1048576, CYAN_ON_BLACK)
+        // " MB"
+        console_putchar(32, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK); console_putchar(66, CYAN_ON_BLACK)
+    } else if total >= 1024 {
+        cprint_decimal(total / 1024, CYAN_ON_BLACK)
+        // " KB"
+        console_putchar(32, CYAN_ON_BLACK); console_putchar(75, CYAN_ON_BLACK); console_putchar(66, CYAN_ON_BLACK)
+    } else {
+        cprint_decimal(total, CYAN_ON_BLACK)
+        // " B"
+        console_putchar(32, CYAN_ON_BLACK); console_putchar(66, CYAN_ON_BLACK)
+    }
+}
+
+@kernel fn mdl_print_source() {
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    // "RamFS" = R(82)a(97)m(109)F(70)S(83)
+    if src_type == 1 { console_putchar(82, GREEN_ON_BLACK); console_putchar(97, GREEN_ON_BLACK); console_putchar(109, GREEN_ON_BLACK); console_putchar(70, GREEN_ON_BLACK); console_putchar(83, GREEN_ON_BLACK) }
+    // "NVMe" = N(78)V(86)M(77)e(101)
+    if src_type == 2 { console_putchar(78, GREEN_ON_BLACK); console_putchar(86, GREEN_ON_BLACK); console_putchar(77, GREEN_ON_BLACK); console_putchar(101, GREEN_ON_BLACK) }
+    // "-"
+    if src_type != 1 && src_type != 2 { console_putchar(45, YELLOW_ON_BLACK) }
+}
+
+@kernel fn mdl_print_layer_status() {
+    let n_layers = mdl_get_n_layers()
+    let mask = volatile_read_u64(MDL_STATE_BASE + MDL_ST_LAYERS_LOADED)
+    let embed = volatile_read_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED)
+    let lmhead = volatile_read_u64(MDL_STATE_BASE + MDL_ST_LMHEAD_LOADED)
+
+    cprintln("Load Status:", YELLOW_ON_BLACK)
+
+    cprint("  Embedding:  ", WHITE_ON_BLACK)
+    mdl_print_loaded(embed)
+
+    cprint("  Layers:     ", WHITE_ON_BLACK)
+    let mut loaded: i64 = 0
+    let mut i: i64 = 0
+    while i < n_layers {
+        if (mask & (1 << i)) != 0 { loaded = loaded + 1 }
+        i = i + 1
+    }
+    cprint_decimal(loaded, CYAN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(n_layers, CYAN_ON_BLACK)
+    cprint(" [", WHITE_ON_BLACK)
+    i = 0
+    while i < n_layers {
+        if (mask & (1 << i)) != 0 {
+            console_putchar(35, GREEN_ON_BLACK)  // '#' = loaded
+        } else {
+            console_putchar(46, YELLOW_ON_BLACK)  // '.' = not loaded
+        }
+        i = i + 1
+    }
+    cprintln("]", WHITE_ON_BLACK)
+
+    cprint("  LM Head:    ", WHITE_ON_BLACK)
+    mdl_print_loaded(lmhead)
+
+    // Memory usage
+    let d_model = mdl_get_d_model()
+    let quant_bits = mdl_get_quant_bits()
+    let layer_size = d_model * 3 * d_model * quant_bits / 8 + d_model * 4 * d_model * quant_bits / 8 + 4 * d_model * d_model * quant_bits / 8
+    let mem_used = loaded * layer_size
+    cprint("  Weight mem: ", WHITE_ON_BLACK)
+    mdl_print_size(mem_used)
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+// Print "yes" or "no" on separate line (avoids LLVM string interleave)
+@kernel fn mdl_print_loaded(flag: i64) {
+    if flag == 1 {
+        // "yes" = y(121)e(101)s(115)
+        console_putchar(121, GREEN_ON_BLACK)
+        console_putchar(101, GREEN_ON_BLACK)
+        console_putchar(115, GREEN_ON_BLACK)
+    } else {
+        // "no" = n(110)o(111)
+        console_putchar(110, YELLOW_ON_BLACK)
+        console_putchar(111, YELLOW_ON_BLACK)
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+}
+
+@kernel fn mdl_print_error(code: i64) {
+    // Use error code numbers to avoid LLVM string interleave
+    // E1=bad magic, E2=bad version, E3=invalid params, E4=too small, E5=NVMe
+    cprint("E", RED_ON_BLACK)
+    let abs_code = 0 - code
+    cprint_decimal(abs_code, RED_ON_BLACK)
+    console_putchar(10, RED_ON_BLACK)
+}

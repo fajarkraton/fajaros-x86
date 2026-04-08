@@ -175,7 +175,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("AI/Compute:", WHITE_ON_BLUE)
     cprintln("  tensor mnist bench fib compute cbench", WHITE_ON_BLACK)
     cprintln("  quant quant-bench quant-info classify", WHITE_ON_BLACK)
-    cprintln("  km-bench km-info", WHITE_ON_BLACK)
+    cprintln("  km-bench km-info model-load model-info", WHITE_ON_BLACK)
     cprintln("  virtio-gpu gpu gpu-info gpu-bench", WHITE_ON_BLACK)
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
@@ -3147,6 +3147,13 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
     // km-info (107,109,45,105,...) len=7 — Kernel Matrix status
     if handled == 0 && len == 7 && volatile_read_u8(0x6F800) == 107 && volatile_read_u8(0x6F801) == 109 && volatile_read_u8(0x6F802) == 45 && volatile_read_u8(0x6F803) == 105 { cmd_km_info(); handled = 1 }
+
+    // model-load (109,111,100,101,108,45,108,...) len>=10 — Load .fjm model
+    // "model-load" = m(109) o(111) d(100) e(101) l(108) -(45) l(108) o(111) a(97) d(100)
+    if handled == 0 && len >= 10 && buf_eq4(109, 111, 100, 101) == 1 && volatile_read_u8(0x6F804) == 108 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 108 { cmd_model_load(); handled = 1 }
+
+    // model-info (109,111,100,101,108,45,105,...) len=10 — Show loaded model info
+    if handled == 0 && len == 10 && buf_eq4(109, 111, 100, 101) == 1 && volatile_read_u8(0x6F804) == 108 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 { cmd_model_info(); handled = 1 }
 
     // === Memory management commands ===
     // frames

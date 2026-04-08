@@ -103,6 +103,7 @@ SOURCES := \
 	kernel/compute/quantize.fj \
 	kernel/compute/fajarquant.fj \
 	kernel/compute/kmatrix.fj \
+	kernel/compute/model_loader.fj \
 	fs/ramfs.fj \
 	fs/directory.fj \
 	fs/links.fj \
