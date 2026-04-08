@@ -33,19 +33,42 @@ MODEL_TYPES = {
 }
 
 
-def lloyd_max_quantize(data, bits):
+def lloyd_max_quantize(data, bits, max_iters=20):
+    """Lloyd-Max quantization with chunked distance computation to avoid OOM."""
     n_centroids = 2 ** bits
+    flat = data.flatten().astype(np.float32)
+    n = len(flat)
+
+    # Use subset for centroid estimation if data is huge (>10M elements)
+    if n > 10_000_000:
+        sample = flat[np.random.choice(n, 2_000_000, replace=False)]
+    else:
+        sample = flat
+
     percentiles = np.linspace(0, 100, n_centroids + 2)[1:-1]
-    centroids = np.percentile(data.flatten(), percentiles)
-    for _ in range(50):
-        dists = np.abs(data.flatten()[:, None] - centroids[None, :])
-        indices = np.argmin(dists, axis=1)
+    centroids = np.percentile(sample, percentiles).astype(np.float32)
+
+    for it in range(max_iters):
+        # Assign in chunks to avoid huge distance matrix
+        indices = np.empty(n, dtype=np.int32)
+        chunk_size = 2_000_000
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            dists = np.abs(flat[start:end, None] - centroids[None, :])
+            indices[start:end] = np.argmin(dists, axis=1)
+        # Update centroids
         for i in range(n_centroids):
             mask = indices == i
             if mask.any():
-                centroids[i] = data.flatten()[mask].mean()
-    dists = np.abs(data.flatten()[:, None] - centroids[None, :])
-    indices = np.argmin(dists, axis=1)
+                centroids[i] = flat[mask].mean()
+
+    # Final assignment (chunked)
+    indices = np.empty(n, dtype=np.int32)
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        dists = np.abs(flat[start:end, None] - centroids[None, :])
+        indices[start:end] = np.argmin(dists, axis=1)
+
     return indices.astype(np.uint8), centroids
 
 
@@ -65,13 +88,14 @@ def build_v2_header(model_type, n_layers, d_model, n_heads, d_head, vocab_size,
                      bits, total_size, embed_off, layer0_off, lmhead_off,
                      n_kv_heads=0, ffn_type=0, norm_type=0, ffn_dim=0,
                      rope_theta=0, eos_token=2):
-    header = struct.pack("<II iiiii iI III iiiIIi",
-        FJM_MAGIC, 2,  # version 2
-        model_type, n_layers, d_model, n_heads, d_head,
-        vocab_size, bits, total_size, embed_off, layer0_off, lmhead_off,
-        n_kv_heads, ffn_type, norm_type, ffn_dim,
-        rope_theta // 1000,  # stored as theta/1000
-        eos_token,
+    # 19 fields × 4 bytes = 76 bytes + padding to 96
+    header = struct.pack("<19I",
+        FJM_MAGIC, 2,  # magic + version
+        model_type, n_layers, d_model, n_heads, d_head,  # 5 fields
+        vocab_size, bits, total_size, embed_off, layer0_off, lmhead_off,  # 6 fields
+        n_kv_heads, ffn_type, norm_type, ffn_dim,  # 4 v2 fields
+        rope_theta // 1000 if rope_theta > 0 else 0,  # stored as theta/1000
+        eos_token,  # EOS token ID
     )
     header += b"\x00" * (FJM_HEADER_V2_SIZE - len(header))
     return header
@@ -98,7 +122,12 @@ def export_gemma3(model_name, bits):
     d_head = getattr(config, 'head_dim', d_model // n_heads)
     vocab_size = config.vocab_size
     ffn_dim = config.intermediate_size
+    # Gemma 3 stores rope_theta in rope_scaling dict, not as top-level attr
     rope_theta = int(getattr(config, 'rope_theta', 0))
+    if rope_theta == 0 and hasattr(config, 'rope_scaling'):
+        rs = config.rope_scaling
+        if isinstance(rs, dict) and 'full_attention' in rs:
+            rope_theta = int(rs['full_attention'].get('rope_theta', 0))
     eos_token = getattr(config, 'eos_token_id', 2)
     if isinstance(eos_token, list):
         eos_token = eos_token[0]
