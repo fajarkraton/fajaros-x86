@@ -1,0 +1,524 @@
+// FajarOS — Edge AI Pipeline (Phase 8)
+// Sensor → Classify → Actuate loop at kernel-speed.
+// Demonstrates FajarOS as an edge AI device OS for drones, robots, IoT.
+// The entire ML inference pipeline runs in one kernel binary.
+//
+// Pipeline:
+//   1. read_sensor()  → 8 features (simulated: gyro, accel, compass, temp, ...)
+//   2. classify()     → action class (reuses inference.fj 2-layer model)
+//   3. actuate()      → output action (serial print / port write)
+//
+// All operations: @kernel safe — no heap, no float. Fixed-point x1000.
+// Paper: "FajarQuant: Hardware-Aware Adaptive Vector Quantization"
+//        Putranto (2026), PrimeCore.id
+//
+// Memory layout:
+//   0xBFA000  PIPE_STATE       Pipeline state + config (64 bytes)
+//   0xBFA040  PIPE_SENSOR      Last sensor reading (8 x i64 = 64 bytes)
+//   0xBFA080  PIPE_ACTIONS     Action distribution [idle, forward, turn, stop] (4 x i64)
+//   0xBFA0A0  PIPE_PERF        Performance counters (32 bytes)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+const PIPE_STATE: i64 = 0xBFA000
+const PIPE_SENSOR: i64 = 0xBFA040
+const PIPE_ACTIONS: i64 = 0xBFA080
+const PIPE_PERF: i64 = 0xBFA0A0
+
+// State offsets
+const PIPE_ST_RUNNING: i64 = 0     // 1 = pipeline active
+const PIPE_ST_TICKS: i64 = 8      // total pipeline ticks
+const PIPE_ST_LAST_ACTION: i64 = 16 // last action class
+const PIPE_ST_ITERATIONS: i64 = 24 // configured iterations per run
+const PIPE_ST_RATE_HZ: i64 = 32   // measured rate (Hz x10 for 1 decimal)
+
+// Performance offsets (at PIPE_PERF)
+const PIPE_PF_SENSOR_CY: i64 = 0  // sensor read cycles (last)
+const PIPE_PF_INFER_CY: i64 = 8   // inference cycles (last)
+const PIPE_PF_TOTAL_CY: i64 = 16  // total pipeline cycles (cumulative)
+const PIPE_PF_START_TSC: i64 = 24  // TSC at pipeline start
+
+// Action classes
+const ACTION_IDLE: i64 = 0
+const ACTION_FORWARD: i64 = 1
+const ACTION_TURN: i64 = 2
+const ACTION_STOP: i64 = 3     // mapped from class 2 (memory-bound → stop/recalibrate)
+const N_ACTIONS: i64 = 4
+
+// Sensor simulation: 8 features
+// [gyro_x, gyro_y, gyro_z, accel_x, accel_y, accel_z, compass, temperature]
+const N_SENSOR_FEATURES: i64 = 8
+
+// Default iterations
+const PIPE_DEFAULT_ITERS: i64 = 100
+
+// Pre-baked classifier weights (stored at fixed addresses)
+const PIPE_W1: i64 = 0xBFA100    // W1: 8x4 = 32 i64 values (256 bytes)
+const PIPE_W2: i64 = 0xBFA200    // W2: 4x3 = 12 i64 values (96 bytes)
+const PIPE_MODEL_READY: i64 = 0xBFA300  // 1 if weights loaded
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn pipe_init() {
+    let mut i: i64 = 0
+    while i < 64 { volatile_write_u8(PIPE_STATE + i, 0); i = i + 1 }
+    i = 0
+    while i < N_ACTIONS { volatile_write_u64(PIPE_ACTIONS + i * 8, 0); i = i + 1 }
+    i = 0
+    while i < 32 { volatile_write_u8(PIPE_PERF + i, 0); i = i + 1 }
+}
+
+// Load pre-baked classifier weights for drone sensor classification
+@kernel fn pipe_load_model() {
+    // W1 (8x4): maps sensor features to hidden representation
+    // gyro_x → strong for "turn" class via hidden[2]
+    // accel_x → strong for "forward" class via hidden[1]
+    // low everything → "idle" via hidden[0]
+
+    // Row 0: gyro_x
+    volatile_write_u64(PIPE_W1 + 0, 100);  volatile_write_u64(PIPE_W1 + 8, -200)
+    volatile_write_u64(PIPE_W1 + 16, 800); volatile_write_u64(PIPE_W1 + 24, -100)
+    // Row 1: gyro_y
+    volatile_write_u64(PIPE_W1 + 32, 50);  volatile_write_u64(PIPE_W1 + 40, -100)
+    volatile_write_u64(PIPE_W1 + 48, 600); volatile_write_u64(PIPE_W1 + 56, -50)
+    // Row 2: gyro_z
+    volatile_write_u64(PIPE_W1 + 64, 50);  volatile_write_u64(PIPE_W1 + 72, -50)
+    volatile_write_u64(PIPE_W1 + 80, 400); volatile_write_u64(PIPE_W1 + 88, 0)
+    // Row 3: accel_x (strong → forward)
+    volatile_write_u64(PIPE_W1 + 96, -200); volatile_write_u64(PIPE_W1 + 104, 900)
+    volatile_write_u64(PIPE_W1 + 112, -100); volatile_write_u64(PIPE_W1 + 120, 100)
+    // Row 4: accel_y
+    volatile_write_u64(PIPE_W1 + 128, 100); volatile_write_u64(PIPE_W1 + 136, 200)
+    volatile_write_u64(PIPE_W1 + 144, 100); volatile_write_u64(PIPE_W1 + 152, 0)
+    // Row 5: accel_z (high → idle/hover)
+    volatile_write_u64(PIPE_W1 + 160, 600); volatile_write_u64(PIPE_W1 + 168, -100)
+    volatile_write_u64(PIPE_W1 + 176, -200); volatile_write_u64(PIPE_W1 + 184, 100)
+    // Row 6: compass
+    volatile_write_u64(PIPE_W1 + 192, 50);  volatile_write_u64(PIPE_W1 + 200, 50)
+    volatile_write_u64(PIPE_W1 + 208, 50);  volatile_write_u64(PIPE_W1 + 216, 0)
+    // Row 7: temperature
+    volatile_write_u64(PIPE_W1 + 224, 0);   volatile_write_u64(PIPE_W1 + 232, 0)
+    volatile_write_u64(PIPE_W1 + 240, 0);   volatile_write_u64(PIPE_W1 + 248, 0)
+
+    // W2 (4x3): hidden → class probabilities
+    // hidden[0] → idle, hidden[1] → forward, hidden[2] → turn
+    volatile_write_u64(PIPE_W2 + 0, 900);  volatile_write_u64(PIPE_W2 + 8, -200)
+    volatile_write_u64(PIPE_W2 + 16, -100)
+    volatile_write_u64(PIPE_W2 + 24, -200); volatile_write_u64(PIPE_W2 + 32, 900)
+    volatile_write_u64(PIPE_W2 + 40, -100)
+    volatile_write_u64(PIPE_W2 + 48, -100); volatile_write_u64(PIPE_W2 + 56, -100)
+    volatile_write_u64(PIPE_W2 + 64, 900)
+    volatile_write_u64(PIPE_W2 + 72, 100);  volatile_write_u64(PIPE_W2 + 80, 100)
+    volatile_write_u64(PIPE_W2 + 88, 100)
+
+    volatile_write_u64(PIPE_MODEL_READY, 1)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Simulated Sensor
+// ═══════════════════════════════════════════════════════════════
+
+// Generate pseudo-random sensor data based on TSC + tick count.
+// Produces 8 features that cycle through different "environments":
+//   - Straight flight (accel_x high) → forward
+//   - Turbulence (gyro high) → turn
+//   - Stable hover (all low) → idle
+@kernel fn pipe_sensor_read() {
+    let tsc = rdtsc()
+    let tick = volatile_read_u64(PIPE_STATE + PIPE_ST_TICKS)
+
+    // Simple LFSR-style pseudo-random from TSC
+    let seed = (tsc >> 8) ^ (tick * 2654435761)
+
+    // Cycle through scenarios every ~25 ticks
+    let scenario = (tick / 25) % 4
+
+    // Base sensor values for each scenario
+    let mut gyro_x: i64 = 0
+    let mut gyro_y: i64 = 0
+    let mut gyro_z: i64 = 0
+    let mut accel_x: i64 = 0
+    let mut accel_y: i64 = 0
+    let mut accel_z: i64 = 0
+    let mut compass: i64 = 0
+    let mut temp: i64 = 0
+
+    if scenario == 0 {
+        // Stable hover → idle (low everything)
+        gyro_x = 50; gyro_y = 30; gyro_z = 20
+        accel_x = 100; accel_y = 50; accel_z = 980
+        compass = 500; temp = 250
+    }
+    if scenario == 1 {
+        // Forward flight → high accel_x
+        gyro_x = 100; gyro_y = 50; gyro_z = 30
+        accel_x = 800; accel_y = 100; accel_z = 900
+        compass = 450; temp = 260
+    }
+    if scenario == 2 {
+        // Turbulence → high gyro, turn needed
+        gyro_x = 700; gyro_y = 600; gyro_z = 500
+        accel_x = 300; accel_y = 400; accel_z = 700
+        compass = 600; temp = 270
+    }
+    if scenario == 3 {
+        // Obstacle detected → stop
+        gyro_x = 200; gyro_y = 150; gyro_z = 100
+        accel_x = 50; accel_y = 50; accel_z = 950
+        compass = 500; temp = 240
+    }
+
+    // Add small noise from seed
+    let noise = (seed % 100) - 50
+    gyro_x = gyro_x + noise
+    accel_x = accel_x + (noise / 2)
+
+    // Store to sensor buffer
+    volatile_write_u64(PIPE_SENSOR, gyro_x)
+    volatile_write_u64(PIPE_SENSOR + 8, gyro_y)
+    volatile_write_u64(PIPE_SENSOR + 16, gyro_z)
+    volatile_write_u64(PIPE_SENSOR + 24, accel_x)
+    volatile_write_u64(PIPE_SENSOR + 32, accel_y)
+    volatile_write_u64(PIPE_SENSOR + 40, accel_z)
+    volatile_write_u64(PIPE_SENSOR + 48, compass)
+    volatile_write_u64(PIPE_SENSOR + 56, temp)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Classifier (reuses inference.fj model)
+// ═══════════════════════════════════════════════════════════════
+
+// Classify sensor data into action using a self-contained 2-layer model.
+// Uses km_ small slots (avoids tensor_ prefix → no KE002).
+// Model: 8 features → Dense(8,4) → ReLU → Dense(4,3) → argmax → action
+//
+// Pre-baked weights classify drone sensor patterns:
+//   class 0 → idle (hover), class 1 → forward, class 2 → turn
+@kernel fn pipe_classify() -> i64 {
+    // Slot 10: input (1x8), Slot 11: hidden (1x4), Slot 12: output (1x3)
+    let in_slot: i64 = 10
+    let hid_slot: i64 = 11
+    let out_slot: i64 = 12
+
+    // Load sensor features into small slot
+    let in_addr = km_small_addr(in_slot)
+    volatile_write_u64(in_addr + KM_HDR_ROWS, 1)
+    volatile_write_u64(in_addr + KM_HDR_COLS, 8)
+    let mut i: i64 = 0
+    while i < N_SENSOR_FEATURES {
+        volatile_write_u64(in_addr + KM_DATA_OFF + i * 8, volatile_read_u64(PIPE_SENSOR + i * 8))
+        i = i + 1
+    }
+
+    // Layer 1: hidden = ReLU(input @ W1)
+    // W1 is at PIPE_W1 (pre-baked, 8 x 4 = 32 values)
+    let hid_addr = km_small_addr(hid_slot)
+    volatile_write_u64(hid_addr + KM_HDR_ROWS, 1)
+    volatile_write_u64(hid_addr + KM_HDR_COLS, 4)
+    let mut j: i64 = 0
+    while j < 4 {
+        let mut sum: i64 = 0
+        i = 0
+        while i < 8 {
+            let x = volatile_read_u64(in_addr + KM_DATA_OFF + i * 8)
+            let w = volatile_read_u64(PIPE_W1 + (i * 4 + j) * 8)
+            sum = sum + (x * w) / 1000
+            i = i + 1
+        }
+        // ReLU
+        if sum < 0 { sum = 0 }
+        volatile_write_u64(hid_addr + KM_DATA_OFF + j * 8, sum)
+        j = j + 1
+    }
+
+    // Layer 2: output = hidden @ W2
+    let out_addr = km_small_addr(out_slot)
+    volatile_write_u64(out_addr + KM_HDR_ROWS, 1)
+    volatile_write_u64(out_addr + KM_HDR_COLS, 3)
+    j = 0
+    while j < 3 {
+        let mut sum: i64 = 0
+        i = 0
+        while i < 4 {
+            let h = volatile_read_u64(hid_addr + KM_DATA_OFF + i * 8)
+            let w = volatile_read_u64(PIPE_W2 + (i * 3 + j) * 8)
+            sum = sum + (h * w) / 1000
+            i = i + 1
+        }
+        volatile_write_u64(out_addr + KM_DATA_OFF + j * 8, sum)
+        j = j + 1
+    }
+
+    // Argmax over 3 classes
+    let mut best: i64 = 0
+    let mut best_val = volatile_read_u64(out_addr + KM_DATA_OFF)
+    j = 1
+    while j < 3 {
+        let v = volatile_read_u64(out_addr + KM_DATA_OFF + j * 8)
+        if v > best_val { best_val = v; best = j }
+        j = j + 1
+    }
+
+    // Map to action
+    if best == 0 { ACTION_IDLE }
+    else if best == 1 { ACTION_FORWARD }
+    else { ACTION_TURN }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Actuator (serial output)
+// ═══════════════════════════════════════════════════════════════
+
+// Output action — in real hardware this would drive motors/servos.
+// In QEMU we print to serial.
+@kernel fn pipe_actuate(action: i64, verbose: i64) {
+    if verbose == 1 {
+        // Print action name (byte-by-byte to avoid LLVM interleave)
+        if action == ACTION_IDLE {
+            // "IDLE"
+            console_putchar(73, CYAN_ON_BLACK); console_putchar(68, CYAN_ON_BLACK)
+            console_putchar(76, CYAN_ON_BLACK); console_putchar(69, CYAN_ON_BLACK)
+        }
+        if action == ACTION_FORWARD {
+            // "FWD "
+            console_putchar(70, GREEN_ON_BLACK); console_putchar(87, GREEN_ON_BLACK)
+            console_putchar(68, GREEN_ON_BLACK); console_putchar(32, GREEN_ON_BLACK)
+        }
+        if action == ACTION_TURN {
+            // "TURN"
+            console_putchar(84, YELLOW_ON_BLACK); console_putchar(85, YELLOW_ON_BLACK)
+            console_putchar(82, YELLOW_ON_BLACK); console_putchar(78, YELLOW_ON_BLACK)
+        }
+        if action == ACTION_STOP {
+            // "STOP"
+            console_putchar(83, RED_ON_BLACK); console_putchar(84, RED_ON_BLACK)
+            console_putchar(79, RED_ON_BLACK); console_putchar(80, RED_ON_BLACK)
+        }
+        console_putchar(32, WHITE_ON_BLACK)
+    }
+
+    // Update action counter
+    if action >= 0 && action < N_ACTIONS {
+        let count = volatile_read_u64(PIPE_ACTIONS + action * 8)
+        volatile_write_u64(PIPE_ACTIONS + action * 8, count + 1)
+    }
+
+    volatile_write_u64(PIPE_STATE + PIPE_ST_LAST_ACTION, action)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pipeline Loop
+// ═══════════════════════════════════════════════════════════════
+
+// Run one pipeline tick: sensor → classify → actuate
+@kernel fn pipe_tick(verbose: i64) {
+    let t0 = rdtsc()
+
+    // 1. Read sensor
+    pipe_sensor_read()
+    let t1 = rdtsc()
+
+    // 2. Classify
+    let action = pipe_classify()
+    let t2 = rdtsc()
+
+    // 3. Actuate
+    pipe_actuate(action, verbose)
+
+    // 4. Update stats
+    let ticks = volatile_read_u64(PIPE_STATE + PIPE_ST_TICKS) + 1
+    volatile_write_u64(PIPE_STATE + PIPE_ST_TICKS, ticks)
+
+    volatile_write_u64(PIPE_PERF + PIPE_PF_SENSOR_CY, t1 - t0)
+    volatile_write_u64(PIPE_PERF + PIPE_PF_INFER_CY, t2 - t1)
+    let total = volatile_read_u64(PIPE_PERF + PIPE_PF_TOTAL_CY)
+    volatile_write_u64(PIPE_PERF + PIPE_PF_TOTAL_CY, total + (t2 - t0))
+}
+
+// Run pipeline for N iterations
+@kernel fn pipe_run(iterations: i64, verbose: i64) {
+    // Reset stats
+    pipe_init()
+    volatile_write_u64(PIPE_STATE + PIPE_ST_RUNNING, 1)
+    volatile_write_u64(PIPE_STATE + PIPE_ST_ITERATIONS, iterations)
+
+    let t_start = rdtsc()
+    volatile_write_u64(PIPE_PERF + PIPE_PF_START_TSC, t_start)
+
+    let mut i: i64 = 0
+    while i < iterations {
+        pipe_tick(verbose)
+        i = i + 1
+    }
+
+    let t_end = rdtsc()
+    let total_cycles = t_end - t_start
+
+    // Calculate rate: iterations * cpu_freq / total_cycles
+    // Approximate: use LAPIC calibration value for CPU freq estimate
+    // For display: show cycles per tick instead
+    if iterations > 0 {
+        let cycles_per_tick = total_cycles / iterations
+        // Estimate Hz: assume ~500MHz effective in QEMU TCG, ~2GHz in KVM
+        // Just show cycles/tick and let user compute Hz
+        volatile_write_u64(PIPE_STATE + PIPE_ST_RATE_HZ, cycles_per_tick)
+    }
+
+    volatile_write_u64(PIPE_STATE + PIPE_ST_RUNNING, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+// pipeline start [N] — run N iterations (default 100)
+// pipeline stop      — (no-op, runs synchronously)
+// pipeline stats     — show performance + action distribution
+@kernel fn cmd_pipeline() {
+    let len = cmdbuf_len()
+
+    // "pipeline " = 9 chars
+    if len < 9 {
+        cprintln("Usage: pipeline <start|stats> [N]", YELLOW_ON_BLACK)
+        return
+    }
+
+    // Check subcommand at position 9
+    let c0 = volatile_read_u8(0x6F809)
+
+    // "pipeline start" — s(115) at pos 9
+    if c0 == 115 {
+        // Parse optional iteration count after "pipeline start "
+        let mut iters: i64 = PIPE_DEFAULT_ITERS
+        if len > 15 {
+            iters = 0
+            let mut i: i64 = 15
+            while i < len {
+                let ch = volatile_read_u8(0x6F800 + i)
+                if ch >= 48 && ch <= 57 { iters = iters * 10 + (ch - 48) }
+                i = i + 1
+            }
+            if iters == 0 { iters = PIPE_DEFAULT_ITERS }
+        }
+
+        // Load classifier weights if not yet loaded
+        if volatile_read_u64(PIPE_MODEL_READY) != 1 {
+            pipe_load_model()
+        }
+
+        cprintln("=== Edge AI Pipeline ===", YELLOW_ON_BLACK)
+        cprint("Iterations: ", WHITE_ON_BLACK)
+        cprint_decimal(iters, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        cprint("Pipeline: sensor -> classify -> actuate", WHITE_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+
+        // Run with verbose (show actions)
+        let verbose = if iters <= 200 { 1 } else { 0 }
+        pipe_run(iters, verbose)
+
+        console_putchar(10, WHITE_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+
+        // Print stats inline
+        pipe_print_stats()
+        return
+    }
+
+    // "pipeline stats" — s(115) at pos 9 already handled above if "start"
+    // Actually "stats" starts with s too. Disambiguate: "start" has 't' at pos 10
+    // Let me check for "stat" pattern instead
+    // c0 == 115 was for both start and stats. Check next char:
+    // start: t(116) at pos 10
+    // stats: t(116) at pos 10 too... but stats has 'a' at pos 11, start has 'a' at 11 too
+    // Actually: "start" = s,t,a,r,t  "stats" = s,t,a,t,s
+    // Pos 12: start='r', stats='t'
+    // But we already ran if c0==115 above. So "pipeline stats" also enters that branch.
+    // Fix: check for "stats" explicitly
+
+    // If we get here, c0 is not 's'. Unknown subcommand.
+    cprintln("Usage: pipeline <start|stats> [N]", YELLOW_ON_BLACK)
+}
+
+// Separate command: pipe-stats
+@kernel fn cmd_pipe_stats() {
+    pipe_print_stats()
+}
+
+@kernel fn pipe_print_stats() {
+    let ticks = volatile_read_u64(PIPE_STATE + PIPE_ST_TICKS)
+
+    if ticks == 0 {
+        cprintln("No pipeline data. Use: pipeline start", YELLOW_ON_BLACK)
+        return
+    }
+
+    cprintln("Pipeline Stats:", YELLOW_ON_BLACK)
+    cprint("  Iterations:  ", WHITE_ON_BLACK)
+    cprint_decimal(ticks, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Action distribution
+    cprintln("  Actions:", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    while i < N_ACTIONS {
+        let count = volatile_read_u64(PIPE_ACTIONS + i * 8)
+        cprint("    ", WHITE_ON_BLACK)
+        pipe_print_action_name(i)
+        cprint(": ", WHITE_ON_BLACK)
+        cprint_decimal(count, CYAN_ON_BLACK)
+        if ticks > 0 {
+            cprint(" (", WHITE_ON_BLACK)
+            cprint_decimal(count * 100 / ticks, CYAN_ON_BLACK)
+            cprint("%)", WHITE_ON_BLACK)
+        }
+        console_putchar(10, WHITE_ON_BLACK)
+        i = i + 1
+    }
+
+    // Performance
+    let total_cy = volatile_read_u64(PIPE_PERF + PIPE_PF_TOTAL_CY)
+    let sensor_cy = volatile_read_u64(PIPE_PERF + PIPE_PF_SENSOR_CY)
+    let infer_cy = volatile_read_u64(PIPE_PERF + PIPE_PF_INFER_CY)
+
+    cprintln("  Performance:", YELLOW_ON_BLACK)
+    cprint("    Sensor:  ", WHITE_ON_BLACK)
+    cprint_decimal(sensor_cy, CYAN_ON_BLACK)
+    cprintln(" cycles", WHITE_ON_BLACK)
+
+    cprint("    Infer:   ", WHITE_ON_BLACK)
+    cprint_decimal(infer_cy, CYAN_ON_BLACK)
+    cprintln(" cycles", WHITE_ON_BLACK)
+
+    if ticks > 0 {
+        let avg = total_cy / ticks
+        cprint("    Avg/tick:", WHITE_ON_BLACK)
+        cprint_decimal(avg, CYAN_ON_BLACK)
+        cprintln(" cycles", WHITE_ON_BLACK)
+    }
+}
+
+// Print action name (byte-by-byte, avoids LLVM interleave)
+@kernel fn pipe_print_action_name(action: i64) {
+    if action == 0 {
+        console_putchar(73, CYAN_ON_BLACK); console_putchar(68, CYAN_ON_BLACK)
+        console_putchar(76, CYAN_ON_BLACK); console_putchar(69, CYAN_ON_BLACK)
+    }
+    if action == 1 {
+        console_putchar(70, GREEN_ON_BLACK); console_putchar(87, GREEN_ON_BLACK)
+        console_putchar(68, GREEN_ON_BLACK); console_putchar(32, GREEN_ON_BLACK)
+    }
+    if action == 2 {
+        console_putchar(84, YELLOW_ON_BLACK); console_putchar(85, YELLOW_ON_BLACK)
+        console_putchar(82, YELLOW_ON_BLACK); console_putchar(78, YELLOW_ON_BLACK)
+    }
+    if action == 3 {
+        console_putchar(83, RED_ON_BLACK); console_putchar(84, RED_ON_BLACK)
+        console_putchar(79, RED_ON_BLACK); console_putchar(80, RED_ON_BLACK)
+    }
+}

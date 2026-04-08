@@ -179,6 +179,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  tokenize tok-info tok-load tok-reset", WHITE_ON_BLACK)
     cprintln("  infer ask gen tfm-info", WHITE_ON_BLACK)
     cprintln("  sched-mode sched-info", WHITE_ON_BLACK)
+    cprintln("  pipeline pipe-stats", WHITE_ON_BLACK)
     cprintln("  virtio-gpu gpu gpu-info gpu-bench", WHITE_ON_BLACK)
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
@@ -3190,6 +3191,13 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     // sched-info (115,99,104,101,100,45,105,...) len=10 — scheduler stats
     if handled == 0 && len == 10 && buf_eq4(115, 99, 104, 101) == 1 && volatile_read_u8(0x6F804) == 100 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 { cmd_sched_info(); handled = 1 }
 
+    // pipeline (112,105,112,101,108,105,110,101,...) len>=8 — "pipeline start [N]"
+    // p(112) i(105) p(112) e(101) l(108) i(105) n(110) e(101)
+    if handled == 0 && len >= 8 && buf_eq4(112, 105, 112, 101) == 1 && volatile_read_u8(0x6F804) == 108 && volatile_read_u8(0x6F805) == 105 && volatile_read_u8(0x6F806) == 110 { cmd_pipeline(); handled = 1 }
+
+    // pipe-stats (112,105,112,101,45,115,...) len=10
+    if handled == 0 && len == 10 && buf_eq4(112, 105, 112, 101) == 1 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 115 { cmd_pipe_stats(); handled = 1 }
+
     // === Memory management commands ===
     // frames
     if handled == 0 && len == 6 && buf_eq4(102, 114, 97, 109) == 1 && volatile_read_u8(0x6F804) == 101 { cmd_frames(); handled = 1 }
@@ -3229,8 +3237,8 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 3 && volatile_read_u8(0x6F800) == 105 && volatile_read_u8(0x6F801) == 112 && volatile_read_u8(0x6F802) == 99 { cmd_ipc(); handled = 1 }
     // security (115,101,99,117,114,105,116,121)
     if handled == 0 && len == 8 && buf_eq4(115, 101, 99, 117) == 1 { cmd_security(); handled = 1 }
-    // pipe (112,105,112,101) — "pipe <text>"
-    if handled == 0 && len >= 4 && buf_eq4(112, 105, 112, 101) == 1 { cmd_pipe(); handled = 1 }
+    // pipe (112,105,112,101) — "pipe <text>" (not "pipeline" or "pipe-stats")
+    if handled == 0 && len >= 4 && buf_eq4(112, 105, 112, 101) == 1 && (len == 4 || volatile_read_u8(0x6F804) == 32) { cmd_pipe(); handled = 1 }
     // spinlock
     if handled == 0 && len == 8 && buf_eq4(115, 112, 105, 110) == 1 { cmd_spinlock(); handled = 1 }
     // ansi
