@@ -581,88 +581,101 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
 // Single Transformer Layer
 // ═══════════════════════════════════════════════════════════════
 
-// Process one transformer layer:
-// x = x + Attention(LayerNorm(x))
-// x = x + FFN(LayerNorm(x))
+// Process one transformer layer. Dispatches to v1 (LayerNorm + standard FFN)
+// or v2 (RMSNorm + gated FFN) based on model config.
 @kernel fn tfm_layer(x_slot: i64, layer: i64, pos: i64) {
     let d_model = mdl_get_d_model()
     let quant_bits = mdl_get_quant_bits()
+    let norm_type = mdl_get_norm_type()   // 0=LN, 1=RMSNorm
+    let ffn_type = mdl_get_ffn_type()     // 0=standard, 1=gated
 
-    // === Pre-Attention LayerNorm ===
-    // Save residual
-    let res_data = km_data_ptr(TFM_RES)
     let x_data = km_data_ptr(x_slot)
+    let res_data = km_data_ptr(TFM_RES)
+
+    // === Pre-Attention Normalization + Save Residual ===
     mdl_memcpy(res_data, x_data, d_model * 8)
     let res_base = km_large_addr(TFM_RES)
     volatile_write_u64(res_base + KM_HDR_ROWS, 1)
     volatile_write_u64(res_base + KM_HDR_COLS, d_model)
 
-    // LayerNorm on x (in-place)
     let ln1_g = mdl_layer_ln_gamma(layer, 0)
-    let ln1_b = mdl_layer_ln_beta(layer, 0)
-    km_layernorm(x_slot, d_model, ln1_g, ln1_b)
+    if norm_type == 1 {
+        km_rmsnorm(x_data, d_model, ln1_g)
+    } else {
+        let ln1_b = mdl_layer_ln_beta(layer, 0)
+        km_layernorm(x_slot, d_model, ln1_g, ln1_b)
+    }
 
-    // === QKV Projection (separate sizes for GQA) ===
+    // === QKV Projection (GQA-aware sizes) ===
     let qkv_addr = mdl_layer_qkv_addr(layer)
     let cb_addr = MDL_CODEBOOK_BASE + layer * 64
     let n_heads = mdl_get_n_heads()
     let n_kv_heads = tfm_get_n_kv_heads()
     let d_head = mdl_get_d_head()
-    let q_dim = n_heads * d_head       // Q output: 4*256=1024 for Gemma 1B
-    let kv_d = n_kv_heads * d_head     // KV output: 1*256=256 for Gemma 1B
+    let q_dim = n_heads * d_head
+    let kv_d = n_kv_heads * d_head
 
-    // Q = x @ W_q [d_model × q_dim]
-    tfm_vecmat_packed(x_slot, qkv_addr, d_model, q_dim,
-                       quant_bits, cb_addr, TFM_Q)
+    tfm_vecmat_packed(x_slot, qkv_addr, d_model, q_dim, quant_bits, cb_addr, TFM_Q)
+    let wk_off = d_model * q_dim * quant_bits / 8
+    tfm_vecmat_packed(x_slot, qkv_addr + wk_off, d_model, kv_d, quant_bits, cb_addr, TFM_K)
+    let wv_off = wk_off + d_model * kv_d * quant_bits / 8
+    tfm_vecmat_packed(x_slot, qkv_addr + wv_off, d_model, kv_d, quant_bits, cb_addr, TFM_V)
 
-    // K = x @ W_k [d_model × kv_dim]
-    let wk_offset = d_model * q_dim * quant_bits / 8
-    tfm_vecmat_packed(x_slot, qkv_addr + wk_offset, d_model, kv_d,
-                       quant_bits, cb_addr, TFM_K)
-
-    // V = x @ W_v [d_model × kv_dim]
-    let wv_offset = wk_offset + d_model * kv_d * quant_bits / 8
-    tfm_vecmat_packed(x_slot, qkv_addr + wv_offset, d_model, kv_d,
-                       quant_bits, cb_addr, TFM_V)
-
-    // === Apply RoPE to Q and K ===
+    // === RoPE ===
     tfm_rope_apply(km_data_ptr(TFM_Q), km_data_ptr(TFM_K), pos,
                     n_heads, n_kv_heads, d_head)
 
-    // === Multi-Head Attention (with sliding window for local layers) ===
+    // === Attention (GQA + sliding window) ===
     let window = tfm_attn_window(layer)
     tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, window, TFM_ATTN)
 
-    // === Residual Add: x = residual + attn ===
-    let attn_data = km_data_ptr(TFM_ATTN)
-    mdl_memcpy(x_data, res_data, d_model * 8)  // restore residual to x
+    // === Residual: x = residual + attention ===
+    mdl_memcpy(x_data, res_data, d_model * 8)
     km_add(x_slot, TFM_ATTN, d_model)
 
-    // === Pre-FFN LayerNorm ===
-    // Save residual
+    // === Pre-FFN Normalization + Save Residual ===
     mdl_memcpy(res_data, x_data, d_model * 8)
-
-    // LayerNorm
     let ln2_g = mdl_layer_ln_gamma(layer, 1)
-    let ln2_b = mdl_layer_ln_beta(layer, 1)
-    km_layernorm(x_slot, d_model, ln2_g, ln2_b)
+    if norm_type == 1 {
+        km_rmsnorm(x_data, d_model, ln2_g)
+    } else {
+        let ln2_b = mdl_layer_ln_beta(layer, 1)
+        km_layernorm(x_slot, d_model, ln2_g, ln2_b)
+    }
 
-    // === FFN: GELU(x @ W1) @ W2 ===
-    let ffn1_addr = mdl_layer_ffn1_addr(layer)
-    let ffn2_addr = mdl_layer_ffn2_addr(layer)
-    let ffn_dim = d_model * 4  // intermediate dimension
+    // === FFN ===
+    let ffn_dim = mdl_get_ffn_dim()
 
-    // FFN part 1: mid = GELU(x @ W1)
-    tfm_vecmat_packed(x_slot, ffn1_addr, d_model, ffn_dim,
-                       quant_bits, cb_addr, TFM_FFN_MID)
-    km_gelu(TFM_FFN_MID, ffn_dim)
+    if ffn_type == 1 {
+        // Gated FFN: out = down(GELU_tanh(gate(x)) * up(x))
+        // Weight layout: [gate_packed | up_packed | down_packed]
+        let ffn_addr = mdl_layer_ffn1_addr(layer)
+        let gate_size = d_model * ffn_dim * quant_bits / 8
+        let up_size = gate_size
+        let gate_w = ffn_addr
+        let up_w = ffn_addr + gate_size
+        let down_w = ffn_addr + gate_size + up_size
+        // Allocate FFN intermediate buffers if not already done
+        // Use TFM_SCRATCH area for small models, frame-alloc for large
+        let gate_buf = TFM_SCRATCH + 8192
+        let up_buf = TFM_SCRATCH + 8192 + ffn_dim * 8
+        let out_buf = km_data_ptr(TFM_FFN_OUT)
+        tfm_ffn_gated(x_data, gate_w, up_w, down_w,
+                       d_model, ffn_dim, quant_bits, cb_addr,
+                       out_buf, gate_buf, up_buf)
+    } else {
+        // Standard 2-matrix FFN: out = W2(GELU(W1(x)))
+        let ffn1_addr = mdl_layer_ffn1_addr(layer)
+        let ffn2_addr = mdl_layer_ffn2_addr(layer)
+        tfm_vecmat_packed(x_slot, ffn1_addr, d_model, ffn_dim,
+                           quant_bits, cb_addr, TFM_FFN_MID)
+        km_gelu(TFM_FFN_MID, ffn_dim)
+        tfm_vecmat_packed(TFM_FFN_MID, ffn2_addr, ffn_dim, d_model,
+                           quant_bits, cb_addr, TFM_FFN_OUT)
+    }
 
-    // FFN part 2: out = mid @ W2
-    tfm_vecmat_packed(TFM_FFN_MID, ffn2_addr, ffn_dim, d_model,
-                       quant_bits, cb_addr, TFM_FFN_OUT)
-
-    // === Residual Add: x = residual + ffn_out ===
-    mdl_memcpy(x_data, res_data, d_model * 8)  // restore residual
+    // === Residual: x = residual + ffn_out ===
+    mdl_memcpy(x_data, res_data, d_model * 8)
     km_add(x_slot, TFM_FFN_OUT, d_model)
 }
 
@@ -827,7 +840,8 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
     tfm_alloc_slots(mdl_get_d_model(), mdl_get_vocab_size())
-    rope_init_freq(mdl_get_d_head(), 1000000)  // default: Gemma 3 theta=1M
+    let theta = mdl_get_rope_theta()
+    if theta > 0 { rope_init_freq(mdl_get_d_head(), theta) }
     tfm_clear_kv()
 
     // Process all prompt tokens (prefill)
@@ -951,7 +965,8 @@ const TFM_EOS_TOKEN: i64 = 2
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
     tfm_alloc_slots(mdl_get_d_model(), mdl_get_vocab_size())
-    rope_init_freq(mdl_get_d_head(), 1000000)
+    let theta = mdl_get_rope_theta()
+    if theta > 0 { rope_init_freq(mdl_get_d_head(), theta) }
     tfm_clear_kv()
 
     let t_start = rdtsc()
