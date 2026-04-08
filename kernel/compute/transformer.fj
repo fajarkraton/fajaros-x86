@@ -407,6 +407,31 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Sliding Window + Global Layer Detection (Gemma 3)
+// ═══════════════════════════════════════════════════════════════
+//
+// Gemma 3 pattern: every Nth layer is global attention (full context),
+// all others are local sliding window (512 tokens).
+// sliding_window_pattern = 6 → globals at layers 5, 11, 17, 23 (0-indexed)
+
+const TFM_SLIDING_WINDOW: i64 = 512    // local attention window size
+const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
+
+// Returns 1 if layer is global attention, 0 if local sliding window
+@kernel fn tfm_is_global_layer(layer: i64) -> i64 {
+    // Pattern: first global at (pattern-1), then every pattern layers
+    // For pattern=6: globals at 5, 11, 17, 23
+    if ((layer + 1) % TFM_GLOBAL_PATTERN) == 0 { 1 } else { 0 }
+}
+
+// Get attention window size for a given layer
+// Global layers: attend to all positions (return 0 = no limit)
+// Local layers: attend to last 512 positions
+@kernel fn tfm_attn_window(layer: i64) -> i64 {
+    if tfm_is_global_layer(layer) == 1 { 0 } else { TFM_SLIDING_WINDOW }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // KV Cache
 // ═══════════════════════════════════════════════════════════════
 
@@ -437,21 +462,22 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 // Attention (Multi-Head, with KV Cache)
 // ═══════════════════════════════════════════════════════════════
 
-// Compute multi-head attention with GQA support.
-// GQA: n_heads query heads share n_kv_heads KV heads (n_heads >= n_kv_heads).
-// MHA: n_kv_heads == n_heads (backward compatible).
+// Compute multi-head attention with GQA + sliding window support.
+// GQA: n_heads query heads share n_kv_heads KV heads.
+// Sliding window: local layers attend only to last `window` positions.
 //
-// q_slot: query vector (1 x n_heads*d_head), in km_ slot
-// k_slot: key vector (1 x n_kv_heads*d_head), in km_ slot
-// v_slot: value vector (1 x n_kv_heads*d_head), in km_ slot
-// out_slot: output vector (1 x n_heads*d_head), in km_ slot
+// q_slot: query vector (1 x n_heads*d_head)
+// k_slot: key vector (1 x n_kv_heads*d_head)
+// v_slot: value vector (1 x n_kv_heads*d_head)
+// window: 0 = full attention (global), >0 = sliding window size
+// out_slot: output vector (1 x n_heads*d_head)
 @kernel fn tfm_attention(q_slot: i64, k_slot: i64, v_slot: i64,
-                          layer: i64, cur_pos: i64, out_slot: i64) {
+                          layer: i64, cur_pos: i64, window: i64, out_slot: i64) {
     let n_heads = mdl_get_n_heads()
     let n_kv_heads = tfm_get_n_kv_heads()
     let d_head = mdl_get_d_head()
-    let q_dim = n_heads * d_head       // total Q dimension
-    let kv_d = n_kv_heads * d_head     // total KV dimension
+    let q_dim = n_heads * d_head
+    let kv_d = n_kv_heads * d_head
 
     // Store current K, V into KV cache at cur_pos
     tfm_kv_store(layer, cur_pos, k_slot, v_slot)
@@ -464,28 +490,32 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
     let q_data = km_data_ptr(q_slot)
     let seq_len = cur_pos + 1
 
+    // Sliding window: compute attention start position
+    // Global (window=0): attend from position 0
+    // Local (window>0): attend from max(0, cur_pos - window + 1)
+    let attn_start = if window > 0 && seq_len > window { seq_len - window } else { 0 }
+    let attn_len = seq_len - attn_start  // number of positions to attend to
+
     // Pre-compute loop-invariant values
     let sqrt_dh = km_isqrt(d_head * 1000000)
     let attn_scale = if sqrt_dh > 0 { 1000000 / sqrt_dh } else { 1000 }
-    // KV cache strides (use kv_d, not d_model)
     let kv_pos_stride = 2 * kv_d * 8
     let kv_layer_off = TFM_KV_BASE + layer * TFM_KV_MAX_POS * kv_pos_stride
-    // GQA group size: how many Q heads share one KV head
     let heads_per_kv = n_heads / n_kv_heads
 
     // Process each query head
     let mut h: i64 = 0
     while h < n_heads {
         let q_head_off = h * d_head
-        // GQA mapping: which KV head does this Q head attend to?
         let kv_head = h / heads_per_kv
         let kv_head_off = kv_head * d_head
 
-        // Compute attention scores: Q_h · K_kv^T for all cached positions
+        // Compute attention scores over windowed positions
         let scores_addr = TFM_SCRATCH
-        let mut p: i64 = 0
+        let mut si: i64 = 0  // score index (0..attn_len)
+        let mut p: i64 = attn_start
         while p < seq_len {
-            let k_cache = kv_layer_off + p * kv_pos_stride  // key base for this position
+            let k_cache = kv_layer_off + p * kv_pos_stride
             let mut dot: i64 = 0
             let mut d: i64 = 0
             while d < d_head {
@@ -494,46 +524,49 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
                 dot = dot + (qi * ki) / 1000
                 d = d + 1
             }
-            volatile_write_u64(scores_addr + p * 8, (dot * attn_scale) / 1000)
+            volatile_write_u64(scores_addr + si * 8, (dot * attn_scale) / 1000)
+            si = si + 1
             p = p + 1
         }
 
-        // Softmax over scores
+        // Softmax over windowed scores (attn_len entries)
         let mut max_score = volatile_read_u64(scores_addr)
-        p = 1
-        while p < seq_len {
-            let s = volatile_read_u64(scores_addr + p * 8)
+        si = 1
+        while si < attn_len {
+            let s = volatile_read_u64(scores_addr + si * 8)
             if s > max_score { max_score = s }
-            p = p + 1
+            si = si + 1
         }
         let mut exp_sum: i64 = 0
-        p = 0
-        while p < seq_len {
-            let s = volatile_read_u64(scores_addr + p * 8) - max_score
+        si = 0
+        while si < attn_len {
+            let s = volatile_read_u64(scores_addr + si * 8) - max_score
             let e = km_exp_approx(s)
-            volatile_write_u64(scores_addr + p * 8, e)
+            volatile_write_u64(scores_addr + si * 8, e)
             exp_sum = exp_sum + e
-            p = p + 1
+            si = si + 1
         }
         if exp_sum > 0 {
-            p = 0
-            while p < seq_len {
-                let e = volatile_read_u64(scores_addr + p * 8)
-                volatile_write_u64(scores_addr + p * 8, (e * 1000) / exp_sum)
-                p = p + 1
+            si = 0
+            while si < attn_len {
+                let e = volatile_read_u64(scores_addr + si * 8)
+                volatile_write_u64(scores_addr + si * 8, (e * 1000) / exp_sum)
+                si = si + 1
             }
         }
 
-        // Weighted sum of V: out_h[d] = sum(score_p * V_kv_p[d])
+        // Weighted sum of V over windowed positions
         let mut d: i64 = 0
         while d < d_head {
             let mut weighted: i64 = 0
-            p = 0
-            while p < seq_len {
-                let score = volatile_read_u64(scores_addr + p * 8)
-                let v_cache = kv_layer_off + p * kv_pos_stride + kv_d * 8  // value offset
+            si = 0
+            p = attn_start
+            while si < attn_len {
+                let score = volatile_read_u64(scores_addr + si * 8)
+                let v_cache = kv_layer_off + p * kv_pos_stride + kv_d * 8
                 let vi = volatile_read_u64(v_cache + (kv_head_off + d) * 8)
                 weighted = weighted + (score * vi) / 1000
+                si = si + 1
                 p = p + 1
             }
             volatile_write_u64(out_data + (q_head_off + d) * 8, weighted)
@@ -596,8 +629,9 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
     tfm_rope_apply(km_data_ptr(TFM_Q), km_data_ptr(TFM_K), pos,
                     n_heads, n_kv_heads, d_head)
 
-    // === Multi-Head Attention ===
-    tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, TFM_ATTN)
+    // === Multi-Head Attention (with sliding window for local layers) ===
+    let window = tfm_attn_window(layer)
+    tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, window, TFM_ATTN)
 
     // === Residual Add: x = residual + attn ===
     let attn_data = km_data_ptr(TFM_ATTN)
