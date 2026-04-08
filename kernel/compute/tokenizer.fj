@@ -71,24 +71,28 @@ const FJT_HEADER_SIZE: i64 = 32
 // Byte-Level Tokenizer (built-in)
 // ═══════════════════════════════════════════════════════════════
 
+// Max tokens per encode call (prevents buffer overflow)
+const TOK_MAX_OUTPUT: i64 = 2048
+
 // Encode text at text_addr (text_len bytes) into token IDs at out_addr
-// Returns: number of tokens written
+// Returns: number of tokens written (capped at TOK_MAX_OUTPUT)
 @kernel fn tok_encode(text_addr: i64, text_len: i64, out_addr: i64) -> i64 {
     let mode = volatile_read_u64(TOK_META + TOK_M_MODE)
     if mode == 1 {
         return tok_encode_bpe(text_addr, text_len, out_addr)
     }
     // Byte-level: each byte is a token
+    let limit = if text_len > TOK_MAX_OUTPUT { TOK_MAX_OUTPUT } else { text_len }
     let mut i: i64 = 0
-    while i < text_len {
+    while i < limit {
         let byte_val = volatile_read_u8(text_addr + i)
         volatile_write_u64(out_addr + i * 8, byte_val)
         i = i + 1
     }
     // Update counter
     let prev = volatile_read_u64(TOK_META + TOK_M_ENCODED)
-    volatile_write_u64(TOK_META + TOK_M_ENCODED, prev + text_len)
-    text_len
+    volatile_write_u64(TOK_META + TOK_M_ENCODED, prev + limit)
+    limit
 }
 
 // Decode token_id to bytes at out_addr, returns byte length
@@ -205,7 +209,7 @@ const FJT_HEADER_SIZE: i64 = 32
     let mut pos: i64 = 0
     let mut n_tokens: i64 = 0
 
-    while pos < text_len {
+    while pos < text_len && n_tokens < TOK_MAX_OUTPUT {
         let first_byte = volatile_read_u8(text_addr + pos)
 
         // Look up first-byte index

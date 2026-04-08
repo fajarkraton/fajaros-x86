@@ -156,6 +156,12 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if vocab_size <= 0 || vocab_size > MDL_MAX_VOCAB { return -3 }
     if quant_bits < 1 || quant_bits > 8 { return -3 }
 
+    // Validate offsets don't exceed file size
+    if total_size < FJM_HEADER_SIZE { return -3 }
+    if embed_off >= total_size { return -3 }
+    if layer0_off >= total_size { return -3 }
+    if lmhead_off >= total_size { return -3 }
+
     // Copy validated header to MDL_HDR_BASE
     let mut i: i64 = 0
     while i < FJM_HEADER_SIZE {

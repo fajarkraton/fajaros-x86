@@ -172,8 +172,9 @@ const PIPE_MODEL_READY: i64 = 0xBFA300  // 1 if weights loaded
         compass = 500; temp = 240
     }
 
-    // Add small noise from seed
-    let noise = (seed % 100) - 50
+    // Add small noise from seed (safe for negative seed values)
+    let abs_seed = if seed < 0 { 0 - seed } else { seed }
+    let noise = (abs_seed % 100) - 50
     gyro_x = gyro_x + noise
     accel_x = accel_x + (noise / 2)
 

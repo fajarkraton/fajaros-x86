@@ -172,11 +172,11 @@ const Q3_C7: i64 = 866
         while j < actual_dim {
             let r = volatile_read_u64(FQ_ROTATION_BASE + (i * FQ_ROTATION_DIM + j) * 8)
             let v = volatile_read_u64(input_addr + j * 8)
-            // Accumulate full product, divide once at end to minimize truncation
-            sum = sum + r * v
+            // Divide per-element to prevent overflow (r is x1000 scaled)
+            sum = sum + (r * v) / 1000
             j = j + 1
         }
-        volatile_write_u64(output_addr + i * 8, sum / 1000)
+        volatile_write_u64(output_addr + i * 8, sum)
         i = i + 1
     }
 }
