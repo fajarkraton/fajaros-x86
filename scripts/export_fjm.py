@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-export_fjm.py — Convert HuggingFace model to .fjm (Fajar Model) binary format.
+export_fjm.py — Convert HuggingFace model to .fjm v3 (Fajar Model) binary format.
 
-Supports:
-  v1: SmolLM-style (MHA, standard FFN, LayerNorm)
-  v2: Gemma 3 style (GQA, gated FFN, RMSNorm, RoPE)
+v3 changes (production quality):
+  - Header extended to 160 bytes (was 96)
+  - Embed codebook + LM-head codebook stored in header
+  - Shared codebook per layer (all matrices use same centroids)
+  - Final RMSNorm weights exported (model.norm before LM head)
+  - O projection included in layer data
 
 Usage:
     python export_fjm.py --test-model -o test.fjm
-    python export_fjm.py --model google/gemma-3-1b-it --bits 2 -o gemma3.fjm
-    python export_fjm.py --model google/gemma-3-1b-it --bits 2 -o gemma3.fjm --write-disk ../disk.img --lba 0
+    python export_fjm.py --model unsloth/gemma-3-1b-it --bits 2 -o gemma3.fjm
 
 Author: Muhamad Fajar Putranto, SE., SH., MH. (TaxPrime / PrimeCore.id)
 """
@@ -22,7 +24,7 @@ from pathlib import Path
 
 FJM_MAGIC = 0x314D4A46  # "FJM1"
 FJM_HEADER_V1_SIZE = 64
-FJM_HEADER_V2_SIZE = 96
+FJM_HEADER_V3_SIZE = 160  # v3: extended with embed_cb + lmhead_cb + final_norm_off
 FJM_LAYER_HDR_SIZE = 16
 
 MODEL_TYPES = {
@@ -30,39 +32,35 @@ MODEL_TYPES = {
     "HuggingFaceTB/SmolLM-135M": 1,
     "google/gemma-3-1b-it": 10,
     "google/gemma-3-270m-it": 11,
+    "unsloth/gemma-3-1b-it": 10,
+    "unsloth/gemma-3-270m-it": 11,
 }
 
 
 def lloyd_max_quantize(data, bits, max_iters=20):
-    """Lloyd-Max quantization with chunked distance computation to avoid OOM."""
+    """Lloyd-Max quantization. Returns (indices, centroids)."""
     n_centroids = 2 ** bits
     flat = data.flatten().astype(np.float32)
     n = len(flat)
 
-    # Use subset for centroid estimation if data is huge (>10M elements)
-    if n > 10_000_000:
-        sample = flat[np.random.choice(n, 2_000_000, replace=False)]
-    else:
-        sample = flat
+    sample = flat[np.random.choice(n, min(2_000_000, n), replace=False)] if n > 10_000_000 else flat
 
     percentiles = np.linspace(0, 100, n_centroids + 2)[1:-1]
     centroids = np.percentile(sample, percentiles).astype(np.float32)
 
-    for it in range(max_iters):
-        # Assign in chunks to avoid huge distance matrix
+    chunk_size = 2_000_000
+    for _ in range(max_iters):
         indices = np.empty(n, dtype=np.int32)
-        chunk_size = 2_000_000
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
             dists = np.abs(flat[start:end, None] - centroids[None, :])
             indices[start:end] = np.argmin(dists, axis=1)
-        # Update centroids
         for i in range(n_centroids):
             mask = indices == i
             if mask.any():
                 centroids[i] = flat[mask].mean()
 
-    # Final assignment (chunked)
+    # Final assignment
     indices = np.empty(n, dtype=np.int32)
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
@@ -70,6 +68,19 @@ def lloyd_max_quantize(data, bits, max_iters=20):
         indices[start:end] = np.argmin(dists, axis=1)
 
     return indices.astype(np.uint8), centroids
+
+
+def quantize_with_codebook(data, centroids, bits):
+    """Quantize data using pre-computed codebook centroids (no re-fitting)."""
+    flat = data.flatten().astype(np.float32)
+    n = len(flat)
+    indices = np.empty(n, dtype=np.int32)
+    chunk_size = 2_000_000
+    for start in range(0, n, chunk_size):
+        end = min(start + chunk_size, n)
+        dists = np.abs(flat[start:end, None] - centroids[None, :])
+        indices[start:end] = np.argmin(dists, axis=1)
+    return indices.astype(np.uint8)
 
 
 def pack_quantized(indices, bits):
@@ -84,25 +95,49 @@ def pack_quantized(indices, bits):
     return bytes(result)
 
 
-def build_v2_header(model_type, n_layers, d_model, n_heads, d_head, vocab_size,
+def serialize_codebook(centroids):
+    """Serialize codebook centroids as i64 values (x1000 fixed-point)."""
+    data = b""
+    for c in centroids:
+        data += struct.pack("<q", int(c * 1000))
+    return data
+
+
+def build_v3_header(model_type, n_layers, d_model, n_heads, d_head, vocab_size,
                      bits, total_size, embed_off, layer0_off, lmhead_off,
                      n_kv_heads=0, ffn_type=0, norm_type=0, ffn_dim=0,
-                     rope_theta=0, eos_token=2):
-    # 19 fields × 4 bytes = 76 bytes + padding to 96
+                     rope_theta=0, eos_token=2, final_norm_off=0,
+                     embed_cb=None, lmhead_cb=None):
+    """Build 160-byte v3 header with embedded codebooks."""
+    # Bytes 0-75: standard v2 fields (19 × u32 = 76 bytes)
     header = struct.pack("<19I",
-        FJM_MAGIC, 2,  # magic + version
-        model_type, n_layers, d_model, n_heads, d_head,  # 5 fields
-        vocab_size, bits, total_size, embed_off, layer0_off, lmhead_off,  # 6 fields
-        n_kv_heads, ffn_type, norm_type, ffn_dim,  # 4 v2 fields
-        rope_theta // 1000 if rope_theta > 0 else 0,  # stored as theta/1000
-        eos_token,  # EOS token ID
+        FJM_MAGIC, 3,  # magic + version=3
+        model_type, n_layers, d_model, n_heads, d_head,
+        vocab_size, bits, total_size, embed_off, layer0_off, lmhead_off,
+        n_kv_heads, ffn_type, norm_type, ffn_dim,
+        rope_theta // 1000 if rope_theta > 0 else 0,
+        eos_token,
     )
-    header += b"\x00" * (FJM_HEADER_V2_SIZE - len(header))
+    # Bytes 76-107: embed codebook (4 centroids × 8 bytes = 32 bytes for 2-bit)
+    if embed_cb is not None:
+        header += serialize_codebook(embed_cb)
+    else:
+        header += b"\x00" * 32
+    # Bytes 108-139: lmhead codebook (32 bytes)
+    if lmhead_cb is not None:
+        header += serialize_codebook(lmhead_cb)
+    else:
+        header += b"\x00" * 32
+    # Bytes 140-143: final_norm_off (u32)
+    header += struct.pack("<I", final_norm_off)
+    # Bytes 144-159: reserved
+    header += b"\x00" * (FJM_HEADER_V3_SIZE - len(header))
+    assert len(header) == FJM_HEADER_V3_SIZE, f"Header size mismatch: {len(header)} != {FJM_HEADER_V3_SIZE}"
     return header
 
 
 def export_gemma3(model_name, bits):
-    """Export Gemma 3 model to .fjm v2 format."""
+    """Export Gemma 3 model to .fjm v3 format with production-quality codebooks."""
     try:
         from transformers import AutoModelForCausalLM, AutoConfig
         import torch
@@ -122,7 +157,6 @@ def export_gemma3(model_name, bits):
     d_head = getattr(config, 'head_dim', d_model // n_heads)
     vocab_size = config.vocab_size
     ffn_dim = config.intermediate_size
-    # Gemma 3 stores rope_theta in rope_scaling dict, not as top-level attr
     rope_theta = int(getattr(config, 'rope_theta', 0))
     if rope_theta == 0 and hasattr(config, 'rope_scaling'):
         rs = config.rope_scaling
@@ -132,65 +166,71 @@ def export_gemma3(model_name, bits):
     if isinstance(eos_token, list):
         eos_token = eos_token[0]
 
-    # Detect architecture
     is_gated = hasattr(model.model.layers[0].mlp, 'gate_proj')
-    is_rmsnorm = True  # Gemma 3 always uses RMSNorm
-
     model_type = MODEL_TYPES.get(model_name, 99)
+
     print(f"Model: {n_layers}L d={d_model} {n_heads}Q:{n_kv_heads}KV d_head={d_head}")
     print(f"FFN: {'gated' if is_gated else 'standard'} dim={ffn_dim}")
-    print(f"Norm: {'RMSNorm' if is_rmsnorm else 'LayerNorm'}, RoPE theta={rope_theta}")
-    print(f"Quantizing to {bits}-bit...")
+    print(f"Norm: RMSNorm, RoPE theta={rope_theta}")
+    print(f"Quantizing to {bits}-bit (shared codebook per layer)...")
 
-    # Embedding
+    # === Embedding (own codebook) ===
     embed_w = model.model.embed_tokens.weight.detach().numpy()
     embed_idx, embed_cb = lloyd_max_quantize(embed_w, bits)
     embed_packed = pack_quantized(embed_idx, bits)
-    print(f"  Embedding: {embed_w.shape} → {len(embed_packed)} bytes")
+    print(f"  Embedding: {embed_w.shape} → {len(embed_packed)} bytes (own codebook)")
 
-    # Layers
+    # === Layers (shared codebook per layer) ===
     layer_blocks = []
     for i in range(n_layers):
         layer = model.model.layers[i]
 
-        # Q/K/V projections (separate for GQA)
         q_w = layer.self_attn.q_proj.weight.detach().numpy().T
         k_w = layer.self_attn.k_proj.weight.detach().numpy().T
         v_w = layer.self_attn.v_proj.weight.detach().numpy().T
-
-        # O projection (output, for GQA where q_dim != d_model)
         o_w = layer.self_attn.o_proj.weight.detach().numpy().T
 
-        q_idx, q_cb = lloyd_max_quantize(q_w, bits)
-        k_idx, _ = lloyd_max_quantize(k_w, bits)
-        v_idx, _ = lloyd_max_quantize(v_w, bits)
-        o_idx, _ = lloyd_max_quantize(o_w, bits)
+        if is_gated:
+            gate_w = layer.mlp.gate_proj.weight.detach().numpy().T
+            up_w = layer.mlp.up_proj.weight.detach().numpy().T
+            down_w = layer.mlp.down_proj.weight.detach().numpy().T
+        else:
+            gate_w = layer.mlp.gate_proj.weight.detach().numpy().T
+            down_w = layer.mlp.down_proj.weight.detach().numpy().T
+            up_w = None
+
+        # Shared codebook: concatenate all weight matrices for this layer
+        all_weights = [q_w.flatten(), k_w.flatten(), v_w.flatten(), o_w.flatten(), gate_w.flatten(), down_w.flatten()]
+        if up_w is not None:
+            all_weights.append(up_w.flatten())
+        all_concat = np.concatenate(all_weights)
+        _, shared_cb = lloyd_max_quantize(all_concat, bits)
+
+        # Quantize each matrix with the shared codebook
+        q_idx = quantize_with_codebook(q_w, shared_cb, bits)
+        k_idx = quantize_with_codebook(k_w, shared_cb, bits)
+        v_idx = quantize_with_codebook(v_w, shared_cb, bits)
+        o_idx = quantize_with_codebook(o_w, shared_cb, bits)
         q_packed = pack_quantized(q_idx, bits)
         k_packed = pack_quantized(k_idx, bits)
         v_packed = pack_quantized(v_idx, bits)
         o_packed = pack_quantized(o_idx, bits)
         qkv_packed = q_packed + k_packed + v_packed + o_packed
 
-        # FFN (gated: gate + up + down)
         if is_gated:
-            gate_w = layer.mlp.gate_proj.weight.detach().numpy().T
-            up_w = layer.mlp.up_proj.weight.detach().numpy().T
-            down_w = layer.mlp.down_proj.weight.detach().numpy().T
-            gate_idx, _ = lloyd_max_quantize(gate_w, bits)
-            up_idx, _ = lloyd_max_quantize(up_w, bits)
-            down_idx, _ = lloyd_max_quantize(down_w, bits)
+            gate_idx = quantize_with_codebook(gate_w, shared_cb, bits)
+            up_idx = quantize_with_codebook(up_w, shared_cb, bits)
+            down_idx = quantize_with_codebook(down_w, shared_cb, bits)
             ffn_packed = (pack_quantized(gate_idx, bits) +
                           pack_quantized(up_idx, bits) +
                           pack_quantized(down_idx, bits))
         else:
-            ffn1_w = layer.mlp.gate_proj.weight.detach().numpy().T
-            ffn2_w = layer.mlp.down_proj.weight.detach().numpy().T
-            ffn1_idx, _ = lloyd_max_quantize(ffn1_w, bits)
-            ffn2_idx, _ = lloyd_max_quantize(ffn2_w, bits)
-            ffn_packed = (pack_quantized(ffn1_idx, bits) +
-                          pack_quantized(ffn2_idx, bits))
+            gate_idx = quantize_with_codebook(gate_w, shared_cb, bits)
+            down_idx = quantize_with_codebook(down_w, shared_cb, bits)
+            ffn_packed = (pack_quantized(gate_idx, bits) +
+                          pack_quantized(down_idx, bits))
 
-        # RMSNorm gamma (no beta)
+        # RMSNorm gamma
         ln1_gamma = layer.input_layernorm.weight.detach().numpy().astype(np.float64)
         ln2_gamma = layer.post_attention_layernorm.weight.detach().numpy().astype(np.float64)
         norm_data = b""
@@ -198,86 +238,101 @@ def export_gemma3(model_name, bits):
             for v in arr:
                 norm_data += struct.pack("<q", int(v * 1000))
 
-        # Codebook
-        cb_data = b""
-        for c in q_cb:
-            cb_data += struct.pack("<q", int(c * 1000))
+        # Shared codebook for this layer
+        cb_data = serialize_codebook(shared_cb)
 
         weight_data = qkv_packed + ffn_packed + norm_data + cb_data
         layer_hdr = struct.pack("<iiii",
             i, FJM_LAYER_HDR_SIZE + len(weight_data),
             len(qkv_packed), len(ffn_packed))
         layer_blocks.append(layer_hdr + weight_data)
-        print(f"  Layer {i}: Q={len(q_packed)} K={len(k_packed)} V={len(v_packed)} O={len(o_packed)} FFN={len(ffn_packed)}")
+        print(f"  Layer {i}: Q={len(q_packed)} K={len(k_packed)} V={len(v_packed)} O={len(o_packed)} FFN={len(ffn_packed)} cb=shared")
 
-    # LM head
+    # === Final RMSNorm (model.norm — applied AFTER last layer, BEFORE lm_head) ===
+    final_norm_w = model.model.norm.weight.detach().numpy().astype(np.float64)
+    final_norm_data = b""
+    for v in final_norm_w:
+        final_norm_data += struct.pack("<q", int(v * 1000))
+    print(f"  Final norm: {len(final_norm_data)} bytes ({d_model} dims)")
+
+    # === LM head (own codebook) ===
     lmhead_w = model.lm_head.weight.detach().numpy().T
-    lmhead_idx, _ = lloyd_max_quantize(lmhead_w, bits)
+    lmhead_idx, lmhead_cb = lloyd_max_quantize(lmhead_w, bits)
     lmhead_packed = pack_quantized(lmhead_idx, bits)
-    print(f"  LM head: {len(lmhead_packed)} bytes")
+    print(f"  LM head: {len(lmhead_packed)} bytes (own codebook)")
 
-    # Assemble
-    embed_off = FJM_HEADER_V2_SIZE
+    # === Assemble ===
+    embed_off = FJM_HEADER_V3_SIZE
     layer0_off = embed_off + len(embed_packed)
     layers_total = sum(len(b) for b in layer_blocks)
-    lmhead_off = layer0_off + layers_total
+    final_norm_off = layer0_off + layers_total
+    lmhead_off = final_norm_off + len(final_norm_data)
     total_size = lmhead_off + len(lmhead_packed)
 
-    header = build_v2_header(
+    header = build_v3_header(
         model_type, n_layers, d_model, n_heads, d_head, vocab_size, bits,
         total_size, embed_off, layer0_off, lmhead_off,
         n_kv_heads=n_kv_heads, ffn_type=1 if is_gated else 0,
-        norm_type=1 if is_rmsnorm else 0, ffn_dim=ffn_dim,
-        rope_theta=rope_theta, eos_token=eos_token)
+        norm_type=1, ffn_dim=ffn_dim,
+        rope_theta=rope_theta, eos_token=eos_token,
+        final_norm_off=final_norm_off,
+        embed_cb=embed_cb, lmhead_cb=lmhead_cb)
 
     fjm = header + embed_packed
     for block in layer_blocks:
         fjm += block
+    fjm += final_norm_data
     fjm += lmhead_packed
 
     print(f"\nTotal: {total_size} bytes ({total_size/1024/1024:.1f} MB)")
+    print(f"Header: {FJM_HEADER_V3_SIZE}B | Embed: {len(embed_packed)}B | Layers: {layers_total}B | FinalNorm: {len(final_norm_data)}B | LMHead: {len(lmhead_packed)}B")
     return fjm
 
 
 def create_test_model(bits=2):
-    """Create a tiny v2 test model."""
+    """Create a tiny v3 test model with O projection + final norm."""
     n_layers, d_model, n_heads, n_kv_heads = 2, 16, 4, 1
     d_head, vocab_size, ffn_dim = 4, 64, 32
     q_dim, kv_d = n_heads * d_head, n_kv_heads * d_head
     rng = np.random.RandomState(42)
 
+    # Embedding with own codebook
     embed_w = rng.randn(vocab_size, d_model).astype(np.float32)
-    embed_idx, _ = lloyd_max_quantize(embed_w, bits)
+    embed_idx, embed_cb = lloyd_max_quantize(embed_w, bits)
     embed_packed = pack_quantized(embed_idx, bits)
 
     layer_blocks = []
     for li in range(n_layers):
+        # All layer weights
         q_w = rng.randn(d_model, q_dim).astype(np.float32)
         k_w = rng.randn(d_model, kv_d).astype(np.float32)
         v_w = rng.randn(d_model, kv_d).astype(np.float32)
-        q_idx, q_cb = lloyd_max_quantize(q_w, bits)
-        k_idx, _ = lloyd_max_quantize(k_w, bits)
-        v_idx, _ = lloyd_max_quantize(v_w, bits)
-        qkv_packed = (pack_quantized(q_idx, bits) +
-                      pack_quantized(k_idx, bits) +
-                      pack_quantized(v_idx, bits))
-
+        o_w = rng.randn(q_dim, d_model).astype(np.float32)
         gate_w = rng.randn(d_model, ffn_dim).astype(np.float32)
         up_w = rng.randn(d_model, ffn_dim).astype(np.float32)
         down_w = rng.randn(ffn_dim, d_model).astype(np.float32)
-        gate_idx, _ = lloyd_max_quantize(gate_w, bits)
-        up_idx, _ = lloyd_max_quantize(up_w, bits)
-        down_idx, _ = lloyd_max_quantize(down_w, bits)
-        ffn_packed = (pack_quantized(gate_idx, bits) +
-                      pack_quantized(up_idx, bits) +
+
+        # Shared codebook from all weights
+        all_concat = np.concatenate([w.flatten() for w in [q_w, k_w, v_w, o_w, gate_w, up_w, down_w]])
+        _, shared_cb = lloyd_max_quantize(all_concat, bits)
+
+        q_idx = quantize_with_codebook(q_w, shared_cb, bits)
+        k_idx = quantize_with_codebook(k_w, shared_cb, bits)
+        v_idx = quantize_with_codebook(v_w, shared_cb, bits)
+        o_idx = quantize_with_codebook(o_w, shared_cb, bits)
+        qkv_packed = (pack_quantized(q_idx, bits) + pack_quantized(k_idx, bits) +
+                      pack_quantized(v_idx, bits) + pack_quantized(o_idx, bits))
+
+        gate_idx = quantize_with_codebook(gate_w, shared_cb, bits)
+        up_idx = quantize_with_codebook(up_w, shared_cb, bits)
+        down_idx = quantize_with_codebook(down_w, shared_cb, bits)
+        ffn_packed = (pack_quantized(gate_idx, bits) + pack_quantized(up_idx, bits) +
                       pack_quantized(down_idx, bits))
 
         norm_data = b""
         for _ in range(2 * d_model):
             norm_data += struct.pack("<q", 0)  # gamma=0 → identity (1+0=1)
-        cb_data = b""
-        for c in q_cb:
-            cb_data += struct.pack("<q", int(c * 1000))
+        cb_data = serialize_codebook(shared_cb)
 
         weight_data = qkv_packed + ffn_packed + norm_data + cb_data
         layer_hdr = struct.pack("<iiii",
@@ -285,28 +340,37 @@ def create_test_model(bits=2):
             len(qkv_packed), len(ffn_packed))
         layer_blocks.append(layer_hdr + weight_data)
 
+    # Final norm (identity for test: gamma=0 → (1+0)=1)
+    final_norm_data = b""
+    for _ in range(d_model):
+        final_norm_data += struct.pack("<q", 0)
+
+    # LM head with own codebook
     lmhead_w = rng.randn(d_model, vocab_size).astype(np.float32)
-    lmhead_idx, _ = lloyd_max_quantize(lmhead_w, bits)
+    lmhead_idx, lmhead_cb = lloyd_max_quantize(lmhead_w, bits)
     lmhead_packed = pack_quantized(lmhead_idx, bits)
 
-    embed_off = FJM_HEADER_V2_SIZE
+    embed_off = FJM_HEADER_V3_SIZE
     layer0_off = embed_off + len(embed_packed)
     layers_total = sum(len(b) for b in layer_blocks)
-    lmhead_off = layer0_off + layers_total
+    final_norm_off = layer0_off + layers_total
+    lmhead_off = final_norm_off + len(final_norm_data)
     total_size = lmhead_off + len(lmhead_packed)
 
-    header = build_v2_header(
+    header = build_v3_header(
         0, n_layers, d_model, n_heads, d_head, vocab_size, bits,
         total_size, embed_off, layer0_off, lmhead_off,
         n_kv_heads=n_kv_heads, ffn_type=1, norm_type=1, ffn_dim=ffn_dim,
-        rope_theta=1000000, eos_token=106)
+        rope_theta=1000000, eos_token=106, final_norm_off=final_norm_off,
+        embed_cb=embed_cb, lmhead_cb=lmhead_cb)
 
     fjm = header + embed_packed
     for block in layer_blocks:
         fjm += block
+    fjm += final_norm_data
     fjm += lmhead_packed
 
-    print(f"Test v2: {n_layers}L d={d_model} {n_heads}Q:{n_kv_heads}KV gated={ffn_dim}")
+    print(f"Test v3: {n_layers}L d={d_model} {n_heads}Q:{n_kv_heads}KV gated={ffn_dim}")
     print(f"Total: {total_size} bytes ({total_size/1024:.1f} KB)")
     return fjm
 
@@ -328,7 +392,7 @@ def write_to_disk(data, disk_path, lba):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Export model to .fjm format")
+    parser = argparse.ArgumentParser(description="Export model to .fjm v3 format")
     parser.add_argument("--model", type=str, help="HuggingFace model name")
     parser.add_argument("--bits", type=int, default=2)
     parser.add_argument("--test-model", action="store_true")

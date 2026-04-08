@@ -52,9 +52,14 @@ const FJM_OFF_NORM_TYPE: i64 = 60   // 4B: 0=LayerNorm, 1=RMSNorm
 const FJM_OFF_FFN_DIM: i64 = 64     // 4B: FFN intermediate size (0=4*d_model)
 const FJM_OFF_ROPE_THETA: i64 = 68  // 4B: RoPE theta / 1000 (0=no RoPE)
 const FJM_OFF_EOS_TOKEN: i64 = 72   // 4B: EOS token ID
-const FJM_OFF_RESERVED2: i64 = 76   // 20B: reserved
+// v3 fields (offset 76-159):
+const FJM_OFF_EMBED_CB: i64 = 76    // 32B: embedding codebook (4 centroids × 8B)
+const FJM_OFF_LMHEAD_CB: i64 = 108  // 32B: LM head codebook (4 centroids × 8B)
+const FJM_OFF_FINAL_NORM: i64 = 140 // 4B: byte offset to final RMSNorm weights
+// Bytes 144-159: reserved
 const FJM_HEADER_V1_SIZE: i64 = 64
-const FJM_HEADER_SIZE: i64 = 96
+const FJM_HEADER_V2_SIZE: i64 = 96
+const FJM_HEADER_SIZE: i64 = 160    // v3 header (was 96 for v2)
 
 // Per-layer block header (16 bytes before weight data)
 const FJM_LAYER_OFF_ID: i64 = 0       // 4B: layer index
@@ -70,6 +75,8 @@ const FJM_LAYER_HDR_SIZE: i64 = 16
 const MDL_HDR_BASE: i64 = 0xC00000       // Parsed header copy (96 bytes for v2)
 const MDL_STATE_BASE: i64 = 0xC00060     // Loader state (64 bytes)
 const MDL_CODEBOOK_BASE: i64 = 0xC000A0 // Per-layer codebooks (32 × 32B = 1KB)
+const MDL_EMBED_CB: i64 = 0xC004A0      // Embedding codebook (32 bytes)
+const MDL_LMHEAD_CB: i64 = 0xC004C0     // LM head codebook (32 bytes)
 const MDL_LN_BASE: i64 = 0xC00500       // LayerNorm parameters
 
 const MDL_EMBED_BASE: i64 = 0xC30000   // Embedding table start
@@ -145,9 +152,9 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         return -1  // Bad magic
     }
 
-    // Check version (support v1 and v2)
+    // Check version (support v1, v2, v3)
     let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
-    if version != 1 && version != 2 {
+    if version < 1 || version > 3 {
         return -2  // Unsupported version
     }
 
@@ -172,20 +179,21 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if quant_bits < 1 || quant_bits > 8 { return -3 }
 
     // Validate offsets don't exceed file size
-    if total_size < FJM_HEADER_SIZE { return -3 }
+    let min_hdr = if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
+    if total_size < min_hdr { return -3 }
     if embed_off >= total_size { return -3 }
     if layer0_off >= total_size { return -3 }
     if lmhead_off >= total_size { return -3 }
 
     // Copy validated header to MDL_HDR_BASE
-    let hdr_size = if version >= 2 { FJM_HEADER_SIZE } else { FJM_HEADER_V1_SIZE }
+    let hdr_size = if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
     let mut i: i64 = 0
     while i < hdr_size {
         volatile_write_u8(MDL_HDR_BASE + i, volatile_read_u8(src_addr + i))
         i = i + 1
     }
-    // Zero v2 fields if v1 header (backward compat: n_kv_heads=0 → MHA)
-    if version == 1 {
+    // Zero remaining fields for older versions (backward compat)
+    if version < 3 {
         while i < FJM_HEADER_SIZE {
             volatile_write_u8(MDL_HDR_BASE + i, 0)
             i = i + 1
@@ -195,6 +203,22 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     // Store n_kv_heads in transformer state for GQA
     let n_kv_h = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_N_KV_HEADS)
     volatile_write_u64(0xBE8000 + 56, n_kv_h)  // TFM_STATE + TFM_ST_N_KV_HEADS
+
+    // Extract embed + lmhead codebooks from v3 header to dedicated memory
+    if version >= 3 {
+        // Copy 32 bytes of embed codebook: header[76..108] → MDL_EMBED_CB
+        let mut ci: i64 = 0
+        while ci < 32 {
+            volatile_write_u8(MDL_EMBED_CB + ci, volatile_read_u8(MDL_HDR_BASE + FJM_OFF_EMBED_CB + ci))
+            ci = ci + 1
+        }
+        // Copy 32 bytes of lmhead codebook: header[108..140] → MDL_LMHEAD_CB
+        ci = 0
+        while ci < 32 {
+            volatile_write_u8(MDL_LMHEAD_CB + ci, volatile_read_u8(MDL_HDR_BASE + FJM_OFF_LMHEAD_CB + ci))
+            ci = ci + 1
+        }
+    }
 
     0  // Success
 }
@@ -214,6 +238,7 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 @kernel fn mdl_get_embed_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_EMBED_OFF) }
 @kernel fn mdl_get_layer0_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LAYER0_OFF) }
 @kernel fn mdl_get_lmhead_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LMHEAD_OFF) }
+@kernel fn mdl_get_final_norm_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_FINAL_NORM) }
 
 @kernel fn mdl_get_version() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_VERSION) }
 @kernel fn mdl_get_n_kv_heads() -> i64 {
@@ -554,7 +579,7 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 // Model: 2 layers, d=16, 2 heads, d_head=8, vocab=64, 2-bit
 // Total size: ~100 bytes — fits easily in RamFS
 @kernel fn mdl_create_test_model() {
-    // .fjm v2 test model with GQA + gated FFN + RMSNorm
+    // .fjm v3 test model with GQA + O proj + gated FFN + RMSNorm + final norm
     let n_layers: i64 = 2
     let d_model: i64 = 16
     let n_heads: i64 = 4       // 4 query heads
@@ -570,7 +595,8 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     let q_size = d_model * q_dim * quant_bits / 8         // 16*16*2/8 = 64
     let k_size = d_model * kv_d * quant_bits / 8          // 16*4*2/8 = 16
     let v_size = k_size                                    // 16
-    let qkv_total = q_size + k_size + v_size               // 96
+    let o_size = q_dim * d_model * quant_bits / 8          // 16*16*2/8 = 64
+    let qkv_total = q_size + k_size + v_size + o_size      // 160 (was 96)
     // Gated FFN: gate + up + down (3 matrices)
     let gate_size = d_model * ffn_dim * quant_bits / 8     // 16*32*2/8 = 128
     let up_size = gate_size                                 // 128
@@ -583,17 +609,19 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 
     let embed_size = vocab_size * d_model * quant_bits / 8
     let lmhead_size = embed_size
+    let fnorm_size = d_model * 8                            // 16*8 = 128
 
-    let embed_off = FJM_HEADER_SIZE                             // 96
+    let embed_off = FJM_HEADER_SIZE                             // 160 (v3)
     let layer0_off = embed_off + embed_size
-    let lmhead_off = layer0_off + n_layers * layer_data_size
+    let fnorm_off = layer0_off + n_layers * layer_data_size
+    let lmhead_off = fnorm_off + fnorm_size
     let total_size = lmhead_off + lmhead_size
 
     let buf: i64 = 0xBF0000
 
-    // Write v2 header (96 bytes)
+    // Write v3 header (160 bytes)
     mdl_write_u32(buf + FJM_OFF_MAGIC, FJM_MAGIC)
-    mdl_write_u32(buf + FJM_OFF_VERSION, 2)        // v2!
+    mdl_write_u32(buf + FJM_OFF_VERSION, 3)        // v3
     mdl_write_u32(buf + FJM_OFF_MODEL_TYPE, 0)
     mdl_write_u32(buf + FJM_OFF_N_LAYERS, n_layers)
     mdl_write_u32(buf + FJM_OFF_D_MODEL, d_model)
@@ -605,15 +633,25 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     mdl_write_u32(buf + FJM_OFF_EMBED_OFF, embed_off)
     mdl_write_u32(buf + FJM_OFF_LAYER0_OFF, layer0_off)
     mdl_write_u32(buf + FJM_OFF_LMHEAD_OFF, lmhead_off)
-    // v2 fields
-    mdl_write_u32(buf + FJM_OFF_N_KV_HEADS, n_kv_heads)  // GQA 4:1
-    mdl_write_u32(buf + FJM_OFF_FFN_TYPE, 1)              // gated FFN
-    mdl_write_u32(buf + FJM_OFF_NORM_TYPE, 1)             // RMSNorm
+    mdl_write_u32(buf + FJM_OFF_N_KV_HEADS, n_kv_heads)
+    mdl_write_u32(buf + FJM_OFF_FFN_TYPE, 1)
+    mdl_write_u32(buf + FJM_OFF_NORM_TYPE, 1)
     mdl_write_u32(buf + FJM_OFF_FFN_DIM, ffn_dim)
-    mdl_write_u32(buf + FJM_OFF_ROPE_THETA, 1000)         // theta=1M → stored as 1000 (÷1000)
-    mdl_write_u32(buf + FJM_OFF_EOS_TOKEN, 106)           // Gemma 3 EOS
-    // Zero reserved
-    let mut i: i64 = 76
+    mdl_write_u32(buf + FJM_OFF_ROPE_THETA, 1000)
+    mdl_write_u32(buf + FJM_OFF_EOS_TOKEN, 106)
+    // v3 fields: embed_cb (32B), lmhead_cb (32B), final_norm_off (4B)
+    // Codebook centroids: [-750, -250, 250, 750]
+    volatile_write_u64(buf + FJM_OFF_EMBED_CB, -750)
+    volatile_write_u64(buf + FJM_OFF_EMBED_CB + 8, -250)
+    volatile_write_u64(buf + FJM_OFF_EMBED_CB + 16, 250)
+    volatile_write_u64(buf + FJM_OFF_EMBED_CB + 24, 750)
+    volatile_write_u64(buf + FJM_OFF_LMHEAD_CB, -750)
+    volatile_write_u64(buf + FJM_OFF_LMHEAD_CB + 8, -250)
+    volatile_write_u64(buf + FJM_OFF_LMHEAD_CB + 16, 250)
+    volatile_write_u64(buf + FJM_OFF_LMHEAD_CB + 24, 750)
+    mdl_write_u32(buf + FJM_OFF_FINAL_NORM, fnorm_off)
+    // Zero remaining reserved
+    let mut i: i64 = 144
     while i < FJM_HEADER_SIZE { volatile_write_u8(buf + i, 0); i = i + 1 }
 
     // Embedding
@@ -648,6 +686,10 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 
         layer = layer + 1
     }
+
+    // Final RMSNorm gamma = 0 (identity: 1+0 = 1)
+    i = 0
+    while i < d_model { volatile_write_u64(buf + fnorm_off + i * 8, 0); i = i + 1 }
 
     // LM head
     i = 0
@@ -998,6 +1040,7 @@ const STREAM_LAYER_BUF: i64 = 0xCC00000     // 204 MB mark
 const STREAM_LAYER_SIZE: i64 = 0x800000      // 8 MB buffer (fits any layer)
 const STREAM_LMHEAD_BUF: i64 = 0xD400000    // 212 MB mark
 const STREAM_LMHEAD_CHUNK: i64 = 0x100000   // 1 MB per LM head chunk
+const STREAM_FINAL_NORM: i64 = 0xD530000    // Final RMSNorm gamma (d_model × 8 bytes)
 
 // State extensions (at MDL_STATE_BASE + offset)
 const MDL_ST_STREAM_LAYER: i64 = 48  // Current streaming layer (-1 = none)
@@ -1031,9 +1074,14 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     let embed_size = layer0_off - embed_off
     let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
 
+    // Handle sub-sector offset: embed_off may not be sector-aligned (e.g. 160 bytes)
     let lba_start = src_lba + embed_off / 512
-    let total_sectors = (embed_size + 511) / 512
+    let intra_offset = embed_off % 512  // bytes to skip in first sector
+    // Total sectors needed: cover embed_size bytes starting at intra_offset
+    let total_bytes = embed_size + intra_offset
+    let total_sectors = (total_bytes + 511) / 512
     let mut sect_done: i64 = 0
+    let mut bytes_written: i64 = 0
     let mut last_dot: i64 = -1
 
     // Progress: print a '#' every 10%
@@ -1047,7 +1095,13 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
             cprintln("] NVMe error", RED_ON_BLACK)
             return -3
         }
-        mdl_memcpy(STREAM_EMBED_BASE + sect_done * 512, NVME_DMA, read_count * 512)
+
+        // First chunk: skip intra_offset bytes (header data)
+        let copy_src = if sect_done == 0 { NVME_DMA + intra_offset } else { NVME_DMA }
+        let copy_len_raw = if sect_done == 0 { read_count * 512 - intra_offset } else { read_count * 512 }
+        let copy_len = if bytes_written + copy_len_raw > embed_size { embed_size - bytes_written } else { copy_len_raw }
+        mdl_memcpy(STREAM_EMBED_BASE + bytes_written, copy_src, copy_len)
+        bytes_written = bytes_written + copy_len
         sect_done = sect_done + read_count
 
         // Print progress dot every 10%
@@ -1062,6 +1116,46 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED, 1)
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 1)
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Final RMSNorm Loader (model.norm — applied after last layer)
+// ═══════════════════════════════════════════════════════════════
+
+// Load final RMSNorm gamma from NVMe into STREAM_FINAL_NORM.
+// v3 format: final_norm_off points to d_model × i64 values (x1000).
+// Returns: 0=success, -1=no model, -6=not NVMe, -9=no final norm
+@kernel fn mdl_stream_load_final_norm() -> i64 {
+    if mdl_is_loaded() != 1 { return -1 }
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    if src_type != 2 { return -6 }
+
+    let fnorm_off = mdl_get_final_norm_offset()
+    if fnorm_off == 0 { return -9 }  // v2 header: no final norm
+
+    let d_model = mdl_get_d_model()
+    let norm_size = d_model * 8
+    let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+
+    let lba_start = src_lba + fnorm_off / 512
+    let intra_offset = fnorm_off % 512
+    let total_sectors = (norm_size + intra_offset + 511) / 512
+    let mut sect_done: i64 = 0
+    let mut bytes_written: i64 = 0
+
+    while sect_done < total_sectors {
+        let remaining = total_sectors - sect_done
+        let read_count = if remaining > 128 { 128 } else { remaining }
+        let rc = nvme_read_sectors(lba_start + sect_done, read_count, NVME_DMA)
+        if rc != 0 { return -3 }
+        let copy_src = if sect_done == 0 { NVME_DMA + intra_offset } else { NVME_DMA }
+        let copy_raw = if sect_done == 0 { read_count * 512 - intra_offset } else { read_count * 512 }
+        let copy_len = if bytes_written + copy_raw > norm_size { norm_size - bytes_written } else { copy_raw }
+        mdl_memcpy(STREAM_FINAL_NORM + bytes_written, copy_src, copy_len)
+        bytes_written = bytes_written + copy_len
+        sect_done = sect_done + read_count
+    }
     0
 }
 
@@ -1218,7 +1312,7 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 
     let elems_per_byte = 8 / bits
     let mask = (1 << bits) - 1
-    let cb_addr = MDL_CODEBOOK_BASE
+    let cb_addr = MDL_EMBED_CB  // v3: use embedding's own codebook
 
     let mut i: i64 = 0
     while i < d_model {
@@ -1246,7 +1340,7 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     let src = STREAM_EMBED_BASE + token_id * bytes_per_row
     let elems_per_byte = 8 / bits
     let mask = (1 << bits) - 1
-    let cb_addr = MDL_CODEBOOK_BASE
+    let cb_addr = MDL_EMBED_CB  // v3: use embedding's own codebook
 
     let mut i: i64 = 0
     while i < d_model {
@@ -1281,7 +1375,7 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     let bits = mdl_get_quant_bits()
     let lmhead_off = mdl_get_lmhead_offset()
     let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
-    let cb_addr = MDL_CODEBOOK_BASE
+    let cb_addr = MDL_LMHEAD_CB  // v3: use LM head's own codebook
 
     let row_bytes = d_model * bits / 8
     if row_bytes <= 0 { return -8 }
@@ -1364,6 +1458,14 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
         cprint(" (", GREEN_ON_BLACK)
         mdl_print_size(embed_size)
         cprintln(")", GREEN_ON_BLACK)
+
+        // Also load final RMSNorm (model.norm) if v3 header
+        let fnorm_rc = mdl_stream_load_final_norm()
+        if fnorm_rc == 0 {
+            cprintln("[OK] Final RMSNorm loaded", GREEN_ON_BLACK)
+        } else if fnorm_rc == -9 {
+            cprintln("[WARN] No final norm in header (v2)", YELLOW_ON_BLACK)
+        }
     } else {
         cprint("[ERR] Embed load failed: ", RED_ON_BLACK)
         mdl_print_error(rc)

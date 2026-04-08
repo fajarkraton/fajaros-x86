@@ -1341,8 +1341,13 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
         layer = layer + 1
     }
 
+    // Step 2.5: Final RMSNorm (model.norm — AFTER last layer, BEFORE LM head)
+    let fnorm_off = mdl_get_final_norm_offset()
+    if fnorm_off > 0 {
+        km_rmsnorm(STFM_X, d_model, STREAM_FINAL_NORM)
+    }
+
     // Step 3: LM head argmax (streamed from NVMe, 1 MB chunks)
-    // Codebook at MDL_CODEBOOK_BASE was set by last layer — used for LM head too
     let next_token = mdl_stream_lmhead_argmax(STFM_X)
 
     // Update state
