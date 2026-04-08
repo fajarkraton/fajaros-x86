@@ -1219,6 +1219,34 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     out_slot
 }
 
+// Raw-address variant: dequantize embedding directly to a memory address
+// For d_model > 1024 (km_large limit). Writes d_model i64 values to out_addr.
+@kernel fn mdl_stream_embed_lookup_raw(token_id: i64, out_addr: i64) -> i64 {
+    if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 { return -1 }
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let bits = mdl_get_quant_bits()
+    if token_id < 0 || token_id >= vocab_size { return -2 }
+
+    let bytes_per_row = d_model * bits / 8
+    let src = STREAM_EMBED_BASE + token_id * bytes_per_row
+    let elems_per_byte = 8 / bits
+    let mask = (1 << bits) - 1
+    let cb_addr = MDL_CODEBOOK_BASE
+
+    let mut i: i64 = 0
+    while i < d_model {
+        let byte_idx = i / elems_per_byte
+        let bit_off = (i % elems_per_byte) * bits
+        let raw = volatile_read_u8(src + byte_idx)
+        let idx = (raw >> bit_off) & mask
+        let centroid = volatile_read_u64(cb_addr + idx * 8)
+        volatile_write_u64(out_addr + i * 8, centroid)
+        i = i + 1
+    }
+    0
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Streaming LM Head Argmax
 // ═══════════════════════════════════════════════════════════════

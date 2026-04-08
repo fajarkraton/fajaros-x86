@@ -816,6 +816,13 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
         return
     }
 
+    // NVMe source → use streaming inference path
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    if src_type == 2 {
+        cmd_infer_stream()
+        return
+    }
+
     let text_addr: i64 = 0x6F800 + 6
     let text_len = len - 6
 
@@ -1071,6 +1078,29 @@ const TFM_EOS_TOKEN: i64 = 2
         return
     }
 
+    // NVMe source → use streaming path
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    if src_type == 2 {
+        if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 {
+            cprintln("Embedding not loaded. Use: embed-load", YELLOW_ON_BLACK)
+            return
+        }
+        // Reparse "ask <text>" for streaming generate
+        let text_addr: i64 = 0x6F800 + 4
+        let text_len = len - 4
+        let tok_buf = TFM_SCRATCH + 16384
+        let n_prompt = tok_encode(text_addr, text_len, tok_buf)
+        if n_prompt <= 0 {
+            cprintln("Tokenization failed.", RED_ON_BLACK)
+            return
+        }
+        cprint("Output: ", WHITE_ON_BLACK)
+        let n_gen = tfm_generate_stream(tok_buf, n_prompt, 64)
+        tfm_print_perf(n_prompt, n_gen)
+        volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 0)
+        return
+    }
+
     let text_addr: i64 = 0x6F800 + 4
     let text_len = len - 4
 
@@ -1172,5 +1202,255 @@ const TFM_EOS_TOKEN: i64 = 2
 
     // Cleanup
     tfm_free_slots()
+    volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Streaming Transformer Forward Pass (Gemma 3 1B)
+// ═══════════════════════════════════════════════════════════════
+//
+// For large models loaded from NVMe via layer streaming.
+// Uses dedicated high-memory work buffers (d_model=1152 > km_large 1024 limit).
+// Streams each layer from NVMe, processes, discards. One layer in memory at a time.
+// LM head computed via streaming argmax (never loads full 75 MB).
+//
+// Memory:
+//   STFM_X/RES/FFN_OUT:  d_model-sized work vectors (12 KB each)
+//   STFM_FFN_GATE/UP:    ffn_dim-sized intermediate (56 KB each)
+//   TFM_Q/K/V/ATTN:      km_large slots (fit: Q=1024, K=256, V=256, ATTN=1024)
+//   TFM_KV_BASE:          KV cache (unchanged)
+//   STREAM_LAYER_BUF:     layer weights (6 MB from NVMe)
+
+// Work buffer addresses (213-215 MB range, within 512 MB identity mapping)
+const STFM_X: i64 = 0xD500000           // hidden state [d_model] (12 KB)
+const STFM_RES: i64 = 0xD503000         // residual copy (12 KB)
+const STFM_FFN_OUT: i64 = 0xD506000     // FFN output (12 KB)
+const STFM_FFN_GATE: i64 = 0xD510000    // gated FFN gate buf (56 KB)
+const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
+
+// ── Streaming layer forward pass ──
+// x_addr: raw address of hidden state (d_model i64 values)
+// layer: layer index (0..n_layers-1)
+// pos: sequence position
+@kernel fn tfm_layer_stream(x_addr: i64, layer: i64, pos: i64) {
+    let d_model = mdl_get_d_model()
+    let bits = mdl_get_quant_bits()
+    let n_heads = mdl_get_n_heads()
+    let n_kv = tfm_get_n_kv_heads()
+    let d_head = mdl_get_d_head()
+    let q_dim = n_heads * d_head
+    let kv_d = n_kv * d_head
+
+    // Load layer weights from NVMe if needed
+    if mdl_stream_current_layer() != layer {
+        mdl_stream_load_layer(layer)
+    }
+
+    // Streaming weight addresses
+    let qkv_addr = mdl_stream_qkv_addr()
+    let ffn_addr = mdl_stream_ffn_addr()
+    let norm_addr = mdl_stream_norm_addr()
+    let cb_addr = mdl_stream_codebook_addr()
+
+    // === Pre-attention RMSNorm ===
+    mdl_memcpy(STFM_RES, x_addr, d_model * 8)
+    km_rmsnorm(x_addr, d_model, norm_addr)
+
+    // === QKV Projections → km_large slots (Q=1024, K/V=256 — fit) ===
+    let q_out = km_data_ptr(TFM_Q)
+    km_vecmat_packed_raw(x_addr, qkv_addr, d_model, q_dim, bits, cb_addr, q_out)
+    let q_base = km_large_addr(TFM_Q)
+    volatile_write_u64(q_base + KM_HDR_ROWS, 1)
+    volatile_write_u64(q_base + KM_HDR_COLS, q_dim)
+
+    let k_off = mdl_stream_q_size()
+    let k_out = km_data_ptr(TFM_K)
+    km_vecmat_packed_raw(x_addr, qkv_addr + k_off, d_model, kv_d, bits, cb_addr, k_out)
+    let k_base = km_large_addr(TFM_K)
+    volatile_write_u64(k_base + KM_HDR_ROWS, 1)
+    volatile_write_u64(k_base + KM_HDR_COLS, kv_d)
+
+    let v_off = k_off + mdl_stream_kv_size()
+    let v_out = km_data_ptr(TFM_V)
+    km_vecmat_packed_raw(x_addr, qkv_addr + v_off, d_model, kv_d, bits, cb_addr, v_out)
+    let v_base = km_large_addr(TFM_V)
+    volatile_write_u64(v_base + KM_HDR_ROWS, 1)
+    volatile_write_u64(v_base + KM_HDR_COLS, kv_d)
+
+    // === RoPE ===
+    tfm_rope_apply(q_out, k_out, pos, n_heads, n_kv, d_head)
+
+    // === Attention → ATTN slot (q_dim=1024, fits km_large) ===
+    let window = tfm_attn_window(layer)
+    tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, window, TFM_ATTN)
+
+    // === Residual + Attention ===
+    // ATTN has q_dim elements; add to first q_dim of x (no W_o projection yet)
+    mdl_memcpy(x_addr, STFM_RES, d_model * 8)
+    let attn_data = km_data_ptr(TFM_ATTN)
+    km_add_raw(x_addr, attn_data, q_dim)
+
+    // === Pre-FFN RMSNorm ===
+    mdl_memcpy(STFM_RES, x_addr, d_model * 8)
+    let ln2_gamma = norm_addr + d_model * 8
+    km_rmsnorm(x_addr, d_model, ln2_gamma)
+
+    // === Gated FFN (gate_buf/up_buf in high memory — fits 6912 dims) ===
+    let ffn_dim = mdl_get_ffn_dim()
+    let mat_size = d_model * ffn_dim * bits / 8
+    tfm_ffn_gated(x_addr, ffn_addr, ffn_addr + mat_size, ffn_addr + mat_size * 2,
+                   d_model, ffn_dim, bits, cb_addr,
+                   STFM_FFN_OUT, STFM_FFN_GATE, STFM_FFN_UP)
+
+    // === Residual + FFN ===
+    mdl_memcpy(x_addr, STFM_RES, d_model * 8)
+    km_add_raw(x_addr, STFM_FFN_OUT, d_model)
+}
+
+// ── Streaming forward pass (single token) ──
+// Embeds token → runs all layers (streaming from NVMe) → LM head argmax
+// Returns: next token ID
+@kernel fn tfm_forward_stream(token_id: i64, pos: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    let n_layers = mdl_get_n_layers()
+
+    // Step 1: Embedding lookup → STFM_X (raw address, supports d > 1024)
+    mdl_stream_embed_lookup_raw(token_id, STFM_X)
+
+    // Step 2: Process all layers (stream each from NVMe)
+    let mut layer: i64 = 0
+    while layer < n_layers {
+        tfm_layer_stream(STFM_X, layer, pos)
+        layer = layer + 1
+    }
+
+    // Step 3: LM head argmax (streamed from NVMe, 1 MB chunks)
+    let next_token = mdl_stream_lmhead_argmax(STFM_X)
+
+    // Update state
+    volatile_write_u64(TFM_STATE + TFM_ST_LAST_TOKEN, next_token)
+    let gen = volatile_read_u64(TFM_STATE + TFM_ST_TOKENS_GEN)
+    volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, gen + 1)
+
+    next_token
+}
+
+// ── Streaming generate (multi-token) ──
+// Prefill prompt tokens, then autoregressive decode up to max_gen tokens.
+// Streams output token-by-token to serial.
+@kernel fn tfm_generate_stream(prompt_addr: i64, n_prompt: i64, max_gen: i64) -> i64 {
+    // Initialize state
+    volatile_write_u64(TFM_STATE + TFM_ST_POS, 0)
+    volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
+    volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
+
+    // Allocate Q/K/V/ATTN km_large slots (still used by attention)
+    let n_heads = mdl_get_n_heads()
+    let d_head = mdl_get_d_head()
+    let q_dim = n_heads * d_head
+    let kv_d = tfm_kv_dim()
+    tfm_set_slot_dim(TFM_Q, 1, q_dim)
+    tfm_set_slot_dim(TFM_K, 1, kv_d)
+    tfm_set_slot_dim(TFM_V, 1, kv_d)
+    tfm_set_slot_dim(TFM_ATTN, 1, q_dim)
+
+    // Init RoPE frequencies
+    let theta = mdl_get_rope_theta()
+    if theta > 0 { rope_init_freq(d_head, theta) }
+    tfm_clear_kv()
+
+    let eos = mdl_get_eos_token()
+    let t_start = rdtsc()
+
+    // Phase 1: Prefill
+    let mut pos: i64 = 0
+    while pos < n_prompt {
+        let tid = volatile_read_u64(prompt_addr + pos * 8)
+        tfm_forward_stream(tid, pos)
+        pos = pos + 1
+    }
+
+    let t_prefill = rdtsc()
+
+    // Phase 2: Decode
+    let mut prev_token = volatile_read_u64(TFM_STATE + TFM_ST_LAST_TOKEN)
+    let mut gen_count: i64 = 0
+    let dec_buf = TFM_SCRATCH + 24576
+
+    while gen_count < max_gen && pos < TFM_KV_MAX_POS {
+        let next = tfm_forward_stream(prev_token, pos)
+
+        if next == eos {
+            gen_count = max_gen
+        } else {
+            // Stream output
+            let dec_len = tok_decode(next, dec_buf)
+            let mut j: i64 = 0
+            while j < dec_len {
+                let ch = volatile_read_u8(dec_buf + j)
+                if ch >= 32 && ch < 127 {
+                    console_putchar(ch, GREEN_ON_BLACK)
+                } else if ch == 10 {
+                    console_putchar(10, WHITE_ON_BLACK)
+                } else {
+                    console_putchar(46, YELLOW_ON_BLACK)
+                }
+                j = j + 1
+            }
+            prev_token = next
+            pos = pos + 1
+            gen_count = gen_count + 1
+        }
+    }
+
+    let t_decode = rdtsc()
+    volatile_write_u64(TFM_STATE + TFM_ST_PREFILL_CY, t_prefill - t_start)
+    volatile_write_u64(TFM_STATE + TFM_ST_DECODE_CY, t_decode - t_prefill)
+    volatile_write_u64(TFM_STATE + TFM_ST_TOTAL_POS, pos)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    gen_count
+}
+
+// ── cmd_infer_stream: streaming inference command ──
+@kernel fn cmd_infer_stream() {
+    if mdl_is_loaded() != 1 {
+        cprintln("No model loaded.", YELLOW_ON_BLACK)
+        return
+    }
+    if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 {
+        cprintln("Embedding not loaded. Use: embed-load", YELLOW_ON_BLACK)
+        return
+    }
+
+    let len = cmdbuf_len()
+    if len <= 6 {
+        cprintln("Usage: infer <text>", YELLOW_ON_BLACK)
+        return
+    }
+
+    // Tokenize input
+    let text_addr: i64 = 0x6F800 + 6  // skip "infer "
+    let text_len = len - 6
+    let tok_buf = TFM_SCRATCH + 16384
+    let n_prompt = tok_encode(text_addr, text_len, tok_buf)
+
+    if n_prompt <= 0 {
+        cprintln("Tokenization failed.", RED_ON_BLACK)
+        return
+    }
+
+    cprint("Streaming inference (", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_n_layers(), CYAN_ON_BLACK)
+    cprintln(" layers from NVMe)...", WHITE_ON_BLACK)
+    cprint("Prompt tokens: ", WHITE_ON_BLACK)
+    cprint_decimal(n_prompt, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+    cprint("Output: ", WHITE_ON_BLACK)
+
+    let n_gen = tfm_generate_stream(tok_buf, n_prompt, 32)
+
+    // Stats
+    tfm_print_perf(n_prompt, n_gen)
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 0)
 }
