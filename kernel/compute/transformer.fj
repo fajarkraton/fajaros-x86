@@ -50,6 +50,12 @@ const TFM_ST_TOTAL_POS: i64 = 48   // total positions processed
 // Address = TFM_KV_BASE + layer * kv_layer_stride + pos * kv_pos_stride + type * d_model * 8
 const TFM_KV_MAX_POS: i64 = 128    // max context length
 
+// Frame-allocated vector registry (for d > 1024)
+// Up to 16 active vectors tracked at TFM_FVEC_REG
+// Each entry: [addr(8B), frames(8B)] = 16 bytes, 16 entries = 256 bytes
+const TFM_FVEC_REG: i64 = 0xBE7E00
+const TFM_FVEC_MAX: i64 = 16
+
 // ═══════════════════════════════════════════════════════════════
 // Packed Quantized Vector-Matrix Multiply
 // ═══════════════════════════════════════════════════════════════
@@ -89,6 +95,118 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
         volatile_write_u64(out_data + j * 8, sum)
         j = j + 1
     }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Frame-Allocated Vectors (for d > 1024)
+// ═══════════════════════════════════════════════════════════════
+
+// Allocate a frame-backed vector of `dim` i64 elements.
+// Returns raw memory address, or -1 on failure.
+@kernel fn tfm_fvec_alloc(dim: i64) -> i64 {
+    let bytes = dim * 8
+    let n_frames = (bytes + 4095) / 4096
+    let addr = frame_alloc_contiguous(n_frames)
+    if addr == -1 { return -1 }
+
+    // Zero the vector
+    let mut i: i64 = 0
+    while i < dim {
+        volatile_write_u64(addr + i * 8, 0)
+        i = i + 1
+    }
+
+    // Register in tracking table
+    let mut slot: i64 = 0
+    while slot < TFM_FVEC_MAX {
+        let entry = TFM_FVEC_REG + slot * 16
+        if volatile_read_u64(entry) == 0 {
+            volatile_write_u64(entry, addr)
+            volatile_write_u64(entry + 8, n_frames)
+            return addr
+        }
+        slot = slot + 1
+    }
+    // Registry full — free frames and fail
+    i = 0
+    while i < n_frames { frame_free(addr + i * 4096); i = i + 1 }
+    -1
+}
+
+// Free a frame-allocated vector
+@kernel fn tfm_fvec_free(addr: i64) {
+    if addr <= 0 { return }
+    let mut slot: i64 = 0
+    while slot < TFM_FVEC_MAX {
+        let entry = TFM_FVEC_REG + slot * 16
+        if volatile_read_u64(entry) == addr {
+            let n_frames = volatile_read_u64(entry + 8)
+            let mut i: i64 = 0
+            while i < n_frames { frame_free(addr + i * 4096); i = i + 1 }
+            volatile_write_u64(entry, 0)
+            volatile_write_u64(entry + 8, 0)
+            return
+        }
+        slot = slot + 1
+    }
+}
+
+// Free ALL registered frame vectors (cleanup after inference)
+@kernel fn tfm_fvec_free_all() {
+    let mut slot: i64 = 0
+    while slot < TFM_FVEC_MAX {
+        let entry = TFM_FVEC_REG + slot * 16
+        let addr = volatile_read_u64(entry)
+        if addr != 0 {
+            let n_frames = volatile_read_u64(entry + 8)
+            let mut i: i64 = 0
+            while i < n_frames { frame_free(addr + i * 4096); i = i + 1 }
+            volatile_write_u64(entry, 0)
+            volatile_write_u64(entry + 8, 0)
+        }
+        slot = slot + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Gated FFN (Gemma 3 / LLaMA-style: gate * up → down)
+// ═══════════════════════════════════════════════════════════════
+//
+// Standard FFN:  out = W2(GELU(W1(x)))           — 2 matrices
+// Gated FFN:     out = down(GELU(gate(x)) * up(x)) — 3 matrices
+//
+// gate_proj: d_model → ffn_dim
+// up_proj:   d_model → ffn_dim
+// down_proj: ffn_dim → d_model
+//
+// x_addr:        input vector (d_model elements)
+// gate_w_addr:   packed quantized gate_proj weights
+// up_w_addr:     packed quantized up_proj weights
+// down_w_addr:   packed quantized down_proj weights
+// d_model:       input/output dimension
+// ffn_dim:       intermediate dimension
+// bits:          quantization bit width
+// cb_addr:       codebook address
+// out_addr:      output vector (d_model elements)
+// gate_buf/up_buf: pre-allocated ffn_dim buffers (frame-allocated)
+
+@kernel fn tfm_ffn_gated(x_addr: i64, gate_w_addr: i64, up_w_addr: i64, down_w_addr: i64,
+                          d_model: i64, ffn_dim: i64, bits: i64, cb_addr: i64,
+                          out_addr: i64, gate_buf: i64, up_buf: i64) {
+    // Step 1: gate = gate_proj(x) → ffn_dim
+    km_vecmat_packed_raw(x_addr, gate_w_addr, d_model, ffn_dim, bits, cb_addr, gate_buf)
+
+    // Step 2: up = up_proj(x) → ffn_dim
+    km_vecmat_packed_raw(x_addr, up_w_addr, d_model, ffn_dim, bits, cb_addr, up_buf)
+
+    // Step 3: gate = GELU(gate)
+    km_gelu_tanh(gate_buf, ffn_dim)
+
+    // Step 4: gate = gate * up (element-wise)
+    km_mul_raw(gate_buf, up_buf, ffn_dim)
+
+    // Step 5: out = down_proj(gate) → d_model
+    km_vecmat_packed_raw(gate_buf, down_w_addr, ffn_dim, d_model, bits, cb_addr, out_addr)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -397,13 +515,14 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
     }
 }
 
-// Free transformer slots after inference
+// Free transformer slots + frame vectors after inference
 @kernel fn tfm_free_slots() {
     let mut i: i64 = 0
     while i <= TFM_TMP {
         km_free(i)
         i = i + 1
     }
+    tfm_fvec_free_all()
 }
 
 // Clear KV cache

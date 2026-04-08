@@ -461,6 +461,171 @@ const KM_TILE_SIZE: i64 = 64
 }
 
 // ═══════════════════════════════════════════════════════════════
+// RMSNorm (Gemma 3 / LLaMA-style, no mean, no beta)
+// ═══════════════════════════════════════════════════════════════
+//
+// RMSNorm(x) = x / sqrt(mean(x²) + eps) * gamma
+// Gemma 3 uses (1 + weight) scaling: result = normed * (1000 + gamma[i]) / 1000
+// If gamma_addr == 0, skip affine (identity).
+// Works on raw memory address (for frame-allocated vectors with d > 1024).
+
+@kernel fn km_rmsnorm(data_addr: i64, dim: i64, gamma_addr: i64) {
+    // Step 1: compute mean(x²) = sum(x²) / dim
+    // Use chunked accumulation to prevent overflow:
+    // sum += (x / dim) * (x / 1000) → gives sum(x²) / (dim * 1000)
+    let mut rms_sum: i64 = 0
+    let mut i: i64 = 0
+    while i < dim {
+        let x = volatile_read_u64(data_addr + i * 8)
+        rms_sum = rms_sum + (x / dim) * (x / 1000)
+        i = i + 1
+    }
+    // rms_sum ≈ mean(x²) / 1000
+    let rms_val = if rms_sum < 0 { 0 - rms_sum } else { rms_sum }
+    // eps = 1 in fixed-point (≈ 1e-6 at x1e6 scale)
+    let rms = km_isqrt(rms_val + 1)
+    if rms == 0 { return }
+
+    // Step 2: normalize and apply gamma
+    i = 0
+    while i < dim {
+        let x = volatile_read_u64(data_addr + i * 8)
+        let normed = (x * 1000) / rms
+        if gamma_addr != 0 {
+            // Gemma 3 style: weight is zero-centered, apply as (1 + w) * x
+            let g = volatile_read_u64(gamma_addr + i * 8)
+            volatile_write_u64(data_addr + i * 8, (normed * (1000 + g)) / 1000)
+        } else {
+            volatile_write_u64(data_addr + i * 8, normed)
+        }
+        i = i + 1
+    }
+}
+
+// Convenience wrapper for km_ slot-based RMSNorm
+@kernel fn km_rmsnorm_slot(slot: i64, dim: i64, gamma_addr: i64) {
+    km_rmsnorm(km_data_ptr(slot), dim, gamma_addr)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// GELU (tanh approximation — Gemma 3 / GPT-2 style)
+// ═══════════════════════════════════════════════════════════════
+//
+// GELU_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x³)))
+// Fixed-point approximation:
+//   sqrt(2/pi) ≈ 0.7979 → 798 in x1000
+//   0.044715 → 45 in x1000
+//   tanh(z) ≈ piecewise: z for |z|<1, sign(z)*1000 for |z|>3
+// Works on raw memory address.
+
+@kernel fn km_tanh_approx(x: i64) -> i64 {
+    // Piecewise tanh approximation (fixed-point x1000)
+    if x > 2500 { 1000 }
+    else if x > 1500 { 900 + (x - 1500) / 10 }
+    else if x > 500 { 500 + (x - 500) * 400 / 1000 }
+    else if x > -500 { x }
+    else if x > -1500 { -500 + (x + 500) * 400 / 1000 }
+    else if x > -2500 { -900 + (x + 1500) / 10 }
+    else { -1000 }
+}
+
+@kernel fn km_gelu_tanh(data_addr: i64, dim: i64) {
+    let mut i: i64 = 0
+    while i < dim {
+        let x = volatile_read_u64(data_addr + i * 8)
+        // inner = sqrt(2/pi) * (x + 0.044715 * x³)
+        // x³ in fixed-point: (x * x / 1000) * x / 1000
+        let x2 = (x * x) / 1000
+        let x3 = (x2 * x) / 1000
+        let inner = (798 * (x + (45 * x3) / 1000)) / 1000
+        let t = km_tanh_approx(inner)
+        // result = 0.5 * x * (1 + tanh) = x * (1000 + tanh) / 2000
+        let result = (x * (1000 + t)) / 2000
+        volatile_write_u64(data_addr + i * 8, result)
+        i = i + 1
+    }
+}
+
+// Convenience wrapper for km_ slot
+@kernel fn km_gelu_tanh_slot(slot: i64, dim: i64) {
+    km_gelu_tanh(km_data_ptr(slot), dim)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Raw-address operations (for frame-allocated vectors)
+// ═══════════════════════════════════════════════════════════════
+
+// Element-wise add: a[i] += b[i], both raw addresses
+@kernel fn km_add_raw(a_addr: i64, b_addr: i64, dim: i64) {
+    let mut i: i64 = 0
+    while i < dim {
+        let a = volatile_read_u64(a_addr + i * 8)
+        let b = volatile_read_u64(b_addr + i * 8)
+        volatile_write_u64(a_addr + i * 8, a + b)
+        i = i + 1
+    }
+}
+
+// Element-wise multiply: out[i] = a[i] * b[i] / 1000, all raw addresses
+@kernel fn km_mul_raw(a_addr: i64, b_addr: i64, dim: i64) {
+    let mut i: i64 = 0
+    while i < dim {
+        let a = volatile_read_u64(a_addr + i * 8)
+        let b = volatile_read_u64(b_addr + i * 8)
+        volatile_write_u64(a_addr + i * 8, (a * b) / 1000)
+        i = i + 1
+    }
+}
+
+// Copy: dst = src, raw addresses
+@kernel fn km_copy_raw(dst_addr: i64, src_addr: i64, dim: i64) {
+    let mut i: i64 = 0
+    while i < dim {
+        volatile_write_u64(dst_addr + i * 8, volatile_read_u64(src_addr + i * 8))
+        i = i + 1
+    }
+}
+
+// Argmax over raw address, returns index of max element
+@kernel fn km_argmax_raw(data_addr: i64, dim: i64) -> i64 {
+    let mut best_idx: i64 = 0
+    let mut best_val = volatile_read_u64(data_addr)
+    let mut i: i64 = 1
+    while i < dim {
+        let v = volatile_read_u64(data_addr + i * 8)
+        if v > best_val { best_val = v; best_idx = i }
+        i = i + 1
+    }
+    best_idx
+}
+
+// Packed quantized vecmat on raw addresses (no km_ slots)
+// y[n] = x[m] @ dequant(W_packed[m×n])
+@kernel fn km_vecmat_packed_raw(x_addr: i64, packed_addr: i64, m: i64, n: i64,
+                                 bits: i64, cb_addr: i64, out_addr: i64) {
+    let elems_per_byte = 8 / bits
+    let mask = (1 << bits) - 1
+    let mut j: i64 = 0
+    while j < n {
+        let mut sum: i64 = 0
+        let mut k: i64 = 0
+        while k < m {
+            let v = volatile_read_u64(x_addr + k * 8)
+            let flat_idx = k * n + j
+            let byte_idx = flat_idx / elems_per_byte
+            let bit_off = (flat_idx % elems_per_byte) * bits
+            let raw_byte = volatile_read_u8(packed_addr + byte_idx)
+            let idx = (raw_byte >> bit_off) & mask
+            let w = volatile_read_u64(cb_addr + idx * 8)
+            sum = sum + (v * w) / 1000
+            k = k + 1
+        }
+        volatile_write_u64(out_addr + j * 8, sum)
+        j = j + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Residual Add: out = a + b (element-wise, in-place on a)
 // ═══════════════════════════════════════════════════════════════
 
