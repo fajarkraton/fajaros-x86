@@ -177,7 +177,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  quant quant-bench quant-info classify", WHITE_ON_BLACK)
     cprintln("  km-bench km-info model-load model-info", WHITE_ON_BLACK)
     cprintln("  tokenize tok-info tok-load tok-reset", WHITE_ON_BLACK)
-    cprintln("  infer tfm-info", WHITE_ON_BLACK)
+    cprintln("  infer ask gen tfm-info", WHITE_ON_BLACK)
     cprintln("  virtio-gpu gpu gpu-info gpu-bench", WHITE_ON_BLACK)
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
@@ -3175,6 +3175,12 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
     // tfm-info (116,102,109,45,105,110,102,111) len=8 — transformer status
     if handled == 0 && len == 8 && buf_eq4(116, 102, 109, 45) == 1 && volatile_read_u8(0x6F804) == 105 && volatile_read_u8(0x6F805) == 110 { cmd_tfm_info(); handled = 1 }
+
+    // ask (97,115,107,32,...) len>=4 — "ask <prompt>" — generate response
+    if handled == 0 && len >= 4 && volatile_read_u8(0x6F800) == 97 && volatile_read_u8(0x6F801) == 115 && volatile_read_u8(0x6F802) == 107 && (len == 3 || volatile_read_u8(0x6F803) == 32) { cmd_ask(); handled = 1 }
+
+    // gen (103,101,110,32,...) len>=4 — "gen <prompt> [max]" — open-ended generation
+    if handled == 0 && len >= 4 && volatile_read_u8(0x6F800) == 103 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 110 && (len == 3 || volatile_read_u8(0x6F803) == 32) { cmd_gen(); handled = 1 }
 
     // === Memory management commands ===
     // frames

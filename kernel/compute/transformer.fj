@@ -557,3 +557,235 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
     cprint_decimal(kv_per_pos, CYAN_ON_BLACK)
     cprintln(" bytes", WHITE_ON_BLACK)
 }
+
+// ═══════════════════════════════════════════════════════════════
+// Phase 6: Autoregressive Generation
+// ═══════════════════════════════════════════════════════════════
+
+// Default max generation length
+const TFM_MAX_GEN: i64 = 64
+// EOS token (0 for test model, 2 for SmolLM/LLaMA-style)
+const TFM_EOS_TOKEN: i64 = 2
+
+// Core generation loop: prefill prompt + generate N tokens
+// prompt_addr: address of tokenized prompt IDs (i64 array)
+// n_prompt: number of prompt tokens
+// max_gen: maximum tokens to generate
+// streaming: 1 = print each token as generated, 0 = silent
+// Returns: number of tokens generated
+@kernel fn tfm_generate(prompt_addr: i64, n_prompt: i64, max_gen: i64, streaming: i64) -> i64 {
+    // Initialize
+    volatile_write_u64(TFM_STATE + TFM_ST_POS, 0)
+    volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
+    volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
+    tfm_clear_kv()
+
+    let t_start = rdtsc()
+
+    // Phase 1: Prefill — process all prompt tokens
+    let mut pos: i64 = 0
+    while pos < n_prompt {
+        let tid = volatile_read_u64(prompt_addr + pos * 8)
+        tfm_forward(tid, pos)
+        pos = pos + 1
+    }
+
+    let t_prefill = rdtsc()
+
+    // Phase 2: Autoregressive decode
+    let mut prev_token = volatile_read_u64(TFM_STATE + TFM_ST_LAST_TOKEN)
+    let mut gen_count: i64 = 0
+    let dec_buf = TFM_SCRATCH + 24576  // decode scratch
+
+    while gen_count < max_gen && pos < TFM_KV_MAX_POS {
+        let next = tfm_forward(prev_token, pos)
+
+        // EOS check (skip for test model where vocab < EOS token)
+        let vocab = mdl_get_vocab_size()
+        if vocab > TFM_EOS_TOKEN && next == TFM_EOS_TOKEN {
+            gen_count = max_gen  // break
+        } else {
+            // Stream output
+            if streaming == 1 {
+                let dec_len = tok_decode(next, dec_buf)
+                let mut j: i64 = 0
+                while j < dec_len {
+                    let ch = volatile_read_u8(dec_buf + j)
+                    if ch >= 32 && ch < 127 {
+                        console_putchar(ch, GREEN_ON_BLACK)
+                    } else if ch == 10 {
+                        console_putchar(10, WHITE_ON_BLACK)
+                    } else {
+                        console_putchar(46, YELLOW_ON_BLACK)  // non-printable → dot
+                    }
+                    j = j + 1
+                }
+            }
+
+            prev_token = next
+            pos = pos + 1
+            gen_count = gen_count + 1
+        }
+    }
+
+    let t_end = rdtsc()
+
+    // Store timing info in state (reuse unused slots)
+    // TFM_STATE + 32: prefill cycles
+    // TFM_STATE + 40: decode cycles
+    // TFM_STATE + 48: total tokens (prompt + generated)
+    volatile_write_u64(TFM_STATE + 32, t_prefill - t_start)
+    volatile_write_u64(TFM_STATE + 40, t_end - t_prefill)
+    volatile_write_u64(TFM_STATE + 48, pos)
+
+    gen_count
+}
+
+// Print performance stats after generation
+@kernel fn tfm_print_perf(n_prompt: i64, n_gen: i64) {
+    let prefill_cycles = volatile_read_u64(TFM_STATE + 32)
+    let decode_cycles = volatile_read_u64(TFM_STATE + 40)
+
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("--- Stats ---", YELLOW_ON_BLACK)
+    cprint("  Prompt:   ", WHITE_ON_BLACK)
+    cprint_decimal(n_prompt, CYAN_ON_BLACK)
+    cprintln(" tokens", WHITE_ON_BLACK)
+
+    cprint("  Generated:", WHITE_ON_BLACK)
+    cprint_decimal(n_gen, CYAN_ON_BLACK)
+    cprintln(" tokens", WHITE_ON_BLACK)
+
+    cprint("  Prefill:  ", WHITE_ON_BLACK)
+    cprint_decimal(prefill_cycles / 1000000, CYAN_ON_BLACK)
+    cprintln(" M cycles", WHITE_ON_BLACK)
+
+    cprint("  Decode:   ", WHITE_ON_BLACK)
+    cprint_decimal(decode_cycles / 1000000, CYAN_ON_BLACK)
+    cprintln(" M cycles", WHITE_ON_BLACK)
+
+    if n_gen > 0 {
+        let per_token = decode_cycles / n_gen
+        cprint("  Per token:", WHITE_ON_BLACK)
+        cprint_decimal(per_token / 1000, CYAN_ON_BLACK)
+        cprintln(" K cycles", WHITE_ON_BLACK)
+    }
+}
+
+// ask <prompt> — generate response to a question
+@kernel fn cmd_ask() {
+    let len = cmdbuf_len()
+    // "ask " = 4 chars
+    if len <= 4 {
+        cprintln("Usage: ask <question>", YELLOW_ON_BLACK)
+        return
+    }
+
+    if mdl_is_loaded() != 1 {
+        cprintln("[ERR] No model loaded. Use: model-load test", RED_ON_BLACK)
+        return
+    }
+
+    let text_addr: i64 = 0x6F800 + 4
+    let text_len = len - 4
+
+    // Print prompt
+    cprint("> ", YELLOW_ON_BLACK)
+    let mut i: i64 = 0
+    while i < text_len {
+        console_putchar(volatile_read_u8(text_addr + i), WHITE_ON_BLACK)
+        i = i + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Tokenize
+    let tok_buf = TFM_SCRATCH + 16384
+    let n_prompt = tok_encode(text_addr, text_len, tok_buf)
+
+    // Generate with streaming
+    console_putchar(10, WHITE_ON_BLACK)
+    let n_gen = tfm_generate(tok_buf, n_prompt, TFM_MAX_GEN, 1)
+
+    // Print stats
+    tfm_print_perf(n_prompt, n_gen)
+
+    // Cleanup
+    tfm_free_slots()
+    volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 0)
+}
+
+// gen <prompt> [max_tokens] — open-ended generation
+@kernel fn cmd_gen() {
+    let len = cmdbuf_len()
+    // "gen " = 4 chars
+    if len <= 4 {
+        cprintln("Usage: gen <prompt> [max_tokens]", YELLOW_ON_BLACK)
+        return
+    }
+
+    if mdl_is_loaded() != 1 {
+        cprintln("[ERR] No model loaded. Use: model-load test", RED_ON_BLACK)
+        return
+    }
+
+    // Parse optional max_tokens from end of command
+    // Look for last space followed by a number
+    let mut max_tokens: i64 = TFM_MAX_GEN
+    let mut text_end = len
+    let mut last_space: i64 = -1
+
+    let mut i: i64 = 4
+    while i < len {
+        if volatile_read_u8(0x6F800 + i) == 32 { last_space = i }
+        i = i + 1
+    }
+
+    // Check if text after last space is a number
+    if last_space > 4 {
+        let mut is_num: i64 = 1
+        let mut num: i64 = 0
+        i = last_space + 1
+        while i < len {
+            let ch = volatile_read_u8(0x6F800 + i)
+            if ch >= 48 && ch <= 57 {
+                num = num * 10 + (ch - 48)
+            } else {
+                is_num = 0
+            }
+            i = i + 1
+        }
+        if is_num == 1 && num > 0 {
+            max_tokens = num
+            text_end = last_space
+        }
+    }
+
+    let text_addr: i64 = 0x6F800 + 4
+    let text_len = text_end - 4
+
+    // Print prompt
+    cprint("Prompt: \"", WHITE_ON_BLACK)
+    i = 0
+    while i < text_len {
+        console_putchar(volatile_read_u8(text_addr + i), CYAN_ON_BLACK)
+        i = i + 1
+    }
+    cprintln("\"", WHITE_ON_BLACK)
+    cprint("Max tokens: ", WHITE_ON_BLACK)
+    cprint_decimal(max_tokens, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Tokenize
+    let tok_buf = TFM_SCRATCH + 16384
+    let n_prompt = tok_encode(text_addr, text_len, tok_buf)
+
+    cprint("Output: ", WHITE_ON_BLACK)
+    let n_gen = tfm_generate(tok_buf, n_prompt, max_tokens, 1)
+
+    // Stats
+    tfm_print_perf(n_prompt, n_gen)
+
+    // Cleanup
+    tfm_free_slots()
+    volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 0)
+}
