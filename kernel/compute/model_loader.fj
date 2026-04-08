@@ -72,12 +72,12 @@ const FJM_LAYER_HDR_SIZE: i64 = 16
 // Memory Layout for Loaded Model
 // ═══════════════════════════════════════════════════════════════
 
-const MDL_HDR_BASE: i64 = 0xC00000       // Parsed header copy (96 bytes for v2)
-const MDL_STATE_BASE: i64 = 0xC00060     // Loader state (64 bytes)
-const MDL_CODEBOOK_BASE: i64 = 0xC000A0 // Per-layer codebooks (32 × 32B = 1KB)
-const MDL_EMBED_CB: i64 = 0xC004A0      // Embedding codebook (32 bytes)
-const MDL_LMHEAD_CB: i64 = 0xC004C0     // LM head codebook (32 bytes)
-const MDL_LN_BASE: i64 = 0xC00500       // LayerNorm parameters
+const MDL_HDR_BASE: i64 = 0xC00000       // Parsed header copy (160 bytes for v3)
+const MDL_STATE_BASE: i64 = 0xC000A0     // Loader state (64 bytes) — after 160B header
+const MDL_CODEBOOK_BASE: i64 = 0xC000E0 // Per-layer codebooks (32 × 32B = 1KB)
+const MDL_EMBED_CB: i64 = 0xC004E0      // Embedding codebook (32 bytes)
+const MDL_LMHEAD_CB: i64 = 0xC00500     // LM head codebook (32 bytes)
+const MDL_LN_BASE: i64 = 0xC00520       // LayerNorm parameters
 
 const MDL_EMBED_BASE: i64 = 0xC30000   // Embedding table start
 const MDL_LAYER_BASE: i64 = 0x1200000  // Layer weights start
@@ -1045,7 +1045,7 @@ const STREAM_FINAL_NORM: i64 = 0xD530000    // Final RMSNorm gamma (d_model × 8
 // RAM-resident mode: load ALL weights to RAM (no NVMe per-token)
 const RAM_LAYERS_BASE: i64 = 0x10000000    // 256 MB — 26 layers contiguous
 const RAM_LMHEAD_BASE: i64 = 0x1AF00000   // ~431 MB — LM head (adjusted at load time)
-const MDL_RAM_STATE: i64 = 0xC004E0       // RAM-resident state (16 bytes)
+const MDL_RAM_STATE: i64 = 0xC00540       // RAM-resident state (16 bytes)
 const MDL_RAM_ACTIVE: i64 = 0             // offset: 1 if RAM mode active
 const MDL_RAM_LMHEAD: i64 = 8             // offset: actual LM head address in RAM
 
