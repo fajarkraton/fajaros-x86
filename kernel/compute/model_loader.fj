@@ -22,32 +22,40 @@
 // .fjm Binary Format Constants
 // ═══════════════════════════════════════════════════════════════
 
-// Header (64 bytes, all i64 little-endian)
+// Header v2 (96 bytes). v1 (64 bytes) still supported for backward compat.
 const FJM_MAGIC: i64 = 0x314D4A46   // "FJM1" in little-endian
-const FJM_VERSION: i64 = 1
 
-// Header field offsets (each 4 bytes = i32, but we read as i64 pairs)
+// Header field offsets (each 4 bytes, little-endian u32)
+// v1 fields (offset 0-51):
 const FJM_OFF_MAGIC: i64 = 0        // 4B: "FJM1"
-const FJM_OFF_VERSION: i64 = 4      // 4B: format version
-const FJM_OFF_MODEL_TYPE: i64 = 8   // 4B: 1=SmolLM-135M, 2=TinyLlama
+const FJM_OFF_VERSION: i64 = 4      // 4B: 1=v1 (SmolLM), 2=v2 (Gemma 3)
+const FJM_OFF_MODEL_TYPE: i64 = 8   // 4B: 0=test, 1=SmolLM-135M, 10=Gemma3-1B
 const FJM_OFF_N_LAYERS: i64 = 12    // 4B: number of transformer layers
-const FJM_OFF_D_MODEL: i64 = 16     // 4B: model dimension
-const FJM_OFF_N_HEADS: i64 = 20     // 4B: number of attention heads
-const FJM_OFF_D_HEAD: i64 = 24      // 4B: head dimension (d_model / n_heads)
+const FJM_OFF_D_MODEL: i64 = 16     // 4B: model dimension (hidden_size)
+const FJM_OFF_N_HEADS: i64 = 20     // 4B: number of query attention heads
+const FJM_OFF_D_HEAD: i64 = 24      // 4B: head dimension
 const FJM_OFF_VOCAB_SIZE: i64 = 28  // 4B: vocabulary size
 const FJM_OFF_QUANT_BITS: i64 = 32  // 4B: quantization bit width
 const FJM_OFF_TOTAL_SIZE: i64 = 36  // 4B: total file size in bytes
 const FJM_OFF_EMBED_OFF: i64 = 40   // 4B: byte offset to embedding table
 const FJM_OFF_LAYER0_OFF: i64 = 44  // 4B: byte offset to first layer block
 const FJM_OFF_LMHEAD_OFF: i64 = 48  // 4B: byte offset to LM head weights
-const FJM_OFF_RESERVED: i64 = 52    // 12B: reserved (zero)
-const FJM_HEADER_SIZE: i64 = 64
+// v2 fields (offset 52-95):
+const FJM_OFF_N_KV_HEADS: i64 = 52  // 4B: n_kv_heads (0=same as n_heads, MHA)
+const FJM_OFF_FFN_TYPE: i64 = 56    // 4B: 0=standard 2-matrix, 1=gated 3-matrix
+const FJM_OFF_NORM_TYPE: i64 = 60   // 4B: 0=LayerNorm, 1=RMSNorm
+const FJM_OFF_FFN_DIM: i64 = 64     // 4B: FFN intermediate size (0=4*d_model)
+const FJM_OFF_ROPE_THETA: i64 = 68  // 4B: RoPE theta / 1000 (0=no RoPE)
+const FJM_OFF_EOS_TOKEN: i64 = 72   // 4B: EOS token ID
+const FJM_OFF_RESERVED2: i64 = 76   // 20B: reserved
+const FJM_HEADER_V1_SIZE: i64 = 64
+const FJM_HEADER_SIZE: i64 = 96
 
 // Per-layer block header (16 bytes before weight data)
 const FJM_LAYER_OFF_ID: i64 = 0       // 4B: layer index
 const FJM_LAYER_OFF_SIZE: i64 = 4     // 4B: total block size (including header)
-const FJM_LAYER_OFF_QKV_SIZE: i64 = 8 // 4B: QKV weight size in bytes
-const FJM_LAYER_OFF_FFN_SIZE: i64 = 12 // 4B: FFN weight size in bytes
+const FJM_LAYER_OFF_QKV_SIZE: i64 = 8 // 4B: Q+K+V weight size in bytes
+const FJM_LAYER_OFF_FFN_SIZE: i64 = 12 // 4B: FFN weight size (all matrices)
 const FJM_LAYER_HDR_SIZE: i64 = 16
 
 // ═══════════════════════════════════════════════════════════════
@@ -74,7 +82,7 @@ const MDL_ST_LMHEAD_LOADED: i64 = 40 // 1 if LM head loaded
 // Maximum supported model size
 const MDL_MAX_LAYERS: i64 = 32
 const MDL_MAX_D_MODEL: i64 = 2048
-const MDL_MAX_VOCAB: i64 = 65536
+const MDL_MAX_VOCAB: i64 = 262144   // Gemma 3: 256K vocab
 
 // Per-layer memory budget (how much space per layer at MDL_LAYER_BASE)
 // SmolLM-135M at 2-bit: QKV=768*3*768*2/8 = 442KB, FFN=768*3072*2*2/8 = 1.18MB
@@ -130,9 +138,9 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         return -1  // Bad magic
     }
 
-    // Check version
+    // Check version (support v1 and v2)
     let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
-    if version != FJM_VERSION {
+    if version != 1 && version != 2 {
         return -2  // Unsupported version
     }
 
@@ -163,11 +171,23 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if lmhead_off >= total_size { return -3 }
 
     // Copy validated header to MDL_HDR_BASE
+    let hdr_size = if version >= 2 { FJM_HEADER_SIZE } else { FJM_HEADER_V1_SIZE }
     let mut i: i64 = 0
-    while i < FJM_HEADER_SIZE {
+    while i < hdr_size {
         volatile_write_u8(MDL_HDR_BASE + i, volatile_read_u8(src_addr + i))
         i = i + 1
     }
+    // Zero v2 fields if v1 header (backward compat: n_kv_heads=0 → MHA)
+    if version == 1 {
+        while i < FJM_HEADER_SIZE {
+            volatile_write_u8(MDL_HDR_BASE + i, 0)
+            i = i + 1
+        }
+    }
+
+    // Store n_kv_heads in transformer state for GQA
+    let n_kv_h = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_N_KV_HEADS)
+    volatile_write_u64(0xBE8000 + 56, n_kv_h)  // TFM_STATE + TFM_ST_N_KV_HEADS
 
     0  // Success
 }
@@ -187,6 +207,26 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 @kernel fn mdl_get_embed_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_EMBED_OFF) }
 @kernel fn mdl_get_layer0_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LAYER0_OFF) }
 @kernel fn mdl_get_lmhead_offset() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LMHEAD_OFF) }
+
+@kernel fn mdl_get_version() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_VERSION) }
+@kernel fn mdl_get_n_kv_heads() -> i64 {
+    let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_N_KV_HEADS)
+    if v > 0 { v } else { mdl_get_n_heads() }  // 0 = MHA
+}
+@kernel fn mdl_get_ffn_type() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_FFN_TYPE) }
+@kernel fn mdl_get_norm_type() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_NORM_TYPE) }
+@kernel fn mdl_get_ffn_dim() -> i64 {
+    let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_FFN_DIM)
+    if v > 0 { v } else { mdl_get_d_model() * 4 }  // 0 = default 4x
+}
+@kernel fn mdl_get_rope_theta() -> i64 {
+    let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_ROPE_THETA)
+    if v > 0 { v * 1000 } else { 0 }  // stored as theta/1000, return full
+}
+@kernel fn mdl_get_eos_token() -> i64 {
+    let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_EOS_TOKEN)
+    if v > 0 { v } else { 2 }  // default EOS=2
+}
 
 @kernel fn mdl_is_loaded() -> i64 {
     volatile_read_u64(MDL_STATE_BASE + MDL_ST_LOADED)
@@ -504,41 +544,47 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 // Model: 2 layers, d=16, 2 heads, d_head=8, vocab=64, 2-bit
 // Total size: ~100 bytes — fits easily in RamFS
 @kernel fn mdl_create_test_model() {
-    // Calculate sizes
+    // .fjm v2 test model with GQA + gated FFN + RMSNorm
     let n_layers: i64 = 2
     let d_model: i64 = 16
-    let n_heads: i64 = 2
-    let d_head: i64 = 8
+    let n_heads: i64 = 4       // 4 query heads
+    let n_kv_heads: i64 = 1    // 1 KV head (GQA 4:1)
+    let d_head: i64 = 4        // head dim (n_heads * d_head = 16 = d_model for Q)
     let vocab_size: i64 = 64
     let quant_bits: i64 = 2
+    let ffn_dim: i64 = 32      // gated FFN intermediate
+    let q_dim = n_heads * d_head       // 16
+    let kv_d = n_kv_heads * d_head     // 4
 
-    // Per-layer data size (quantized)
-    let qkv_size = d_model * 3 * d_model * quant_bits / 8    // 16*3*16*2/8 = 192
-    let ffn1_size = d_model * 4 * d_model * quant_bits / 8   // 16*4*16*2/8 = 256
-    let ffn2_size = 4 * d_model * d_model * quant_bits / 8   // 4*16*16*2/8 = 256
-    let ln_size = 2 * d_model * 8 * 2                        // 2*16*8*2 = 512
-    let cb_size = (1 << quant_bits) * 8                       // 4*8 = 32
-    let layer_data_size = FJM_LAYER_HDR_SIZE + qkv_size + ffn1_size + ffn2_size + ln_size + cb_size
-    // = 16 + 192 + 256 + 256 + 512 + 32 = 1264 per layer
+    // Per-layer weight sizes (packed 2-bit)
+    let q_size = d_model * q_dim * quant_bits / 8         // 16*16*2/8 = 64
+    let k_size = d_model * kv_d * quant_bits / 8          // 16*4*2/8 = 16
+    let v_size = k_size                                    // 16
+    let qkv_total = q_size + k_size + v_size               // 96
+    // Gated FFN: gate + up + down (3 matrices)
+    let gate_size = d_model * ffn_dim * quant_bits / 8     // 16*32*2/8 = 128
+    let up_size = gate_size                                 // 128
+    let down_size = ffn_dim * d_model * quant_bits / 8     // 32*16*2/8 = 128
+    let ffn_total = gate_size + up_size + down_size         // 384
+    // RMSNorm: gamma only (no beta), 2 norms per layer
+    let norm_size = 2 * d_model * 8                        // 2*16*8 = 256
+    let cb_size = (1 << quant_bits) * 8                    // 32
+    let layer_data_size = FJM_LAYER_HDR_SIZE + qkv_total + ffn_total + norm_size + cb_size
 
-    // Embedding size
-    let embed_size = vocab_size * d_model * quant_bits / 8    // 64*16*2/8 = 256
-    // LM head size (same as embed)
+    let embed_size = vocab_size * d_model * quant_bits / 8
     let lmhead_size = embed_size
 
-    // Offsets
-    let embed_off = FJM_HEADER_SIZE                                  // 64
-    let layer0_off = embed_off + embed_size                          // 320
-    let lmhead_off = layer0_off + n_layers * layer_data_size         // 320 + 2*1264 = 2848
-    let total_size = lmhead_off + lmhead_size                        // 3104
+    let embed_off = FJM_HEADER_SIZE                             // 96
+    let layer0_off = embed_off + embed_size
+    let lmhead_off = layer0_off + n_layers * layer_data_size
+    let total_size = lmhead_off + lmhead_size
 
-    // Write to a scratch buffer at 0xBF0000 (safe area before 0xC00000)
     let buf: i64 = 0xBF0000
 
-    // Write header
+    // Write v2 header (96 bytes)
     mdl_write_u32(buf + FJM_OFF_MAGIC, FJM_MAGIC)
-    mdl_write_u32(buf + FJM_OFF_VERSION, FJM_VERSION)
-    mdl_write_u32(buf + FJM_OFF_MODEL_TYPE, 0)  // 0 = test model
+    mdl_write_u32(buf + FJM_OFF_VERSION, 2)        // v2!
+    mdl_write_u32(buf + FJM_OFF_MODEL_TYPE, 0)
     mdl_write_u32(buf + FJM_OFF_N_LAYERS, n_layers)
     mdl_write_u32(buf + FJM_OFF_D_MODEL, d_model)
     mdl_write_u32(buf + FJM_OFF_N_HEADS, n_heads)
@@ -549,71 +595,54 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     mdl_write_u32(buf + FJM_OFF_EMBED_OFF, embed_off)
     mdl_write_u32(buf + FJM_OFF_LAYER0_OFF, layer0_off)
     mdl_write_u32(buf + FJM_OFF_LMHEAD_OFF, lmhead_off)
-    // Zero reserved bytes
-    mdl_write_u32(buf + 52, 0)
-    mdl_write_u32(buf + 56, 0)
-    mdl_write_u32(buf + 60, 0)
+    // v2 fields
+    mdl_write_u32(buf + FJM_OFF_N_KV_HEADS, n_kv_heads)  // GQA 4:1
+    mdl_write_u32(buf + FJM_OFF_FFN_TYPE, 1)              // gated FFN
+    mdl_write_u32(buf + FJM_OFF_NORM_TYPE, 1)             // RMSNorm
+    mdl_write_u32(buf + FJM_OFF_FFN_DIM, ffn_dim)
+    mdl_write_u32(buf + FJM_OFF_ROPE_THETA, 1000)         // theta=1M → stored as 1000 (÷1000)
+    mdl_write_u32(buf + FJM_OFF_EOS_TOKEN, 106)           // Gemma 3 EOS
+    // Zero reserved
+    let mut i: i64 = 76
+    while i < FJM_HEADER_SIZE { volatile_write_u8(buf + i, 0); i = i + 1 }
 
-    // Fill embedding table with sequential pattern (quantized indices)
-    let mut i: i64 = 0
-    while i < embed_size {
-        // Alternating 2-bit patterns: 00 01 10 11 = 0x1B repeated
-        volatile_write_u8(buf + embed_off + i, 0x1B)
-        i = i + 1
-    }
+    // Embedding
+    i = 0
+    while i < embed_size { volatile_write_u8(buf + embed_off + i, 0x1B); i = i + 1 }
 
-    // Fill layer data
+    // Layers
     let mut layer: i64 = 0
     while layer < n_layers {
-        let layer_off = layer0_off + layer * layer_data_size
+        let lo = layer0_off + layer * layer_data_size
+        mdl_write_u32(buf + lo + FJM_LAYER_OFF_ID, layer)
+        mdl_write_u32(buf + lo + FJM_LAYER_OFF_SIZE, layer_data_size)
+        mdl_write_u32(buf + lo + FJM_LAYER_OFF_QKV_SIZE, qkv_total)
+        mdl_write_u32(buf + lo + FJM_LAYER_OFF_FFN_SIZE, ffn_total)
 
-        // Layer header
-        mdl_write_u32(buf + layer_off + FJM_LAYER_OFF_ID, layer)
-        mdl_write_u32(buf + layer_off + FJM_LAYER_OFF_SIZE, layer_data_size)
-        mdl_write_u32(buf + layer_off + FJM_LAYER_OFF_QKV_SIZE, qkv_size)
-        mdl_write_u32(buf + layer_off + FJM_LAYER_OFF_FFN_SIZE, ffn1_size + ffn2_size)
-
-        // Fill weights with pattern (all indices = 01 repeated = 0x55)
-        let weight_start = layer_off + FJM_LAYER_HDR_SIZE
-        let weight_size = qkv_size + ffn1_size + ffn2_size
+        // Fill all weights with 0x55 (index 1 repeated)
+        let ws = lo + FJM_LAYER_HDR_SIZE
         i = 0
-        while i < weight_size {
-            volatile_write_u8(buf + weight_start + i, 0x55)
-            i = i + 1
-        }
+        while i < qkv_total + ffn_total { volatile_write_u8(buf + ws + i, 0x55); i = i + 1 }
 
-        // LayerNorm gamma = 1000 (x1000 fixed point for 1.0)
-        let ln_start = weight_start + weight_size
+        // RMSNorm gamma = 0 (Gemma style: applied as 1+gamma, so 0 = identity)
+        let ns = ws + qkv_total + ffn_total
         i = 0
-        while i < d_model * 2 {
-            volatile_write_u64(buf + ln_start + i * 8, 1000)
-            i = i + 1
-        }
-        // LayerNorm beta = 0
-        i = d_model * 2
-        while i < d_model * 4 {
-            volatile_write_u64(buf + ln_start + i * 8, 0)
-            i = i + 1
-        }
+        while i < d_model * 2 { volatile_write_u64(buf + ns + i * 8, 0); i = i + 1 }
 
-        // Codebook: 4 centroids for 2-bit [-750, -250, 250, 750]
-        let cb_start = ln_start + ln_size
-        volatile_write_u64(buf + cb_start, -750)
-        volatile_write_u64(buf + cb_start + 8, -250)
-        volatile_write_u64(buf + cb_start + 16, 250)
-        volatile_write_u64(buf + cb_start + 24, 750)
+        // Codebook
+        let cs = ns + norm_size
+        volatile_write_u64(buf + cs, -750)
+        volatile_write_u64(buf + cs + 8, -250)
+        volatile_write_u64(buf + cs + 16, 250)
+        volatile_write_u64(buf + cs + 24, 750)
 
         layer = layer + 1
     }
 
-    // Fill LM head with pattern
+    // LM head
     i = 0
-    while i < lmhead_size {
-        volatile_write_u8(buf + lmhead_off + i, 0xAA)
-        i = i + 1
-    }
+    while i < lmhead_size { volatile_write_u8(buf + lmhead_off + i, 0xAA); i = i + 1 }
 
-    // Write to RamFS
     ramfs_write_at_addr("test.fjm", buf, total_size)
 }
 
@@ -781,6 +810,52 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     cprint("  Source:     ", WHITE_ON_BLACK)
     mdl_print_source()
     console_putchar(10, WHITE_ON_BLACK)
+
+    // v2 fields
+    let ver = mdl_get_version()
+    if ver >= 2 {
+        let n_kv = mdl_get_n_kv_heads()
+        cprint("  KV heads:   ", WHITE_ON_BLACK)
+        cprint_decimal(n_kv, CYAN_ON_BLACK)
+        cprint(" (GQA ", WHITE_ON_BLACK)
+        cprint_decimal(mdl_get_n_heads(), CYAN_ON_BLACK)
+        cprint(":", WHITE_ON_BLACK)
+        cprint_decimal(n_kv, CYAN_ON_BLACK)
+        cprintln(")", WHITE_ON_BLACK)
+
+        cprint("  FFN:        ", WHITE_ON_BLACK)
+        if mdl_get_ffn_type() == 1 {
+            // "gated" = g(103)a(97)t(116)e(101)d(100)
+            console_putchar(103, CYAN_ON_BLACK); console_putchar(97, CYAN_ON_BLACK)
+            console_putchar(116, CYAN_ON_BLACK); console_putchar(101, CYAN_ON_BLACK)
+            console_putchar(100, CYAN_ON_BLACK)
+        } else {
+            // "std" = s(115)t(116)d(100)
+            console_putchar(115, CYAN_ON_BLACK); console_putchar(116, CYAN_ON_BLACK)
+            console_putchar(100, CYAN_ON_BLACK)
+        }
+        cprint(" dim=", WHITE_ON_BLACK)
+        cprint_decimal(mdl_get_ffn_dim(), CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+
+        cprint("  Norm:       ", WHITE_ON_BLACK)
+        if mdl_get_norm_type() == 1 {
+            // "RMSNorm"
+            console_putchar(82, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK)
+            console_putchar(83, CYAN_ON_BLACK); console_putchar(78, CYAN_ON_BLACK)
+        } else {
+            // "LN"
+            console_putchar(76, CYAN_ON_BLACK); console_putchar(78, CYAN_ON_BLACK)
+        }
+        console_putchar(10, WHITE_ON_BLACK)
+
+        let rt = mdl_get_rope_theta()
+        if rt > 0 {
+            cprint("  RoPE:       ", WHITE_ON_BLACK)
+            cprint_decimal(rt / 1000, CYAN_ON_BLACK)
+            cprintln("K", CYAN_ON_BLACK)
+        }
+    }
 }
 
 // Separate functions to avoid LLVM string interleave in if/else chains
@@ -791,7 +866,9 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if t == 1 { console_putchar(83, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK); console_putchar(111, CYAN_ON_BLACK); console_putchar(108, CYAN_ON_BLACK); console_putchar(76, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK); console_putchar(45, CYAN_ON_BLACK); console_putchar(49, CYAN_ON_BLACK); console_putchar(51, CYAN_ON_BLACK); console_putchar(53, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK) }
     if t == 2 { console_putchar(84, CYAN_ON_BLACK); console_putchar(105, CYAN_ON_BLACK); console_putchar(110, CYAN_ON_BLACK); console_putchar(121, CYAN_ON_BLACK); console_putchar(76, CYAN_ON_BLACK); console_putchar(108, CYAN_ON_BLACK); console_putchar(97, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK); console_putchar(97, CYAN_ON_BLACK) }
     if t == 3 { console_putchar(83, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK); console_putchar(111, CYAN_ON_BLACK); console_putchar(108, CYAN_ON_BLACK); console_putchar(76, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK); console_putchar(45, CYAN_ON_BLACK); console_putchar(51, CYAN_ON_BLACK); console_putchar(54, CYAN_ON_BLACK); console_putchar(48, CYAN_ON_BLACK); console_putchar(77, CYAN_ON_BLACK) }
-    if t > 3 { console_putchar(63, YELLOW_ON_BLACK) }
+    // Gemma3-1B = G(71)e(101)m(109)m(109)a(97)3(51)-(45)1(49)B(66)
+    if t == 10 { console_putchar(71, CYAN_ON_BLACK); console_putchar(101, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK); console_putchar(109, CYAN_ON_BLACK); console_putchar(97, CYAN_ON_BLACK); console_putchar(51, CYAN_ON_BLACK); console_putchar(45, CYAN_ON_BLACK); console_putchar(49, CYAN_ON_BLACK); console_putchar(66, CYAN_ON_BLACK) }
+    if t > 3 && t != 10 { console_putchar(63, YELLOW_ON_BLACK) }
 }
 
 @kernel fn mdl_print_size(total: i64) {
