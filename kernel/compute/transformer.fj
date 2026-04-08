@@ -41,6 +41,9 @@ const TFM_ST_POS: i64 = 0          // current sequence position
 const TFM_ST_ACTIVE: i64 = 8       // 1 if inference active
 const TFM_ST_TOKENS_GEN: i64 = 16  // tokens generated counter
 const TFM_ST_LAST_TOKEN: i64 = 24  // last generated token ID
+const TFM_ST_PREFILL_CY: i64 = 32  // prefill cycles (set by tfm_generate)
+const TFM_ST_DECODE_CY: i64 = 40   // decode cycles (set by tfm_generate)
+const TFM_ST_TOTAL_POS: i64 = 48   // total positions processed
 
 // KV cache layout: [layer][position][type][d_model]
 // type 0 = key, type 1 = value
@@ -140,18 +143,25 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
     let q_data = km_data_ptr(q_slot)
     let seq_len = cur_pos + 1  // positions 0..cur_pos inclusive
 
+    // Pre-compute loop-invariant values
+    // Scale = 1000 / sqrt(d_head). Use: sqrt(d_head) = isqrt(d_head * 1000000) / 1000
+    let sqrt_dh = km_isqrt(d_head * 1000000)
+    let attn_scale = if sqrt_dh > 0 { 1000000 / sqrt_dh } else { 1000 }
+    // Pre-compute KV cache strides to avoid repeated mdl_get_d_model() volatile reads
+    let kv_pos_stride = 2 * d_model * 8
+    let kv_layer_off = TFM_KV_BASE + layer * TFM_KV_MAX_POS * kv_pos_stride
+
     // Process each head independently
     let mut h: i64 = 0
     while h < n_heads {
         let head_off = h * d_head
 
         // Compute attention scores: Q_h · K_h^T for all positions in cache
-        // Use TFM_SCRATCH for scores (max TFM_KV_MAX_POS i64 values)
         let scores_addr = TFM_SCRATCH
         let mut p: i64 = 0
         while p < seq_len {
-            let k_cache = tfm_kv_addr(layer, p, 0)
-            // Dot product: Q_h · K_p_h
+            // Inline KV addr: avoid calling tfm_kv_addr per position
+            let k_cache = kv_layer_off + p * kv_pos_stride
             let mut dot: i64 = 0
             let mut d: i64 = 0
             while d < d_head {
@@ -160,11 +170,8 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
                 dot = dot + (qi * ki) / 1000
                 d = d + 1
             }
-            // Scale by 1/sqrt(d_head) — approximate: divide by isqrt(d_head*1000)
-            // For d_head=8: sqrt(8)≈2.83, scale=354 (1000/2.83)
-            // For d_head=64: sqrt(64)=8, scale=125 (1000/8)
-            let scale = 1000 / km_isqrt(d_head * 1000)
-            volatile_write_u64(scores_addr + p * 8, (dot * scale) / 1000)
+            // Apply pre-computed scale
+            volatile_write_u64(scores_addr + p * 8, (dot * attn_scale) / 1000)
             p = p + 1
         }
 
@@ -204,7 +211,8 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
             p = 0
             while p < seq_len {
                 let score = volatile_read_u64(scores_addr + p * 8)
-                let v_cache = tfm_kv_addr(layer, p, 1)
+                // Inline KV addr for value: layer_off + pos*stride + d_model*8 (value offset)
+                let v_cache = kv_layer_off + p * kv_pos_stride + d_model * 8
                 let vi = volatile_read_u64(v_cache + (head_off + d) * 8)
                 weighted = weighted + (score * vi) / 1000
                 p = p + 1
@@ -310,8 +318,8 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
     let vocab_size = mdl_get_vocab_size()
     let quant_bits = mdl_get_quant_bits()
 
-    // Allocate slots
-    tfm_alloc_slots(d_model, vocab_size)
+    // Note: tfm_alloc_slots must be called ONCE before the first tfm_forward,
+    // not per-token. Caller (tfm_generate/cmd_infer) is responsible.
 
     // Step 1: Embedding lookup → x
     mdl_embed_lookup(token_id, TFM_X)
@@ -400,16 +408,15 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
 
 // Clear KV cache
 @kernel fn tfm_clear_kv() {
-    // Zero the KV cache area
-    // Size depends on model: n_layers * max_pos * 2 * d_model * 8
+    // Zero the KV cache area using 8-byte writes (8x faster than byte-by-byte)
     let d_model = mdl_get_d_model()
     let n_layers = mdl_get_n_layers()
     let total = n_layers * TFM_KV_MAX_POS * 2 * d_model * 8
-    // Limit to prevent very long zeroing for large models
     let limit = if total > 131072 { 131072 } else { total }
+    let qwords = limit / 8
     let mut i: i64 = 0
-    while i < limit {
-        volatile_write_u8(TFM_KV_BASE + i, 0)
+    while i < qwords {
+        volatile_write_u64(TFM_KV_BASE + i * 8, 0)
         i = i + 1
     }
 }
@@ -451,10 +458,11 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
     cprint_decimal(n_tokens, CYAN_ON_BLACK)
     cprintln(" input tokens", WHITE_ON_BLACK)
 
-    // Initialize state
+    // Initialize state + allocate slots ONCE
     volatile_write_u64(TFM_STATE + TFM_ST_POS, 0)
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
+    tfm_alloc_slots(mdl_get_d_model(), mdl_get_vocab_size())
     tfm_clear_kv()
 
     // Process all prompt tokens (prefill)
@@ -469,7 +477,6 @@ const TFM_KV_MAX_POS: i64 = 128    // max context length
     console_putchar(10, WHITE_ON_BLACK)
 
     // Generate 1 next token
-    let last_tid = volatile_read_u64(tok_buf + (n_tokens - 1) * 8)
     let next_token = volatile_read_u64(TFM_STATE + TFM_ST_LAST_TOKEN)
 
     cprint("Next token ID: ", WHITE_ON_BLACK)
@@ -574,10 +581,11 @@ const TFM_EOS_TOKEN: i64 = 2
 // streaming: 1 = print each token as generated, 0 = silent
 // Returns: number of tokens generated
 @kernel fn tfm_generate(prompt_addr: i64, n_prompt: i64, max_gen: i64, streaming: i64) -> i64 {
-    // Initialize
+    // Initialize + allocate slots ONCE (not per-token)
     volatile_write_u64(TFM_STATE + TFM_ST_POS, 0)
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
+    tfm_alloc_slots(mdl_get_d_model(), mdl_get_vocab_size())
     tfm_clear_kv()
 
     let t_start = rdtsc()
@@ -630,21 +638,17 @@ const TFM_EOS_TOKEN: i64 = 2
 
     let t_end = rdtsc()
 
-    // Store timing info in state (reuse unused slots)
-    // TFM_STATE + 32: prefill cycles
-    // TFM_STATE + 40: decode cycles
-    // TFM_STATE + 48: total tokens (prompt + generated)
-    volatile_write_u64(TFM_STATE + 32, t_prefill - t_start)
-    volatile_write_u64(TFM_STATE + 40, t_end - t_prefill)
-    volatile_write_u64(TFM_STATE + 48, pos)
+    volatile_write_u64(TFM_STATE + TFM_ST_PREFILL_CY, t_prefill - t_start)
+    volatile_write_u64(TFM_STATE + TFM_ST_DECODE_CY, t_end - t_prefill)
+    volatile_write_u64(TFM_STATE + TFM_ST_TOTAL_POS, pos)
 
     gen_count
 }
 
 // Print performance stats after generation
 @kernel fn tfm_print_perf(n_prompt: i64, n_gen: i64) {
-    let prefill_cycles = volatile_read_u64(TFM_STATE + 32)
-    let decode_cycles = volatile_read_u64(TFM_STATE + 40)
+    let prefill_cycles = volatile_read_u64(TFM_STATE + TFM_ST_PREFILL_CY)
+    let decode_cycles = volatile_read_u64(TFM_STATE + TFM_ST_DECODE_CY)
 
     console_putchar(10, WHITE_ON_BLACK)
     cprintln("--- Stats ---", YELLOW_ON_BLACK)

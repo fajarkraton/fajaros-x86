@@ -277,27 +277,7 @@ const PIPE_MODEL_READY: i64 = 0xBFA300  // 1 if weights loaded
 // In QEMU we print to serial.
 @kernel fn pipe_actuate(action: i64, verbose: i64) {
     if verbose == 1 {
-        // Print action name (byte-by-byte to avoid LLVM interleave)
-        if action == ACTION_IDLE {
-            // "IDLE"
-            console_putchar(73, CYAN_ON_BLACK); console_putchar(68, CYAN_ON_BLACK)
-            console_putchar(76, CYAN_ON_BLACK); console_putchar(69, CYAN_ON_BLACK)
-        }
-        if action == ACTION_FORWARD {
-            // "FWD "
-            console_putchar(70, GREEN_ON_BLACK); console_putchar(87, GREEN_ON_BLACK)
-            console_putchar(68, GREEN_ON_BLACK); console_putchar(32, GREEN_ON_BLACK)
-        }
-        if action == ACTION_TURN {
-            // "TURN"
-            console_putchar(84, YELLOW_ON_BLACK); console_putchar(85, YELLOW_ON_BLACK)
-            console_putchar(82, YELLOW_ON_BLACK); console_putchar(78, YELLOW_ON_BLACK)
-        }
-        if action == ACTION_STOP {
-            // "STOP"
-            console_putchar(83, RED_ON_BLACK); console_putchar(84, RED_ON_BLACK)
-            console_putchar(79, RED_ON_BLACK); console_putchar(80, RED_ON_BLACK)
-        }
+        pipe_print_action_name(action)
         console_putchar(32, WHITE_ON_BLACK)
     }
 

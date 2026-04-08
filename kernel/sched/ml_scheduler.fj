@@ -109,37 +109,16 @@ const MLS_W_OUT: i64 = 1792
     // Row 3 (blocked_time): strong positive — was blocked, deserves CPU
     mlsched_set_row(w + MLS_W_FEAT, 3, 400, 300, 200, 100, 50, 25, 10, 5)
 
-    // Query weight: identity-like (pass features through)
+    // Q/K/V weights: all identity-like (written in one loop)
     let mut r: i64 = 0
     while r < MLS_D_MODEL {
         let mut c: i64 = 0
         while c < MLS_D_MODEL {
             let val = if r == c { 1000 } else { 0 }
-            volatile_write_u64(w + MLS_W_QUERY + (r * MLS_D_MODEL + c) * 8, val)
-            c = c + 1
-        }
-        r = r + 1
-    }
-
-    // Key weight: identity-like
-    r = 0
-    while r < MLS_D_MODEL {
-        let mut c: i64 = 0
-        while c < MLS_D_MODEL {
-            let val = if r == c { 1000 } else { 0 }
-            volatile_write_u64(w + MLS_W_KEY + (r * MLS_D_MODEL + c) * 8, val)
-            c = c + 1
-        }
-        r = r + 1
-    }
-
-    // Value weight: identity-like
-    r = 0
-    while r < MLS_D_MODEL {
-        let mut c: i64 = 0
-        while c < MLS_D_MODEL {
-            let val = if r == c { 1000 } else { 0 }
-            volatile_write_u64(w + MLS_W_VALUE + (r * MLS_D_MODEL + c) * 8, val)
+            let off = (r * MLS_D_MODEL + c) * 8
+            volatile_write_u64(w + MLS_W_QUERY + off, val)
+            volatile_write_u64(w + MLS_W_KEY + off, val)
+            volatile_write_u64(w + MLS_W_VALUE + off, val)
             c = c + 1
         }
         r = r + 1
@@ -311,8 +290,9 @@ const MLS_W_OUT: i64 = 1792
     }
 
     // Starvation prevention: boost processes that haven't run recently
-    // The more ticks since last scheduled, the higher the bonus
-    let starvation_bonus = ticks * 10
+    // Cap to prevent i64 overflow for long-running processes
+    let capped_ticks = if ticks > 100000 { 100000 } else { ticks }
+    let starvation_bonus = capped_ticks * 10
     final_score = final_score + starvation_bonus
 
     final_score
