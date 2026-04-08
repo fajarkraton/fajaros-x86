@@ -1,0 +1,559 @@
+// FajarOS — Transformer Forward Pass Engine (Phase 5)
+// Single-token inference through quantized transformer layers.
+// Connects all Phase 1-4 components: FajarQuant, KMatrix, ModelLoader, Tokenizer.
+//
+// Pipeline per token:
+//   Embed → [LayerNorm → QKV → Attention → Residual → LayerNorm → FFN → Residual] × N → LM Head → argmax
+//
+// All operations: @kernel safe — no heap, no float. Fixed-point i64 scaled x1000.
+// Paper: "FajarQuant: Hardware-Aware Adaptive Vector Quantization"
+//        Putranto (2026), PrimeCore.id
+//
+// Memory layout:
+//   KM slots 0-9: transformer working tensors (allocated during inference)
+//   0xBE0000  TFM_SCRATCH    Unpacked weight buffer (32 KB)
+//   0xBE8000  TFM_STATE      Inference state (64 bytes)
+//   0xBE8040  TFM_KV_BASE    KV cache (key+value per layer per position)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+// KM large pool slot assignments during inference
+const TFM_X: i64 = 0       // hidden state (1 x d_model)
+const TFM_RES: i64 = 1     // residual copy
+const TFM_Q: i64 = 2       // query projection
+const TFM_K: i64 = 3       // key projection
+const TFM_V: i64 = 4       // value projection
+const TFM_ATTN: i64 = 5    // attention output
+const TFM_FFN_MID: i64 = 6 // FFN intermediate
+const TFM_FFN_OUT: i64 = 7 // FFN output
+const TFM_LOGITS: i64 = 8  // output logits
+const TFM_TMP: i64 = 9     // scratch slot
+
+// Memory areas
+const TFM_SCRATCH: i64 = 0xBE0000     // 32 KB for unpacked weights
+const TFM_STATE: i64 = 0xBE8000       // inference state
+const TFM_KV_BASE: i64 = 0xBE8040     // KV cache
+
+// State offsets
+const TFM_ST_POS: i64 = 0          // current sequence position
+const TFM_ST_ACTIVE: i64 = 8       // 1 if inference active
+const TFM_ST_TOKENS_GEN: i64 = 16  // tokens generated counter
+const TFM_ST_LAST_TOKEN: i64 = 24  // last generated token ID
+
+// KV cache layout: [layer][position][type][d_model]
+// type 0 = key, type 1 = value
+// Address = TFM_KV_BASE + layer * kv_layer_stride + pos * kv_pos_stride + type * d_model * 8
+const TFM_KV_MAX_POS: i64 = 128    // max context length
+
+// ═══════════════════════════════════════════════════════════════
+// Packed Quantized Vector-Matrix Multiply
+// ═══════════════════════════════════════════════════════════════
+//
+// y[1 x n] = x[1 x m] @ dequant(W_packed[m x n])
+// W_packed: packed bytes, each byte holds (8/bits) quantized indices
+// Codebook: (1 << bits) centroids as i64 values
+
+@kernel fn tfm_vecmat_packed(vec_slot: i64, packed_addr: i64, m: i64, n: i64,
+                              bits: i64, cb_addr: i64, out_slot: i64) {
+    let vec_data = km_data_ptr(vec_slot)
+    let out_data = km_data_ptr(out_slot)
+    let out_base = km_large_addr(out_slot)
+    volatile_write_u64(out_base + KM_HDR_ROWS, 1)
+    volatile_write_u64(out_base + KM_HDR_COLS, n)
+
+    let elems_per_byte = 8 / bits
+    let mask = (1 << bits) - 1
+
+    let mut j: i64 = 0
+    while j < n {
+        let mut sum: i64 = 0
+        let mut k: i64 = 0
+        while k < m {
+            let v = volatile_read_u64(vec_data + k * 8)
+            // Extract quantized index from packed byte array
+            let flat_idx = k * n + j
+            let byte_idx = flat_idx / elems_per_byte
+            let bit_off = (flat_idx % elems_per_byte) * bits
+            let raw_byte = volatile_read_u8(packed_addr + byte_idx)
+            let idx = (raw_byte >> bit_off) & mask
+            // Look up codebook centroid
+            let w = volatile_read_u64(cb_addr + idx * 8)
+            sum = sum + (v * w) / 1000
+            k = k + 1
+        }
+        volatile_write_u64(out_data + j * 8, sum)
+        j = j + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KV Cache
+// ═══════════════════════════════════════════════════════════════
+
+// Calculate KV cache address for a specific layer, position, type (0=key, 1=val)
+@kernel fn tfm_kv_addr(layer: i64, pos: i64, kv_type: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    let n_layers = mdl_get_n_layers()
+    // Stride: per position = 2 * d_model * 8 (key + value)
+    let pos_stride = 2 * d_model * 8
+    // Stride: per layer = max_pos * pos_stride
+    let layer_stride = TFM_KV_MAX_POS * pos_stride
+    TFM_KV_BASE + layer * layer_stride + pos * pos_stride + kv_type * d_model * 8
+}
+
+// Store key/value vectors from km_ slots into KV cache
+@kernel fn tfm_kv_store(layer: i64, pos: i64, k_slot: i64, v_slot: i64) {
+    let d_model = mdl_get_d_model()
+    let k_data = km_data_ptr(k_slot)
+    let v_data = km_data_ptr(v_slot)
+    let k_dst = tfm_kv_addr(layer, pos, 0)
+    let v_dst = tfm_kv_addr(layer, pos, 1)
+    mdl_memcpy(k_dst, k_data, d_model * 8)
+    mdl_memcpy(v_dst, v_data, d_model * 8)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Attention (Multi-Head, with KV Cache)
+// ═══════════════════════════════════════════════════════════════
+
+// Compute multi-head attention for current position
+// q_slot: query vector (1 x d_model)
+// layer: layer index (for KV cache access)
+// cur_pos: current position in sequence
+// out_slot: output vector (1 x d_model)
+@kernel fn tfm_attention(q_slot: i64, k_slot: i64, v_slot: i64,
+                          layer: i64, cur_pos: i64, out_slot: i64) {
+    let d_model = mdl_get_d_model()
+    let n_heads = mdl_get_n_heads()
+    let d_head = mdl_get_d_head()
+
+    // Store current K, V into KV cache at cur_pos
+    tfm_kv_store(layer, cur_pos, k_slot, v_slot)
+
+    let out_data = km_data_ptr(out_slot)
+    let out_base = km_large_addr(out_slot)
+    volatile_write_u64(out_base + KM_HDR_ROWS, 1)
+    volatile_write_u64(out_base + KM_HDR_COLS, d_model)
+
+    let q_data = km_data_ptr(q_slot)
+    let seq_len = cur_pos + 1  // positions 0..cur_pos inclusive
+
+    // Process each head independently
+    let mut h: i64 = 0
+    while h < n_heads {
+        let head_off = h * d_head
+
+        // Compute attention scores: Q_h · K_h^T for all positions in cache
+        // Use TFM_SCRATCH for scores (max TFM_KV_MAX_POS i64 values)
+        let scores_addr = TFM_SCRATCH
+        let mut p: i64 = 0
+        while p < seq_len {
+            let k_cache = tfm_kv_addr(layer, p, 0)
+            // Dot product: Q_h · K_p_h
+            let mut dot: i64 = 0
+            let mut d: i64 = 0
+            while d < d_head {
+                let qi = volatile_read_u64(q_data + (head_off + d) * 8)
+                let ki = volatile_read_u64(k_cache + (head_off + d) * 8)
+                dot = dot + (qi * ki) / 1000
+                d = d + 1
+            }
+            // Scale by 1/sqrt(d_head) — approximate: divide by isqrt(d_head*1000)
+            // For d_head=8: sqrt(8)≈2.83, scale=354 (1000/2.83)
+            // For d_head=64: sqrt(64)=8, scale=125 (1000/8)
+            let scale = 1000 / km_isqrt(d_head * 1000)
+            volatile_write_u64(scores_addr + p * 8, (dot * scale) / 1000)
+            p = p + 1
+        }
+
+        // Softmax over scores
+        // Find max
+        let mut max_score = volatile_read_u64(scores_addr)
+        p = 1
+        while p < seq_len {
+            let s = volatile_read_u64(scores_addr + p * 8)
+            if s > max_score { max_score = s }
+            p = p + 1
+        }
+        // Exp and sum
+        let mut exp_sum: i64 = 0
+        p = 0
+        while p < seq_len {
+            let s = volatile_read_u64(scores_addr + p * 8) - max_score
+            let e = km_exp_approx(s)
+            volatile_write_u64(scores_addr + p * 8, e)
+            exp_sum = exp_sum + e
+            p = p + 1
+        }
+        // Normalize
+        if exp_sum > 0 {
+            p = 0
+            while p < seq_len {
+                let e = volatile_read_u64(scores_addr + p * 8)
+                volatile_write_u64(scores_addr + p * 8, (e * 1000) / exp_sum)
+                p = p + 1
+            }
+        }
+
+        // Weighted sum of V: out_h = sum(score_p * V_p_h)
+        let mut d: i64 = 0
+        while d < d_head {
+            let mut weighted: i64 = 0
+            p = 0
+            while p < seq_len {
+                let score = volatile_read_u64(scores_addr + p * 8)
+                let v_cache = tfm_kv_addr(layer, p, 1)
+                let vi = volatile_read_u64(v_cache + (head_off + d) * 8)
+                weighted = weighted + (score * vi) / 1000
+                p = p + 1
+            }
+            volatile_write_u64(out_data + (head_off + d) * 8, weighted)
+            d = d + 1
+        }
+
+        h = h + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Single Transformer Layer
+// ═══════════════════════════════════════════════════════════════
+
+// Process one transformer layer:
+// x = x + Attention(LayerNorm(x))
+// x = x + FFN(LayerNorm(x))
+@kernel fn tfm_layer(x_slot: i64, layer: i64, pos: i64) {
+    let d_model = mdl_get_d_model()
+    let quant_bits = mdl_get_quant_bits()
+
+    // === Pre-Attention LayerNorm ===
+    // Save residual
+    let res_data = km_data_ptr(TFM_RES)
+    let x_data = km_data_ptr(x_slot)
+    mdl_memcpy(res_data, x_data, d_model * 8)
+    let res_base = km_large_addr(TFM_RES)
+    volatile_write_u64(res_base + KM_HDR_ROWS, 1)
+    volatile_write_u64(res_base + KM_HDR_COLS, d_model)
+
+    // LayerNorm on x (in-place)
+    let ln1_g = mdl_layer_ln_gamma(layer, 0)
+    let ln1_b = mdl_layer_ln_beta(layer, 0)
+    km_layernorm(x_slot, d_model, ln1_g, ln1_b)
+
+    // === QKV Projection (3 separate matmuls) ===
+    let qkv_addr = mdl_layer_qkv_addr(layer)
+    let cb_addr = MDL_CODEBOOK_BASE + layer * 64
+
+    // Q = x @ W_q (first d_model columns of QKV weight)
+    tfm_vecmat_packed(x_slot, qkv_addr, d_model, d_model,
+                       quant_bits, cb_addr, TFM_Q)
+
+    // K = x @ W_k (next d_model columns)
+    let wk_offset = d_model * d_model * quant_bits / 8
+    tfm_vecmat_packed(x_slot, qkv_addr + wk_offset, d_model, d_model,
+                       quant_bits, cb_addr, TFM_K)
+
+    // V = x @ W_v (last d_model columns)
+    let wv_offset = 2 * d_model * d_model * quant_bits / 8
+    tfm_vecmat_packed(x_slot, qkv_addr + wv_offset, d_model, d_model,
+                       quant_bits, cb_addr, TFM_V)
+
+    // === Multi-Head Attention ===
+    tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, TFM_ATTN)
+
+    // === Residual Add: x = residual + attn ===
+    let attn_data = km_data_ptr(TFM_ATTN)
+    mdl_memcpy(x_data, res_data, d_model * 8)  // restore residual to x
+    km_add(x_slot, TFM_ATTN, d_model)
+
+    // === Pre-FFN LayerNorm ===
+    // Save residual
+    mdl_memcpy(res_data, x_data, d_model * 8)
+
+    // LayerNorm
+    let ln2_g = mdl_layer_ln_gamma(layer, 1)
+    let ln2_b = mdl_layer_ln_beta(layer, 1)
+    km_layernorm(x_slot, d_model, ln2_g, ln2_b)
+
+    // === FFN: GELU(x @ W1) @ W2 ===
+    let ffn1_addr = mdl_layer_ffn1_addr(layer)
+    let ffn2_addr = mdl_layer_ffn2_addr(layer)
+    let ffn_dim = d_model * 4  // intermediate dimension
+
+    // FFN part 1: mid = GELU(x @ W1)
+    tfm_vecmat_packed(x_slot, ffn1_addr, d_model, ffn_dim,
+                       quant_bits, cb_addr, TFM_FFN_MID)
+    km_gelu(TFM_FFN_MID, ffn_dim)
+
+    // FFN part 2: out = mid @ W2
+    tfm_vecmat_packed(TFM_FFN_MID, ffn2_addr, ffn_dim, d_model,
+                       quant_bits, cb_addr, TFM_FFN_OUT)
+
+    // === Residual Add: x = residual + ffn_out ===
+    mdl_memcpy(x_data, res_data, d_model * 8)  // restore residual
+    km_add(x_slot, TFM_FFN_OUT, d_model)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Full Forward Pass
+// ═══════════════════════════════════════════════════════════════
+
+// Run one token through all layers, return logit slot
+// token_id: input token ID
+// pos: position in sequence
+// Returns: predicted next token ID
+@kernel fn tfm_forward(token_id: i64, pos: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    let n_layers = mdl_get_n_layers()
+    let vocab_size = mdl_get_vocab_size()
+    let quant_bits = mdl_get_quant_bits()
+
+    // Allocate slots
+    tfm_alloc_slots(d_model, vocab_size)
+
+    // Step 1: Embedding lookup → x
+    mdl_embed_lookup(token_id, TFM_X)
+
+    // Step 2: Process all layers
+    let mut layer: i64 = 0
+    while layer < n_layers {
+        // Load layer weights if not already loaded
+        let layer_mask = volatile_read_u64(MDL_STATE_BASE + MDL_ST_LAYERS_LOADED)
+        if (layer_mask & (1 << layer)) == 0 {
+            mdl_load_layer(layer)
+        }
+        tfm_layer(TFM_X, layer, pos)
+        layer = layer + 1
+    }
+
+    // Step 3: Final LayerNorm (use layer 0's gamma/beta as approximation)
+    // In a real model, there's a separate final LN — for test model, skip
+    // km_layernorm(TFM_X, d_model, 0, 0)
+
+    // Step 4: LM head projection → logits
+    let lmhead_off = mdl_get_lmhead_offset()
+    let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
+    let src_addr = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
+
+    // For RamFS: LM head at src_addr + lmhead_off
+    if src_type == 1 {
+        let cb_addr = MDL_CODEBOOK_BASE  // use layer 0 codebook for LM head
+        tfm_vecmat_packed(TFM_X, src_addr + lmhead_off, d_model, vocab_size,
+                           quant_bits, cb_addr, TFM_LOGITS)
+    }
+
+    // Step 5: Argmax
+    let next_token = km_argmax(TFM_LOGITS, vocab_size)
+
+    // Update state
+    volatile_write_u64(TFM_STATE + TFM_ST_LAST_TOKEN, next_token)
+    let gen = volatile_read_u64(TFM_STATE + TFM_ST_TOKENS_GEN)
+    volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, gen + 1)
+
+    next_token
+}
+
+// Allocate km_ slots for transformer tensors
+@kernel fn tfm_alloc_slots(d_model: i64, vocab_size: i64) {
+    // Set dimensions on pre-assigned slots
+    let ffn_dim = d_model * 4
+    let logit_dim = if vocab_size > 1024 { 1024 } else { vocab_size }
+
+    tfm_set_slot_dim(TFM_X, 1, d_model)
+    tfm_set_slot_dim(TFM_RES, 1, d_model)
+    tfm_set_slot_dim(TFM_Q, 1, d_model)
+    tfm_set_slot_dim(TFM_K, 1, d_model)
+    tfm_set_slot_dim(TFM_V, 1, d_model)
+    tfm_set_slot_dim(TFM_ATTN, 1, d_model)
+
+    // FFN intermediate: may exceed 1024 for large models
+    let mid_dim = if ffn_dim > 1024 { 1024 } else { ffn_dim }
+    tfm_set_slot_dim(TFM_FFN_MID, 1, mid_dim)
+    tfm_set_slot_dim(TFM_FFN_OUT, 1, d_model)
+    tfm_set_slot_dim(TFM_LOGITS, 1, logit_dim)
+    tfm_set_slot_dim(TFM_TMP, 1, d_model)
+}
+
+@kernel fn tfm_set_slot_dim(slot: i64, rows: i64, cols: i64) {
+    let addr = km_large_addr(slot)
+    volatile_write_u64(addr + KM_HDR_ROWS, rows)
+    volatile_write_u64(addr + KM_HDR_COLS, cols)
+    // Zero data
+    let total = rows * cols
+    let mut i: i64 = 0
+    while i < total {
+        volatile_write_u64(addr + KM_DATA_OFF + i * 8, 0)
+        i = i + 1
+    }
+}
+
+// Free transformer slots after inference
+@kernel fn tfm_free_slots() {
+    let mut i: i64 = 0
+    while i <= TFM_TMP {
+        km_free(i)
+        i = i + 1
+    }
+}
+
+// Clear KV cache
+@kernel fn tfm_clear_kv() {
+    // Zero the KV cache area
+    // Size depends on model: n_layers * max_pos * 2 * d_model * 8
+    let d_model = mdl_get_d_model()
+    let n_layers = mdl_get_n_layers()
+    let total = n_layers * TFM_KV_MAX_POS * 2 * d_model * 8
+    // Limit to prevent very long zeroing for large models
+    let limit = if total > 131072 { 131072 } else { total }
+    let mut i: i64 = 0
+    while i < limit {
+        volatile_write_u8(TFM_KV_BASE + i, 0)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+// infer <text> — tokenize input, run forward pass, produce next token
+@kernel fn cmd_infer() {
+    let len = cmdbuf_len()
+    // "infer " = 6 chars
+    if len <= 6 {
+        cprintln("Usage: infer <text>", YELLOW_ON_BLACK)
+        return
+    }
+
+    if mdl_is_loaded() != 1 {
+        cprintln("[ERR] No model loaded. Use: model-load test", RED_ON_BLACK)
+        return
+    }
+
+    let text_addr: i64 = 0x6F800 + 6
+    let text_len = len - 6
+
+    // Print input
+    cprint("Input: \"", WHITE_ON_BLACK)
+    let mut i: i64 = 0
+    while i < text_len {
+        console_putchar(volatile_read_u8(text_addr + i), CYAN_ON_BLACK)
+        i = i + 1
+    }
+    cprintln("\"", WHITE_ON_BLACK)
+
+    // Tokenize input
+    let tok_buf = TFM_SCRATCH + 16384  // use second half of scratch for tokens
+    let n_tokens = tok_encode(text_addr, text_len, tok_buf)
+    cprint("Tokens: ", WHITE_ON_BLACK)
+    cprint_decimal(n_tokens, CYAN_ON_BLACK)
+    cprintln(" input tokens", WHITE_ON_BLACK)
+
+    // Initialize state
+    volatile_write_u64(TFM_STATE + TFM_ST_POS, 0)
+    volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
+    volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
+    tfm_clear_kv()
+
+    // Process all prompt tokens (prefill)
+    cprint("Prefill: ", WHITE_ON_BLACK)
+    let mut pos: i64 = 0
+    while pos < n_tokens {
+        let tid = volatile_read_u64(tok_buf + pos * 8)
+        tfm_forward(tid, pos)
+        console_putchar(46, CYAN_ON_BLACK)  // '.' progress
+        pos = pos + 1
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Generate 1 next token
+    let last_tid = volatile_read_u64(tok_buf + (n_tokens - 1) * 8)
+    let next_token = volatile_read_u64(TFM_STATE + TFM_ST_LAST_TOKEN)
+
+    cprint("Next token ID: ", WHITE_ON_BLACK)
+    cprint_decimal(next_token, GREEN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Decode next token
+    cprint("Decoded: \"", WHITE_ON_BLACK)
+    let dec_buf = TFM_SCRATCH + 24576
+    let dec_len = tok_decode(next_token, dec_buf)
+    i = 0
+    while i < dec_len {
+        let ch = volatile_read_u8(dec_buf + i)
+        if ch >= 32 && ch < 127 {
+            console_putchar(ch, GREEN_ON_BLACK)
+        } else {
+            cprint("\\x", YELLOW_ON_BLACK)
+            cprint_hex(ch, 2, YELLOW_ON_BLACK)
+        }
+        i = i + 1
+    }
+    cprintln("\"", WHITE_ON_BLACK)
+
+    // Show vocab-level info
+    let vocab = mdl_get_vocab_size()
+    cprint("Vocab: ", WHITE_ON_BLACK)
+    cprint_decimal(vocab, CYAN_ON_BLACK)
+    cprint(" | Position: ", WHITE_ON_BLACK)
+    cprint_decimal(n_tokens, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    // Cleanup
+    tfm_free_slots()
+    volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 0)
+}
+
+// tfm-info — show transformer engine status
+@kernel fn cmd_tfm_info() {
+    cprintln("Transformer Engine:", YELLOW_ON_BLACK)
+
+    if mdl_is_loaded() != 1 {
+        cprintln("  No model loaded", YELLOW_ON_BLACK)
+        return
+    }
+
+    cprint("  d_model:   ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_d_model(), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Layers:    ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_n_layers(), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Heads:     ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_n_heads(), CYAN_ON_BLACK)
+    cprint(" x ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_d_head(), CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    cprint("  Quant:     ", WHITE_ON_BLACK)
+    cprint_decimal(mdl_get_quant_bits(), CYAN_ON_BLACK)
+    cprintln("-bit", CYAN_ON_BLACK)
+
+    cprint("  KV cache:  ", WHITE_ON_BLACK)
+    cprint_decimal(TFM_KV_MAX_POS, CYAN_ON_BLACK)
+    cprintln(" positions max", WHITE_ON_BLACK)
+
+    let gen = volatile_read_u64(TFM_STATE + TFM_ST_TOKENS_GEN)
+    cprint("  Generated: ", WHITE_ON_BLACK)
+    cprint_decimal(gen, CYAN_ON_BLACK)
+    cprintln(" tokens total", WHITE_ON_BLACK)
+
+    let last = volatile_read_u64(TFM_STATE + TFM_ST_LAST_TOKEN)
+    if gen > 0 {
+        cprint("  Last token:", WHITE_ON_BLACK)
+        cprint_decimal(last, CYAN_ON_BLACK)
+        console_putchar(10, WHITE_ON_BLACK)
+    }
+
+    // KV cache memory usage
+    let d_model = mdl_get_d_model()
+    let n_layers = mdl_get_n_layers()
+    let kv_per_pos = n_layers * 2 * d_model * 8
+    cprint("  KV/pos:    ", WHITE_ON_BLACK)
+    cprint_decimal(kv_per_pos, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+}

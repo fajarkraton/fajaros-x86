@@ -105,6 +105,7 @@ SOURCES := \
 	kernel/compute/kmatrix.fj \
 	kernel/compute/model_loader.fj \
 	kernel/compute/tokenizer.fj \
+	kernel/compute/transformer.fj \
 	fs/ramfs.fj \
 	fs/directory.fj \
 	fs/links.fj \

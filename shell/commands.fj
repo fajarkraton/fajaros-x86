@@ -177,6 +177,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  quant quant-bench quant-info classify", WHITE_ON_BLACK)
     cprintln("  km-bench km-info model-load model-info", WHITE_ON_BLACK)
     cprintln("  tokenize tok-info tok-load tok-reset", WHITE_ON_BLACK)
+    cprintln("  infer tfm-info", WHITE_ON_BLACK)
     cprintln("  virtio-gpu gpu gpu-info gpu-bench", WHITE_ON_BLACK)
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
@@ -3168,6 +3169,12 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
     // tok-reset (116,111,107,45,114,...) len=9
     if handled == 0 && len == 9 && buf_eq4(116, 111, 107, 45) == 1 && volatile_read_u8(0x6F804) == 114 { cmd_tok_reset(); handled = 1 }
+
+    // infer (105,110,102,101,114,32,...) len>=6 — "infer <text>"
+    if handled == 0 && len >= 5 && buf_eq4(105, 110, 102, 101) == 1 && volatile_read_u8(0x6F804) == 114 && (len == 5 || volatile_read_u8(0x6F805) == 32) { cmd_infer(); handled = 1 }
+
+    // tfm-info (116,102,109,45,105,110,102,111) len=8 — transformer status
+    if handled == 0 && len == 8 && buf_eq4(116, 102, 109, 45) == 1 && volatile_read_u8(0x6F804) == 105 && volatile_read_u8(0x6F805) == 110 { cmd_tfm_info(); handled = 1 }
 
     // === Memory management commands ===
     // frames
