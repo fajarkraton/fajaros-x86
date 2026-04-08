@@ -8,9 +8,9 @@
 // ═══════════════════════════════════════════════
 
 const FRAME_SIZE: i64 = 4096
-const TOTAL_FRAMES: i64 = 32768
+const TOTAL_FRAMES: i64 = 65536    // 256 MB (was 32768=128MB)
 const BITMAP_BASE: i64 = 0x580000
-const BITMAP_SIZE: i64 = 4096
+const BITMAP_SIZE: i64 = 8192      // 65536/8 = 8KB (was 4KB)
 
 @kernel fn frames_init() {
     // Clear ALL bitmap bytes (4096 bytes = 32768 bits = 32768 frames)
@@ -31,8 +31,9 @@ const BITMAP_SIZE: i64 = 4096
     // Mark heap area (0x400000 - 0x580000 = frames 1024-1408)
     f = 1024
     while f < 1408 { frame_mark_used(f); f = f + 1 }
-    // Mark bitmap itself (0x580000 - 0x581000 = frame 1408)
+    // Mark bitmap itself (0x580000 - 0x582000 = frames 1408-1409, 8KB for 256MB)
     frame_mark_used(1408)
+    frame_mark_used(1409)
     // Mark process table + cmdbuf region (0x600000 - 0x700000 = frames 1536-1792)
     f = 1536
     while f < 1792 { frame_mark_used(f); f = f + 1 }
@@ -204,7 +205,7 @@ const BITMAP_SIZE: i64 = 4096
     cprintln("  0x6F8000-0x6FD000  20K   Shell state", WHITE_ON_BLACK)
     cprintln("  0x700000-0x7E0000  896K  RamFS", CYAN_ON_BLACK)
     cprintln("  0x7F0000-0x800000  64K   Stack", WHITE_ON_BLACK)
-    cprintln("  0x800000-0x7FFFFFF 120M  Free frames", GREEN_ON_BLACK)
+    cprintln("  0x800000-0xFFFFFFF 248M  Free frames (256MB mapped)", GREEN_ON_BLACK)
 }
 
 @kernel fn cmd_alloc() {

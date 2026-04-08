@@ -162,6 +162,50 @@ const TOK_MAX_OUTPUT: i64 = 2048
     0
 }
 
+// Load BPE token table from NVMe disk at given LBA
+// Returns: 0=success, negative=error
+@kernel fn tok_load_nvme(start_lba: i64) -> i64 {
+    // Read first sector for header
+    let rc = nvme_read_sectors(start_lba, 1, NVME_DMA)
+    if rc != 0 { return -5 }
+
+    let magic = mdl_read_u32(NVME_DMA)
+    if magic != FJT_MAGIC { return -1 }
+    let version = mdl_read_u32(NVME_DMA + 4)
+    if version != 1 { return -2 }
+    let vocab_size = mdl_read_u32(NVME_DMA + 8)
+    let max_token_len = mdl_read_u32(NVME_DMA + 12)
+    if vocab_size <= 0 || vocab_size > 262144 { return -3 }
+
+    // Allocate frames for token table
+    let table_bytes = vocab_size * TOK_ENTRY_SIZE
+    let n_frames = (table_bytes + 4095) / 4096
+    let table_addr = frame_alloc_contiguous(n_frames)
+    if table_addr == -1 { return -5 }
+
+    // Read token entries from NVMe in 128-sector chunks
+    let data_lba = start_lba + 1  // entries start at sector after header
+    let total_sectors = (table_bytes + 511) / 512
+    let mut sect_done: i64 = 0
+    while sect_done < total_sectors {
+        let chunk = total_sectors - sect_done
+        let read_count = if chunk > 128 { 128 } else { chunk }
+        let r = nvme_read_sectors(data_lba + sect_done, read_count, NVME_DMA)
+        if r != 0 { return -5 }
+        mdl_memcpy(table_addr + sect_done * 512, NVME_DMA, read_count * 512)
+        sect_done = sect_done + read_count
+    }
+
+    tok_build_fbi(table_addr, vocab_size)
+
+    volatile_write_u64(TOK_META + TOK_M_MODE, 1)
+    volatile_write_u64(TOK_META + TOK_M_VOCAB, vocab_size)
+    volatile_write_u64(TOK_META + TOK_M_TABLE_ADDR, table_addr)
+    volatile_write_u64(TOK_META + TOK_M_TABLE_FRAMES, n_frames)
+    volatile_write_u64(TOK_META + TOK_M_MAX_LEN, max_token_len)
+    0
+}
+
 // Build first-byte index from sorted token table
 // Entries must be sorted by first byte, then by length descending
 @kernel fn tok_build_fbi(table_addr: i64, vocab_size: i64) {
@@ -536,6 +580,33 @@ const TOK_MAX_OUTPUT: i64 = 2048
     if len <= 9 {
         cprintln("Usage: tok-load <file.fjt>", YELLOW_ON_BLACK)
         cprintln("       tok-load test", YELLOW_ON_BLACK)
+        cprintln("       tok-load nvme <lba>", YELLOW_ON_BLACK)
+        return
+    }
+
+    // Check for "tok-load nvme <lba>" — n(110) at pos 9
+    if len > 14 && volatile_read_u8(0x6F809) == 110 && volatile_read_u8(0x6F80A) == 118 {
+        let mut lba: i64 = 0
+        let mut i: i64 = 14
+        while i < len {
+            let ch = volatile_read_u8(0x6F800 + i)
+            if ch >= 48 && ch <= 57 { lba = lba * 10 + (ch - 48) }
+            i = i + 1
+        }
+        cprint("Loading tokenizer from NVMe LBA ", WHITE_ON_BLACK)
+        cprint_decimal(lba, CYAN_ON_BLACK)
+        cprintln("...", WHITE_ON_BLACK)
+        let rc = tok_load_nvme(lba)
+        if rc == 0 {
+            let vs = volatile_read_u64(TOK_META + TOK_M_VOCAB)
+            cprint("[OK] Loaded ", GREEN_ON_BLACK)
+            cprint_decimal(vs, CYAN_ON_BLACK)
+            cprintln(" tokens from NVMe (BPE mode)", GREEN_ON_BLACK)
+        } else {
+            cprint("[ERR] NVMe load failed: E", RED_ON_BLACK)
+            cprint_decimal(0 - rc, RED_ON_BLACK)
+            console_putchar(10, RED_ON_BLACK)
+        }
         return
     }
 
