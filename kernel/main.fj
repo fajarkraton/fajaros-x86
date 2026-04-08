@@ -199,6 +199,7 @@
     fajarquant_init()
     km_init()
     tok_init()
+    mlsched_init()
     println(53)
 
     // Map LAPIC + IOAPIC MMIO pages (beyond 128MB identity region)

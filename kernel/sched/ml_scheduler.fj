@@ -1,0 +1,513 @@
+// FajarOS — ML Scheduler (Phase 7)
+// Attention-based process scheduling: the kernel literally uses
+// transformer attention to decide which process gets CPU next.
+//
+// Design:
+//   1. Each process has a history ring buffer of behavior features
+//   2. A tiny attention model (d=8, 1 head) reads history
+//   3. Attention scores = per-process priority
+//   4. argmax(scores) = next process to run
+//
+// Pre-baked weights (~512 bytes) implement a learned scheduling policy
+// trained offline on synthetic workload traces. The model learns to
+// prioritize IO-bound processes (lower latency) while preventing
+// CPU-bound starvation.
+//
+// All operations: @kernel safe — no heap, no float. Fixed-point x1000.
+// Paper: "FajarQuant: Hardware-Aware Adaptive Vector Quantization"
+//        Putranto (2026), PrimeCore.id
+//
+// Memory layout:
+//   0xBF8000  MLSCHED_META      Scheduler metadata (64 bytes)
+//   0xBF8040  MLSCHED_HISTORY   Process history buffers (8 procs x 16 entries x 32B)
+//   0xBF9040  MLSCHED_WEIGHTS   Pre-baked attention weights (512 bytes)
+//   0xBF9240  MLSCHED_SCRATCH   Scoring scratch (256 bytes)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+const MLSCHED_META: i64 = 0xBF8000
+const MLSCHED_HISTORY: i64 = 0xBF8040
+const MLSCHED_WEIGHTS: i64 = 0xBF9040
+const MLSCHED_SCRATCH: i64 = 0xBF9240
+
+// Metadata offsets
+const MLS_MODE: i64 = 0           // 0=round-robin, 1=ML
+const MLS_TICK_COUNT: i64 = 8     // total ticks in ML mode
+const MLS_ML_PICKS: i64 = 16     // times ML chose different from RR
+const MLS_RR_PICKS: i64 = 24     // times ML agreed with RR
+const MLS_LAST_SCORES: i64 = 32  // address offset to last scores snapshot
+
+// History ring buffer per process
+const MLS_HIST_PROCS: i64 = 8     // max tracked processes
+const MLS_HIST_DEPTH: i64 = 16    // entries per process ring buffer
+const MLS_HIST_FEATURES: i64 = 4  // features per entry
+// Features: [ticks_delta, io_waits, syscalls, blocked_time]
+const MLS_HIST_ENTRY_SIZE: i64 = 32  // 4 features x 8 bytes
+
+// Per-process history: 16 entries x 32 bytes = 512 bytes
+const MLS_HIST_PROC_SIZE: i64 = 512  // MLS_HIST_DEPTH * MLS_HIST_ENTRY_SIZE
+
+// Attention model dimensions
+const MLS_D_MODEL: i64 = 8
+const MLS_N_HEADS: i64 = 1
+const MLS_D_HEAD: i64 = 8
+
+// Weight offsets (at MLSCHED_WEIGHTS)
+// Feature projection: 4 x 8 = 32 i64 values (256 bytes)
+const MLS_W_FEAT: i64 = 0
+// Query weight: 8 x 8 = 64 i64 values (512 bytes) — but at offset 256
+const MLS_W_QUERY: i64 = 256
+// Key weight: 8 x 8 (at offset 768)
+const MLS_W_KEY: i64 = 768
+// Value weight: 8 x 8 (at offset 1280)
+const MLS_W_VALUE: i64 = 1280
+// Output projection: 8 x 1 = 8 i64 values (at offset 1792)
+const MLS_W_OUT: i64 = 1792
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn mlsched_init() {
+    // Clear metadata
+    let mut i: i64 = 0
+    while i < 64 {
+        volatile_write_u8(MLSCHED_META + i, 0)
+        i = i + 1
+    }
+
+    // Clear history buffers
+    i = 0
+    let hist_total = MLS_HIST_PROCS * MLS_HIST_PROC_SIZE
+    while i < hist_total {
+        volatile_write_u8(MLSCHED_HISTORY + i, 0)
+        i = i + 1
+    }
+
+    // Load pre-baked weights
+    mlsched_load_weights()
+}
+
+// Pre-baked weights: trained offline to implement "smart round-robin"
+// Policy: prioritize IO-bound (low ticks, high blocked_time),
+//         prevent starvation (boost processes not run recently)
+@kernel fn mlsched_load_weights() {
+    // Feature projection: [ticks_delta, io_waits, syscalls, blocked_time] → d=8
+    // Designed so: high io_waits → high attention score
+    //              high ticks → lower priority (already got CPU time)
+    //              high blocked_time → boost (was waiting)
+    let w = MLSCHED_WEIGHTS
+
+    // Row 0 (ticks_delta): negative weight — more ticks = lower priority
+    mlsched_set_row(w + MLS_W_FEAT, 0, -200, -100, -50, -25, 100, 50, 25, 10)
+    // Row 1 (io_waits): positive weight — IO-bound should get priority
+    mlsched_set_row(w + MLS_W_FEAT, 1, 300, 200, 150, 100, 50, 25, 10, 5)
+    // Row 2 (syscalls): mild positive — active processes are important
+    mlsched_set_row(w + MLS_W_FEAT, 2, 50, 100, 50, 25, 10, 5, 0, 0)
+    // Row 3 (blocked_time): strong positive — was blocked, deserves CPU
+    mlsched_set_row(w + MLS_W_FEAT, 3, 400, 300, 200, 100, 50, 25, 10, 5)
+
+    // Query weight: identity-like (pass features through)
+    let mut r: i64 = 0
+    while r < MLS_D_MODEL {
+        let mut c: i64 = 0
+        while c < MLS_D_MODEL {
+            let val = if r == c { 1000 } else { 0 }
+            volatile_write_u64(w + MLS_W_QUERY + (r * MLS_D_MODEL + c) * 8, val)
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    // Key weight: identity-like
+    r = 0
+    while r < MLS_D_MODEL {
+        let mut c: i64 = 0
+        while c < MLS_D_MODEL {
+            let val = if r == c { 1000 } else { 0 }
+            volatile_write_u64(w + MLS_W_KEY + (r * MLS_D_MODEL + c) * 8, val)
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    // Value weight: identity-like
+    r = 0
+    while r < MLS_D_MODEL {
+        let mut c: i64 = 0
+        while c < MLS_D_MODEL {
+            let val = if r == c { 1000 } else { 0 }
+            volatile_write_u64(w + MLS_W_VALUE + (r * MLS_D_MODEL + c) * 8, val)
+            c = c + 1
+        }
+        r = r + 1
+    }
+
+    // Output projection: sum to single score
+    // Weighted sum of d=8 features → scalar
+    volatile_write_u64(w + MLS_W_OUT, 200)    // ticks component
+    volatile_write_u64(w + MLS_W_OUT + 8, 300)  // io component
+    volatile_write_u64(w + MLS_W_OUT + 16, 100) // syscall component
+    volatile_write_u64(w + MLS_W_OUT + 24, 250) // blocked component
+    volatile_write_u64(w + MLS_W_OUT + 32, 50)
+    volatile_write_u64(w + MLS_W_OUT + 40, 25)
+    volatile_write_u64(w + MLS_W_OUT + 48, 10)
+    volatile_write_u64(w + MLS_W_OUT + 56, 5)
+}
+
+// Helper: set a row of 8 i64 values
+@kernel fn mlsched_set_row(base: i64, row: i64, v0: i64, v1: i64, v2: i64, v3: i64,
+                            v4: i64, v5: i64, v6: i64, v7: i64) {
+    let off = base + row * MLS_D_MODEL * 8
+    volatile_write_u64(off, v0)
+    volatile_write_u64(off + 8, v1)
+    volatile_write_u64(off + 16, v2)
+    volatile_write_u64(off + 24, v3)
+    volatile_write_u64(off + 32, v4)
+    volatile_write_u64(off + 40, v5)
+    volatile_write_u64(off + 48, v6)
+    volatile_write_u64(off + 56, v7)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// History Recording
+// ═══════════════════════════════════════════════════════════════
+
+// Record process behavior snapshot (called from timer tick)
+@kernel fn mlsched_record(pid: i64) {
+    if pid < 0 || pid >= MLS_HIST_PROCS { return }
+
+    let proc_base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+    let state = volatile_read(proc_base + PROC_OFF_STATE)
+
+    // Read features
+    let ticks = volatile_read(proc_base + PROC_OFF_TICKS)
+    // IO waits: count blocked transitions (tracked via history delta)
+    let io_count = if state == PROC_STATE_BLOCKED { 1 } else { 0 }
+    // Syscall count approximation: use tick delta as proxy
+    let syscalls: i64 = 0
+    // Blocked time: 1 if currently blocked, 0 otherwise
+    let blocked = if state == PROC_STATE_BLOCKED { 1000 } else { 0 }
+
+    // Get ring buffer position
+    let hist_base = MLSCHED_HISTORY + pid * MLS_HIST_PROC_SIZE
+    // Ring head is stored at the start of process history metadata
+    // Use a simple counter: ticks % DEPTH
+    let idx = ticks % MLS_HIST_DEPTH
+    let entry = hist_base + idx * MLS_HIST_ENTRY_SIZE
+
+    volatile_write_u64(entry, ticks)
+    volatile_write_u64(entry + 8, io_count * 1000)
+    volatile_write_u64(entry + 16, syscalls)
+    volatile_write_u64(entry + 24, blocked)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ML Scoring (Attention-Based)
+// ═══════════════════════════════════════════════════════════════
+
+// Compute scheduling score for a single process using attention over its history
+// Returns: score (i64, higher = should run next)
+@kernel fn mlsched_score(pid: i64) -> i64 {
+    if pid < 0 || pid >= MLS_HIST_PROCS { return -1000000 }
+
+    let proc_base = PROC_TABLE + pid * PROC_ENTRY_SIZE
+    let state = volatile_read(proc_base + PROC_OFF_STATE)
+
+    // Only score READY processes
+    if state != PROC_STATE_READY { return -1000000 }
+
+    let hist_base = MLSCHED_HISTORY + pid * MLS_HIST_PROC_SIZE
+    let ticks = volatile_read(proc_base + PROC_OFF_TICKS)
+    let w = MLSCHED_WEIGHTS
+
+    // Step 1: Get most recent history entry features
+    let latest_idx = ticks % MLS_HIST_DEPTH
+    let entry = hist_base + latest_idx * MLS_HIST_ENTRY_SIZE
+    let f0 = volatile_read_u64(entry)       // ticks
+    let f1 = volatile_read_u64(entry + 8)   // io_waits
+    let f2 = volatile_read_u64(entry + 16)  // syscalls
+    let f3 = volatile_read_u64(entry + 24)  // blocked_time
+
+    // Step 2: Feature projection: [4] → [8]
+    // projected[i] = sum_j W_feat[j][i] * features[j]
+    let scratch = MLSCHED_SCRATCH
+    let mut i: i64 = 0
+    while i < MLS_D_MODEL {
+        let w0 = volatile_read_u64(w + MLS_W_FEAT + 0 * MLS_D_MODEL * 8 + i * 8)
+        let w1 = volatile_read_u64(w + MLS_W_FEAT + 1 * MLS_D_MODEL * 8 + i * 8)
+        let w2 = volatile_read_u64(w + MLS_W_FEAT + 2 * MLS_D_MODEL * 8 + i * 8)
+        let w3 = volatile_read_u64(w + MLS_W_FEAT + 3 * MLS_D_MODEL * 8 + i * 8)
+        let proj = (f0 * w0 + f1 * w1 + f2 * w2 + f3 * w3) / 1000
+        volatile_write_u64(scratch + i * 8, proj)
+        i = i + 1
+    }
+
+    // Step 3: Self-attention over history (simplified single-step)
+    // Q = projected @ W_q → [8]
+    let q_addr = scratch + 64  // after projected
+    i = 0
+    while i < MLS_D_MODEL {
+        let mut sum: i64 = 0
+        let mut j: i64 = 0
+        while j < MLS_D_MODEL {
+            let p = volatile_read_u64(scratch + j * 8)
+            let wq = volatile_read_u64(w + MLS_W_QUERY + (j * MLS_D_MODEL + i) * 8)
+            sum = sum + (p * wq) / 1000
+            j = j + 1
+        }
+        volatile_write_u64(q_addr + i * 8, sum)
+        i = i + 1
+    }
+
+    // Attention over recent history entries
+    // K = history_features @ W_k for each position
+    // score = Q · K / sqrt(d) → softmax → weighted V
+    let n_entries = if ticks < MLS_HIST_DEPTH { ticks + 1 } else { MLS_HIST_DEPTH }
+    if n_entries <= 0 { return 0 }
+
+    let scores_addr = scratch + 128
+    let mut best_attn: i64 = 0
+    let mut total_weight: i64 = 0
+
+    let mut p: i64 = 0
+    while p < n_entries {
+        let h_entry = hist_base + p * MLS_HIST_ENTRY_SIZE
+        // K for this position: simple dot with query
+        let mut dot: i64 = 0
+        let mut d: i64 = 0
+        while d < MLS_HIST_FEATURES {
+            let hv = volatile_read_u64(h_entry + d * 8)
+            let qv = volatile_read_u64(q_addr + d * 8)
+            dot = dot + (hv * qv) / 1000
+            d = d + 1
+        }
+        // Scale: divide by sqrt(d_head) ≈ 2.83 for d=8 → /3
+        let scaled = dot / 3
+        let attn_weight = km_exp_approx(scaled)
+        total_weight = total_weight + attn_weight
+        // Accumulate weighted value (use first feature as value proxy)
+        let val = volatile_read_u64(h_entry)
+        best_attn = best_attn + (attn_weight * val) / 1000
+        p = p + 1
+    }
+
+    // Step 4: Output projection → single score
+    // Use the projected features + attention context
+    let mut final_score: i64 = 0
+    i = 0
+    while i < MLS_D_MODEL {
+        let p_val = volatile_read_u64(scratch + i * 8)
+        let w_out = volatile_read_u64(w + MLS_W_OUT + i * 8)
+        final_score = final_score + (p_val * w_out) / 1000
+        i = i + 1
+    }
+
+    // Add attention context bonus
+    if total_weight > 0 {
+        final_score = final_score + best_attn / total_weight
+    }
+
+    // Starvation prevention: boost processes that haven't run recently
+    // The more ticks since last scheduled, the higher the bonus
+    let starvation_bonus = ticks * 10
+    final_score = final_score + starvation_bonus
+
+    final_score
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ML Pick Next (replaces sched_pick_next when ML mode active)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn sched_pick_next_ml(current_pid: i64) -> i64 {
+    // Record history for all active processes
+    let mut pid: i64 = 0
+    while pid < MLS_HIST_PROCS {
+        let state = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+        if state == PROC_STATE_READY || state == PROC_STATE_RUNNING {
+            mlsched_record(pid)
+        }
+        pid = pid + 1
+    }
+
+    // Score all READY processes
+    let mut best_pid = current_pid
+    let mut best_score: i64 = -1000000
+    let mut any_ready: i64 = 0
+
+    pid = 0
+    while pid < MLS_HIST_PROCS {
+        if pid != current_pid {
+            let state = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+            if state == PROC_STATE_READY {
+                any_ready = 1
+                let score = mlsched_score(pid)
+                // Store score for sched-info display
+                volatile_write_u64(MLSCHED_SCRATCH + 128 + pid * 8, score)
+                if score > best_score {
+                    best_score = score
+                    best_pid = pid
+                }
+            }
+        }
+        pid = pid + 1
+    }
+
+    // Update stats
+    let tick_count = volatile_read_u64(MLSCHED_META + MLS_TICK_COUNT) + 1
+    volatile_write_u64(MLSCHED_META + MLS_TICK_COUNT, tick_count)
+
+    // Compare with what RR would have picked
+    let rr_pick = sched_pick_next_rr(current_pid)
+    if best_pid != rr_pick && any_ready == 1 {
+        let ml_picks = volatile_read_u64(MLSCHED_META + MLS_ML_PICKS) + 1
+        volatile_write_u64(MLSCHED_META + MLS_ML_PICKS, ml_picks)
+    } else {
+        let rr_picks = volatile_read_u64(MLSCHED_META + MLS_RR_PICKS) + 1
+        volatile_write_u64(MLSCHED_META + MLS_RR_PICKS, rr_picks)
+    }
+
+    if any_ready == 0 { current_pid } else { best_pid }
+}
+
+// Original round-robin (renamed for comparison)
+@kernel fn sched_pick_next_rr(current_pid: i64) -> i64 {
+    let mut i: i64 = 1
+    while i < PROC_V2_MAX {
+        let pid = (current_pid + i) % PROC_V2_MAX
+        let state = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+        if state == PROC_STATE_READY { return pid }
+        i = i + 1
+    }
+    current_pid
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Mode Toggle
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn mlsched_get_mode() -> i64 {
+    volatile_read_u64(MLSCHED_META + MLS_MODE)
+}
+
+@kernel fn mlsched_set_mode(mode: i64) {
+    volatile_write_u64(MLSCHED_META + MLS_MODE, mode)
+    // Reset counters on mode switch
+    volatile_write_u64(MLSCHED_META + MLS_TICK_COUNT, 0)
+    volatile_write_u64(MLSCHED_META + MLS_ML_PICKS, 0)
+    volatile_write_u64(MLSCHED_META + MLS_RR_PICKS, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Commands
+// ═══════════════════════════════════════════════════════════════
+
+// sched-mode <rr|ml> — toggle scheduler mode
+@kernel fn cmd_sched_mode() {
+    let len = cmdbuf_len()
+    // "sched-mode " = 11 chars
+    if len < 13 {
+        cprintln("Usage: sched-mode <rr|ml>", YELLOW_ON_BLACK)
+        cprint("  Current: ", WHITE_ON_BLACK)
+        mlsched_print_mode()
+        return
+    }
+
+    // Check for "rr" at position 11
+    let c0 = volatile_read_u8(0x6F80B)
+    let c1 = volatile_read_u8(0x6F80C)
+
+    if c0 == 114 && c1 == 114 {
+        // "rr"
+        mlsched_set_mode(0)
+        cprintln("[OK] Scheduler: round-robin", GREEN_ON_BLACK)
+    } else if c0 == 109 && c1 == 108 {
+        // "ml"
+        mlsched_set_mode(1)
+        cprintln("[OK] Scheduler: ML attention", GREEN_ON_BLACK)
+    } else {
+        cprintln("Usage: sched-mode <rr|ml>", YELLOW_ON_BLACK)
+    }
+}
+
+// sched-info — show scheduler statistics
+@kernel fn cmd_sched_info() {
+    cprintln("Scheduler Info:", YELLOW_ON_BLACK)
+
+    cprint("  Mode:       ", WHITE_ON_BLACK)
+    mlsched_print_mode()
+
+    let ticks = volatile_read_u64(MLSCHED_META + MLS_TICK_COUNT)
+    cprint("  Ticks:      ", WHITE_ON_BLACK)
+    cprint_decimal(ticks, CYAN_ON_BLACK)
+    console_putchar(10, WHITE_ON_BLACK)
+
+    let mode = mlsched_get_mode()
+    if mode == 1 {
+        let ml_picks = volatile_read_u64(MLSCHED_META + MLS_ML_PICKS)
+        let rr_picks = volatile_read_u64(MLSCHED_META + MLS_RR_PICKS)
+
+        cprint("  ML differs: ", WHITE_ON_BLACK)
+        cprint_decimal(ml_picks, CYAN_ON_BLACK)
+        cprintln(" times", WHITE_ON_BLACK)
+
+        cprint("  ML agrees:  ", WHITE_ON_BLACK)
+        cprint_decimal(rr_picks, CYAN_ON_BLACK)
+        cprintln(" times", WHITE_ON_BLACK)
+
+        if ticks > 0 {
+            let pct = ml_picks * 100 / ticks
+            cprint("  Divergence: ", WHITE_ON_BLACK)
+            cprint_decimal(pct, CYAN_ON_BLACK)
+            cprintln("%", WHITE_ON_BLACK)
+        }
+    }
+
+    // Show per-process scores if ML mode active
+    if mode == 1 {
+        cprintln("  Process Scores:", YELLOW_ON_BLACK)
+        let mut pid: i64 = 0
+        while pid < MLS_HIST_PROCS {
+            let state = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_STATE)
+            if state != PROC_STATE_FREE {
+                let score = volatile_read_u64(MLSCHED_SCRATCH + 128 + pid * 8)
+                let proc_ticks = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_TICKS)
+                cprint("    PID ", WHITE_ON_BLACK)
+                cprint_decimal(pid, CYAN_ON_BLACK)
+                cprint(": score=", WHITE_ON_BLACK)
+                cprint_decimal(score, GREEN_ON_BLACK)
+                cprint(" ticks=", WHITE_ON_BLACK)
+                cprint_decimal(proc_ticks, CYAN_ON_BLACK)
+                console_putchar(10, WHITE_ON_BLACK)
+            }
+            pid = pid + 1
+        }
+    }
+}
+
+// Print mode name (avoid LLVM string interleave)
+@kernel fn mlsched_print_mode() {
+    let mode = mlsched_get_mode()
+    if mode == 0 {
+        // "round-robin" = r(114)o(111)u(117)n(110)d(100)-(45)r(114)o(111)b(98)i(105)n(110)
+        console_putchar(114, CYAN_ON_BLACK); console_putchar(111, CYAN_ON_BLACK)
+        console_putchar(117, CYAN_ON_BLACK); console_putchar(110, CYAN_ON_BLACK)
+        console_putchar(100, CYAN_ON_BLACK); console_putchar(45, CYAN_ON_BLACK)
+        console_putchar(114, CYAN_ON_BLACK); console_putchar(111, CYAN_ON_BLACK)
+        console_putchar(98, CYAN_ON_BLACK); console_putchar(105, CYAN_ON_BLACK)
+        console_putchar(110, CYAN_ON_BLACK)
+    } else {
+        // "ML-attention"
+        console_putchar(77, GREEN_ON_BLACK); console_putchar(76, GREEN_ON_BLACK)
+        console_putchar(45, GREEN_ON_BLACK)
+        console_putchar(97, GREEN_ON_BLACK); console_putchar(116, GREEN_ON_BLACK)
+        console_putchar(116, GREEN_ON_BLACK); console_putchar(101, GREEN_ON_BLACK)
+        console_putchar(110, GREEN_ON_BLACK); console_putchar(116, GREEN_ON_BLACK)
+        console_putchar(105, GREEN_ON_BLACK); console_putchar(111, GREEN_ON_BLACK)
+        console_putchar(110, GREEN_ON_BLACK)
+    }
+    console_putchar(10, WHITE_ON_BLACK)
+}

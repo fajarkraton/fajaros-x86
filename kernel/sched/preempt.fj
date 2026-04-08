@@ -70,6 +70,12 @@
 // ═══════════════════════════════════════════════════
 
 @kernel fn sched_pick_next(current_pid: i64) -> i64 {
+    // Check ML scheduler mode (Phase 7)
+    let ml_mode = volatile_read_u64(0xBF8000)  // MLSCHED_META + MLS_MODE
+    if ml_mode == 1 {
+        return sched_pick_next_ml(current_pid)
+    }
+    // Default: round-robin
     let mut i: i64 = 1
     while i < PROC_V2_MAX {
         let pid = (current_pid + i) % PROC_V2_MAX

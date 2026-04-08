@@ -178,6 +178,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  km-bench km-info model-load model-info", WHITE_ON_BLACK)
     cprintln("  tokenize tok-info tok-load tok-reset", WHITE_ON_BLACK)
     cprintln("  infer ask gen tfm-info", WHITE_ON_BLACK)
+    cprintln("  sched-mode sched-info", WHITE_ON_BLACK)
     cprintln("  virtio-gpu gpu gpu-info gpu-bench", WHITE_ON_BLACK)
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
@@ -3181,6 +3182,13 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
     // gen (103,101,110,32,...) len>=4 — "gen <prompt> [max]" — open-ended generation
     if handled == 0 && len >= 4 && volatile_read_u8(0x6F800) == 103 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 110 && (len == 3 || volatile_read_u8(0x6F803) == 32) { cmd_gen(); handled = 1 }
+
+    // sched-mode (115,99,104,101,100,45,109,...) len>=10 — "sched-mode <rr|ml>"
+    // s(115) c(99) h(104) e(101) d(100) -(45) m(109) o(111) d(100) e(101)
+    if handled == 0 && len >= 10 && buf_eq4(115, 99, 104, 101) == 1 && volatile_read_u8(0x6F804) == 100 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 109 && volatile_read_u8(0x6F807) == 111 { cmd_sched_mode(); handled = 1 }
+
+    // sched-info (115,99,104,101,100,45,105,...) len=10 — scheduler stats
+    if handled == 0 && len == 10 && buf_eq4(115, 99, 104, 101) == 1 && volatile_read_u8(0x6F804) == 100 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 { cmd_sched_info(); handled = 1 }
 
     // === Memory management commands ===
     // frames

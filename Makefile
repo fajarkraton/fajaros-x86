@@ -58,6 +58,7 @@ SOURCES := \
 	kernel/sched/scheduler.fj \
 	kernel/sched/batch.fj \
 	kernel/sched/preempt.fj \
+	kernel/sched/ml_scheduler.fj \
 	kernel/sched/smp.fj \
 	kernel/sched/spinlock.fj \
 	kernel/sched/pcpu.fj \
