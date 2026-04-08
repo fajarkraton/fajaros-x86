@@ -176,6 +176,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  tensor mnist bench fib compute cbench", WHITE_ON_BLACK)
     cprintln("  quant quant-bench quant-info classify", WHITE_ON_BLACK)
     cprintln("  km-bench km-info model-load model-info", WHITE_ON_BLACK)
+    cprintln("  tokenize tok-info tok-load tok-reset", WHITE_ON_BLACK)
     cprintln("  virtio-gpu gpu gpu-info gpu-bench", WHITE_ON_BLACK)
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
@@ -3154,6 +3155,19 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
     // model-info (109,111,100,101,108,45,105,...) len=10 — Show loaded model info
     if handled == 0 && len == 10 && buf_eq4(109, 111, 100, 101) == 1 && volatile_read_u8(0x6F804) == 108 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 { cmd_model_info(); handled = 1 }
+
+    // tokenize (116,111,107,101,110,105,122,101,32,...) — "tokenize <text>"
+    // t(116) o(111) k(107) e(101) n(110) i(105) z(122) e(101) ' '(32)
+    if handled == 0 && len >= 9 && buf_eq4(116, 111, 107, 101) == 1 && volatile_read_u8(0x6F804) == 110 && volatile_read_u8(0x6F805) == 105 && volatile_read_u8(0x6F806) == 122 && volatile_read_u8(0x6F807) == 101 { cmd_tokenize(); handled = 1 }
+
+    // tok-info (116,111,107,45,105,110,102,111) len=8
+    if handled == 0 && len == 8 && buf_eq4(116, 111, 107, 45) == 1 && volatile_read_u8(0x6F804) == 105 && volatile_read_u8(0x6F805) == 110 { cmd_tok_info(); handled = 1 }
+
+    // tok-load (116,111,107,45,108,...) len>=8 — "tok-load <file>" or "tok-load test"
+    if handled == 0 && len >= 8 && buf_eq4(116, 111, 107, 45) == 1 && volatile_read_u8(0x6F804) == 108 && volatile_read_u8(0x6F805) == 111 { cmd_tok_load(); handled = 1 }
+
+    // tok-reset (116,111,107,45,114,...) len=9
+    if handled == 0 && len == 9 && buf_eq4(116, 111, 107, 45) == 1 && volatile_read_u8(0x6F804) == 114 { cmd_tok_reset(); handled = 1 }
 
     // === Memory management commands ===
     // frames
