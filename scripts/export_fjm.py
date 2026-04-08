@@ -158,13 +158,18 @@ def export_gemma3(model_name, bits):
         k_w = layer.self_attn.k_proj.weight.detach().numpy().T
         v_w = layer.self_attn.v_proj.weight.detach().numpy().T
 
+        # O projection (output, for GQA where q_dim != d_model)
+        o_w = layer.self_attn.o_proj.weight.detach().numpy().T
+
         q_idx, q_cb = lloyd_max_quantize(q_w, bits)
         k_idx, _ = lloyd_max_quantize(k_w, bits)
         v_idx, _ = lloyd_max_quantize(v_w, bits)
+        o_idx, _ = lloyd_max_quantize(o_w, bits)
         q_packed = pack_quantized(q_idx, bits)
         k_packed = pack_quantized(k_idx, bits)
         v_packed = pack_quantized(v_idx, bits)
-        qkv_packed = q_packed + k_packed + v_packed
+        o_packed = pack_quantized(o_idx, bits)
+        qkv_packed = q_packed + k_packed + v_packed + o_packed
 
         # FFN (gated: gate + up + down)
         if is_gated:
@@ -203,7 +208,7 @@ def export_gemma3(model_name, bits):
             i, FJM_LAYER_HDR_SIZE + len(weight_data),
             len(qkv_packed), len(ffn_packed))
         layer_blocks.append(layer_hdr + weight_data)
-        print(f"  Layer {i}: Q={len(q_packed)} K={len(k_packed)} V={len(v_packed)} FFN={len(ffn_packed)}")
+        print(f"  Layer {i}: Q={len(q_packed)} K={len(k_packed)} V={len(v_packed)} O={len(o_packed)} FFN={len(ffn_packed)}")
 
     # LM head
     lmhead_w = model.lm_head.weight.detach().numpy().T

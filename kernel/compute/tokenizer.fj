@@ -175,7 +175,7 @@ const TOK_MAX_OUTPUT: i64 = 2048
     if version != 1 { return -2 }
     let vocab_size = mdl_read_u32(NVME_DMA + 8)
     let max_token_len = mdl_read_u32(NVME_DMA + 12)
-    if vocab_size <= 0 || vocab_size > 262144 { return -3 }
+    if vocab_size <= 0 || vocab_size > 262200 { return -3 }  // Gemma 3: 262145
 
     // Allocate frames for token table
     let table_bytes = vocab_size * TOK_ENTRY_SIZE

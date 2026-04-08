@@ -1252,6 +1252,10 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let norm_addr = mdl_stream_norm_addr()
     let cb_addr = mdl_stream_codebook_addr()
 
+    // Copy per-layer codebook to MDL_CODEBOOK_BASE (used by embed lookup + LM head)
+    let cb_size = (1 << bits) * 8  // 2-bit: 4 centroids × 8 bytes = 32 bytes
+    mdl_memcpy(MDL_CODEBOOK_BASE, cb_addr, cb_size)
+
     // === Pre-attention RMSNorm ===
     mdl_memcpy(STFM_RES, x_addr, d_model * 8)
     km_rmsnorm(x_addr, d_model, norm_addr)
@@ -1284,11 +1288,15 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let window = tfm_attn_window(layer)
     tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, window, TFM_ATTN)
 
-    // === Residual + Attention ===
-    // ATTN has q_dim elements; add to first q_dim of x (no W_o projection yet)
-    mdl_memcpy(x_addr, STFM_RES, d_model * 8)
+    // === O Projection: ATTN (q_dim=1024) → d_model (1152) ===
+    let o_addr = mdl_stream_o_addr()
     let attn_data = km_data_ptr(TFM_ATTN)
-    km_add_raw(x_addr, attn_data, q_dim)
+    km_vecmat_packed_raw(attn_data, o_addr, q_dim, d_model, bits, cb_addr, STFM_FFN_OUT)
+    // Note: reusing STFM_FFN_OUT temporarily for O projection output
+
+    // === Residual + Projected Attention ===
+    mdl_memcpy(x_addr, STFM_RES, d_model * 8)
+    km_add_raw(x_addr, STFM_FFN_OUT, d_model)
 
     // === Pre-FFN RMSNorm ===
     mdl_memcpy(STFM_RES, x_addr, d_model * 8)
@@ -1314,6 +1322,15 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let d_model = mdl_get_d_model()
     let n_layers = mdl_get_n_layers()
 
+    // Pre-load layer 0 codebook for embedding dequantization
+    // (codebook at MDL_CODEBOOK_BASE is used by embed_lookup_raw)
+    if mdl_stream_current_layer() != 0 {
+        mdl_stream_load_layer(0)
+    }
+    let bits = mdl_get_quant_bits()
+    let cb_size = (1 << bits) * 8
+    mdl_memcpy(MDL_CODEBOOK_BASE, mdl_stream_codebook_addr(), cb_size)
+
     // Step 1: Embedding lookup → STFM_X (raw address, supports d > 1024)
     mdl_stream_embed_lookup_raw(token_id, STFM_X)
 
@@ -1325,6 +1342,7 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     }
 
     // Step 3: LM head argmax (streamed from NVMe, 1 MB chunks)
+    // Codebook at MDL_CODEBOOK_BASE was set by last layer — used for LM head too
     let next_token = mdl_stream_lmhead_argmax(STFM_X)
 
     // Update state

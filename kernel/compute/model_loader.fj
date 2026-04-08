@@ -1144,12 +1144,26 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     d_model * n_kv * d_head * bits / 8
 }
 
-// QKV total packed size
-@kernel fn mdl_stream_qkv_total() -> i64 {
-    mdl_stream_q_size() + mdl_stream_kv_size() * 2
+// O projection size: (n_heads × d_head) × d_model × bits/8
+@kernel fn mdl_stream_o_size() -> i64 {
+    let d_model = mdl_get_d_model()
+    let n_heads = mdl_get_n_heads()
+    let d_head = mdl_get_d_head()
+    let bits = mdl_get_quant_bits()
+    n_heads * d_head * d_model * bits / 8
 }
 
-// Get FFN weight address in streaming buffer
+// QKVO total packed size (Q + K + V + O)
+@kernel fn mdl_stream_qkv_total() -> i64 {
+    mdl_stream_q_size() + mdl_stream_kv_size() * 2 + mdl_stream_o_size()
+}
+
+// O projection address in streaming buffer (after Q+K+V)
+@kernel fn mdl_stream_o_addr() -> i64 {
+    STREAM_LAYER_BUF + mdl_stream_q_size() + mdl_stream_kv_size() * 2
+}
+
+// Get FFN weight address in streaming buffer (after Q+K+V+O)
 @kernel fn mdl_stream_ffn_addr() -> i64 {
     STREAM_LAYER_BUF + mdl_stream_qkv_total()
 }
@@ -1492,13 +1506,15 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 
     // Per-layer breakdown
     cprintln("Per-Layer Weights:", YELLOW_ON_BLACK)
-    cprint("  QKV:  ", WHITE_ON_BLACK)
+    cprint("  QKVO: ", WHITE_ON_BLACK)
     cprint("Q=", CYAN_ON_BLACK)
     mdl_print_size(mdl_stream_q_size())
     cprint(" K=", CYAN_ON_BLACK)
     mdl_print_size(mdl_stream_kv_size())
     cprint(" V=", CYAN_ON_BLACK)
     mdl_print_size(mdl_stream_kv_size())
+    cprint(" O=", CYAN_ON_BLACK)
+    mdl_print_size(mdl_stream_o_size())
     console_putchar(10, WHITE_ON_BLACK)
 
     cprint("  FFN:  ", WHITE_ON_BLACK)
