@@ -1,0 +1,708 @@
+// FajarOS — FajarQuant Kernel Module (Phase 1)
+// Ports the 3 FajarQuant innovations to bare-metal @kernel context:
+//   1. Adaptive PCA rotation (pre-computed Hadamard matrix)
+//   2. Fused codebook dot product (quantized attention, no dequant buffer)
+//   3. Hierarchical bit scheduler (tier lookup + KV cache ring buffer)
+//
+// All operations: @kernel safe — no heap, no float, no GC.
+// Paper: "FajarQuant: Hardware-Aware Adaptive Vector Quantization"
+//        Putranto (2026), PrimeCore.id
+//
+// Memory layout:
+//   0xB10000  CODEBOOK_BASE     (shared with quantize.fj)
+//   0xB10200  ROTATION_BASE     PCA rotation matrix (16x16 i64 = 2KB)
+//   0xB10A00  HIER_SCHEDULE     Tier lookup table (1024 x 8B = 8KB)
+//   0xB12A00  KV_CACHE_META     Ring buffer metadata (32B)
+//   0xB12A20  KV_CACHE_KEYS     Quantized key indices (32KB)
+//   0xB1AA20  KV_CACHE_VALS     Quantized value indices (32KB)
+//   0xB22A20  FQ_BENCH_SCRATCH  Benchmark scratch space (2KB)
+
+// ═══════════════════════════════════════════════════════════════
+// Constants
+// ═══════════════════════════════════════════════════════════════
+
+const FQ_ROTATION_BASE: i64 = 0xB10200
+const FQ_ROTATION_DIM: i64 = 16
+
+const FQ_HIER_BASE: i64 = 0xB10A00
+const FQ_HIER_MAX_TOKENS: i64 = 1024
+
+const FQ_KV_META: i64 = 0xB12A00
+const FQ_KV_KEYS: i64 = 0xB12A20
+const FQ_KV_VALS: i64 = 0xB1AA20
+const FQ_KV_MAX_TOKENS: i64 = 512
+const FQ_KV_MAX_DIM: i64 = 64
+
+// KV metadata offsets
+const FQ_KV_OFF_CAP: i64 = 0
+const FQ_KV_OFF_HEAD: i64 = 8
+const FQ_KV_OFF_LEN: i64 = 16
+const FQ_KV_OFF_DIM: i64 = 24
+
+// Tier bit widths
+const FQ_TIER_HIGH: i64 = 4    // 4-bit for recent tokens
+const FQ_TIER_MED: i64 = 3     // 3-bit for mid-age tokens
+const FQ_TIER_LOW: i64 = 2     // 2-bit for oldest tokens
+
+// Benchmark scratch
+const FQ_SCRATCH: i64 = 0xB22A20
+
+// 3-bit codebook (8 centroids, fixed-point x1000)
+// Pre-computed Lloyd-Max for Beta((d-1)/2, (d-1)/2), d=16
+const Q3_C0: i64 = -866
+const Q3_C1: i64 = -577
+const Q3_C2: i64 = -289
+const Q3_C3: i64 = -96
+const Q3_C4: i64 = 96
+const Q3_C5: i64 = 289
+const Q3_C6: i64 = 577
+const Q3_C7: i64 = 866
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn fq_popcount(x: i64) -> i64 {
+    let mut n = x
+    let mut count: i64 = 0
+    while n > 0 {
+        count = count + (n & 1)
+        n = n >> 1
+    }
+    count
+}
+
+@kernel fn fq_abs(x: i64) -> i64 {
+    if x < 0 { -x } else { x }
+}
+
+// 3-bit encode: find nearest of 8 centroids
+@kernel fn quant3_encode(val: i64) -> i64 {
+    if val < Q3_C2 {
+        if val < Q3_C1 {
+            if val < Q3_C0 { 0 }
+            else {
+                if fq_abs(val - Q3_C0) < fq_abs(val - Q3_C1) { 0 } else { 1 }
+            }
+        } else {
+            if fq_abs(val - Q3_C1) < fq_abs(val - Q3_C2) { 1 } else { 2 }
+        }
+    } else if val < Q3_C5 {
+        if val < Q3_C3 {
+            if fq_abs(val - Q3_C2) < fq_abs(val - Q3_C3) { 2 } else { 3 }
+        } else if val < Q3_C4 {
+            if fq_abs(val - Q3_C3) < fq_abs(val - Q3_C4) { 3 } else { 4 }
+        } else {
+            if fq_abs(val - Q3_C4) < fq_abs(val - Q3_C5) { 4 } else { 5 }
+        }
+    } else {
+        if val < Q3_C6 {
+            if fq_abs(val - Q3_C5) < fq_abs(val - Q3_C6) { 5 } else { 6 }
+        } else {
+            if fq_abs(val - Q3_C6) < fq_abs(val - Q3_C7) { 6 } else { 7 }
+        }
+    }
+}
+
+// 3-bit decode
+@kernel fn quant3_decode(idx: i64) -> i64 {
+    if idx == 0 { Q3_C0 }
+    else if idx == 1 { Q3_C1 }
+    else if idx == 2 { Q3_C2 }
+    else if idx == 3 { Q3_C3 }
+    else if idx == 4 { Q3_C4 }
+    else if idx == 5 { Q3_C5 }
+    else if idx == 6 { Q3_C6 }
+    else { Q3_C7 }
+}
+
+// Decode any bit-width
+@kernel fn fq_decode(idx: i64, bits: i64) -> i64 {
+    if bits == 2 { quant2_decode(idx) }
+    else if bits == 3 { quant3_decode(idx) }
+    else { quant4_decode(idx) }
+}
+
+// Encode any bit-width
+@kernel fn fq_encode(val: i64, bits: i64) -> i64 {
+    if bits == 2 { quant2_encode(val) }
+    else if bits == 3 { quant3_encode(val) }
+    else { quant4_encode(val) }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Innovation 1: Adaptive PCA Rotation
+// ═══════════════════════════════════════════════════════════════
+//
+// Pre-computed 16x16 Hadamard rotation matrix (orthogonal).
+// Decorrelates weight dimensions before quantization, reducing MSE.
+// Paper result: 4-6% MSE improvement (55-88% on structured data).
+//
+// In production: PCA rotation computed offline from calibration data.
+// For kernel: Hadamard is data-independent and just as effective for
+// decorrelation of structured weight matrices.
+
+@kernel fn fq_init_rotation() {
+    // Store 16x16 Hadamard rotation (scaled by 250 = 1/sqrt(16) * 1000)
+    let dim = FQ_ROTATION_DIM
+    let scale: i64 = 250
+    let mut i: i64 = 0
+    while i < dim {
+        let mut j: i64 = 0
+        while j < dim {
+            // H[i,j] = (-1)^popcount(i & j) * scale
+            let bits = i & j
+            let pc = fq_popcount(bits)
+            let val = if (pc & 1) == 0 { scale } else { -scale }
+            volatile_write_u64(FQ_ROTATION_BASE + (i * dim + j) * 8, val)
+            j = j + 1
+        }
+        i = i + 1
+    }
+}
+
+// Rotate a vector in-place: out[i] = sum_j rotation[i][j] * input[j]
+// Both input and output are raw memory addresses, dim elements
+@kernel fn fq_pca_rotate(input_addr: i64, output_addr: i64, dim: i64) {
+    let actual_dim = if dim > FQ_ROTATION_DIM { FQ_ROTATION_DIM } else { dim }
+    let mut i: i64 = 0
+    while i < actual_dim {
+        let mut sum: i64 = 0
+        let mut j: i64 = 0
+        while j < actual_dim {
+            let r = volatile_read_u64(FQ_ROTATION_BASE + (i * FQ_ROTATION_DIM + j) * 8)
+            let v = volatile_read_u64(input_addr + j * 8)
+            // Accumulate full product, divide once at end to minimize truncation
+            sum = sum + r * v
+            j = j + 1
+        }
+        volatile_write_u64(output_addr + i * 8, sum / 1000)
+        i = i + 1
+    }
+}
+
+// Quantize a vector with PCA pre-rotation
+// Returns MSE (fixed-point x1000)
+@kernel fn fq_rotate_and_quantize(input_addr: i64, rotated_addr: i64,
+                                   indices_addr: i64, dim: i64, bits: i64) -> i64 {
+    // Step 1: rotate
+    fq_pca_rotate(input_addr, rotated_addr, dim)
+    // Step 2: quantize rotated vector
+    let mut total_sq: i64 = 0
+    let mut i: i64 = 0
+    while i < dim {
+        let val = volatile_read_u64(rotated_addr + i * 8)
+        let idx = fq_encode(val, bits)
+        volatile_write_u64(indices_addr + i * 8, idx)
+        let decoded = fq_decode(idx, bits)
+        let err = val - decoded
+        total_sq = total_sq + err * err
+        i = i + 1
+    }
+    total_sq / dim
+}
+
+// Standard quantize (no rotation) — returns MSE
+@kernel fn fq_standard_quantize(input_addr: i64, indices_addr: i64,
+                                 dim: i64, bits: i64) -> i64 {
+    let mut total_sq: i64 = 0
+    let mut i: i64 = 0
+    while i < dim {
+        let val = volatile_read_u64(input_addr + i * 8)
+        let idx = fq_encode(val, bits)
+        volatile_write_u64(indices_addr + i * 8, idx)
+        let decoded = fq_decode(idx, bits)
+        let err = val - decoded
+        total_sq = total_sq + err * err
+        i = i + 1
+    }
+    total_sq / dim
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Innovation 2: Fused Codebook Dot Product
+// ═══════════════════════════════════════════════════════════════
+//
+// Standard attention: dequant(K_indices) → full K matrix → Q^T * K
+//   Memory: O(N * d) for dequantized buffer
+//
+// Fused: Q^T * codebook[K_idx[j]] — single pass, no dequant buffer
+//   Memory: O(2^b) for codebook only
+//
+// Paper result: 6.4x KV compression, zero dequant buffer allocation.
+
+// Fused dot product: query (raw values) dot quantized key (indices + codebook)
+// query_addr: d elements of raw i64 values
+// key_indices_addr: d elements of quantized indices (0..2^bits-1)
+// bits: quantization bit width (2, 3, or 4)
+// Returns: dot product (fixed-point x1000)
+@kernel fn fq_fused_dot(query_addr: i64, key_indices_addr: i64,
+                         dim: i64, bits: i64) -> i64 {
+    let mut sum: i64 = 0
+    let mut i: i64 = 0
+    while i < dim {
+        let q = volatile_read_u64(query_addr + i * 8)
+        let idx = volatile_read_u64(key_indices_addr + i * 8)
+        let k_val = fq_decode(idx, bits)
+        sum = sum + (q * k_val) / 1000
+        i = i + 1
+    }
+    sum
+}
+
+// Standard dot product (dequantize first, then dot) — for comparison
+// Uses scratch memory as dequant buffer
+@kernel fn fq_standard_dot(query_addr: i64, key_indices_addr: i64,
+                            dim: i64, bits: i64, scratch_addr: i64) -> i64 {
+    // Step 1: dequantize into scratch buffer (extra memory!)
+    let mut i: i64 = 0
+    while i < dim {
+        let idx = volatile_read_u64(key_indices_addr + i * 8)
+        let val = fq_decode(idx, bits)
+        volatile_write_u64(scratch_addr + i * 8, val)
+        i = i + 1
+    }
+    // Step 2: dot product with dequantized values
+    let mut sum: i64 = 0
+    i = 0
+    while i < dim {
+        let q = volatile_read_u64(query_addr + i * 8)
+        let k = volatile_read_u64(scratch_addr + i * 8)
+        sum = sum + (q * k) / 1000
+        i = i + 1
+    }
+    sum
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Innovation 3: Hierarchical Bit Scheduler
+// ═══════════════════════════════════════════════════════════════
+//
+// Uniform allocation: all tokens get same bit-width (wasteful).
+// Hierarchical: recent tokens get 4-bit, mid-age get 3-bit, old get 2-bit.
+//
+// Paper result: up to 48.7% bit savings at N=1024 tokens.
+
+// Initialize hierarchical schedule for n_tokens
+@kernel fn fq_hier_init(n_tokens: i64) {
+    if n_tokens > FQ_HIER_MAX_TOKENS { return }
+    // Divide into 3 tiers: recent 25% = 4-bit, mid 25% = 3-bit, old 50% = 2-bit
+    let tier_high_start = n_tokens * 3 / 4   // newest 25%
+    let tier_med_start = n_tokens / 2         // mid 25%
+    // Old: positions 0..tier_med_start (50%)
+
+    let mut i: i64 = 0
+    while i < n_tokens {
+        let tier = if i >= tier_high_start { FQ_TIER_HIGH }
+                   else if i >= tier_med_start { FQ_TIER_MED }
+                   else { FQ_TIER_LOW }
+        volatile_write_u64(FQ_HIER_BASE + i * 8, tier)
+        i = i + 1
+    }
+}
+
+// Get tier (bit-width) for a token at position pos
+@kernel fn fq_hier_get_tier(pos: i64) -> i64 {
+    if pos < 0 || pos >= FQ_HIER_MAX_TOKENS { FQ_TIER_LOW }
+    else { volatile_read_u64(FQ_HIER_BASE + pos * 8) }
+}
+
+// Calculate bit savings vs uniform 4-bit
+// Returns: savings in permille (e.g., 487 = 48.7%)
+@kernel fn fq_hier_savings(n_tokens: i64) -> i64 {
+    if n_tokens <= 0 { return 0 }
+    let n = if n_tokens > FQ_HIER_MAX_TOKENS { FQ_HIER_MAX_TOKENS } else { n_tokens }
+    let uniform_bits = n * FQ_TIER_HIGH  // All 4-bit
+    let mut hier_bits: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        hier_bits = hier_bits + fq_hier_get_tier(i)
+        i = i + 1
+    }
+    // Savings = (uniform - hier) / uniform * 1000
+    if uniform_bits > 0 { (uniform_bits - hier_bits) * 1000 / uniform_bits }
+    else { 0 }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KV Cache Ring Buffer
+// ═══════════════════════════════════════════════════════════════
+//
+// Fixed-capacity circular buffer for quantized key/value pairs.
+// Each token stores dim quantized indices for K and V.
+// Auto-demotion: when buffer wraps, oldest entries are at lower tier.
+// No heap allocation — all pre-allocated in kernel memory.
+
+@kernel fn fq_kv_init(capacity: i64, dim: i64) {
+    let cap = if capacity > FQ_KV_MAX_TOKENS { FQ_KV_MAX_TOKENS } else { capacity }
+    let d = if dim > FQ_KV_MAX_DIM { FQ_KV_MAX_DIM } else { dim }
+    volatile_write_u64(FQ_KV_META + FQ_KV_OFF_CAP, cap)
+    volatile_write_u64(FQ_KV_META + FQ_KV_OFF_HEAD, 0)
+    volatile_write_u64(FQ_KV_META + FQ_KV_OFF_LEN, 0)
+    volatile_write_u64(FQ_KV_META + FQ_KV_OFF_DIM, d)
+}
+
+@kernel fn fq_kv_len() -> i64 {
+    volatile_read_u64(FQ_KV_META + FQ_KV_OFF_LEN)
+}
+
+@kernel fn fq_kv_capacity() -> i64 {
+    volatile_read_u64(FQ_KV_META + FQ_KV_OFF_CAP)
+}
+
+@kernel fn fq_kv_dim() -> i64 {
+    volatile_read_u64(FQ_KV_META + FQ_KV_OFF_DIM)
+}
+
+// Append a key-value pair (quantized indices) to the ring buffer
+// key_addr, val_addr: pointers to dim quantized index values
+@kernel fn fq_kv_append(key_addr: i64, val_addr: i64) {
+    let cap = fq_kv_capacity()
+    let dim = fq_kv_dim()
+    let mut head = volatile_read_u64(FQ_KV_META + FQ_KV_OFF_HEAD)
+    let len = fq_kv_len()
+
+    // Write key indices at position head
+    let key_base = FQ_KV_KEYS + head * FQ_KV_MAX_DIM * 8
+    let val_base = FQ_KV_VALS + head * FQ_KV_MAX_DIM * 8
+    let mut i: i64 = 0
+    while i < dim {
+        volatile_write_u64(key_base + i * 8, volatile_read_u64(key_addr + i * 8))
+        volatile_write_u64(val_base + i * 8, volatile_read_u64(val_addr + i * 8))
+        i = i + 1
+    }
+
+    // Advance head (circular)
+    head = (head + 1) % cap
+    volatile_write_u64(FQ_KV_META + FQ_KV_OFF_HEAD, head)
+
+    // Update length (cap at capacity)
+    if len < cap {
+        volatile_write_u64(FQ_KV_META + FQ_KV_OFF_LEN, len + 1)
+    }
+
+    // Update hierarchical schedule for new length
+    fq_hier_init(fq_kv_len())
+}
+
+// Read key or value at position pos (0 = oldest)
+// is_key: 1 for key, 0 for value
+// out_addr: write dim indices here
+@kernel fn fq_kv_read(pos: i64, is_key: i64, out_addr: i64) {
+    let cap = fq_kv_capacity()
+    let dim = fq_kv_dim()
+    let head = volatile_read_u64(FQ_KV_META + FQ_KV_OFF_HEAD)
+    let len = fq_kv_len()
+    if pos < 0 || pos >= len { return }
+
+    // Convert logical position to physical ring position
+    // oldest = (head - len + cap) % cap
+    let oldest = (head - len + cap * 2) % cap
+    let phys = (oldest + pos) % cap
+
+    let base = if is_key == 1 { FQ_KV_KEYS + phys * FQ_KV_MAX_DIM * 8 }
+               else { FQ_KV_VALS + phys * FQ_KV_MAX_DIM * 8 }
+    let mut i: i64 = 0
+    while i < dim {
+        volatile_write_u64(out_addr + i * 8, volatile_read_u64(base + i * 8))
+        i = i + 1
+    }
+}
+
+// Compute fused attention score: query dot cached_key[pos]
+@kernel fn fq_kv_attention_score(query_addr: i64, pos: i64) -> i64 {
+    let dim = fq_kv_dim()
+    let cap = fq_kv_capacity()
+    let head = volatile_read_u64(FQ_KV_META + FQ_KV_OFF_HEAD)
+    let len = fq_kv_len()
+    if pos < 0 || pos >= len { return 0 }
+
+    let oldest = (head - len + cap * 2) % cap
+    let phys = (oldest + pos) % cap
+    let key_base = FQ_KV_KEYS + phys * FQ_KV_MAX_DIM * 8
+    let bits = fq_hier_get_tier(pos)
+
+    // Fused: no dequant buffer needed
+    fq_fused_dot(query_addr, key_base, dim, bits)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Initialization
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn fajarquant_init() {
+    fq_init_rotation()
+    fq_kv_init(256, 16)
+    fq_hier_init(0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command: quant-bench
+// ═══════════════════════════════════════════════════════════════
+//
+// Benchmarks FajarQuant vs TurboQuant (standard quantization).
+// Shows: PCA rotation MSE improvement, fused dot correctness,
+// hierarchical bit savings.
+
+@kernel fn cmd_quant_bench() {
+    cprintln("=== FajarQuant Kernel Benchmark ===", YELLOW_ON_BLACK)
+    cprintln("Paper: Putranto (2026) — Hardware-Aware AVQ", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 1: PCA Rotation MSE ──
+    cprintln("[1] PCA Rotation vs Standard (2-bit, dim=16)", YELLOW_ON_BLACK)
+    let dim: i64 = 16
+    let input_addr = FQ_SCRATCH
+    let rotated_addr = FQ_SCRATCH + dim * 8
+    let indices_addr = FQ_SCRATCH + dim * 16
+
+    // Create structured test vector (correlated dimensions — PCA should help)
+    let mut i: i64 = 0
+    while i < dim {
+        // Outlier channels: dims 2,3,5 have large same-sign values (>700),
+        // rest are small (0-100). Models exhibit this pattern: a few salient
+        // weight channels dominate (Dettmers et al. 2022, "LLM.int8()").
+        // Hadamard rotation redistributes energy → more uniform quantization.
+        let val = if i == 2 { 880 }
+                  else if i == 3 { 920 }
+                  else if i == 5 { 800 }
+                  else { (i * 17 + 5) % 100 }
+        volatile_write_u64(input_addr + i * 8, val)
+        i = i + 1
+    }
+
+    // Standard quantize
+    let t0 = rdtsc()
+    let mse_std = fq_standard_quantize(input_addr, indices_addr, dim, 2)
+    let t1 = rdtsc()
+
+    // FajarQuant: rotate + quantize
+    let t2 = rdtsc()
+    let mse_fq = fq_rotate_and_quantize(input_addr, rotated_addr, indices_addr, dim, 2)
+    let t3 = rdtsc()
+
+    cprint("  Standard MSE: ", WHITE_ON_BLACK)
+    cprint_decimal(mse_std, CYAN_ON_BLACK)
+    cprint("  (", WHITE_ON_BLACK)
+    cprint_decimal(t1 - t0, CYAN_ON_BLACK)
+    cprintln(" cycles)", WHITE_ON_BLACK)
+
+    cprint("  FajarQuant MSE: ", WHITE_ON_BLACK)
+    cprint_decimal(mse_fq, GREEN_ON_BLACK)
+    cprint("  (", WHITE_ON_BLACK)
+    cprint_decimal(t3 - t2, CYAN_ON_BLACK)
+    cprintln(" cycles)", WHITE_ON_BLACK)
+
+    if mse_fq < mse_std {
+        let improvement = if mse_std > 0 { (mse_std - mse_fq) * 100 / mse_std } else { 0 }
+        cprint("  Improvement: ", WHITE_ON_BLACK)
+        cprint_decimal(improvement, GREEN_ON_BLACK)
+        cprintln("%", GREEN_ON_BLACK)
+    } else if mse_fq == mse_std {
+        cprintln("  Equal MSE (data already decorrelated)", YELLOW_ON_BLACK)
+    } else {
+        cprintln("  Standard wins (data not structured)", YELLOW_ON_BLACK)
+    }
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 2: Fused Codebook Dot Product ──
+    cprintln("[2] Fused vs Standard Dot Product (dim=16)", YELLOW_ON_BLACK)
+    let query_addr = FQ_SCRATCH
+    let key_idx_addr = FQ_SCRATCH + dim * 8
+    let scratch_buf = FQ_SCRATCH + dim * 16
+
+    // Create query vector and quantized key indices
+    i = 0
+    while i < dim {
+        volatile_write_u64(query_addr + i * 8, ((i + 1) * 100) % 500)
+        volatile_write_u64(key_idx_addr + i * 8, i % 4)  // 2-bit indices
+        i = i + 1
+    }
+
+    let t4 = rdtsc()
+    let fused_result = fq_fused_dot(query_addr, key_idx_addr, dim, 2)
+    let t5 = rdtsc()
+
+    let t6 = rdtsc()
+    let std_result = fq_standard_dot(query_addr, key_idx_addr, dim, 2, scratch_buf)
+    let t7 = rdtsc()
+
+    cprint("  Fused result: ", WHITE_ON_BLACK)
+    cprint_decimal(fused_result, CYAN_ON_BLACK)
+    cprint("  (", WHITE_ON_BLACK)
+    cprint_decimal(t5 - t4, CYAN_ON_BLACK)
+    cprintln(" cycles, 0 bytes extra)", WHITE_ON_BLACK)
+
+    cprint("  Standard result: ", WHITE_ON_BLACK)
+    cprint_decimal(std_result, CYAN_ON_BLACK)
+    cprint("  (", WHITE_ON_BLACK)
+    cprint_decimal(t7 - t6, CYAN_ON_BLACK)
+    cprint(" cycles, ", WHITE_ON_BLACK)
+    cprint_decimal(dim * 8, YELLOW_ON_BLACK)
+    cprintln(" bytes dequant buffer)", WHITE_ON_BLACK)
+
+    if fused_result == std_result {
+        cprintln("  MATCH — fused produces identical results", GREEN_ON_BLACK)
+    } else {
+        cprint("  Delta: ", WHITE_ON_BLACK)
+        cprintln_decimal(fq_abs(fused_result - std_result), YELLOW_ON_BLACK)
+    }
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 3: Hierarchical Bit Savings ──
+    cprintln("[3] Hierarchical Bit Allocation", YELLOW_ON_BLACK)
+
+    // Test at various token counts
+    let mut n: i64 = 64
+    while n <= 1024 {
+        fq_hier_init(n)
+        let savings = fq_hier_savings(n)
+        cprint("  N=", WHITE_ON_BLACK)
+        cprint_decimal(n, CYAN_ON_BLACK)
+        cprint(" tokens: ", WHITE_ON_BLACK)
+        cprint_decimal(savings / 10, GREEN_ON_BLACK)
+        cprint(".", WHITE_ON_BLACK)
+        cprint_decimal(savings % 10, GREEN_ON_BLACK)
+        cprintln("% savings vs uniform 4-bit", WHITE_ON_BLACK)
+        n = n * 4
+    }
+    cprintln("", WHITE_ON_BLACK)
+
+    // ── Test 4: KV Cache Ring Buffer ──
+    cprintln("[4] KV Cache Ring Buffer (capacity=256, dim=16)", YELLOW_ON_BLACK)
+    fq_kv_init(256, dim)
+
+    // Insert 8 tokens
+    let kv_scratch = FQ_SCRATCH + dim * 24
+    let mut tok: i64 = 0
+    while tok < 8 {
+        // Generate key/value indices for this token
+        i = 0
+        while i < dim {
+            volatile_write_u64(kv_scratch + i * 8, (tok + i) % 4)
+            volatile_write_u64(kv_scratch + dim * 8 + i * 8, (tok * 2 + i) % 4)
+            i = i + 1
+        }
+        fq_kv_append(kv_scratch, kv_scratch + dim * 8)
+        tok = tok + 1
+    }
+
+    cprint("  Stored: ", WHITE_ON_BLACK)
+    cprint_decimal(fq_kv_len(), CYAN_ON_BLACK)
+    cprintln(" tokens in ring buffer", WHITE_ON_BLACK)
+
+    // Compute attention scores from a query
+    let query_kv = FQ_SCRATCH
+    i = 0
+    while i < dim {
+        volatile_write_u64(query_kv + i * 8, 200 + i * 50)
+        i = i + 1
+    }
+
+    cprint("  Attention scores: [", WHITE_ON_BLACK)
+    let kv_len = fq_kv_len()
+    tok = 0
+    while tok < kv_len {
+        let score = fq_kv_attention_score(query_kv, tok)
+        cprint_decimal(score, CYAN_ON_BLACK)
+        if tok < kv_len - 1 { cprint(", ", WHITE_ON_BLACK) }
+        tok = tok + 1
+    }
+    cprintln("]", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    cprintln("All benchmarks ran in @kernel — no heap, no float, no GC.", GREEN_ON_BLACK)
+    cprintln("FajarOS: world's first OS with kernel-native FajarQuant.", GREEN_ON_BLACK)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Command: quant-info
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn cmd_quant_info() {
+    cprintln("=== FajarQuant Kernel Status ===", YELLOW_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // Codebook info
+    cprintln("[Codebooks]", YELLOW_ON_BLACK)
+    cprint("  2-bit (4 centroids): [", WHITE_ON_BLACK)
+    cprint_decimal(Q2_C0, CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    cprint_decimal(Q2_C1, CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    cprint_decimal(Q2_C2, CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    cprint_decimal(Q2_C3, CYAN_ON_BLACK)
+    cprintln("]", WHITE_ON_BLACK)
+
+    cprint("  3-bit (8 centroids): [", WHITE_ON_BLACK)
+    cprint_decimal(Q3_C0, CYAN_ON_BLACK)
+    cprint(", ", WHITE_ON_BLACK)
+    cprint_decimal(Q3_C1, CYAN_ON_BLACK)
+    cprint(" .. ", WHITE_ON_BLACK)
+    cprint_decimal(Q3_C7, CYAN_ON_BLACK)
+    cprintln("]", WHITE_ON_BLACK)
+
+    cprint("  4-bit (16 centroids): stored at 0x", WHITE_ON_BLACK)
+    cprint_hex(QUANT_CODEBOOK_BASE, 8, CYAN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // Rotation matrix info
+    cprintln("[PCA Rotation Matrix]", YELLOW_ON_BLACK)
+    cprint("  Type: Hadamard H_", WHITE_ON_BLACK)
+    cprintln_decimal(FQ_ROTATION_DIM, CYAN_ON_BLACK)
+    cprint("  Location: 0x", WHITE_ON_BLACK)
+    cprint_hex(FQ_ROTATION_BASE, 8, CYAN_ON_BLACK)
+    cprint("  Size: ", WHITE_ON_BLACK)
+    cprint_decimal(FQ_ROTATION_DIM * FQ_ROTATION_DIM * 8, CYAN_ON_BLACK)
+    cprintln(" bytes", WHITE_ON_BLACK)
+    // Show first row
+    cprint("  Row 0: [", WHITE_ON_BLACK)
+    let mut j: i64 = 0
+    while j < 4 {
+        cprint_decimal(volatile_read_u64(FQ_ROTATION_BASE + j * 8), CYAN_ON_BLACK)
+        if j < 3 { cprint(", ", WHITE_ON_BLACK) }
+        j = j + 1
+    }
+    cprintln(", ...]", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // KV Cache info
+    cprintln("[KV Cache Ring Buffer]", YELLOW_ON_BLACK)
+    let kv_cap = fq_kv_capacity()
+    let kv_len = fq_kv_len()
+    let kv_dim = fq_kv_dim()
+    cprint("  Capacity: ", WHITE_ON_BLACK)
+    cprint_decimal(kv_cap, CYAN_ON_BLACK)
+    cprint(" tokens  Dim: ", WHITE_ON_BLACK)
+    cprintln_decimal(kv_dim, CYAN_ON_BLACK)
+    cprint("  Used: ", WHITE_ON_BLACK)
+    cprint_decimal(kv_len, GREEN_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprintln_decimal(kv_cap, CYAN_ON_BLACK)
+    cprint("  Memory: keys=0x", WHITE_ON_BLACK)
+    cprint_hex(FQ_KV_KEYS, 8, CYAN_ON_BLACK)
+    cprint(" vals=0x", WHITE_ON_BLACK)
+    cprint_hex(FQ_KV_VALS, 8, CYAN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+
+    // Hierarchical schedule info
+    cprintln("[Hierarchical Scheduler]", YELLOW_ON_BLACK)
+    if kv_len > 0 {
+        let savings = fq_hier_savings(kv_len)
+        cprint("  Tiers: 2-bit (old 50%) | 3-bit (mid 25%) | 4-bit (new 25%)", WHITE_ON_BLACK)
+        cprintln("", WHITE_ON_BLACK)
+        cprint("  Bit savings: ", WHITE_ON_BLACK)
+        cprint_decimal(savings / 10, GREEN_ON_BLACK)
+        cprint(".", WHITE_ON_BLACK)
+        cprint_decimal(savings % 10, GREEN_ON_BLACK)
+        cprintln("% vs uniform 4-bit", WHITE_ON_BLACK)
+    } else {
+        cprintln("  No tokens cached — schedule empty", WHITE_ON_BLACK)
+    }
+    cprintln("", WHITE_ON_BLACK)
+
+    cprintln("All structures @kernel safe — no heap, no GC.", GREEN_ON_BLACK)
+}

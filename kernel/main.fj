@@ -195,6 +195,8 @@
 
     println(52)
     mnist_init_weights()
+    quant_init()
+    fajarquant_init()
     println(53)
 
     // Map LAPIC + IOAPIC MMIO pages (beyond 128MB identity region)

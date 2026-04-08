@@ -174,6 +174,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("  stat xxd strings df du count md5", WHITE_ON_BLACK)
     cprintln("AI/Compute:", WHITE_ON_BLUE)
     cprintln("  tensor mnist bench fib compute cbench", WHITE_ON_BLACK)
+    cprintln("  quant quant-bench quant-info classify", WHITE_ON_BLACK)
     cprintln("  virtio-gpu gpu gpu-info gpu-bench", WHITE_ON_BLACK)
     cprintln("Math/Text:", WHITE_ON_BLUE)
     cprintln("  calc hex base factor prime len", WHITE_ON_BLACK)
@@ -3133,6 +3134,12 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 
     // quant (113,117,97,110,116) — FajarQuant kernel quantization demo
     if handled == 0 && len == 5 && buf_eq4(113, 117, 97, 110) == 1 && volatile_read_u8(0x6F804) == 116 { cmd_quant_demo(); handled = 1 }
+
+    // quant-bench (113,117,97,110,116,45,98,...) len=11 — FajarQuant full benchmark
+    if handled == 0 && len == 11 && buf_eq4(113, 117, 97, 110) == 1 && volatile_read_u8(0x6F804) == 116 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 98 { cmd_quant_bench(); handled = 1 }
+
+    // quant-info (113,117,97,110,116,45,105,...) len=10 — FajarQuant status
+    if handled == 0 && len == 10 && buf_eq4(113, 117, 97, 110) == 1 && volatile_read_u8(0x6F804) == 116 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 105 { cmd_quant_info(); handled = 1 }
 
     // === Memory management commands ===
     // frames
