@@ -199,7 +199,7 @@ SOURCES := \
 # QEMU settings
 QEMU := qemu-system-x86_64
 QEMU_COMMON := -serial stdio -no-reboot -no-shutdown
-QEMU_MEM := -m 512M
+QEMU_MEM := -m 1G
 QEMU_CPU := -cpu Skylake-Client-v4
 QEMU_KVM := -enable-kvm -cpu host
 QEMU_SMP := -smp 4
