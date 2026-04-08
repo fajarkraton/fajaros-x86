@@ -1405,8 +1405,12 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let eos = mdl_get_eos_token()
     let t_start = rdtsc()
 
-    // Phase 1: Prefill
+    // Phase 0: BOS token (Gemma 3 expects BOS=2 at start)
     let mut pos: i64 = 0
+    tfm_forward_stream(2, pos)
+    pos = 1
+
+    // Phase 1: Prefill prompt tokens
     while pos < n_prompt {
         let tid = volatile_read_u64(prompt_addr + pos * 8)
         tfm_forward_stream(tid, pos)
