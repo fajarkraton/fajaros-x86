@@ -181,6 +181,191 @@ const TFM_FVEC_MAX: i64 = 16
 }
 
 // ═══════════════════════════════════════════════════════════════
+// Rotary Position Embedding (RoPE)
+// ═══════════════════════════════════════════════════════════════
+//
+// RoPE encodes position by rotating pairs of dimensions:
+//   x'[2i]   = x[2i]*cos(θ) - x[2i+1]*sin(θ)
+//   x'[2i+1] = x[2i]*sin(θ) + x[2i+1]*cos(θ)
+// Where θ_i(pos) = pos / (theta^(2i/d_head))
+//
+// Gemma 3 dual frequencies:
+//   Local layers:  theta = 10,000
+//   Global layers: theta = 1,000,000
+//
+// Memory:
+//   ROPE_FREQ at 0xBE7C00: 128 inv_freq values (max d_head/2=128 pairs)
+
+const ROPE_FREQ_BASE: i64 = 0xBE7C00
+const ROPE_MAX_PAIRS: i64 = 128
+const ROPE_PI: i64 = 3142       // π in milliradians (x1000)
+const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
+
+// ── Fixed-point sin/cos (Bhaskara I approximation) ──
+// sin(x) ≈ 16x(π-x) / (5π² - 4x(π-x)) for x in [0, π]
+// Max error: ~0.16% — sufficient for RoPE in kernel context
+
+@kernel fn rope_sin_q1(x_mrad: i64) -> i64 {
+    // sin for x in [0, π/2] milliradians → output x1000
+    // Bhaskara: sin(x) = 16*x*(π-x) / (5π² - 4*x*(π-x))
+    // Scale: x_mrad is in [0, 1571], represents [0, π/2] radians
+    let pi = ROPE_PI
+    let num = 16 * x_mrad * (pi - x_mrad)
+    let px = x_mrad * (pi - x_mrad)
+    let den = 5 * pi * pi - 4 * px
+    if den == 0 { return 0 }
+    (num / den) * 1000
+}
+
+@kernel fn rope_sin(angle_mrad: i64) -> i64 {
+    // Full-range sin: reduce to [0, 2π] then use quadrant logic
+    let raw = angle_mrad % ROPE_TWO_PI
+    let a = if raw < 0 { raw + ROPE_TWO_PI } else { raw }
+    let half_pi = ROPE_PI / 2
+    if a <= half_pi {
+        rope_sin_q1(a)
+    } else if a <= ROPE_PI {
+        rope_sin_q1(ROPE_PI - a)
+    } else if a <= ROPE_PI + half_pi {
+        0 - rope_sin_q1(a - ROPE_PI)
+    } else {
+        0 - rope_sin_q1(ROPE_TWO_PI - a)
+    }
+}
+
+@kernel fn rope_cos(angle_mrad: i64) -> i64 {
+    rope_sin(angle_mrad + ROPE_PI / 2)
+}
+
+// ── Frequency table ──
+// Pre-compute inv_freq[i] = 1000 / theta^(2i/d_head) in milliradians-per-position
+// Stored as: stepping through 1 position adds inv_freq[i] milliradians of angle
+
+@kernel fn rope_init_freq(d_head: i64, theta: i64) {
+    // For each pair i=0..d_head/2-1:
+    //   freq = 1.0 / theta^(2i/d_head)
+    //   In milliradians: freq_mrad = 1000 / theta^(2i/d_head)
+    //
+    // We compute theta^(2i/d_head) iteratively using repeated multiplication.
+    // Start with power=1, multiply by theta^(2/d_head) each step.
+    // theta^(2/d_head) ≈ exp(2*ln(theta)/d_head)
+    //
+    // For simplicity: use a lookup approach.
+    // inv_freq[0] = 1000 (freq=1.0, fastest rotation)
+    // inv_freq[i] = inv_freq[i-1] * decay / 1000
+    // where decay = 1000 / theta^(2/d_head)
+    //
+    // For theta=10000, d_head=8: decay = 1000/10000^0.25 = 1000/10 = 100
+    // For theta=1000000, d_head=256: decay = 1000/1000000^(2/256) = 1000/1.054 ≈ 949
+
+    let n_pairs = d_head / 2
+    if n_pairs > ROPE_MAX_PAIRS { return }
+
+    // Compute decay = 1000 * theta^(-2/d_head)
+    // For integer approximation: use log-space stepping
+    // theta^(2/d_head) = exp(2*ln(theta)/d_head)
+    // For theta=1000000: ln(1000000) ≈ 13816 (x1000)
+    // step = 2*13816/256 = 108 → exp(0.108) ≈ 1114 (x1000)
+    // decay = 1000000/1114 ≈ 897
+
+    // Compute ln(theta) approximation
+    let ln_theta = rope_ln_approx(theta)
+    let step_x1000 = (2 * ln_theta) / d_head  // ln(theta^(2/d)) in x1000
+
+    // Build table: inv_freq[i] = 1000 * exp(-i * step)
+    let mut i: i64 = 0
+    let mut log_acc: i64 = 0  // accumulated log decay
+    while i < n_pairs {
+        // inv_freq = 1000 * exp(-log_acc/1000)
+        let inv_freq = rope_exp_neg(log_acc)
+        volatile_write_u64(ROPE_FREQ_BASE + i * 8, inv_freq)
+        log_acc = log_acc + step_x1000
+        i = i + 1
+    }
+}
+
+// Natural log approximation for integers (output x1000)
+@kernel fn rope_ln_approx(x: i64) -> i64 {
+    // ln(x) using repeated halving + table for small values
+    // ln(1)=0, ln(2)=693, ln(10)=2303, ln(1000)=6908, ln(1000000)=13816
+    if x <= 1 { return 0 }
+    let mut val = x
+    let mut result: i64 = 0
+    // Factor out powers of 1000: ln(a*1000^k) = ln(a) + k*6908
+    while val >= 1000 { val = val / 1000; result = result + 6908 }
+    // Factor out powers of 10
+    while val >= 10 { val = val / 10; result = result + 2303 }
+    // Small value: ln(1)=0, ln(2)=693, ln(3)=1099, ln(4)=1386, ..., ln(9)=2197
+    if val >= 8 { result = result + 2079 }
+    else if val >= 6 { result = result + 1792 }
+    else if val >= 4 { result = result + 1386 }
+    else if val >= 3 { result = result + 1099 }
+    else if val >= 2 { result = result + 693 }
+    result
+}
+
+// exp(-x) where x is in x1000 scale, output x1000
+// exp(-0) = 1000, exp(-1000) = 368, exp(-2000) = 135, exp(-6908) ≈ 1
+@kernel fn rope_exp_neg(x: i64) -> i64 {
+    if x <= 0 { return 1000 }
+    if x > 10000 { return 0 }
+    // Piecewise: exp(-x/1000) * 1000
+    // Use: exp(-x) ≈ 1/(1 + x + x²/2) for moderate x
+    let xr = x  // x in x1000
+    let x2 = (xr * xr) / 2000
+    let denom = 1000 + xr + x2
+    if denom <= 0 { return 0 }
+    (1000 * 1000) / denom
+}
+
+// Apply RoPE to a vector in-place (Q or K, one head at a time)
+// data_addr: pointer to d_head contiguous i64 values
+// pos: sequence position
+// d_head: head dimension (pairs = d_head/2)
+@kernel fn tfm_rope_apply_head(data_addr: i64, pos: i64, d_head: i64) {
+    let n_pairs = d_head / 2
+    let mut i: i64 = 0
+    while i < n_pairs {
+        let inv_freq = volatile_read_u64(ROPE_FREQ_BASE + i * 8)
+        // angle in milliradians = pos * inv_freq
+        let angle = pos * inv_freq
+
+        let cos_a = rope_cos(angle)
+        let sin_a = rope_sin(angle)
+
+        let x0 = volatile_read_u64(data_addr + (2 * i) * 8)
+        let x1 = volatile_read_u64(data_addr + (2 * i + 1) * 8)
+
+        // Rotate: x0' = x0*cos - x1*sin, x1' = x0*sin + x1*cos
+        let new_x0 = (x0 * cos_a - x1 * sin_a) / 1000
+        let new_x1 = (x0 * sin_a + x1 * cos_a) / 1000
+
+        volatile_write_u64(data_addr + (2 * i) * 8, new_x0)
+        volatile_write_u64(data_addr + (2 * i + 1) * 8, new_x1)
+        i = i + 1
+    }
+}
+
+// Apply RoPE to all heads in Q and K vectors
+// q_data: n_heads * d_head elements
+// k_data: n_kv_heads * d_head elements
+@kernel fn tfm_rope_apply(q_data: i64, k_data: i64, pos: i64,
+                           n_heads: i64, n_kv_heads: i64, d_head: i64) {
+    // Apply to each Q head
+    let mut h: i64 = 0
+    while h < n_heads {
+        tfm_rope_apply_head(q_data + h * d_head * 8, pos, d_head)
+        h = h + 1
+    }
+    // Apply to each KV head
+    h = 0
+    while h < n_kv_heads {
+        tfm_rope_apply_head(k_data + h * d_head * 8, pos, d_head)
+        h = h + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Gated FFN (Gemma 3 / LLaMA-style: gate * up → down)
 // ═══════════════════════════════════════════════════════════════
 //
@@ -407,6 +592,10 @@ const TFM_FVEC_MAX: i64 = 16
     tfm_vecmat_packed(x_slot, qkv_addr + wv_offset, d_model, kv_d,
                        quant_bits, cb_addr, TFM_V)
 
+    // === Apply RoPE to Q and K ===
+    tfm_rope_apply(km_data_ptr(TFM_Q), km_data_ptr(TFM_K), pos,
+                    n_heads, n_kv_heads, d_head)
+
     // === Multi-Head Attention ===
     tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, TFM_ATTN)
 
@@ -604,6 +793,7 @@ const TFM_FVEC_MAX: i64 = 16
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
     tfm_alloc_slots(mdl_get_d_model(), mdl_get_vocab_size())
+    rope_init_freq(mdl_get_d_head(), 1000000)  // default: Gemma 3 theta=1M
     tfm_clear_kv()
 
     // Process all prompt tokens (prefill)
@@ -727,6 +917,7 @@ const TFM_EOS_TOKEN: i64 = 2
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
     tfm_alloc_slots(mdl_get_d_model(), mdl_get_vocab_size())
+    rope_init_freq(mdl_get_d_head(), 1000000)
     tfm_clear_kv()
 
     let t_start = rdtsc()
