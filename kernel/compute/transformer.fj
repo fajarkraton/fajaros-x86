@@ -44,6 +44,18 @@ const TFM_ST_LAST_TOKEN: i64 = 24  // last generated token ID
 const TFM_ST_PREFILL_CY: i64 = 32  // prefill cycles (set by tfm_generate)
 const TFM_ST_DECODE_CY: i64 = 40   // decode cycles (set by tfm_generate)
 const TFM_ST_TOTAL_POS: i64 = 48   // total positions processed
+const TFM_ST_N_KV_HEADS: i64 = 56  // n_kv_heads (0 = use n_heads, for MHA compat)
+
+// Get n_kv_heads: 0 or unset means MHA (n_kv_heads == n_heads)
+@kernel fn tfm_get_n_kv_heads() -> i64 {
+    let stored = volatile_read_u64(TFM_STATE + TFM_ST_N_KV_HEADS)
+    if stored > 0 { stored } else { mdl_get_n_heads() }
+}
+
+// KV dimension: n_kv_heads * d_head (not d_model for GQA)
+@kernel fn tfm_kv_dim() -> i64 {
+    tfm_get_n_kv_heads() * mdl_get_d_head()
+}
 
 // KV cache layout: [layer][position][type][d_model]
 // type 0 = key, type 1 = value
@@ -214,41 +226,47 @@ const TFM_FVEC_MAX: i64 = 16
 // ═══════════════════════════════════════════════════════════════
 
 // Calculate KV cache address for a specific layer, position, type (0=key, 1=val)
+// Uses kv_dim (n_kv_heads * d_head) not d_model — saves memory for GQA
 @kernel fn tfm_kv_addr(layer: i64, pos: i64, kv_type: i64) -> i64 {
-    let d_model = mdl_get_d_model()
-    let n_layers = mdl_get_n_layers()
-    // Stride: per position = 2 * d_model * 8 (key + value)
-    let pos_stride = 2 * d_model * 8
+    let kv_d = tfm_kv_dim()
+    // Stride: per position = 2 * kv_dim * 8 (key + value)
+    let pos_stride = 2 * kv_d * 8
     // Stride: per layer = max_pos * pos_stride
     let layer_stride = TFM_KV_MAX_POS * pos_stride
-    TFM_KV_BASE + layer * layer_stride + pos * pos_stride + kv_type * d_model * 8
+    TFM_KV_BASE + layer * layer_stride + pos * pos_stride + kv_type * kv_d * 8
 }
 
-// Store key/value vectors from km_ slots into KV cache
+// Store key/value vectors into KV cache from km_ slots
+// K/V slots contain n_kv_heads * d_head elements (not d_model)
 @kernel fn tfm_kv_store(layer: i64, pos: i64, k_slot: i64, v_slot: i64) {
-    let d_model = mdl_get_d_model()
+    let kv_d = tfm_kv_dim()
     let k_data = km_data_ptr(k_slot)
     let v_data = km_data_ptr(v_slot)
     let k_dst = tfm_kv_addr(layer, pos, 0)
     let v_dst = tfm_kv_addr(layer, pos, 1)
-    mdl_memcpy(k_dst, k_data, d_model * 8)
-    mdl_memcpy(v_dst, v_data, d_model * 8)
+    mdl_memcpy(k_dst, k_data, kv_d * 8)
+    mdl_memcpy(v_dst, v_data, kv_d * 8)
 }
 
 // ═══════════════════════════════════════════════════════════════
 // Attention (Multi-Head, with KV Cache)
 // ═══════════════════════════════════════════════════════════════
 
-// Compute multi-head attention for current position
-// q_slot: query vector (1 x d_model)
-// layer: layer index (for KV cache access)
-// cur_pos: current position in sequence
-// out_slot: output vector (1 x d_model)
+// Compute multi-head attention with GQA support.
+// GQA: n_heads query heads share n_kv_heads KV heads (n_heads >= n_kv_heads).
+// MHA: n_kv_heads == n_heads (backward compatible).
+//
+// q_slot: query vector (1 x n_heads*d_head), in km_ slot
+// k_slot: key vector (1 x n_kv_heads*d_head), in km_ slot
+// v_slot: value vector (1 x n_kv_heads*d_head), in km_ slot
+// out_slot: output vector (1 x n_heads*d_head), in km_ slot
 @kernel fn tfm_attention(q_slot: i64, k_slot: i64, v_slot: i64,
                           layer: i64, cur_pos: i64, out_slot: i64) {
-    let d_model = mdl_get_d_model()
     let n_heads = mdl_get_n_heads()
+    let n_kv_heads = tfm_get_n_kv_heads()
     let d_head = mdl_get_d_head()
+    let q_dim = n_heads * d_head       // total Q dimension
+    let kv_d = n_kv_heads * d_head     // total KV dimension
 
     // Store current K, V into KV cache at cur_pos
     tfm_kv_store(layer, cur_pos, k_slot, v_slot)
@@ -256,45 +274,46 @@ const TFM_FVEC_MAX: i64 = 16
     let out_data = km_data_ptr(out_slot)
     let out_base = km_large_addr(out_slot)
     volatile_write_u64(out_base + KM_HDR_ROWS, 1)
-    volatile_write_u64(out_base + KM_HDR_COLS, d_model)
+    volatile_write_u64(out_base + KM_HDR_COLS, q_dim)
 
     let q_data = km_data_ptr(q_slot)
-    let seq_len = cur_pos + 1  // positions 0..cur_pos inclusive
+    let seq_len = cur_pos + 1
 
     // Pre-compute loop-invariant values
-    // Scale = 1000 / sqrt(d_head). Use: sqrt(d_head) = isqrt(d_head * 1000000) / 1000
     let sqrt_dh = km_isqrt(d_head * 1000000)
     let attn_scale = if sqrt_dh > 0 { 1000000 / sqrt_dh } else { 1000 }
-    // Pre-compute KV cache strides to avoid repeated mdl_get_d_model() volatile reads
-    let kv_pos_stride = 2 * d_model * 8
+    // KV cache strides (use kv_d, not d_model)
+    let kv_pos_stride = 2 * kv_d * 8
     let kv_layer_off = TFM_KV_BASE + layer * TFM_KV_MAX_POS * kv_pos_stride
+    // GQA group size: how many Q heads share one KV head
+    let heads_per_kv = n_heads / n_kv_heads
 
-    // Process each head independently
+    // Process each query head
     let mut h: i64 = 0
     while h < n_heads {
-        let head_off = h * d_head
+        let q_head_off = h * d_head
+        // GQA mapping: which KV head does this Q head attend to?
+        let kv_head = h / heads_per_kv
+        let kv_head_off = kv_head * d_head
 
-        // Compute attention scores: Q_h · K_h^T for all positions in cache
+        // Compute attention scores: Q_h · K_kv^T for all cached positions
         let scores_addr = TFM_SCRATCH
         let mut p: i64 = 0
         while p < seq_len {
-            // Inline KV addr: avoid calling tfm_kv_addr per position
-            let k_cache = kv_layer_off + p * kv_pos_stride
+            let k_cache = kv_layer_off + p * kv_pos_stride  // key base for this position
             let mut dot: i64 = 0
             let mut d: i64 = 0
             while d < d_head {
-                let qi = volatile_read_u64(q_data + (head_off + d) * 8)
-                let ki = volatile_read_u64(k_cache + (head_off + d) * 8)
+                let qi = volatile_read_u64(q_data + (q_head_off + d) * 8)
+                let ki = volatile_read_u64(k_cache + (kv_head_off + d) * 8)
                 dot = dot + (qi * ki) / 1000
                 d = d + 1
             }
-            // Apply pre-computed scale
             volatile_write_u64(scores_addr + p * 8, (dot * attn_scale) / 1000)
             p = p + 1
         }
 
         // Softmax over scores
-        // Find max
         let mut max_score = volatile_read_u64(scores_addr)
         p = 1
         while p < seq_len {
@@ -302,7 +321,6 @@ const TFM_FVEC_MAX: i64 = 16
             if s > max_score { max_score = s }
             p = p + 1
         }
-        // Exp and sum
         let mut exp_sum: i64 = 0
         p = 0
         while p < seq_len {
@@ -312,7 +330,6 @@ const TFM_FVEC_MAX: i64 = 16
             exp_sum = exp_sum + e
             p = p + 1
         }
-        // Normalize
         if exp_sum > 0 {
             p = 0
             while p < seq_len {
@@ -322,20 +339,19 @@ const TFM_FVEC_MAX: i64 = 16
             }
         }
 
-        // Weighted sum of V: out_h = sum(score_p * V_p_h)
+        // Weighted sum of V: out_h[d] = sum(score_p * V_kv_p[d])
         let mut d: i64 = 0
         while d < d_head {
             let mut weighted: i64 = 0
             p = 0
             while p < seq_len {
                 let score = volatile_read_u64(scores_addr + p * 8)
-                // Inline KV addr for value: layer_off + pos*stride + d_model*8 (value offset)
-                let v_cache = kv_layer_off + p * kv_pos_stride + d_model * 8
-                let vi = volatile_read_u64(v_cache + (head_off + d) * 8)
+                let v_cache = kv_layer_off + p * kv_pos_stride + kv_d * 8  // value offset
+                let vi = volatile_read_u64(v_cache + (kv_head_off + d) * 8)
                 weighted = weighted + (score * vi) / 1000
                 p = p + 1
             }
-            volatile_write_u64(out_data + (head_off + d) * 8, weighted)
+            volatile_write_u64(out_data + (q_head_off + d) * 8, weighted)
             d = d + 1
         }
 
@@ -368,22 +384,27 @@ const TFM_FVEC_MAX: i64 = 16
     let ln1_b = mdl_layer_ln_beta(layer, 0)
     km_layernorm(x_slot, d_model, ln1_g, ln1_b)
 
-    // === QKV Projection (3 separate matmuls) ===
+    // === QKV Projection (separate sizes for GQA) ===
     let qkv_addr = mdl_layer_qkv_addr(layer)
     let cb_addr = MDL_CODEBOOK_BASE + layer * 64
+    let n_heads = mdl_get_n_heads()
+    let n_kv_heads = tfm_get_n_kv_heads()
+    let d_head = mdl_get_d_head()
+    let q_dim = n_heads * d_head       // Q output: 4*256=1024 for Gemma 1B
+    let kv_d = n_kv_heads * d_head     // KV output: 1*256=256 for Gemma 1B
 
-    // Q = x @ W_q (first d_model columns of QKV weight)
-    tfm_vecmat_packed(x_slot, qkv_addr, d_model, d_model,
+    // Q = x @ W_q [d_model × q_dim]
+    tfm_vecmat_packed(x_slot, qkv_addr, d_model, q_dim,
                        quant_bits, cb_addr, TFM_Q)
 
-    // K = x @ W_k (next d_model columns)
-    let wk_offset = d_model * d_model * quant_bits / 8
-    tfm_vecmat_packed(x_slot, qkv_addr + wk_offset, d_model, d_model,
+    // K = x @ W_k [d_model × kv_dim]
+    let wk_offset = d_model * q_dim * quant_bits / 8
+    tfm_vecmat_packed(x_slot, qkv_addr + wk_offset, d_model, kv_d,
                        quant_bits, cb_addr, TFM_K)
 
-    // V = x @ W_v (last d_model columns)
-    let wv_offset = 2 * d_model * d_model * quant_bits / 8
-    tfm_vecmat_packed(x_slot, qkv_addr + wv_offset, d_model, d_model,
+    // V = x @ W_v [d_model × kv_dim]
+    let wv_offset = wk_offset + d_model * kv_d * quant_bits / 8
+    tfm_vecmat_packed(x_slot, qkv_addr + wv_offset, d_model, kv_d,
                        quant_bits, cb_addr, TFM_V)
 
     // === Multi-Head Attention ===
@@ -528,9 +549,10 @@ const TFM_FVEC_MAX: i64 = 16
 // Clear KV cache
 @kernel fn tfm_clear_kv() {
     // Zero the KV cache area using 8-byte writes (8x faster than byte-by-byte)
-    let d_model = mdl_get_d_model()
+    // Uses kv_dim (not d_model) for GQA — much less memory to clear
+    let kv_d = tfm_kv_dim()
     let n_layers = mdl_get_n_layers()
-    let total = n_layers * TFM_KV_MAX_POS * 2 * d_model * 8
+    let total = n_layers * TFM_KV_MAX_POS * 2 * kv_d * 8
     let limit = if total > 131072 { 131072 } else { total }
     let qwords = limit / 8
     let mut i: i64 = 0
