@@ -10,10 +10,10 @@
 //        Putranto (2026), PrimeCore.id
 //
 // Memory layout:
-//   0x830000  TOK_META         Tokenizer metadata (64 bytes)
-//   0x830040  TOK_FIRST_BYTE   First-byte index (256 x 8B = 2KB)
-//   0x830840  TOK_SCRATCH      Encode/decode scratch (4KB)
-//   Dynamic   TOK_TABLE        BPE token table (allocated via frame_alloc_contiguous)
+//   0xAF0000  TOK_META         Tokenizer metadata (64 bytes)
+//   0xAF0040  TOK_FIRST_BYTE   First-byte index (256 x 8B = 2KB)
+//   0xAF0840  TOK_SCRATCH      Encode/decode scratch (4KB)
+//   Dynamic   TOK_TABLE        BPE token table (allocated via frame_alloc_contiguous, >= 0xC00000)
 
 // ═══════════════════════════════════════════════════════════════
 // Constants
@@ -184,6 +184,11 @@ const TOK_MAX_OUTPUT: i64 = 2048
     let n_frames = (table_bytes + 4095) / 4096
     let table_addr = frame_alloc_contiguous(n_frames)
     if table_addr == -1 { return -5 }
+
+    // Debug: show allocated address
+    cprint("@0x", WHITE_ON_BLACK)
+    cprint_hex(table_addr, 8, CYAN_ON_BLACK)
+    cprint("...", WHITE_ON_BLACK)
 
     cprint("read...", WHITE_ON_BLACK)
 

@@ -31,6 +31,9 @@ const BITMAP_BASE: i64 = 0x580000
     while f < 2016 { frame_mark_used(f); f = f + 1 }      // RamFS
     f = 2032
     while f < 2048 { frame_mark_used(f); f = f + 1 }      // Stack
+    // Mark NVMe + kernel static data region (0x800000 - 0xC00000)
+    f = 2048
+    while f < 3072 { frame_mark_used(f); f = f + 1 }
 }
 
 @kernel fn frame_mark_used(frame: i64) {
@@ -69,7 +72,7 @@ const BITMAP_BASE: i64 = 0x580000
 }
 
 @kernel fn frame_alloc_contiguous(count: i64) -> i64 {
-    let mut start: i64 = 2048
+    let mut start: i64 = 3072  // Start after kernel static data (0xC00000)
     while start + count <= TOTAL_FRAMES {
         let mut ok: i64 = 1
         let mut i: i64 = 0

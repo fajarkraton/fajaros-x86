@@ -43,9 +43,16 @@ const BITMAP_SIZE: i64 = 8192      // 65536/8 = 8KB (was 4KB)
     // Mark stack (0x7F0000 - 0x800000 = frames 2032-2048)
     f = 2032
     while f < 2048 { frame_mark_used(f); f = f + 1 }
-    // Mark NVMe queues + DMA + PRP (0x800000 - 0x830000 = frames 2048-2096)
+    // Mark NVMe queues + DMA + PRP + kernel static data region
+    // 0x800000-0xC00000 = frames 2048-3072
+    // Covers: NVMe (0x800000), NET_STATE (0x860000), ELF_BUF (0x880000),
+    //   PROC_TABLE (0x890000), KB_BUFFER (0x892000), IPC (0x8A0000),
+    //   KSTACK (0x900000), ACPI (0x9A0000), SECCOMP (0xA10000),
+    //   ASLR (0xA20000), CRYPTO (0xA50000), VQ_RX_BUFS (0xA60000),
+    //   TOK_META (0xAF0000), KM pools (0xB00000), TFM (0xBE0000),
+    //   MLSCHED (0xBF8000), PIPE (0xBFA000)
     f = 2048
-    while f < 2096 { frame_mark_used(f); f = f + 1 }
+    while f < 3072 { frame_mark_used(f); f = f + 1 }
 }
 
 @kernel fn frame_mark_used(frame: i64) {
@@ -132,7 +139,7 @@ const BITMAP_SIZE: i64 = 8192      // 65536/8 = 8KB (was 4KB)
 
 @kernel fn frame_alloc_contiguous(count: i64) -> i64 {
     // Find 'count' contiguous free frames, returns base physical address or -1
-    let mut start: i64 = 2096  // Start after reserved area (incl. NVMe 0x800000-0x830000)
+    let mut start: i64 = 3072  // Start after kernel static data (0xC00000)
     while start + count <= TOTAL_FRAMES {
         let mut ok: i64 = 1
         let mut i: i64 = 0
