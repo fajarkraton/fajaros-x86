@@ -160,8 +160,11 @@ def export_gemma3(model_name, bits):
     rope_theta = int(getattr(config, 'rope_theta', 0))
     if rope_theta == 0 and hasattr(config, 'rope_scaling'):
         rs = config.rope_scaling
-        if isinstance(rs, dict) and 'full_attention' in rs:
-            rope_theta = int(rs['full_attention'].get('rope_theta', 0))
+        if isinstance(rs, dict):
+            if 'full_attention' in rs:
+                rope_theta = int(rs['full_attention'].get('rope_theta', 0))
+            elif 'rope_theta' in rs:
+                rope_theta = int(rs['rope_theta'])
     eos_token = getattr(config, 'eos_token_id', 2)
     if isinstance(eos_token, list):
         eos_token = eos_token[0]

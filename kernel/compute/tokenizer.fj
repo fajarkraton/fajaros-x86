@@ -19,9 +19,9 @@
 // Constants
 // ═══════════════════════════════════════════════════════════════
 
-const TOK_META: i64 = 0x830000
-const TOK_FIRST_BYTE: i64 = 0x830040
-const TOK_SCRATCH: i64 = 0x830840
+const TOK_META: i64 = 0xAF0000       // Tokenizer metadata (before KM pools at 0xB00000)
+const TOK_FIRST_BYTE: i64 = 0xAF0040 // First-byte index (256 × 8B = 2KB)
+const TOK_SCRATCH: i64 = 0xAF0840    // Scratch buffer (4KB)
 const TOK_SCRATCH_SIZE: i64 = 4096
 
 // Metadata offsets (at TOK_META)
@@ -177,25 +177,31 @@ const TOK_MAX_OUTPUT: i64 = 2048
     let max_token_len = mdl_read_u32(NVME_DMA + 12)
     if vocab_size <= 0 || vocab_size > 262200 { return -3 }  // Gemma 3: 262145
 
+    cprint("  alloc...", WHITE_ON_BLACK)
+
     // Allocate frames for token table
     let table_bytes = vocab_size * TOK_ENTRY_SIZE
     let n_frames = (table_bytes + 4095) / 4096
     let table_addr = frame_alloc_contiguous(n_frames)
     if table_addr == -1 { return -5 }
 
-    // Read token entries from NVMe in 128-sector chunks
+    cprint("read...", WHITE_ON_BLACK)
+
+    // Read token entries from NVMe in 8-sector (4KB) chunks.
+    // Using single-page reads avoids PRP list overhead and CQ wrap issues.
     let data_lba = start_lba + 1  // entries start at sector after header
     let total_sectors = (table_bytes + 511) / 512
     let mut sect_done: i64 = 0
     while sect_done < total_sectors {
         let chunk = total_sectors - sect_done
-        let read_count = if chunk > 128 { 128 } else { chunk }
+        let read_count = if chunk > 8 { 8 } else { chunk }
         let r = nvme_read_sectors(data_lba + sect_done, read_count, NVME_DMA)
         if r != 0 { return -5 }
         mdl_memcpy(table_addr + sect_done * 512, NVME_DMA, read_count * 512)
         sect_done = sect_done + read_count
     }
 
+    cprint("fbi...", WHITE_ON_BLACK)
     tok_build_fbi(table_addr, vocab_size)
 
     volatile_write_u64(TOK_META + TOK_M_MODE, 1)
