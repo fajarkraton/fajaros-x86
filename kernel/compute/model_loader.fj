@@ -329,6 +329,11 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     let parse_rc = mdl_parse_header(NVME_DMA)
     if parse_rc != 0 { return parse_rc }
 
+    // Reserve model header region in frame bitmap so frame_alloc_contiguous
+    // won't allocate over model data (0xC00000-0xC30000 = frames 3072-3120)
+    let mut rf: i64 = MDL_HDR_BASE / 4096
+    while rf < MDL_EMBED_BASE / 4096 { frame_mark_used(rf); rf = rf + 1 }
+
     // Store source info
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE, 2)  // nvme
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR, start_lba)
@@ -484,6 +489,12 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     }
 
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 1)
+
+    // Reserve embedding frames in bitmap so frame_alloc_contiguous won't overlap
+    let embed_end = MDL_EMBED_BASE + embed_size
+    let mut ef: i64 = MDL_EMBED_BASE / 4096
+    while ef < (embed_end + 4095) / 4096 { frame_mark_used(ef); ef = ef + 1 }
+
     0
 }
 
