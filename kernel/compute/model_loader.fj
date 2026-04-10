@@ -220,6 +220,16 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         }
     }
 
+    // Set gamma convention based on model type:
+    //   Gemma 3 (types 10/11): GemmaRMSNorm, weight is zero-centered → mode 0
+    //   SmolLM/Llama (type 1+): LlamaRMSNorm, weight is direct scale → mode 1
+    let mt = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_MODEL_TYPE)
+    if mt == 10 || mt == 11 {
+        volatile_write_u64(MDL_GAMMA_MODE, 0)  // zero-centered: (1+g)*x
+    } else {
+        volatile_write_u64(MDL_GAMMA_MODE, 1)  // direct-scale: g*x
+    }
+
     0  // Success
 }
 
@@ -541,8 +551,8 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         let raw_byte = volatile_read_u8(src + byte_idx)
         let idx = (raw_byte >> bit_off) & mask
 
-        // Look up codebook centroid (layer 0 codebook, or global codebook)
-        let centroid = volatile_read_u64(MDL_CODEBOOK_BASE + idx * 8)
+        // Look up codebook centroid (v3: use embedding's own codebook)
+        let centroid = volatile_read_u64(MDL_EMBED_CB + idx * 8)
         volatile_write_u64(dst + KM_DATA_OFF + i * 8, centroid)
         i = i + 1
     }
@@ -1065,6 +1075,10 @@ const RAM_LMHEAD_BASE: i64 = 0x1AF00000   // ~431 MB — LM head (adjusted at lo
 const MDL_RAM_STATE: i64 = 0xC00540       // RAM-resident state (16 bytes)
 const MDL_RAM_ACTIVE: i64 = 0             // offset: 1 if RAM mode active
 const MDL_RAM_LMHEAD: i64 = 8             // offset: actual LM head address in RAM
+// Gamma convention flag (set at model load time)
+// 0 = zero-centered (Gemma): kernel applies (1+g)*x — g stored as-is
+// 1 = direct-scale (Llama/SmolLM): kernel applies g*x — g is weight*1000
+const MDL_GAMMA_MODE: i64 = 0xC00558
 
 // State extensions (at MDL_STATE_BASE + offset)
 const MDL_ST_STREAM_LAYER: i64 = 48  // Current streaming layer (-1 = none)
@@ -1627,6 +1641,90 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
         v = v + 1
     }
     best_token
+}
+
+// RAM-resident LM head top-k sampling (temperature-scaled)
+// Uses RDRAND for randomness. top_k=8 fixed. temp: 1000 = greedy, 500 = creative.
+// Top-k buffer stored at 0xBEF100 (8 entries × 16 bytes = 128 bytes)
+const LM_TOPK_BUF: i64 = 0xBEF100  // [score(8B), token_id(8B)] × 8
+const LM_TOPK_K: i64 = 8
+
+@kernel fn mdl_ram_lmhead_sample(x_addr: i64, temperature: i64) -> i64 {
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let bits = mdl_get_quant_bits()
+    let lmhead_addr = volatile_read_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD)
+    let cb_addr = MDL_LMHEAD_CB
+
+    let row_bytes = d_model * bits / 8
+    let elems_per_byte = 8 / bits
+    let mask = (1 << bits) - 1
+
+    // Initialize top-k buffer with minimum scores
+    let mut ti: i64 = 0
+    while ti < LM_TOPK_K {
+        volatile_write_u64(LM_TOPK_BUF + ti * 16, -999999999)  // score
+        volatile_write_u64(LM_TOPK_BUF + ti * 16 + 8, 0)       // token_id
+        ti = ti + 1
+    }
+
+    // Score all vocab tokens, maintain top-k
+    let mut v: i64 = 0
+    while v < vocab_size {
+        let row_addr = lmhead_addr + v * row_bytes
+        let mut sum: i64 = 0
+        let mut j: i64 = 0
+        while j < d_model {
+            let x_val = volatile_read_u64(x_addr + j * 8)
+            let byte_idx = j / elems_per_byte
+            let bit_off = (j % elems_per_byte) * bits
+            let raw = volatile_read_u8(row_addr + byte_idx)
+            let idx = (raw >> bit_off) & mask
+            let w = volatile_read_u64(cb_addr + idx * 8)
+            sum = sum + (x_val * w) / 1000
+            j = j + 1
+        }
+        // Insert into top-k if better than current minimum
+        let mut min_idx: i64 = 0
+        let mut min_score: i64 = volatile_read_u64(LM_TOPK_BUF)
+        let mut ki: i64 = 1
+        while ki < LM_TOPK_K {
+            let ks = volatile_read_u64(LM_TOPK_BUF + ki * 16)
+            if ks < min_score {
+                min_score = ks
+                min_idx = ki
+            }
+            ki = ki + 1
+        }
+        if sum > min_score {
+            volatile_write_u64(LM_TOPK_BUF + min_idx * 16, sum)
+            volatile_write_u64(LM_TOPK_BUF + min_idx * 16 + 8, v)
+        }
+        v = v + 1
+    }
+
+    // Temperature sampling from top-k using RDRAND
+    if temperature >= 1000 {
+        // Greedy: return highest score
+        let mut best_idx: i64 = 0
+        let mut best_s: i64 = volatile_read_u64(LM_TOPK_BUF)
+        let mut bi: i64 = 1
+        while bi < LM_TOPK_K {
+            let s = volatile_read_u64(LM_TOPK_BUF + bi * 16)
+            if s > best_s {
+                best_s = s
+                best_idx = bi
+            }
+            bi = bi + 1
+        }
+        return volatile_read_u64(LM_TOPK_BUF + best_idx * 16 + 8)
+    }
+
+    // Random selection from top-k weighted by score
+    // Use RDRAND for hardware randomness
+    let rand = rdrand() & 0x7FFFFFFF  // positive 31-bit random
+    let pick = rand % LM_TOPK_K
+    volatile_read_u64(LM_TOPK_BUF + pick * 16 + 8)
 }
 
 // Shell command: ram-load

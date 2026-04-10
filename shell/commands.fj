@@ -3197,6 +3197,9 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     // gen (103,101,110,32,...) len>=4 — "gen <prompt> [max]" — open-ended generation
     if handled == 0 && len >= 4 && volatile_read_u8(0x6F800) == 103 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 110 && (len == 3 || volatile_read_u8(0x6F803) == 32) { cmd_gen(); handled = 1 }
 
+    // temp (116,101,109,112) — set sampling temperature
+    if handled == 0 && len >= 4 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 101 && volatile_read_u8(0x6F802) == 109 && volatile_read_u8(0x6F803) == 112 { cmd_temp(); handled = 1 }
+
     // sched-mode (115,99,104,101,100,45,109,...) len>=10 — "sched-mode <rr|ml>"
     // s(115) c(99) h(104) e(101) d(100) -(45) m(109) o(111) d(100) e(101)
     if handled == 0 && len >= 10 && buf_eq4(115, 99, 104, 101) == 1 && volatile_read_u8(0x6F804) == 100 && volatile_read_u8(0x6F805) == 45 && volatile_read_u8(0x6F806) == 109 && volatile_read_u8(0x6F807) == 111 { cmd_sched_mode(); handled = 1 }

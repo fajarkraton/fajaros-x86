@@ -45,6 +45,7 @@ const TFM_ST_PREFILL_CY: i64 = 32  // prefill cycles (set by tfm_generate)
 const TFM_ST_DECODE_CY: i64 = 40   // decode cycles (set by tfm_generate)
 const TFM_ST_TOTAL_POS: i64 = 48   // total positions processed
 const TFM_ST_N_KV_HEADS: i64 = 56  // n_kv_heads (0 = use n_heads, for MHA compat)
+const TFM_ST_TEMPERATURE: i64 = 64 // sampling temperature (0 or >=1000 = greedy, 500 = creative)
 
 // Get n_kv_heads: 0 or unset means MHA (n_kv_heads == n_heads)
 @kernel fn tfm_get_n_kv_heads() -> i64 {
@@ -60,7 +61,7 @@ const TFM_ST_N_KV_HEADS: i64 = 56  // n_kv_heads (0 = use n_heads, for MHA compa
 // KV cache layout: [layer][position][type][d_model]
 // type 0 = key, type 1 = value
 // Address = TFM_KV_BASE + layer * kv_layer_stride + pos * kv_pos_stride + type * d_model * 8
-const TFM_KV_MAX_POS: i64 = 128    // max context length
+const TFM_KV_MAX_POS: i64 = 256    // max context length
 
 // Frame-allocated vector registry (for d > 1024)
 // Up to 16 active vectors tracked at TFM_FVEC_REG
@@ -726,7 +727,7 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
 
     // For RamFS: LM head at src_addr + lmhead_off
     if src_type == 1 {
-        let cb_addr = MDL_CODEBOOK_BASE  // use layer 0 codebook for LM head
+        let cb_addr = MDL_LMHEAD_CB  // v3: use LM head's own codebook
         tfm_vecmat_packed(TFM_X, src_addr + lmhead_off, d_model, vocab_size,
                            quant_bits, cb_addr, TFM_LOGITS)
     }
@@ -1068,6 +1069,31 @@ const TFM_EOS_TOKEN: i64 = 2
 }
 
 // ask <prompt> — generate response to a question
+// temp <value> — set sampling temperature (0=greedy, 500=creative, 700=diverse)
+@kernel fn cmd_temp() {
+    let len = cmdbuf_len()
+    if len <= 5 {
+        cprint("Temperature: ", WHITE_ON_BLACK)
+        cprint_decimal(volatile_read_u64(TFM_STATE + TFM_ST_TEMPERATURE), WHITE_ON_BLACK)
+        cprintln(" (0=greedy, 500=creative)", WHITE_ON_BLACK)
+        return
+    }
+    // Parse number after "temp "
+    let mut val: i64 = 0
+    let mut i: i64 = 5
+    while i < len {
+        let ch = volatile_read_u8(0x6F800 + i)
+        if ch >= 48 && ch <= 57 {
+            val = val * 10 + (ch - 48)
+        }
+        i = i + 1
+    }
+    volatile_write_u64(TFM_STATE + TFM_ST_TEMPERATURE, val)
+    cprint("Temperature set to ", WHITE_ON_BLACK)
+    cprint_decimal(val, GREEN_ON_BLACK)
+    cprintln("", WHITE_ON_BLACK)
+}
+
 @kernel fn cmd_ask() {
     let len = cmdbuf_len()
     // "ask " = 4 chars
@@ -1366,11 +1392,16 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
         km_rmsnorm(STFM_X, d_model, STREAM_FINAL_NORM)
     }
 
-    // Step 3: LM head argmax
+    // Step 3: LM head — use sampling if temperature set, else argmax
+    let temp = volatile_read_u64(TFM_STATE + TFM_ST_TEMPERATURE)
     let next_token = if mdl_ram_active() == 1 {
-        mdl_ram_lmhead_argmax(STFM_X)  // RAM: direct memory (fast)
+        if temp > 0 && temp < 1000 {
+            mdl_ram_lmhead_sample(STFM_X, temp)
+        } else {
+            mdl_ram_lmhead_argmax(STFM_X)
+        }
     } else {
-        mdl_stream_lmhead_argmax(STFM_X)  // NVMe: 1 MB chunks (slow)
+        mdl_stream_lmhead_argmax(STFM_X)  // NVMe: argmax only
     }
 
     // Update state

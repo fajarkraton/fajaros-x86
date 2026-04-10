@@ -37,48 +37,56 @@ MODEL_TYPES = {
 }
 
 
-def lloyd_max_quantize(data, bits, max_iters=20):
-    """Lloyd-Max quantization. Returns (indices, centroids)."""
+def lloyd_max_quantize(data, bits, max_iters=50):
+    """Lloyd-Max quantization with L2 distance. Returns (indices, centroids)."""
     n_centroids = 2 ** bits
     flat = data.flatten().astype(np.float32)
     n = len(flat)
 
-    sample = flat[np.random.choice(n, min(2_000_000, n), replace=False)] if n > 10_000_000 else flat
+    # Use larger sample for centroid initialization (5M or full data)
+    sample_size = min(5_000_000, n)
+    sample = flat[np.random.choice(n, sample_size, replace=False)] if n > sample_size else flat
 
     percentiles = np.linspace(0, 100, n_centroids + 2)[1:-1]
     centroids = np.percentile(sample, percentiles).astype(np.float32)
 
     chunk_size = 2_000_000
-    for _ in range(max_iters):
+    prev_centroids = centroids.copy()
+    for iteration in range(max_iters):
         indices = np.empty(n, dtype=np.int32)
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
-            dists = np.abs(flat[start:end, None] - centroids[None, :])
+            # L2 distance (squared) — minimizes MSE
+            dists = (flat[start:end, None] - centroids[None, :]) ** 2
             indices[start:end] = np.argmin(dists, axis=1)
         for i in range(n_centroids):
             mask = indices == i
             if mask.any():
                 centroids[i] = flat[mask].mean()
+        # Early stopping if converged
+        if np.allclose(centroids, prev_centroids, atol=1e-7):
+            break
+        prev_centroids = centroids.copy()
 
-    # Final assignment
+    # Final assignment with L2
     indices = np.empty(n, dtype=np.int32)
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        dists = np.abs(flat[start:end, None] - centroids[None, :])
+        dists = (flat[start:end, None] - centroids[None, :]) ** 2
         indices[start:end] = np.argmin(dists, axis=1)
 
     return indices.astype(np.uint8), centroids
 
 
 def quantize_with_codebook(data, centroids, bits):
-    """Quantize data using pre-computed codebook centroids (no re-fitting)."""
+    """Quantize data using pre-computed codebook centroids (L2 distance)."""
     flat = data.flatten().astype(np.float32)
     n = len(flat)
     indices = np.empty(n, dtype=np.int32)
     chunk_size = 2_000_000
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
-        dists = np.abs(flat[start:end, None] - centroids[None, :])
+        dists = (flat[start:end, None] - centroids[None, :]) ** 2
         indices[start:end] = np.argmin(dists, axis=1)
     return indices.astype(np.uint8)
 
@@ -183,6 +191,13 @@ def export_gemma3(model_name, bits):
     embed_packed = pack_quantized(embed_idx, bits)
     print(f"  Embedding: {embed_w.shape} → {len(embed_packed)} bytes (own codebook)")
 
+    # RMSNorm gamma convention: stored as int(weight × 1000), no conversion.
+    # Kernel detects model_type at load time and applies:
+    #   Gemma (type 10/11):     (1 + g/1000) × x  — gamma is zero-centered (~0)
+    #   Llama/SmolLM (type 1):  g/1000 × x        — gamma is direct scale (~0.03-1.4)
+    is_gemma_norm = 'Gemma' in type(model.model.layers[0].input_layernorm).__name__
+    print(f"  Norm convention: {'Gemma (zero-centered)' if is_gemma_norm else 'Llama (direct scale)'}")
+
     # === Layers (shared codebook per layer) ===
     layer_blocks = []
     for i in range(n_layers):
@@ -233,7 +248,7 @@ def export_gemma3(model_name, bits):
             ffn_packed = (pack_quantized(gate_idx, bits) +
                           pack_quantized(down_idx, bits))
 
-        # RMSNorm gamma
+        # RMSNorm gamma — store raw weight × 1000 (kernel handles convention)
         ln1_gamma = layer.input_layernorm.weight.detach().numpy().astype(np.float64)
         ln2_gamma = layer.post_attention_layernorm.weight.detach().numpy().astype(np.float64)
         norm_data = b""

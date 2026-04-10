@@ -394,16 +394,52 @@ const KM_TILE_SIZE: i64 = 64
 // Kernel exp approximation: exp(z) ≈ max(1, 1000 + z + z*z/2000)
 
 @kernel fn km_exp_approx(x: i64) -> i64 {
-    // Piecewise exp approximation (fixed-point x1000)
-    // exp(0) = 1000, exp(1000) ≈ 2718, exp(-1000) ≈ 368
-    if x > 3000 { 20000 }  // cap to prevent overflow
-    else if x < -3000 { 1 }
-    else {
-        // Taylor: exp(x/1000) ≈ 1 + x/1000 + (x/1000)^2/2
-        // In fixed-point: 1000 + x + x*x/2000
-        let result = 1000 + x + (x * x) / 2000
-        if result < 1 { 1 } else { result }
+    // Fixed-point exp(x/1000) → result in ×1000 scale
+    // Split x = ±(1000*q + r), use lookup for exp(±q), Taylor for exp(±r/1000)
+    // Old Taylor-only was catastrophically wrong for x < -1000 (went back UP).
+    if x > 5000 { return 148413 }  // cap: exp(5) × 1000
+    if x < -7000 { return 0 }     // exp(-7) ≈ 0.001 → rounds to 0
+
+    if x >= 0 {
+        let q = x / 1000
+        let r = x - q * 1000
+        let base = km_exp_pos_lookup(q)
+        // Taylor: exp(r/1000) ≈ 1 + r/1000 + r²/2e6 → in ×1000: 1000 + r + r²/2000
+        let frac = 1000 + r + (r * r) / 2000
+        return (base * frac) / 1000
     }
+
+    // Negative: exp(-q - r/1000) = exp(-q) × exp(-r/1000)
+    let abs_x = 0 - x
+    let q = abs_x / 1000
+    let r = abs_x - q * 1000
+    let base = km_exp_neg_lookup(q)
+    // Taylor: exp(-r/1000) ≈ 1 - r/1000 + r²/2e6 → in ×1000: 1000 - r + r²/2000
+    let frac = 1000 - r + (r * r) / 2000
+    let result = (base * frac) / 1000
+    if result < 1 { 1 } else { result }
+}
+
+@kernel fn km_exp_pos_lookup(q: i64) -> i64 {
+    // exp(q) × 1000 for q=0..5
+    if q == 0 { 1000 }
+    else if q == 1 { 2718 }
+    else if q == 2 { 7389 }
+    else if q == 3 { 20086 }
+    else if q == 4 { 54598 }
+    else { 148413 }
+}
+
+@kernel fn km_exp_neg_lookup(q: i64) -> i64 {
+    // exp(-q) × 1000 for q=0..7
+    if q == 0 { 1000 }
+    else if q == 1 { 368 }
+    else if q == 2 { 135 }
+    else if q == 3 { 50 }
+    else if q == 4 { 18 }
+    else if q == 5 { 7 }
+    else if q == 6 { 2 }
+    else { 1 }
 }
 
 @kernel fn km_softmax(slot: i64, dim: i64) {
@@ -475,30 +511,45 @@ const KM_TILE_SIZE: i64 = 64
     if data_addr <= 0 || data_addr > 0x20000000 { return }
     if gamma_addr != 0 && gamma_addr > 0x20000000 { return }
     // Step 1: compute mean(x²) = sum(x²) / dim
-    // Use chunked accumulation to prevent overflow:
-    // sum += (x / dim) * (x / 1000) → gives sum(x²) / (dim * 1000)
+    // Direct accumulation: sum += x² / dim (overflow-safe for |x| < 3×10^9)
+    // Old chunked formula `(x/dim)*(x/1000)` truncated to 0 for |x| < dim,
+    // causing RMS=0 and normalization explosion on first layer embeddings.
     let mut rms_sum: i64 = 0
     let mut i: i64 = 0
     while i < dim {
         let x = volatile_read_u64(data_addr + i * 8)
-        rms_sum = rms_sum + (x / dim) * (x / 1000)
+        // For large |x| > 1000000: use safe chunking to avoid x*x overflow
+        if x > 1000000 || x < -1000000 {
+            rms_sum = rms_sum + (x / 1000) * (x / 1000) * 1000000 / dim
+        } else {
+            rms_sum = rms_sum + (x * x) / dim
+        }
         i = i + 1
     }
-    // rms_sum ≈ mean(x²) / 1000
+    // rms_sum ≈ mean(x²) in x1000² scale
     let rms_val = if rms_sum < 0 { 0 - rms_sum } else { rms_sum }
-    // eps = 1 in fixed-point (≈ 1e-6 at x1e6 scale)
+    // eps = 1 to prevent division by zero
     let rms = km_isqrt(rms_val + 1)
     if rms == 0 { return }
 
     // Step 2: normalize and apply gamma
+    // Gamma convention set by model loader at MDL_GAMMA_MODE (0xC00558):
+    //   mode 0 (Gemma): zero-centered gamma, apply as (1+g)*x
+    //   mode 1 (Llama/SmolLM): direct-scale gamma, apply as g*x
+    let gamma_mode = volatile_read_u64(0xC00558)
     i = 0
     while i < dim {
         let x = volatile_read_u64(data_addr + i * 8)
         let normed = (x * 1000) / rms
         if gamma_addr != 0 {
-            // Gemma 3 style: weight is zero-centered, apply as (1 + w) * x
             let g = volatile_read_u64(gamma_addr + i * 8)
-            volatile_write_u64(data_addr + i * 8, (normed * (1000 + g)) / 1000)
+            if gamma_mode == 1 {
+                // Llama/SmolLM: g = weight×1000, formula = g * x / 1000
+                volatile_write_u64(data_addr + i * 8, (normed * g) / 1000)
+            } else {
+                // Gemma: g = (weight-1)×1000, formula = (1+g/1000) * x
+                volatile_write_u64(data_addr + i * 8, (normed * (1000 + g)) / 1000)
+            }
         } else {
             volatile_write_u64(data_addr + i * 8, normed)
         }
