@@ -82,6 +82,12 @@ const MDL_LMHEAD_CB: i64 = 0xC00500     // LM head codebook (32 bytes) — v3/v4
 // v5 mixed precision: 4-bit codebooks need 128 bytes (16 centroids × 8B)
 const MDL_EMBED_CB_V5: i64 = 0xBEE000   // Embedding codebook (128 bytes) — v5+
 const MDL_LMHEAD_CB_V5: i64 = 0xBEE080  // LM head codebook (128 bytes) — v5+
+// Repetition penalty: bitset for fast O(1) lookup in hot loop + circular history
+const RECENT_BITSET: i64 = 0xBEC000     // 6144 bytes (49152 bits, 1 per vocab tok)
+const RECENT_TOK_BUF: i64 = 0xBEE100    // 8 entries × 8B = 64 bytes (eviction history)
+const RECENT_TOK_HEAD: i64 = 0xBEE140   // 8 bytes (circular write position)
+const RECENT_TOK_K: i64 = 8
+const RECENT_BITSET_BYTES: i64 = 6144
 const MDL_LN_BASE: i64 = 0xC00520       // LayerNorm parameters
 
 const MDL_EMBED_BASE: i64 = 0xC30000   // Embedding table start
@@ -1829,8 +1835,9 @@ const LM_TOPK_K: i64 = 8
 // v5 4-bit Hot Path Functions (mixed precision support)
 // ═══════════════════════════════════════════════════════════════
 
-// v5 4-bit RAM-resident LM head argmax
+// v5 4-bit RAM-resident LM head argmax with repetition penalty (bitset)
 // Hardcoded: bits=4, elems_per_byte=2, mask=15, cb=MDL_LMHEAD_CB_V5
+// Repetition penalty: skip vocab tokens whose bit is set in RECENT_BITSET
 @kernel fn mdl_ram_lmhead_argmax_v5_4bit(x_addr: i64) -> i64 {
     let vocab_size = mdl_get_vocab_size()
     let d_model = mdl_get_d_model()
@@ -1856,7 +1863,12 @@ const LM_TOPK_K: i64 = 8
             sum = sum + (x_val * w) / 1000
             j = j + 1
         }
-        if sum > best_score {
+        // Repetition penalty: O(1) bitset lookup (no inner loop)
+        let bs_byte = v / 8
+        let bs_bit = v % 8
+        let bs_raw = volatile_read_u8(RECENT_BITSET + bs_byte)
+        let in_recent = (bs_raw >> bs_bit) & 1
+        if in_recent == 0 && sum > best_score {
             best_score = sum
             best_token = v
         }
@@ -1868,6 +1880,53 @@ const LM_TOPK_K: i64 = 8
 // NOTE: v5 4-bit sample function not implemented — top-k inner loop with 4-bit
 // row_bytes (288) triggers LLVM O2 wild pointer crash. Use argmax instead.
 // (Dispatch in tfm_forward_stream falls back to argmax for v5 4-bit.)
+
+// ═══════════════════════════════════════════════════════════════
+// Repetition Penalty Buffer (last N generated tokens)
+// ═══════════════════════════════════════════════════════════════
+
+// Clear bitset and history buffer (called at start of each ask command)
+@kernel fn recent_token_init() {
+    // Clear 6144-byte bitset (8-byte writes for speed)
+    let mut i: i64 = 0
+    while i < RECENT_BITSET_BYTES / 8 {
+        volatile_write_u64(RECENT_BITSET + i * 8, 0)
+        i = i + 1
+    }
+    // Mark history slots as empty (-1)
+    let mut j: i64 = 0
+    while j < RECENT_TOK_K {
+        volatile_write_u64(RECENT_TOK_BUF + j * 8, -1)
+        j = j + 1
+    }
+    volatile_write_u64(RECENT_TOK_HEAD, 0)
+}
+
+// Push generated token: evict oldest from bitset, set new bit, update history
+@kernel fn recent_token_push(tok: i64) {
+    let head = volatile_read_u64(RECENT_TOK_HEAD)
+    let pos = head % RECENT_TOK_K
+
+    // Evict the token currently in this slot (clear its bit)
+    let old_tok = volatile_read_u64(RECENT_TOK_BUF + pos * 8)
+    if old_tok >= 0 {
+        let old_byte_idx = old_tok / 8
+        let old_bit_off = old_tok % 8
+        let old_byte = volatile_read_u8(RECENT_BITSET + old_byte_idx)
+        let mask = 255 - (1 << old_bit_off)
+        volatile_write_u8(RECENT_BITSET + old_byte_idx, old_byte & mask)
+    }
+
+    // Store new token and set its bit
+    volatile_write_u64(RECENT_TOK_BUF + pos * 8, tok)
+    volatile_write_u64(RECENT_TOK_HEAD, head + 1)
+    if tok >= 0 {
+        let byte_idx = tok / 8
+        let bit_off = tok % 8
+        let byte = volatile_read_u8(RECENT_BITSET + byte_idx)
+        volatile_write_u8(RECENT_BITSET + byte_idx, byte | (1 << bit_off))
+    }
+}
 
 // v5 4-bit streaming embedding lookup (raw address)
 @kernel fn mdl_stream_embed_lookup_raw_v5_4bit(token_id: i64, out_addr: i64) -> i64 {

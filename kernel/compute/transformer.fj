@@ -1446,6 +1446,10 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let gen = volatile_read_u64(TFM_STATE + TFM_ST_TOKENS_GEN)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, gen + 1)
 
+    // Repetition penalty: track this token in recent buffer
+    // (only checked by v5_4bit argmax; v4 path ignores buffer)
+    recent_token_push(next_token)
+
     next_token
 }
 
@@ -1457,6 +1461,9 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     volatile_write_u64(TFM_STATE + TFM_ST_POS, 0)
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
+
+    // Initialize repetition penalty buffer (clear last-N token history)
+    recent_token_init()
 
     // Allocate Q/K/V/ATTN km_large slots (still used by attention)
     let n_heads = mdl_get_n_heads()
