@@ -53,9 +53,11 @@ const FJM_OFF_FFN_DIM: i64 = 64     // 4B: FFN intermediate size (0=4*d_model)
 const FJM_OFF_ROPE_THETA: i64 = 68  // 4B: RoPE theta / 1000 (0=no RoPE)
 const FJM_OFF_EOS_TOKEN: i64 = 72   // 4B: EOS token ID
 // v3 fields (offset 76-159):
-const FJM_OFF_EMBED_CB: i64 = 76    // 32B: embedding codebook (4 centroids × 8B)
-const FJM_OFF_LMHEAD_CB: i64 = 108  // 32B: LM head codebook (4 centroids × 8B)
+const FJM_OFF_EMBED_CB: i64 = 76    // 32B: embedding codebook (4 centroids × 8B) — v3/v4 only
+const FJM_OFF_LMHEAD_CB: i64 = 108  // 32B: LM head codebook (4 centroids × 8B) — v3/v4 only
 const FJM_OFF_FINAL_NORM: i64 = 140 // 4B: byte offset to final RMSNorm weights
+const FJM_OFF_EMBED_BITS: i64 = 144 // 4B: embedding quant bits (v5+, 0=use global)
+const FJM_OFF_LMHEAD_BITS: i64 = 148 // 4B: LM head quant bits (v5+, 0=use global)
 // Bytes 144-159: reserved
 const FJM_HEADER_V1_SIZE: i64 = 64
 const FJM_HEADER_V2_SIZE: i64 = 96
@@ -75,8 +77,11 @@ const FJM_LAYER_HDR_SIZE: i64 = 16
 const MDL_HDR_BASE: i64 = 0xC00000       // Parsed header copy (160 bytes for v3)
 const MDL_STATE_BASE: i64 = 0xC000A0     // Loader state (64 bytes) — after 160B header
 const MDL_CODEBOOK_BASE: i64 = 0xC000E0 // Per-layer codebooks (32 × 32B = 1KB)
-const MDL_EMBED_CB: i64 = 0xC004E0      // Embedding codebook (32 bytes)
-const MDL_LMHEAD_CB: i64 = 0xC00500     // LM head codebook (32 bytes)
+const MDL_EMBED_CB: i64 = 0xC004E0      // Embedding codebook (32 bytes) — v3/v4
+const MDL_LMHEAD_CB: i64 = 0xC00500     // LM head codebook (32 bytes) — v3/v4
+// v5 mixed precision: 4-bit codebooks need 128 bytes (16 centroids × 8B)
+const MDL_EMBED_CB_V5: i64 = 0xBEE000   // Embedding codebook (128 bytes) — v5+
+const MDL_LMHEAD_CB_V5: i64 = 0xBEE080  // LM head codebook (128 bytes) — v5+
 const MDL_LN_BASE: i64 = 0xC00520       // LayerNorm parameters
 
 const MDL_EMBED_BASE: i64 = 0xC30000   // Embedding table start
@@ -152,9 +157,9 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         return -1  // Bad magic
     }
 
-    // Check version (support v1, v2, v3, v4)
+    // Check version (support v1, v2, v3, v4, v5)
     let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
-    if version < 1 || version > 4 {
+    if version < 1 || version > 5 {
         return -2  // Unsupported version
     }
 
@@ -205,8 +210,9 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     let n_kv_h = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_N_KV_HEADS)
     volatile_write_u64(0xBE8000 + 56, n_kv_h)  // TFM_STATE + TFM_ST_N_KV_HEADS
 
-    // Extract embed + lmhead codebooks from v3 header to dedicated memory
-    if version >= 3 {
+    // Extract embed + lmhead codebooks from v3/v4 header to dedicated memory
+    // v5+: codebooks are inline with data, extracted during embed-load / ram-load
+    if version >= 3 && version <= 4 {
         // Copy 32 bytes of embed codebook: header[76..108] → MDL_EMBED_CB
         let mut ci: i64 = 0
         while ci < 32 {
@@ -257,6 +263,23 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if v > 0 { v } else { mdl_get_n_heads() }  // 0 = MHA
 }
 @kernel fn mdl_get_ffn_type() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_FFN_TYPE) }
+// v5 mixed precision: per-section bit widths (0 = use global quant_bits)
+@kernel fn mdl_get_embed_bits() -> i64 {
+    let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_EMBED_BITS)
+    if v > 0 { v } else { mdl_get_quant_bits() }
+}
+@kernel fn mdl_get_lmhead_bits() -> i64 {
+    let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LMHEAD_BITS)
+    if v > 0 { v } else { mdl_get_quant_bits() }
+}
+// Get embed codebook address (v5 uses separate area for 4-bit)
+@kernel fn mdl_get_embed_cb() -> i64 {
+    if mdl_get_version() >= 5 { MDL_EMBED_CB_V5 } else { MDL_EMBED_CB }
+}
+// Get lmhead codebook address (v5 uses separate area for 4-bit)
+@kernel fn mdl_get_lmhead_cb() -> i64 {
+    if mdl_get_version() >= 5 { MDL_LMHEAD_CB_V5 } else { MDL_LMHEAD_CB }
+}
 @kernel fn mdl_get_norm_type() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_NORM_TYPE) }
 @kernel fn mdl_get_ffn_dim() -> i64 {
     let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_FFN_DIM)
@@ -881,7 +904,17 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 
     cprint("  Quant:      ", WHITE_ON_BLACK)
     cprint_decimal(mdl_get_quant_bits(), CYAN_ON_BLACK)
-    cprintln("-bit", CYAN_ON_BLACK)
+    cprintln("-bit (layers)", CYAN_ON_BLACK)
+
+    // v5: show mixed precision
+    if mdl_get_version() >= 5 {
+        cprint("  Embed:      ", WHITE_ON_BLACK)
+        cprint_decimal(mdl_get_embed_bits(), GREEN_ON_BLACK)
+        cprintln("-bit", GREEN_ON_BLACK)
+        cprint("  LM head:    ", WHITE_ON_BLACK)
+        cprint_decimal(mdl_get_lmhead_bits(), GREEN_ON_BLACK)
+        cprintln("-bit", GREEN_ON_BLACK)
+    }
 
     cprint("  Total size: ", WHITE_ON_BLACK)
     mdl_print_size(mdl_get_total_size())
@@ -1155,6 +1188,24 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 
     cprintln("]", WHITE_ON_BLACK)
 
+    // v5: extract embed codebook from end of loaded data
+    if mdl_get_version() >= 5 {
+        let eb = mdl_get_embed_bits()
+        let vocab_size = mdl_get_vocab_size()
+        let d_model = mdl_get_d_model()
+        let packed_size = vocab_size * d_model * eb / 8
+        let n_centroids = 1 << eb
+        let cb_size = n_centroids * 8
+        let cb_src = STREAM_EMBED_BASE + packed_size
+        // 2-bit (32B) → MDL_EMBED_CB (existing area, hot path uses this)
+        // 4-bit (128B) → MDL_EMBED_CB_V5 (separate area, requires v5 hot path)
+        if eb <= 2 {
+            mdl_memcpy(MDL_EMBED_CB, cb_src, cb_size)
+        } else {
+            mdl_memcpy(MDL_EMBED_CB_V5, cb_src, cb_size)
+        }
+    }
+
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED, 1)
     volatile_write_u64(MDL_STATE_BASE + MDL_ST_EMBED_LOADED, 1)
     0
@@ -1366,7 +1417,7 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 
     let elems_per_byte = 8 / bits
     let mask = (1 << bits) - 1
-    let cb_addr = MDL_EMBED_CB  // v3: use embedding's own codebook
+    let cb_addr = MDL_EMBED_CB
 
     let mut i: i64 = 0
     while i < d_model {
@@ -1394,7 +1445,7 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     let src = STREAM_EMBED_BASE + token_id * bytes_per_row
     let elems_per_byte = 8 / bits
     let mask = (1 << bits) - 1
-    let cb_addr = MDL_EMBED_CB  // v3: use embedding's own codebook
+    let cb_addr = MDL_EMBED_CB
 
     let mut i: i64 = 0
     while i < d_model {
@@ -1429,7 +1480,7 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     let bits = mdl_get_quant_bits()
     let lmhead_off = mdl_get_lmhead_offset()
     let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
-    let cb_addr = MDL_LMHEAD_CB  // v3: use LM head's own codebook
+    let cb_addr = MDL_LMHEAD_CB
 
     let row_bytes = d_model * bits / 8
     if row_bytes <= 0 { return -8 }
@@ -1584,6 +1635,24 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
         if pct > last_dot { console_putchar(35, GREEN_ON_BLACK); last_dot = pct }
     }
     cprintln("]", WHITE_ON_BLACK)
+
+    // v5: extract lmhead codebook from end of loaded data
+    if mdl_get_version() >= 5 {
+        let lb = mdl_get_lmhead_bits()
+        let vocab_size = mdl_get_vocab_size()
+        let d_model = mdl_get_d_model()
+        let packed_size = vocab_size * d_model * lb / 8
+        let n_centroids = 1 << lb
+        let cb_size = n_centroids * 8
+        let cb_src = actual_lmhead_addr + packed_size
+        // 2-bit (32B) → MDL_LMHEAD_CB (hot path uses this)
+        // 4-bit (128B) → MDL_LMHEAD_CB_V5 (requires v5 hot path)
+        if lb <= 2 {
+            mdl_memcpy(MDL_LMHEAD_CB, cb_src, cb_size)
+        } else {
+            mdl_memcpy(MDL_LMHEAD_CB_V5, cb_src, cb_size)
+        }
+    }
 
     // Activate RAM-resident mode
     volatile_write_u64(MDL_RAM_STATE + MDL_RAM_ACTIVE, 1)
@@ -1754,6 +1823,140 @@ const LM_TOPK_K: i64 = 8
     let rand = rdrand() & 0x7FFFFFFF  // positive 31-bit random
     let pick = rand % LM_TOPK_K
     volatile_read_u64(LM_TOPK_BUF + pick * 16 + 8)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// v5 4-bit Hot Path Functions (mixed precision support)
+// ═══════════════════════════════════════════════════════════════
+
+// v5 4-bit RAM-resident LM head argmax
+// Hardcoded: bits=4, elems_per_byte=2, mask=15, cb=MDL_LMHEAD_CB_V5
+@kernel fn mdl_ram_lmhead_argmax_v5_4bit(x_addr: i64) -> i64 {
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let lmhead_addr = volatile_read_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD)
+    let cb_addr = MDL_LMHEAD_CB_V5
+
+    let row_bytes = d_model / 2  // 4-bit: 2 elems per byte
+    let mut best_token: i64 = 0
+    let mut best_score: i64 = -999999999
+    let mut v: i64 = 0
+
+    while v < vocab_size {
+        let row_addr = lmhead_addr + v * row_bytes
+        let mut sum: i64 = 0
+        let mut j: i64 = 0
+        while j < d_model {
+            let x_val = volatile_read_u64(x_addr + j * 8)
+            let byte_idx = j / 2
+            let bit_off = (j % 2) * 4
+            let raw = volatile_read_u8(row_addr + byte_idx)
+            let idx = (raw >> bit_off) & 15
+            let w = volatile_read_u64(cb_addr + idx * 8)
+            sum = sum + (x_val * w) / 1000
+            j = j + 1
+        }
+        if sum > best_score {
+            best_score = sum
+            best_token = v
+        }
+        v = v + 1
+    }
+    best_token
+}
+
+// v5 4-bit RAM-resident LM head top-k sampling
+@kernel fn mdl_ram_lmhead_sample_v5_4bit(x_addr: i64, temperature: i64) -> i64 {
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let lmhead_addr = volatile_read_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD)
+    let cb_addr = MDL_LMHEAD_CB_V5
+
+    let row_bytes = d_model / 2
+
+    // Initialize top-k buffer with minimum scores
+    let mut ti: i64 = 0
+    while ti < LM_TOPK_K {
+        volatile_write_u64(LM_TOPK_BUF + ti * 16, -999999999)
+        volatile_write_u64(LM_TOPK_BUF + ti * 16 + 8, 0)
+        ti = ti + 1
+    }
+
+    let mut v: i64 = 0
+    while v < vocab_size {
+        let row_addr = lmhead_addr + v * row_bytes
+        let mut sum: i64 = 0
+        let mut j: i64 = 0
+        while j < d_model {
+            let x_val = volatile_read_u64(x_addr + j * 8)
+            let byte_idx = j / 2
+            let bit_off = (j % 2) * 4
+            let raw = volatile_read_u8(row_addr + byte_idx)
+            let idx = (raw >> bit_off) & 15
+            let w = volatile_read_u64(cb_addr + idx * 8)
+            sum = sum + (x_val * w) / 1000
+            j = j + 1
+        }
+        let mut min_idx: i64 = 0
+        let mut min_score: i64 = volatile_read_u64(LM_TOPK_BUF)
+        let mut ki: i64 = 1
+        while ki < LM_TOPK_K {
+            let ks = volatile_read_u64(LM_TOPK_BUF + ki * 16)
+            if ks < min_score {
+                min_score = ks
+                min_idx = ki
+            }
+            ki = ki + 1
+        }
+        if sum > min_score {
+            volatile_write_u64(LM_TOPK_BUF + min_idx * 16, sum)
+            volatile_write_u64(LM_TOPK_BUF + min_idx * 16 + 8, v)
+        }
+        v = v + 1
+    }
+
+    if temperature >= 1000 {
+        let mut best_idx: i64 = 0
+        let mut best_s: i64 = volatile_read_u64(LM_TOPK_BUF)
+        let mut bi: i64 = 1
+        while bi < LM_TOPK_K {
+            let s = volatile_read_u64(LM_TOPK_BUF + bi * 16)
+            if s > best_s {
+                best_s = s
+                best_idx = bi
+            }
+            bi = bi + 1
+        }
+        return volatile_read_u64(LM_TOPK_BUF + best_idx * 16 + 8)
+    }
+
+    let rand = rdrand() & 0x7FFFFFFF
+    let pick = rand % LM_TOPK_K
+    volatile_read_u64(LM_TOPK_BUF + pick * 16 + 8)
+}
+
+// v5 4-bit streaming embedding lookup (raw address)
+@kernel fn mdl_stream_embed_lookup_raw_v5_4bit(token_id: i64, out_addr: i64) -> i64 {
+    if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 { return -1 }
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    if token_id < 0 || token_id >= vocab_size { return -2 }
+
+    let bytes_per_row = d_model / 2  // 4-bit: 2 elems per byte
+    let src = STREAM_EMBED_BASE + token_id * bytes_per_row
+    let cb_addr = MDL_EMBED_CB_V5
+
+    let mut i: i64 = 0
+    while i < d_model {
+        let byte_idx = i / 2
+        let bit_off = (i % 2) * 4
+        let raw = volatile_read_u8(src + byte_idx)
+        let idx = (raw >> bit_off) & 15
+        let centroid = volatile_read_u64(cb_addr + idx * 8)
+        volatile_write_u64(out_addr + i * 8, centroid)
+        i = i + 1
+    }
+    0
 }
 
 // Shell command: ram-load

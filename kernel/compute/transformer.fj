@@ -1401,7 +1401,13 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     }
 
     // Step 1: Embedding lookup → STFM_X (raw address, supports d > 1024)
-    mdl_stream_embed_lookup_raw(token_id, STFM_X)
+    // v5 4-bit dispatch (mixed precision)
+    let v5_embed_4bit = mdl_get_version() >= 5 && mdl_get_embed_bits() == 4
+    if v5_embed_4bit {
+        mdl_stream_embed_lookup_raw_v5_4bit(token_id, STFM_X)
+    } else {
+        mdl_stream_embed_lookup_raw(token_id, STFM_X)
+    }
 
     // Step 2: Process all layers (stream each from NVMe)
     let mut layer: i64 = 0
@@ -1416,13 +1422,22 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
         km_rmsnorm(STFM_X, d_model, STREAM_FINAL_NORM)
     }
 
-    // Step 3: LM head — use sampling if temperature set, else argmax
+    // Step 3: LM head — v5 4-bit dispatch + sampling/argmax
     let temp = volatile_read_u64(TFM_STATE + TFM_ST_TEMPERATURE)
+    let v5_lmhead_4bit = mdl_get_version() >= 5 && mdl_get_lmhead_bits() == 4
     let next_token = if mdl_ram_active() == 1 {
-        if temp > 0 && temp < 1000 {
-            mdl_ram_lmhead_sample(STFM_X, temp)
+        if v5_lmhead_4bit {
+            if temp > 0 && temp < 1000 {
+                mdl_ram_lmhead_sample_v5_4bit(STFM_X, temp)
+            } else {
+                mdl_ram_lmhead_argmax_v5_4bit(STFM_X)
+            }
         } else {
-            mdl_ram_lmhead_argmax(STFM_X)
+            if temp > 0 && temp < 1000 {
+                mdl_ram_lmhead_sample(STFM_X, temp)
+            } else {
+                mdl_ram_lmhead_argmax(STFM_X)
+            }
         }
     } else {
         mdl_stream_lmhead_argmax(STFM_X)  // NVMe: argmax only
