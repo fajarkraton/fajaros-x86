@@ -1865,75 +1865,9 @@ const LM_TOPK_K: i64 = 8
     best_token
 }
 
-// v5 4-bit RAM-resident LM head top-k sampling
-@kernel fn mdl_ram_lmhead_sample_v5_4bit(x_addr: i64, temperature: i64) -> i64 {
-    let vocab_size = mdl_get_vocab_size()
-    let d_model = mdl_get_d_model()
-    let lmhead_addr = volatile_read_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD)
-    let cb_addr = MDL_LMHEAD_CB_V5
-
-    let row_bytes = d_model / 2
-
-    // Initialize top-k buffer with minimum scores
-    let mut ti: i64 = 0
-    while ti < LM_TOPK_K {
-        volatile_write_u64(LM_TOPK_BUF + ti * 16, -999999999)
-        volatile_write_u64(LM_TOPK_BUF + ti * 16 + 8, 0)
-        ti = ti + 1
-    }
-
-    let mut v: i64 = 0
-    while v < vocab_size {
-        let row_addr = lmhead_addr + v * row_bytes
-        let mut sum: i64 = 0
-        let mut j: i64 = 0
-        while j < d_model {
-            let x_val = volatile_read_u64(x_addr + j * 8)
-            let byte_idx = j / 2
-            let bit_off = (j % 2) * 4
-            let raw = volatile_read_u8(row_addr + byte_idx)
-            let idx = (raw >> bit_off) & 15
-            let w = volatile_read_u64(cb_addr + idx * 8)
-            sum = sum + (x_val * w) / 1000
-            j = j + 1
-        }
-        let mut min_idx: i64 = 0
-        let mut min_score: i64 = volatile_read_u64(LM_TOPK_BUF)
-        let mut ki: i64 = 1
-        while ki < LM_TOPK_K {
-            let ks = volatile_read_u64(LM_TOPK_BUF + ki * 16)
-            if ks < min_score {
-                min_score = ks
-                min_idx = ki
-            }
-            ki = ki + 1
-        }
-        if sum > min_score {
-            volatile_write_u64(LM_TOPK_BUF + min_idx * 16, sum)
-            volatile_write_u64(LM_TOPK_BUF + min_idx * 16 + 8, v)
-        }
-        v = v + 1
-    }
-
-    if temperature >= 1000 {
-        let mut best_idx: i64 = 0
-        let mut best_s: i64 = volatile_read_u64(LM_TOPK_BUF)
-        let mut bi: i64 = 1
-        while bi < LM_TOPK_K {
-            let s = volatile_read_u64(LM_TOPK_BUF + bi * 16)
-            if s > best_s {
-                best_s = s
-                best_idx = bi
-            }
-            bi = bi + 1
-        }
-        return volatile_read_u64(LM_TOPK_BUF + best_idx * 16 + 8)
-    }
-
-    let rand = rdrand() & 0x7FFFFFFF
-    let pick = rand % LM_TOPK_K
-    volatile_read_u64(LM_TOPK_BUF + pick * 16 + 8)
-}
+// NOTE: v5 4-bit sample function not implemented — top-k inner loop with 4-bit
+// row_bytes (288) triggers LLVM O2 wild pointer crash. Use argmax instead.
+// (Dispatch in tfm_forward_stream falls back to argmax for v5 4-bit.)
 
 // v5 4-bit streaming embedding lookup (raw address)
 @kernel fn mdl_stream_embed_lookup_raw_v5_4bit(token_id: i64, out_addr: i64) -> i64 {

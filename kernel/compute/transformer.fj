@@ -1423,15 +1423,13 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     }
 
     // Step 3: LM head — v5 4-bit dispatch + sampling/argmax
+    // NOTE: v5 4-bit sample function triggers LLVM O2 wild pointer (top-k loop too complex).
+    // Workaround: v5 4-bit always uses argmax even when temp is set.
     let temp = volatile_read_u64(TFM_STATE + TFM_ST_TEMPERATURE)
     let v5_lmhead_4bit = mdl_get_version() >= 5 && mdl_get_lmhead_bits() == 4
     let next_token = if mdl_ram_active() == 1 {
         if v5_lmhead_4bit {
-            if temp > 0 && temp < 1000 {
-                mdl_ram_lmhead_sample_v5_4bit(STFM_X, temp)
-            } else {
-                mdl_ram_lmhead_argmax_v5_4bit(STFM_X)
-            }
+            mdl_ram_lmhead_argmax_v5_4bit(STFM_X)
         } else {
             if temp > 0 && temp < 1000 {
                 mdl_ram_lmhead_sample(STFM_X, temp)
