@@ -83,6 +83,8 @@ const MDL_LMHEAD_CB: i64 = 0xC00500     // LM head codebook (32 bytes) — v3/v4
 const MDL_EMBED_CB_V5: i64 = 0xBEE000   // Embedding codebook (128 bytes) — v5+
 const MDL_LMHEAD_CB_V5: i64 = 0xBEE080  // LM head codebook (128 bytes) — v5+
 // Repetition penalty: bitset for fast O(1) lookup in hot loop + circular history
+// K=8 chosen empirically: K=4 → too much repetition (3x of common tokens),
+// K=16 → forces rare/exotic tokens (Labrador, Beowulf, polyps), K=8 balanced.
 const RECENT_BITSET: i64 = 0xBEC000     // 6144 bytes (49152 bits, 1 per vocab tok)
 const RECENT_TOK_BUF: i64 = 0xBEE100    // 8 entries × 8B = 64 bytes (eviction history)
 const RECENT_TOK_HEAD: i64 = 0xBEE140   // 8 bytes (circular write position)
