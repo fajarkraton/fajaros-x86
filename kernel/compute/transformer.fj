@@ -389,13 +389,14 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 // gate_buf/up_buf: pre-allocated ffn_dim buffers (frame-allocated)
 
 @kernel fn tfm_ffn_gated(x_addr: i64, gate_w_addr: i64, up_w_addr: i64, down_w_addr: i64,
-                          d_model: i64, ffn_dim: i64, bits: i64, cb_addr: i64,
+                          d_model: i64, ffn_dim: i64, bits: i64,
+                          cb_gate: i64, cb_up: i64, cb_down: i64,
                           out_addr: i64, gate_buf: i64, up_buf: i64) {
     // Step 1: gate = gate_proj(x) → ffn_dim
-    km_vecmat_packed_raw(x_addr, gate_w_addr, d_model, ffn_dim, bits, cb_addr, gate_buf)
+    km_vecmat_packed_raw(x_addr, gate_w_addr, d_model, ffn_dim, bits, cb_gate, gate_buf)
 
     // Step 2: up = up_proj(x) → ffn_dim
-    km_vecmat_packed_raw(x_addr, up_w_addr, d_model, ffn_dim, bits, cb_addr, up_buf)
+    km_vecmat_packed_raw(x_addr, up_w_addr, d_model, ffn_dim, bits, cb_up, up_buf)
 
     // Step 3: gate = GELU(gate)
     km_gelu_tanh(gate_buf, ffn_dim)
@@ -404,7 +405,7 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
     km_mul_raw(gate_buf, up_buf, ffn_dim)
 
     // Step 5: out = down_proj(gate) → d_model
-    km_vecmat_packed_raw(gate_buf, down_w_addr, ffn_dim, d_model, bits, cb_addr, out_addr)
+    km_vecmat_packed_raw(gate_buf, down_w_addr, ffn_dim, d_model, bits, cb_down, out_addr)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -666,7 +667,8 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
         let up_buf = TFM_SCRATCH + 8192 + ffn_dim * 8
         let out_buf = km_data_ptr(TFM_FFN_OUT)
         tfm_ffn_gated(x_data, gate_w, up_w, down_w,
-                       d_model, ffn_dim, quant_bits, cb_addr,
+                       d_model, ffn_dim, quant_bits,
+                       cb_addr, cb_addr, cb_addr,
                        out_buf, gate_buf, up_buf)
     } else {
         // Standard 2-matrix FFN: out = W2(GELU(W1(x)))
@@ -1294,31 +1296,53 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
         cb_addr = mdl_stream_codebook_addr()
     }
 
-    // Copy per-layer codebook to MDL_CODEBOOK_BASE
-    let cb_size = (1 << bits) * 8
-    mdl_memcpy(MDL_CODEBOOK_BASE, cb_addr, cb_size)
+    // Per-matrix codebook addresses (v4: 7 per layer, v3: all same)
+    let mut cb_q: i64 = cb_addr
+    let mut cb_k: i64 = cb_addr
+    let mut cb_v: i64 = cb_addr
+    let mut cb_o: i64 = cb_addr
+    let mut cb_gate: i64 = cb_addr
+    let mut cb_up: i64 = cb_addr
+    let mut cb_down: i64 = cb_addr
+    if ram_mode == 1 {
+        cb_q = mdl_ram_layer_codebook_n(layer, 0)
+        cb_k = mdl_ram_layer_codebook_n(layer, 1)
+        cb_v = mdl_ram_layer_codebook_n(layer, 2)
+        cb_o = mdl_ram_layer_codebook_n(layer, 3)
+        cb_gate = mdl_ram_layer_codebook_n(layer, 4)
+        cb_up = mdl_ram_layer_codebook_n(layer, 5)
+        cb_down = mdl_ram_layer_codebook_n(layer, 6)
+    } else {
+        cb_q = mdl_stream_codebook_n(0)
+        cb_k = mdl_stream_codebook_n(1)
+        cb_v = mdl_stream_codebook_n(2)
+        cb_o = mdl_stream_codebook_n(3)
+        cb_gate = mdl_stream_codebook_n(4)
+        cb_up = mdl_stream_codebook_n(5)
+        cb_down = mdl_stream_codebook_n(6)
+    }
 
     // === Pre-attention RMSNorm ===
     mdl_memcpy(STFM_RES, x_addr, d_model * 8)
     km_rmsnorm(x_addr, d_model, norm_addr)
 
-    // === QKV Projections → km_large slots (Q=1024, K/V=256 — fit) ===
+    // === QKV Projections with per-matrix codebooks ===
     let q_out = km_data_ptr(TFM_Q)
-    km_vecmat_packed_raw(x_addr, qkv_addr, d_model, q_dim, bits, cb_addr, q_out)
+    km_vecmat_packed_raw(x_addr, qkv_addr, d_model, q_dim, bits, cb_q, q_out)
     let q_base = km_large_addr(TFM_Q)
     volatile_write_u64(q_base + KM_HDR_ROWS, 1)
     volatile_write_u64(q_base + KM_HDR_COLS, q_dim)
 
     let k_off = mdl_stream_q_size()
     let k_out = km_data_ptr(TFM_K)
-    km_vecmat_packed_raw(x_addr, qkv_addr + k_off, d_model, kv_d, bits, cb_addr, k_out)
+    km_vecmat_packed_raw(x_addr, qkv_addr + k_off, d_model, kv_d, bits, cb_k, k_out)
     let k_base = km_large_addr(TFM_K)
     volatile_write_u64(k_base + KM_HDR_ROWS, 1)
     volatile_write_u64(k_base + KM_HDR_COLS, kv_d)
 
     let v_off = k_off + mdl_stream_kv_size()
     let v_out = km_data_ptr(TFM_V)
-    km_vecmat_packed_raw(x_addr, qkv_addr + v_off, d_model, kv_d, bits, cb_addr, v_out)
+    km_vecmat_packed_raw(x_addr, qkv_addr + v_off, d_model, kv_d, bits, cb_v, v_out)
     let v_base = km_large_addr(TFM_V)
     volatile_write_u64(v_base + KM_HDR_ROWS, 1)
     volatile_write_u64(v_base + KM_HDR_COLS, kv_d)
@@ -1326,15 +1350,14 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     // === RoPE ===
     tfm_rope_apply(q_out, k_out, pos, n_heads, n_kv, d_head)
 
-    // === Attention → ATTN slot (q_dim=1024, fits km_large) ===
+    // === Attention → ATTN slot ===
     let window = tfm_attn_window(layer)
     tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, window, TFM_ATTN)
 
-    // === O Projection: ATTN (q_dim=1024) → d_model (1152) ===
+    // === O Projection with O codebook ===
     let o_addr = mdl_stream_o_addr()
     let attn_data = km_data_ptr(TFM_ATTN)
-    km_vecmat_packed_raw(attn_data, o_addr, q_dim, d_model, bits, cb_addr, STFM_FFN_OUT)
-    // Note: reusing STFM_FFN_OUT temporarily for O projection output
+    km_vecmat_packed_raw(attn_data, o_addr, q_dim, d_model, bits, cb_o, STFM_FFN_OUT)
 
     // === Residual + Projected Attention ===
     mdl_memcpy(x_addr, STFM_RES, d_model * 8)
@@ -1345,11 +1368,12 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let ln2_gamma = norm_addr + d_model * 8
     km_rmsnorm(x_addr, d_model, ln2_gamma)
 
-    // === Gated FFN (gate_buf/up_buf in high memory — fits 6912 dims) ===
+    // === Gated FFN with per-matrix codebooks (gate=4, up=5, down=6) ===
     let ffn_dim = mdl_get_ffn_dim()
     let mat_size = d_model * ffn_dim * bits / 8
     tfm_ffn_gated(x_addr, ffn_addr, ffn_addr + mat_size, ffn_addr + mat_size * 2,
-                   d_model, ffn_dim, bits, cb_addr,
+                   d_model, ffn_dim, bits,
+                   cb_gate, cb_up, cb_down,
                    STFM_FFN_OUT, STFM_FFN_GATE, STFM_FFN_UP)
 
     // === Residual + FFN ===

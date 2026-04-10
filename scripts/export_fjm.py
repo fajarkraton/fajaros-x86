@@ -116,10 +116,11 @@ def build_v3_header(model_type, n_layers, d_model, n_heads, d_head, vocab_size,
                      n_kv_heads=0, ffn_type=0, norm_type=0, ffn_dim=0,
                      rope_theta=0, eos_token=2, final_norm_off=0,
                      embed_cb=None, lmhead_cb=None):
-    """Build 160-byte v3 header with embedded codebooks."""
+    """Build 160-byte v3/v4 header with embedded codebooks.
+    v4: per-matrix codebooks (7 per layer instead of 1 shared)."""
     # Bytes 0-75: standard v2 fields (19 × u32 = 76 bytes)
     header = struct.pack("<19I",
-        FJM_MAGIC, 3,  # magic + version=3
+        FJM_MAGIC, 4,  # magic + version=4 (per-matrix codebooks)
         model_type, n_layers, d_model, n_heads, d_head,
         vocab_size, bits, total_size, embed_off, layer0_off, lmhead_off,
         n_kv_heads, ffn_type, norm_type, ffn_dim,
@@ -217,18 +218,12 @@ def export_gemma3(model_name, bits):
             down_w = layer.mlp.down_proj.weight.detach().numpy().T
             up_w = None
 
-        # Shared codebook: concatenate all weight matrices for this layer
-        all_weights = [q_w.flatten(), k_w.flatten(), v_w.flatten(), o_w.flatten(), gate_w.flatten(), down_w.flatten()]
-        if up_w is not None:
-            all_weights.append(up_w.flatten())
-        all_concat = np.concatenate(all_weights)
-        _, shared_cb = lloyd_max_quantize(all_concat, bits)
-
-        # Quantize each matrix with the shared codebook
-        q_idx = quantize_with_codebook(q_w, shared_cb, bits)
-        k_idx = quantize_with_codebook(k_w, shared_cb, bits)
-        v_idx = quantize_with_codebook(v_w, shared_cb, bits)
-        o_idx = quantize_with_codebook(o_w, shared_cb, bits)
+        # Per-matrix codebooks (v4): each matrix gets its own Lloyd-Max codebook
+        # Order: Q=0, K=1, V=2, O=3, gate=4, up=5, down=6
+        q_idx, q_cb = lloyd_max_quantize(q_w, bits)
+        k_idx, k_cb = lloyd_max_quantize(k_w, bits)
+        v_idx, v_cb = lloyd_max_quantize(v_w, bits)
+        o_idx, o_cb = lloyd_max_quantize(o_w, bits)
         q_packed = pack_quantized(q_idx, bits)
         k_packed = pack_quantized(k_idx, bits)
         v_packed = pack_quantized(v_idx, bits)
@@ -236,15 +231,16 @@ def export_gemma3(model_name, bits):
         qkv_packed = q_packed + k_packed + v_packed + o_packed
 
         if is_gated:
-            gate_idx = quantize_with_codebook(gate_w, shared_cb, bits)
-            up_idx = quantize_with_codebook(up_w, shared_cb, bits)
-            down_idx = quantize_with_codebook(down_w, shared_cb, bits)
+            gate_idx, gate_cb = lloyd_max_quantize(gate_w, bits)
+            up_idx, up_cb = lloyd_max_quantize(up_w, bits)
+            down_idx, down_cb = lloyd_max_quantize(down_w, bits)
             ffn_packed = (pack_quantized(gate_idx, bits) +
                           pack_quantized(up_idx, bits) +
                           pack_quantized(down_idx, bits))
         else:
-            gate_idx = quantize_with_codebook(gate_w, shared_cb, bits)
-            down_idx = quantize_with_codebook(down_w, shared_cb, bits)
+            gate_idx, gate_cb = lloyd_max_quantize(gate_w, bits)
+            down_idx, down_cb = lloyd_max_quantize(down_w, bits)
+            up_cb = gate_cb  # placeholder — not used
             ffn_packed = (pack_quantized(gate_idx, bits) +
                           pack_quantized(down_idx, bits))
 
@@ -256,15 +252,18 @@ def export_gemma3(model_name, bits):
             for v in arr:
                 norm_data += struct.pack("<q", int(v * 1000))
 
-        # Shared codebook for this layer
-        cb_data = serialize_codebook(shared_cb)
+        # Per-matrix codebooks: Q, K, V, O, gate, up, down (7 × 32B = 224B)
+        cb_data = (serialize_codebook(q_cb) + serialize_codebook(k_cb) +
+                   serialize_codebook(v_cb) + serialize_codebook(o_cb) +
+                   serialize_codebook(gate_cb) + serialize_codebook(up_cb) +
+                   serialize_codebook(down_cb))
 
         weight_data = qkv_packed + ffn_packed + norm_data + cb_data
         layer_hdr = struct.pack("<iiii",
             i, FJM_LAYER_HDR_SIZE + len(weight_data),
             len(qkv_packed), len(ffn_packed))
         layer_blocks.append(layer_hdr + weight_data)
-        print(f"  Layer {i}: Q={len(q_packed)} K={len(k_packed)} V={len(v_packed)} O={len(o_packed)} FFN={len(ffn_packed)} cb=shared")
+        print(f"  Layer {i}: Q={len(q_packed)} K={len(k_packed)} V={len(v_packed)} O={len(o_packed)} FFN={len(ffn_packed)} cb=per-matrix(7)")
 
     # === Final RMSNorm (model.norm — applied AFTER last layer, BEFORE lm_head) ===
     final_norm_w = model.model.norm.weight.detach().numpy().astype(np.float64)
@@ -330,27 +329,27 @@ def create_test_model(bits=2):
         up_w = rng.randn(d_model, ffn_dim).astype(np.float32)
         down_w = rng.randn(ffn_dim, d_model).astype(np.float32)
 
-        # Shared codebook from all weights
-        all_concat = np.concatenate([w.flatten() for w in [q_w, k_w, v_w, o_w, gate_w, up_w, down_w]])
-        _, shared_cb = lloyd_max_quantize(all_concat, bits)
-
-        q_idx = quantize_with_codebook(q_w, shared_cb, bits)
-        k_idx = quantize_with_codebook(k_w, shared_cb, bits)
-        v_idx = quantize_with_codebook(v_w, shared_cb, bits)
-        o_idx = quantize_with_codebook(o_w, shared_cb, bits)
+        # Per-matrix codebooks (v4)
+        q_idx, q_cb = lloyd_max_quantize(q_w, bits)
+        k_idx, k_cb = lloyd_max_quantize(k_w, bits)
+        v_idx, v_cb = lloyd_max_quantize(v_w, bits)
+        o_idx, o_cb = lloyd_max_quantize(o_w, bits)
         qkv_packed = (pack_quantized(q_idx, bits) + pack_quantized(k_idx, bits) +
                       pack_quantized(v_idx, bits) + pack_quantized(o_idx, bits))
 
-        gate_idx = quantize_with_codebook(gate_w, shared_cb, bits)
-        up_idx = quantize_with_codebook(up_w, shared_cb, bits)
-        down_idx = quantize_with_codebook(down_w, shared_cb, bits)
+        gate_idx, gate_cb = lloyd_max_quantize(gate_w, bits)
+        up_idx, up_cb = lloyd_max_quantize(up_w, bits)
+        down_idx, down_cb = lloyd_max_quantize(down_w, bits)
         ffn_packed = (pack_quantized(gate_idx, bits) + pack_quantized(up_idx, bits) +
                       pack_quantized(down_idx, bits))
 
         norm_data = b""
         for _ in range(2 * d_model):
             norm_data += struct.pack("<q", 0)  # gamma=0 → identity (1+0=1)
-        cb_data = serialize_codebook(shared_cb)
+        cb_data = (serialize_codebook(q_cb) + serialize_codebook(k_cb) +
+                   serialize_codebook(v_cb) + serialize_codebook(o_cb) +
+                   serialize_codebook(gate_cb) + serialize_codebook(up_cb) +
+                   serialize_codebook(down_cb))
 
         weight_data = qkv_packed + ffn_packed + norm_data + cb_data
         layer_hdr = struct.pack("<iiii",

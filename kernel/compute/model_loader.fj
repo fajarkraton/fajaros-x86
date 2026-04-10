@@ -152,9 +152,9 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         return -1  // Bad magic
     }
 
-    // Check version (support v1, v2, v3)
+    // Check version (support v1, v2, v3, v4)
     let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
-    if version < 1 || version > 3 {
+    if version < 1 || version > 4 {
         return -2  // Unsupported version
     }
 
@@ -179,6 +179,7 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if quant_bits < 1 || quant_bits > 8 { return -3 }
 
     // Validate offsets don't exceed file size
+    // v3 and v4 share same 160-byte header layout
     let min_hdr = if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
     if total_size < min_hdr { return -3 }
     if embed_off >= total_size { return -3 }
@@ -1324,6 +1325,19 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     mdl_stream_norm_addr() + norm_size
 }
 
+// Per-matrix codebook address in streaming buffer (v4)
+@kernel fn mdl_stream_codebook_n(matrix_n: i64) -> i64 {
+    let base = mdl_stream_codebook_addr()
+    let version = mdl_get_version()
+    if version >= 4 {
+        let bits = mdl_get_quant_bits()
+        let cb_entry_size = (1 << bits) * 8
+        base + matrix_n * cb_entry_size
+    } else {
+        base
+    }
+}
+
 // Get currently loaded streaming layer (-1 = none)
 @kernel fn mdl_stream_current_layer() -> i64 {
     volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_LAYER)
@@ -1597,11 +1611,26 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     mdl_ram_layer_addr(layer_n) + mdl_stream_qkv_total() + mdl_stream_ffn_total()
 }
 
-// Get codebook address for RAM-resident layer
+// Get codebook base address for RAM-resident layer (first codebook)
 @kernel fn mdl_ram_layer_codebook(layer_n: i64) -> i64 {
     let d_model = mdl_get_d_model()
     let norm_size = 2 * d_model * 8
     mdl_ram_layer_norm(layer_n) + norm_size
+}
+
+// Get per-matrix codebook address for RAM-resident layer (v4: 7 codebooks per layer)
+// matrix_n: 0=Q, 1=K, 2=V, 3=O, 4=gate, 5=up, 6=down
+// For v3 (shared): returns same address regardless of matrix_n
+@kernel fn mdl_ram_layer_codebook_n(layer_n: i64, matrix_n: i64) -> i64 {
+    let base = mdl_ram_layer_codebook(layer_n)
+    let version = mdl_get_version()
+    if version >= 4 {
+        let bits = mdl_get_quant_bits()
+        let cb_entry_size = (1 << bits) * 8  // 32 bytes for 2-bit
+        base + matrix_n * cb_entry_size
+    } else {
+        base  // v3: shared codebook, ignore matrix_n
+    }
 }
 
 // RAM-resident LM head argmax (direct memory access, no NVMe)
