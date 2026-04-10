@@ -157,9 +157,9 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         return -1  // Bad magic
     }
 
-    // Check version (support v1, v2, v3, v4, v5)
+    // Check version (support v1, v2, v3, v4, v5, v6)
     let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
-    if version < 1 || version > 5 {
+    if version < 1 || version > 6 {
         return -2  // Unsupported version
     }
 
