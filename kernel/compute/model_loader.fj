@@ -255,6 +255,12 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_ROPE_THETA)
     if v > 0 { v * 1000 } else { 0 }  // stored as theta/1000, return full
 }
+@kernel fn mdl_get_bos_token() -> i64 {
+    let mt = mdl_get_model_type()
+    if mt == 10 { 2 }  // Gemma 3: BOS=2
+    else { 1 }         // SmolLM, LLaMA: BOS=1
+}
+
 @kernel fn mdl_get_eos_token() -> i64 {
     let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_EOS_TOKEN)
     if v > 0 { v } else { 2 }  // default EOS=2
@@ -1067,11 +1073,13 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 // ── Per-layer block size (computed from header offsets) ──
 // Exact for uniform-layer models: (lmhead_off - layer0_off) / n_layers
 @kernel fn mdl_layer_block_size() -> i64 {
-    let lmhead_off = mdl_get_lmhead_offset()
     let layer0_off = mdl_get_layer0_offset()
     let n_layers = mdl_get_n_layers()
     if n_layers <= 0 { return 0 }
-    (lmhead_off - layer0_off) / n_layers
+    // v3: final_norm sits between last layer and lmhead — exclude it
+    let final_norm_off = mdl_get_final_norm_offset()
+    let layers_end = if final_norm_off > 0 { final_norm_off } else { mdl_get_lmhead_offset() }
+    (layers_end - layer0_off) / n_layers
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1484,6 +1492,13 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     let total_size = mdl_get_total_size()
     let lmhead_size = total_size - lmhead_off
     let actual_lmhead_addr = RAM_LAYERS_BASE + total_layer_bytes
+
+    // Safety: validate all data fits within identity-mapped region (512 MB)
+    let end_addr = actual_lmhead_addr + lmhead_size
+    if end_addr > 0x20000000 {
+        cprintln("[ERR] Model too large for 512 MB identity mapping", RED_ON_BLACK)
+        return -8
+    }
 
     // Total to load: all layers + LM head
     let total_load = total_layer_bytes + lmhead_size

@@ -470,6 +470,10 @@ const KM_TILE_SIZE: i64 = 64
 // Works on raw memory address (for frame-allocated vectors with d > 1024).
 
 @kernel fn km_rmsnorm(data_addr: i64, dim: i64, gamma_addr: i64) {
+    // Safety: reject invalid dimensions or addresses
+    if dim <= 0 || dim > 4096 { return }
+    if data_addr <= 0 || data_addr > 0x20000000 { return }
+    if gamma_addr != 0 && gamma_addr > 0x20000000 { return }
     // Step 1: compute mean(x²) = sum(x²) / dim
     // Use chunked accumulation to prevent overflow:
     // sum += (x / dim) * (x / 1000) → gives sum(x²) / (dim * 1000)
@@ -557,6 +561,8 @@ const KM_TILE_SIZE: i64 = 64
 
 // Element-wise add: a[i] += b[i], both raw addresses
 @kernel fn km_add_raw(a_addr: i64, b_addr: i64, dim: i64) {
+    if dim <= 0 || dim > 8192 { return }
+    if a_addr <= 0 || b_addr <= 0 { return }
     let mut i: i64 = 0
     while i < dim {
         let a = volatile_read_u64(a_addr + i * 8)
@@ -568,6 +574,8 @@ const KM_TILE_SIZE: i64 = 64
 
 // Element-wise multiply: out[i] = a[i] * b[i] / 1000, all raw addresses
 @kernel fn km_mul_raw(a_addr: i64, b_addr: i64, dim: i64) {
+    if dim <= 0 || dim > 8192 { return }
+    if a_addr <= 0 || b_addr <= 0 { return }
     let mut i: i64 = 0
     while i < dim {
         let a = volatile_read_u64(a_addr + i * 8)
@@ -603,6 +611,34 @@ const KM_TILE_SIZE: i64 = 64
 // y[n] = x[m] @ dequant(W_packed[m×n])
 @kernel fn km_vecmat_packed_raw(x_addr: i64, packed_addr: i64, m: i64, n: i64,
                                  bits: i64, cb_addr: i64, out_addr: i64) {
+    // Safety: validate dimensions
+    if m <= 0 || n <= 0 || bits <= 0 || m > 8192 || n > 8192 { return }
+    // Safety: validate all addresses within identity-mapped region (512 MB)
+    // volatile_write ensures LLVM cannot optimize away these checks
+    let addr_limit: i64 = 0x20000000
+    if packed_addr <= 0 || packed_addr > addr_limit {
+        volatile_write_u64(0xBEF000, packed_addr)
+        return
+    }
+    if cb_addr <= 0 || cb_addr > addr_limit {
+        volatile_write_u64(0xBEF008, cb_addr)
+        return
+    }
+    if x_addr <= 0 || x_addr > addr_limit {
+        volatile_write_u64(0xBEF010, x_addr)
+        return
+    }
+    if out_addr <= 0 || out_addr > addr_limit {
+        volatile_write_u64(0xBEF018, out_addr)
+        return
+    }
+    // Validate max packed access stays in bounds
+    let max_flat = (m - 1) * n + (n - 1)
+    let max_byte = max_flat / (8 / bits)
+    if packed_addr + max_byte > addr_limit {
+        volatile_write_u64(0xBEF020, packed_addr + max_byte)
+        return
+    }
     let elems_per_byte = 8 / bits
     let mask = (1 << bits) - 1
     let mut j: i64 = 0

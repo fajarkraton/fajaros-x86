@@ -36,7 +36,7 @@ const PROC_OFF_TICKS: i64 = 160  // tick counter
 
 // Kernel stack area: one stack per process
 const KSTACK_BASE: i64 = 0x900000   // kernel stacks start at 9MB
-const KSTACK_SIZE: i64 = 0x4000     // 16KB per process kernel stack
+const KSTACK_SIZE: i64 = 0x10000    // 64KB per process kernel stack
 
 @kernel fn proc_v2_init() {
     let mut i: i64 = 0

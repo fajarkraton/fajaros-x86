@@ -34,7 +34,7 @@ const TFM_TMP: i64 = 9     // scratch slot
 // Memory areas
 const TFM_SCRATCH: i64 = 0xBE0000     // 32 KB for unpacked weights
 const TFM_STATE: i64 = 0xBE8000       // inference state
-const TFM_KV_BASE: i64 = 0xBE8040     // KV cache
+const TFM_KV_BASE: i64 = 0x4000000     // KV cache (64 MB — safe from model data at 0xC00000+)
 
 // State offsets
 const TFM_ST_POS: i64 = 0          // current sequence position
@@ -438,12 +438,16 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
 // Calculate KV cache address for a specific layer, position, type (0=key, 1=val)
 // Uses kv_dim (n_kv_heads * d_head) not d_model — saves memory for GQA
 @kernel fn tfm_kv_addr(layer: i64, pos: i64, kv_type: i64) -> i64 {
+    // Clamp pos to valid range to prevent out-of-bounds KV cache access
+    let safe_pos = if pos >= TFM_KV_MAX_POS { pos % TFM_KV_MAX_POS } else { pos }
+    let n_layers = mdl_get_n_layers()
+    let safe_layer = if layer >= n_layers { layer % n_layers } else { layer }
     let kv_d = tfm_kv_dim()
     // Stride: per position = 2 * kv_dim * 8 (key + value)
     let pos_stride = 2 * kv_d * 8
     // Stride: per layer = max_pos * pos_stride
     let layer_stride = TFM_KV_MAX_POS * pos_stride
-    TFM_KV_BASE + layer * layer_stride + pos * pos_stride + kv_type * kv_d * 8
+    TFM_KV_BASE + safe_layer * layer_stride + safe_pos * pos_stride + kv_type * kv_d * 8
 }
 
 // Store key/value vectors into KV cache from km_ slots
@@ -784,13 +788,12 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
 
 // Clear KV cache
 @kernel fn tfm_clear_kv() {
-    // Zero the KV cache area using 8-byte writes (8x faster than byte-by-byte)
+    // Zero the KV cache area using 8-byte writes
     // Uses kv_dim (not d_model) for GQA — much less memory to clear
     let kv_d = tfm_kv_dim()
     let n_layers = mdl_get_n_layers()
     let total = n_layers * TFM_KV_MAX_POS * 2 * kv_d * 8
-    let limit = if total > 131072 { 131072 } else { total }
-    let qwords = limit / 8
+    let qwords = total / 8
     let mut i: i64 = 0
     while i < qwords {
         volatile_write_u64(TFM_KV_BASE + i * 8, 0)
@@ -1405,9 +1408,9 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let eos = mdl_get_eos_token()
     let t_start = rdtsc()
 
-    // Phase 0: BOS token (Gemma 3 expects BOS=2 at start)
+    // Phase 0: BOS token (model-specific: SmolLM=1, Gemma=2)
     let mut pos: i64 = 0
-    tfm_forward_stream(2, pos)
+    tfm_forward_stream(mdl_get_bos_token(), pos)
     pos = 1
 
     // Phase 1: Prefill prompt tokens

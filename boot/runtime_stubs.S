@@ -549,8 +549,8 @@ __sched_exit:
     mov     cr3, rax
 
     /* Load kernel stack (top of PID 0's kernel stack area) */
-    /* KSTACK_BASE(0x900000) + (0+1)*KSTACK_SIZE(0x4000) = 0x904000 */
-    mov     rsp, 0x904000
+    /* KSTACK_BASE(0x900000) + (0+1)*KSTACK_SIZE(0x10000) = 0x910000 */
+    mov     rsp, 0x910000
 
     /* Print "\nnova> " directly via serial */
     mov     dx, 0x3F8
@@ -602,7 +602,7 @@ __sched_exit:
     /* Update TSS RSP0 = KSTACK_BASE + (pid+1)*KSTACK_SIZE */
     mov     rdx, rax
     inc     rdx
-    shl     rdx, 14                /* (pid+1) * 0x4000 */
+    shl     rdx, 16                /* (pid+1) * 0x10000 */
     add     rdx, 0x900000          /* KSTACK_BASE */
     mov     QWORD PTR [0xA52004], rdx
 
