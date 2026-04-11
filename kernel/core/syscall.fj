@@ -246,7 +246,10 @@ const USER_RSP_SAVE: i64 = 0x652010    // per-CPU saved user RSP
         return 0
     }
     if num == SYS_GETPID {
-        return 0 // TODO: return actual PID from scheduler
+        // V26 B1.0: read current PID from canonical location 0x6FE00
+        // (set by set_current_pid() builtin / sched switch path).
+        // Same pattern as kernel/auth/permissions.fj:29 and kernel/main.fj:500.
+        return volatile_read_u64(0x6FE00)
     }
     if num == SYS_YIELD {
         return 0
