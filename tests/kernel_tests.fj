@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 20
+const TEST_TOTAL: i64 = 21  // V26 B1.1.5 added test_proc_exit_stress
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -155,6 +155,47 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     let code = proc_v2_waitpid(0, pid)
     if code != 42 { return 0 }
     if proc_v2_get(pid, 0) == PROC_STATE_FREE { 1 } else { 0 }
+}
+
+// V26 B1.1.5: stress-test fork+exit×100 with frame leak detection.
+// Iteration: proc_v2_fork → proc_v2_exit → proc_v2_waitpid (reap → FREE).
+// Verifies that the free frame count returns to baseline ±5 after 100
+// cycles. Validates B1.1.1 (page table free) + B1.1.2 (kernel stack
+// frame free) + B1.1.3 (fd close) + B1.1.4 (wake parent) all working
+// in concert without leaking.
+//
+// Uses proc_v2_fork (which allocates 1 frame_alloc'd kernel stack
+// per child), NOT sys_fork (which uses pre-reserved KSTACK area
+// frames that don't appear in the leak counter).
+//
+// Tolerance ±5 is generous: a single iteration may transiently
+// allocate page tables for nested page-walk metadata that get reaped
+// across iterations. Strict ±0 would require ordering guarantees we
+// don't enforce.
+@kernel fn test_proc_exit_stress() -> i64 {
+    let baseline = frames_count_free()
+    let mut i: i64 = 0
+    let mut failures: i64 = 0
+    while i < 100 {
+        let child = proc_v2_fork(0)
+        if child < 0 {
+            // PID slot exhaustion — this means a previous iteration's
+            // waitpid failed to reap, which is itself a B1.1 regression.
+            failures = failures + 1
+            i = 100  // bail
+        } else {
+            proc_v2_exit(child, 0)
+            let code = proc_v2_waitpid(0, child)
+            if code != 0 {
+                failures = failures + 1
+            }
+            i = i + 1
+        }
+    }
+    let after = frames_count_free()
+    let leak = baseline - after
+    let leak_abs: i64 = if leak < 0 { 0 - leak } else { leak }
+    if failures == 0 && leak_abs <= 5 { 1 } else { 0 }
 }
 
 @kernel fn test_frame_contiguous() -> i64 {
@@ -414,6 +455,8 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     r = run_test(test_slab_alloc_free(), "slab_alloc_free", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_process_lifecycle(), "process_lifecycle", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_proc_exit_stress(), "proc_exit_stress", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_frame_contiguous(), "frame_contiguous", p, f)
     p = r / 0x100000000; f = r % 0x100000000
