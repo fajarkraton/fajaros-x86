@@ -105,11 +105,26 @@ const KSTACK_SIZE: i64 = 0x10000    // 64KB per process kernel stack
         // Clear CR3 to prevent double-free on second exit/cleanup pass.
         volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_CR3, 0)
     }
-    // TODO (B1.1.2-B1.1.6 follow-up): free kernel stack, close fd table,
-    // wake parent if blocked, mirror fix to kernel/core/sched.fj µkernel.
-    // The B1.1.3+B1.1.4 work is already done by process_exit_with_signal()
-    // in kernel/process/exit.fj for the SYS_EXIT path; this proc_v2_exit
-    // path is the kill-by-target-pid variant called from signals + scheduler.
+    // V26 B1.1.3: walk fd table, close all open files for the target pid.
+    // Mirrors the SYS_EXIT cleanup loop in kernel/process/exit.fj:16 but
+    // uses the target pid argument since proc_v2_exit is called from
+    // signals (signals.fj:30,44) + scheduler cleanup (scheduler.fj:55) +
+    // shell (services/shell/main.fj:247) + tests, not just self-exit.
+    let mut fd: i64 = 0
+    while fd < FD_MAX {
+        fd_v2_set(pid, fd, FD_CLOSED, 0)
+        fd = fd + 1
+    }
+    // V26 B1.1.4: wake parent if blocked in waitpid. Mirrors
+    // kernel/process/exit.fj:13. wake_waiting_parent walks PROC_OFF_PPID,
+    // checks parent's state, transitions BLOCKED → READY only if parent
+    // was waiting on this specific child or 'any child' (-1).
+    wake_waiting_parent(pid, code)
+    // TODO (B1.1.2 + B1.1.6 follow-up): free kernel stack mapping
+    // (tricky — sys_fork uses 16-page identity-mapped kstacks at fixed
+    // addresses, proc_v2_fork uses 1 frame_alloc'd frame); mirror full
+    // fix to kernel/core/sched.fj µkernel variant (requires moving cow.fj
+    // into MICRO_SOURCES first or writing a minimal page-walker locally).
 }
 
 @kernel fn proc_v2_waitpid(parent_pid: i64, child_pid: i64) -> i64 {
