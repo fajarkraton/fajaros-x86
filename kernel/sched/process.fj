@@ -113,6 +113,34 @@ const KSTACK_SIZE: i64 = 0x10000    // 64KB per process kernel stack
         // Clear CR3 to prevent double-free on second exit/cleanup pass.
         volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_CR3, 0)
     }
+    // V26 B1.1.2: free proc_v2_fork-allocated kernel stack frame.
+    // The main build has TWO fork variants with completely different
+    // kernel stack strategies:
+    //   1. sys_fork (kernel/process/fork.fj:8) — uses 16-page identity-
+    //      mapped kstacks at fixed KSTACK_BASE + pid × KSTACK_SIZE
+    //      addresses (lines 40-47 of fork.fj). These frames live in the
+    //      0x800000-0xC00000 kernel static region that frames_init
+    //      (kernel/mm/frames.fj:46-55) PRE-RESERVES at boot. They MUST
+    //      NOT be freed — they persist for reuse on the next sys_fork
+    //      into the same PID slot.
+    //   2. proc_v2_fork (line 72 above, post-B1.1.6 bug fix) — allocates
+    //      1 frame via frame_alloc() and stores its top in PROC_OFF_RSP.
+    //      frame_alloc returns post-3072 frames, OUTSIDE the kernel
+    //      static region.
+    // Distinguish by address: if PROC_OFF_RSP points into the sys_fork
+    // KSTACK reserved range, skip the free. Otherwise it came from
+    // proc_v2_fork — free the single frame.
+    let stack_top = volatile_read(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_RSP)
+    if stack_top > FRAME_SIZE {
+        let stack_phys = stack_top - FRAME_SIZE
+        // outside_sys_kstack: 1 if stack_phys is OUTSIDE the sys_fork
+        // KSTACK reserved area (proc_v2_fork frame, safe to free).
+        let outside_sys_kstack: i64 = if stack_phys >= KSTACK_BASE && stack_phys < KSTACK_BASE + PROC_MAX * KSTACK_SIZE { 0 } else { 1 }
+        if outside_sys_kstack == 1 && stack_phys < TOTAL_FRAMES * FRAME_SIZE {
+            frame_free(stack_phys)
+            volatile_write(PROC_TABLE + pid * PROC_ENTRY_SIZE + PROC_OFF_RSP, 0)
+        }
+    }
     // V26 B1.1.3: walk fd table, close all open files for the target pid.
     // Mirrors the SYS_EXIT cleanup loop in kernel/process/exit.fj:16 but
     // uses the target pid argument since proc_v2_exit is called from
