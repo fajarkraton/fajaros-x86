@@ -15,6 +15,16 @@ const PAGE_USER: i64 = 4
 const PAGE_HUGE: i64 = 128
 const PAGE_NX: i64 = -9223372036854775808  // Bit 63 = 0x8000000000000000 (i64 min = set bit 63)
 
+// V26 B4.1.3: kernel virtual address boundary for the U-bit assertion.
+// 0xC00000 = 12 MB matches the end of the kernel static region pre-reserved
+// by frames_init (kernel/mm/frames.fj:46-55) — any virt below this is
+// unambiguously kernel-only (low mem, .text, page tables, heap, process
+// table, RamFS, NVMe DMA, KSTACK, etc.). Mapping any of these with
+// PAGE_USER set would cause a #PF the next time the kernel fetches through
+// the page after B4.2 enables SMEP, so we must catch the bad caller HERE
+// (at map_page time) instead of later (at SMEP fault time).
+const KERNEL_VIRT_BOUNDARY: i64 = 0xC00000
+
 @kernel fn page_table_entry(table_base: i64, index: i64) -> i64 {
     volatile_read(table_base + index * 8)
 }
@@ -23,7 +33,32 @@ const PAGE_NX: i64 = -9223372036854775808  // Bit 63 = 0x8000000000000000 (i64 m
     volatile_write(table_base + index * 8, value)
 }
 
+// V26 B4.1.3: U-bit assertion for kernel addresses (SMEP prep).
+// Emits "B4U!\n" to COM1 (0x3F8) byte-by-byte if a caller tries to
+// map_page a sub-12-MB virtual address with PAGE_USER set. Does NOT
+// halt the kernel — pure diagnostic, zero boot risk. The grep target
+// is the literal string `B4U!` in serial output. After any kernel
+// development that touches map_page* call sites, run `make run-llvm`
+// and confirm `B4U!` does not appear in the boot log before enabling
+// B4.2 SMEP.
+//
+// Byte-by-byte serial write avoids the LLVM string-interleave hazard
+// documented in audit/B0_hotpath_matrix.md Class B sites.
+@kernel fn b4_assert_no_user_on_kernel_addr(virt: i64, flags: i64) {
+    if virt < KERNEL_VIRT_BOUNDARY {
+        if (flags & PAGE_USER) != 0 {
+            port_outb(0x3F8, 66)   // 'B'
+            port_outb(0x3F8, 52)   // '4'
+            port_outb(0x3F8, 85)   // 'U'
+            port_outb(0x3F8, 33)   // '!'
+            port_outb(0x3F8, 10)   // '\n'
+        }
+    }
+}
+
 @kernel fn map_page(virt: i64, phys: i64, flags: i64) {
+    // V26 B4.1.3: catch PAGE_USER on kernel addresses BEFORE SMEP enable.
+    b4_assert_no_user_on_kernel_addr(virt, flags)
     // Map a 4KB page: virt → phys with given flags
     // Walk PML4 → PDPT → PD → PT, allocating tables as needed
     let pml4_idx = (virt >> 39) & 0x1FF
@@ -84,6 +119,8 @@ const PAGE_NX: i64 = -9223372036854775808  // Bit 63 = 0x8000000000000000 (i64 m
 
 // map_page_in: same as map_page but into a specified PML4 (for per-process page tables)
 @kernel fn map_page_in(pml4_base: i64, virt: i64, phys: i64, flags: i64) {
+    // V26 B4.1.3: catch PAGE_USER on kernel addresses in per-process page tables too.
+    b4_assert_no_user_on_kernel_addr(virt, flags)
     let pml4_idx = (virt >> 39) & 0x1FF
     let pdpt_idx = (virt >> 30) & 0x1FF
     let pd_idx = (virt >> 21) & 0x1FF
