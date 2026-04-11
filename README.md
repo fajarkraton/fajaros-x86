@@ -1,12 +1,13 @@
 # FajarOS Nova -- x86_64 Operating System Written 100% in Fajar Lang
 
-[![Version](https://img.shields.io/badge/version-v3.0.0_Nusantara-blue)](https://github.com/fajarkraton/fajaros-x86)
-[![Files](https://img.shields.io/badge/modules-154_.fj_files-green)](https://github.com/fajarkraton/fajaros-x86)
-[![LOC](https://img.shields.io/badge/LOC-41%2C400+-orange)](https://github.com/fajarkraton/fajaros-x86)
-[![Compiler](https://img.shields.io/badge/compiler-Fajar_Lang_v23.0.0-blueviolet)](https://github.com/fajarkraton/fajar-lang)
-[![Shell](https://img.shields.io/badge/shell-105_commands_(90_auto--tested)-purple)](https://github.com/fajarkraton/fajaros-x86)
+[![Version](https://img.shields.io/badge/version-v3.0.0_Nusantara-blue)](https://github.com/fajarkraton/fajaros-x86/releases/tag/v3.0.0)
+[![Files](https://img.shields.io/badge/modules-163_.fj_files-green)](https://github.com/fajarkraton/fajaros-x86)
+[![LOC](https://img.shields.io/badge/LOC-47%2C821-orange)](https://github.com/fajarkraton/fajaros-x86)
+[![Compiler](https://img.shields.io/badge/compiler-Fajar_Lang_v26.1.0--phase--a-blueviolet)](https://github.com/fajarkraton/fajar-lang)
+[![Shell](https://img.shields.io/badge/shell-119_commands_(14_LLM)-purple)](https://github.com/fajarkraton/fajaros-x86)
+[![LLM E2E](https://img.shields.io/badge/LLM_E2E-SmolLM--135M_v5%2Fv6_in_kernel-success)](https://github.com/fajarkraton/fajaros-x86)
 [![Ring 3](https://img.shields.io/badge/Ring_3-user_mode_works-success)](https://github.com/fajarkraton/fajaros-x86)
-[![FajarQuant](https://img.shields.io/badge/FajarQuant-kernel_native-orange)](https://github.com/fajarkraton/fajaros-x86)
+[![FajarQuant](https://img.shields.io/badge/FajarQuant-Phase_1%2B2_kernel_native-orange)](https://github.com/fajarkraton/fajaros-x86)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 [![Made in](https://img.shields.io/badge/made_in-Indonesia-red)](https://primecore.id)
 
@@ -72,7 +73,7 @@ The key innovation is **compiler-enforced context safety**:
 git clone https://github.com/fajarkraton/fajaros-x86.git
 cd fajaros-x86
 
-# Build the kernel (concatenates 139 .fj files, compiles to ELF)
+# Build the kernel (concatenates 163 .fj files, compiles to ELF)
 make build
 
 # Boot in QEMU with serial console
@@ -82,14 +83,14 @@ make run
 ### Expected Boot Output
 
 ```
-[NOVA] FajarOS Nova v1.4.0 Zenith booted
-[NOVA] 36031 LOC | 240+ commands | Preemptive | 100% Fajar Lang
+[NOVA] FajarOS Nova v3.0.0 Nusantara booted (62 init stages)
+[NOVA] 47821 LOC | 119 commands (incl. 14 LLM) | Preemptive | 100% Fajar Lang
 [NOVA] Frame allocator: 32768 frames (128MB)
 [NOVA] RamFS: 64 entries, 832KB data
 [NOVA] Init system: 16 services registered
 [NOVA] SMP: 4 cores online
 ============================================
-  FajarOS Nova v1.4.0 -- x86_64 Shell
+  FajarOS Nova v3.0.0 -- x86_64 Shell
   Written 100% in Fajar Lang
 ============================================
 
@@ -232,7 +233,7 @@ isolation between layers at compile time -- a `@safe` application cannot call
 ## Module Structure
 
 ```
-fajaros-x86/                          139 .fj files, 36,028 LOC
+fajaros-x86/                          163 .fj files, 47,821 LOC
 |
 +-- kernel/                           Microkernel core
 |   +-- main.fj                       Entry point (kernel_main + shell loop)
@@ -408,12 +409,12 @@ fajaros-x86/                          139 .fj files, 36,028 LOC
 
 ## Build Process
 
-FajarOS uses a **concatenation build model**: all 139 modular `.fj` source files are
+FajarOS uses a **concatenation build model**: all 163 modular `.fj` source files are
 concatenated in dependency order into a single `build/combined.fj`, which the Fajar Lang
 compiler then compiles into a bare-metal ELF binary.
 
 ```
-139 .fj files (dependency-ordered)
+163 .fj files (dependency-ordered)
         |
         v
     make build
@@ -421,7 +422,7 @@ compiler then compiles into a bare-metal ELF binary.
   [concatenate in Makefile order]
         |
         v
-  build/combined.fj (~36,028 lines)
+  build/combined.fj (~47,821 lines)
         |
   [fj build --target x86_64-none]
         |
@@ -468,7 +469,7 @@ not a runtime crash.
 
 ```
 nova> uname -a
-FajarOS Nova v1.4.0 Zenith x86_64 SMP(4) 512MB
+FajarOS Nova v3.0.0 Nusantara x86_64 SMP(4) 512MB
 
 nova> cat /proc/cpuinfo
 cpu0: x86_64 @ 2.0 GHz (QEMU)
@@ -540,6 +541,6 @@ See [LICENSE](LICENSE) for details.
 
 ---
 
-*FajarOS Nova v1.4.0 "Zenith" -- 36,031 LOC | 126 modules | 240+ commands | 34 syscalls | 100% Fajar Lang*
+*FajarOS Nova v3.0.0 "Nusantara" -- 47,821 LOC | 163 modules | 119 commands (incl. 14 LLM) | 34 syscalls | LLM E2E (SmolLM-135M v5/v6 in kernel) | 100% Fajar Lang*
 *Compiler-enforced safety: if it compiles, it's safe to deploy.*
 *Built with [Fajar Lang](https://github.com/fajarkraton/fajar-lang) + Claude Opus 4.6*
