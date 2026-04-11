@@ -1,0 +1,6 @@
+kernel/sched/process.fj:96:    // TODO: signal parent, free resources
+kernel/core/sched.fj:96:    // TODO: signal parent, free resources
+kernel/core/syscall.fj:249:        return 0 // TODO: return actual PID from scheduler
+kernel/main.fj:107:    // TODO: Enable SMEP after verifying all kernel pages have U/S=0.
+drivers/serial.fj:79:    // TODO: iterate string bytes and call serial_send for each
+services/vfs/main.fj:316:        // Write "used:XXXX free:XXXX\n"

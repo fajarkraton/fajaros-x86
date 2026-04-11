@@ -1,0 +1,48 @@
+{
+  "audit_task": "V26 Phase B0.3",
+  "audit_date": "2026-04-11",
+  "repo_head": "6076610",
+  "repo_in_sync_with_origin": true,
+  "build": {
+    "command": "make build-llvm",
+    "exit_code": 0,
+    "duration_seconds": 10.149,
+    "output_path": "build/fajaros-llvm.elf",
+    "compiler": "fj (Fajar Lang) — release build at /home/primecore/Documents/Fajar Lang/target/release/fj",
+    "backend": "LLVM O2 native bare-metal",
+    "warnings": [
+      "1 undefined bare-metal runtime symbol (expected, provided by runtime_stubs.o)",
+      "ld: build/runtime_stubs.o missing .note.GNU-stack section (cosmetic)"
+    ]
+  },
+  "binary_size": {
+    "text_bytes": 1381103,
+    "data_bytes": 8,
+    "bss_bytes": 69640,
+    "total_bytes": 1450751,
+    "total_mib_approx": 1.38,
+    "match_handoff_claim": "1.38 MB",
+    "drift_from_handoff": "none"
+  },
+  "loc": {
+    "total_fj_files": 163,
+    "total_fj_lines": 47821,
+    "per_top_dir": {
+      "kernel": 24379,
+      "shell": 4241,
+      "drivers": 3811,
+      "fs": 2114,
+      "services": 13276
+    },
+    "match_handoff_claim": "47,821 LOC across 163 .fj files",
+    "drift_from_handoff": "none — exact match"
+  },
+  "boot_time_seconds": "TBC — boot test not run in C0 (deferred to B2.6 QEMU boot-stress CI)",
+  "fit_assessment": {
+    "binary_fits_typical_embedded_flash_4mb": true,
+    "headroom_for_growth": "4 MB - 1.38 MB = 2.62 MB (~190%)",
+    "next_growth_target_for_phase_b": "Phase D kernel-LLM Phase 3+ may add ~200 KB"
+  },
+  "verification_command": "make build-llvm && size build/fajaros-llvm.elf",
+  "rerun_command_full": "cd ~/Documents/fajaros-x86 && time make build-llvm 2>&1 | tail -10"
+}
