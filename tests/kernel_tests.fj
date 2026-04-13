@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 22  // V26 B2.2 added test_llm_pipeline_smoke
+const TEST_TOTAL: i64 = 23  // V26 B2.3 added test_o2_sentry_vecmat
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -425,6 +425,73 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 }
 
 // ═══════════════════════════════════════════════════════════════
+// LLVM O2 Sentry Tests (V26 B2.3)
+// Exercises known fragile hot paths that have historically produced
+// wild pointers or data corruption under LLVM O2. If codegen
+// regresses, these tests detect it before LLM inference breaks.
+// Source: audit/B0_hotpath_matrix.md (Class A sites #1, #2, #3)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn test_o2_sentry_vecmat() -> i64 {
+    // Class A site #1: km_vecmat_packed_raw with small known input.
+    // Historical bug: LLVM O2 produced wild pointers in nested loops.
+    // Sentry: call with 2x2 identity-like data, verify output non-garbage.
+
+    let scratch = TEST_SCRATCH + 0x4000
+
+    // x_addr: input vector [1.0, 1.0] as packed u64 (f64 bits)
+    let x_addr = scratch
+    volatile_write_u64(x_addr, 0x3FF0000000000000)      // 1.0
+    volatile_write_u64(x_addr + 8, 0x3FF0000000000000)   // 1.0
+
+    // packed_addr: identity matrix as 4-bit packed (m=2, n=2)
+    // For bits=4, each element = 4 bits. Index 1 = "1.0" in codebook.
+    // Pack: [1,0, 0,1] → byte 0 = 0x10, byte 1 = 0x01
+    let packed_addr = scratch + 256
+    volatile_write_u8(packed_addr, 0x10)      // row 0: [1, 0]
+    volatile_write_u8(packed_addr + 1, 0x01)  // row 1: [0, 1]
+
+    // cb_addr: codebook with 16 entries, [0]=0.0, [1]=1.0
+    let cb_addr = scratch + 512
+    volatile_write_u64(cb_addr, 0)                       // entry 0 = 0.0
+    volatile_write_u64(cb_addr + 8, 0x3FF0000000000000)  // entry 1 = 1.0
+    // entries 2-15 = 0.0 (already zeroed)
+
+    // out_addr: output vector
+    let out_addr = scratch + 1024
+    volatile_write_u64(out_addr, 0xDEADBEEF)     // sentinel
+    volatile_write_u64(out_addr + 8, 0xDEADBEEF) // sentinel
+
+    // Call the fragile function
+    km_vecmat_packed_raw(x_addr, packed_addr, 2, 2, 4, cb_addr, out_addr)
+
+    // Verify output is reasonable (not wild pointer garbage)
+    // Expected: identity * [1,1] = [1,1], so out[0] ≈ 1.0, out[1] ≈ 1.0
+    let out0 = volatile_read_u64(out_addr)
+    let out1 = volatile_read_u64(out_addr + 8)
+
+    // If output is still sentinel (0xDEADBEEF) → function didn't write
+    // If output is 0xFFFFFFFF... → wild pointer corruption
+    // Accept any non-sentinel, non-corrupt value as PASS
+    if out0 == 0xDEADBEEF && out1 == 0xDEADBEEF {
+        serial_print_str("  o2_sentry: vecmat produced no output")
+        serial_putchar(10)
+        return 0
+    }
+
+    // Sanity: output should be valid f64 (not NaN/Inf from corruption)
+    // Check that the high bits aren't all 1s (NaN) or 0x7FF (Inf)
+    let exp0 = (out0 / 0x10000000000000) % 0x800
+    if exp0 == 0x7FF {
+        serial_print_str("  o2_sentry: vecmat output is NaN/Inf (corruption)")
+        serial_putchar(10)
+        return 0
+    }
+
+    1
+}
+
+// ═══════════════════════════════════════════════════════════════
 // LLM Pipeline Smoke Test (V26 B2.2)
 // Validates tokenizer, model loader state, tensor pool — no weights needed.
 // ═══════════════════════════════════════════════════════════════
@@ -545,6 +612,11 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     r = run_test(test_shell_history(), "shell_history", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_init_service_status(), "init_service_status", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("--- LLVM O2 Sentry ---", CYAN_ON_BLACK)
+    r = run_test(test_o2_sentry_vecmat(), "o2_sentry_vecmat", p, f)
     p = r / 0x100000000; f = r % 0x100000000
 
     console_putchar(10, WHITE_ON_BLACK)
