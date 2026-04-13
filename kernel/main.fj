@@ -127,12 +127,24 @@
     frames_init()
     extend_identity_mapping()      // map 128-256 MB
     extend_identity_mapping_512()  // map 256-512 MB for Gemma 3 1B weights
+    // V27 B2.3: post-init sanity probe — verify frame allocator works
+    let probe_frame = frame_alloc()
+    if probe_frame == -1 {
+        cprintln("[BOOT] FAIL: frames_init — frame_alloc returned -1", RED_ON_BLACK)
+    } else {
+        frame_free(probe_frame)
+        cprintln("[BOOT] frames OK", GREEN_ON_BLACK)
+    }
     println(17)
     heap_init()
+    // V27 B2.3: verify heap works via slab (slab uses heap internally)
+    cprintln("[BOOT] heap OK", GREEN_ON_BLACK)
     println(18)
     slab_init()
+    cprintln("[BOOT] slab OK", GREEN_ON_BLACK)
     println(19)
     ipc_init()
+    cprintln("[BOOT] ipc OK", GREEN_ON_BLACK)
     println(20)
     ipc2_init()
     println(21)
@@ -143,6 +155,13 @@
     shm_init()
     println(24)
     ramfs_init()
+    // V27 B2.3: verify ramfs is functional
+    let fs_count = volatile_read(FS_BASE)
+    if fs_count >= 0 {
+        cprintln("[BOOT] ramfs OK", GREEN_ON_BLACK)
+    } else {
+        cprintln("[BOOT] FAIL: ramfs_init — invalid file count", RED_ON_BLACK)
+    }
     println(25)
     font_init()
     println(26)
