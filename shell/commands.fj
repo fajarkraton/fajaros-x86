@@ -2567,22 +2567,7 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     console_putchar(10, WHITE_ON_BLACK)
 }
 
-@kernel fn cmd_yes_arg() {
-    // Handle "yes <text>" — repeat text 20 times
-    let len = cmdbuf_len()
-    if len <= 4 {
-        let mut i: i64 = 0
-        while i < 20 { cprintln("y", WHITE_ON_BLACK); i = i + 1 }
-        return
-    }
-    let mut r: i64 = 0
-    while r < 20 {
-        let mut i: i64 = 4
-        while i < len { console_putchar(volatile_read_u8(0x6F800 + i), WHITE_ON_BLACK); i = i + 1 }
-        console_putchar(10, WHITE_ON_BLACK)
-        r = r + 1
-    }
-}
+// V27 B3.4: cmd_yes_arg removed (dead code — existing `yes` handles arguments)
 
 @kernel fn cmd_repeat() {
     // repeat <n> <text> — repeat text n times
@@ -3115,6 +3100,8 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len >= 4 && buf_eq4(101, 99, 104, 111) == 1 && (len == 4 || volatile_read_u8(0x6F804) == 32) { cmd_echo(); handled = 1 }
     // touch (116,111,117,99,104) — "touch <file>" (not "touch-ipc")
     if handled == 0 && len >= 5 && buf_eq4(116, 111, 117, 99) == 1 && volatile_read_u8(0x6F804) == 104 && (len == 5 || volatile_read_u8(0x6F805) == 32) { cmd_touch(); handled = 1 }
+    // type <cmd> — V27 B3.4: wire previously dead cmd_type() (116,121,112,101)
+    if handled == 0 && len >= 5 && volatile_read_u8(0x6F800) == 116 && volatile_read_u8(0x6F801) == 121 && volatile_read_u8(0x6F802) == 112 && volatile_read_u8(0x6F803) == 101 && volatile_read_u8(0x6F804) == 32 { cmd_type(); handled = 1 }
     // rm (114,109) — "rm <file>"
     if handled == 0 && len >= 2 && volatile_read_u8(0x6F800) == 114 && volatile_read_u8(0x6F801) == 109 && (len == 2 || volatile_read_u8(0x6F802) == 32) { cmd_rm(); handled = 1 }
     // mkdir (109,107,100,105,114) — "mkdir <dir>"

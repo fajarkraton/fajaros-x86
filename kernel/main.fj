@@ -97,6 +97,10 @@
             }
         }
     }
+    // V27 B3.1: warn if critical Multiboot2 tags not found
+    if volatile_read(0x6FF20) == 0 {
+        cprintln("[WARN] No ACPI RSDP in Multiboot2 tags", YELLOW_ON_BLACK)
+    }
 
     // V26 B4.2: Enable SMEP (Supervisor Mode Execution Prevention).
     // B4.1.3 added a compile-time U-bit assertion in map_page() that rejects

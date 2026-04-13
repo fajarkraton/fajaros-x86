@@ -38,7 +38,11 @@ const FEAT_RDRAND: i64 = 8       // bit 3
 
 @kernel fn security_enable_smep() {
     let features = security_check_cpu_features()
-    if (features & FEAT_SMEP) == 0 { return }
+    if (features & FEAT_SMEP) == 0 {
+        // V27 B3.2: warn instead of silent no-op
+        cprintln("[SEC] SMEP not supported by CPU", YELLOW_ON_BLACK)
+        return
+    }
     let cr4 = read_cr4()
     if (cr4 & CR4_SMEP) != 0 { return }  // Already enabled
     write_cr4(cr4 | CR4_SMEP)
@@ -46,7 +50,11 @@ const FEAT_RDRAND: i64 = 8       // bit 3
 
 @kernel fn security_enable_smap() {
     let features = security_check_cpu_features()
-    if (features & FEAT_SMAP) == 0 { return }
+    if (features & FEAT_SMAP) == 0 {
+        // V27 B3.2: warn instead of silent no-op
+        cprintln("[SEC] SMAP not supported by CPU", YELLOW_ON_BLACK)
+        return
+    }
     let cr4 = read_cr4()
     if (cr4 & CR4_SMAP) != 0 { return }  // Already enabled
     write_cr4(cr4 | CR4_SMAP)
@@ -56,6 +64,16 @@ const FEAT_RDRAND: i64 = 8       // bit 3
     security_enable_smep()
     security_enable_smap()
 }
+
+// ═══════════════════════════════════════════════════════════════
+// SMAP Contract (V27 B3.3):
+// Any kernel function that accesses user-space memory (addresses
+// >= USER_HEAP_BASE = 0x2800000) MUST be called within the
+// smap_disable()/smap_enable() bracket. Currently enforced at
+// syscall_dispatch() level (dispatch.fj:97-99). If new paths are
+// added (signal delivery, direct user copy), they MUST follow
+// the same pattern. Violations cause #PF under SMAP-enabled CPUs.
+// ═══════════════════════════════════════════════════════════════
 
 // V26 B4.4: SMAP disable/enable via CR4 toggle for user memory access.
 // Ideally we'd use STAC/CLAC (single-instruction AC flag set/clear),
