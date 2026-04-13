@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 21  // V26 B1.1.5 added test_proc_exit_stress
+const TEST_TOTAL: i64 = 22  // V26 B2.2 added test_llm_pipeline_smoke
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -425,6 +425,58 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 }
 
 // ═══════════════════════════════════════════════════════════════
+// LLM Pipeline Smoke Test (V26 B2.2)
+// Validates tokenizer, model loader state, tensor pool — no weights needed.
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn test_llm_pipeline_smoke() -> i64 {
+    let ok: i64 = 1
+
+    // 1. Model loader state: should be NOT loaded (no weights in test)
+    if mdl_is_loaded() != 0 {
+        serial_print_str("  llm: model should not be loaded in test")
+        serial_putchar(10)
+        return 0
+    }
+
+    // 2. Tokenizer: encode a short string, verify non-zero output
+    // Write "hello" to a scratch buffer
+    let text_buf: i64 = TEST_SCRATCH + 0x3000
+    volatile_write_u8(text_buf, 104)     // 'h'
+    volatile_write_u8(text_buf + 1, 101) // 'e'
+    volatile_write_u8(text_buf + 2, 108) // 'l'
+    volatile_write_u8(text_buf + 3, 108) // 'l'
+    volatile_write_u8(text_buf + 4, 111) // 'o'
+    let tok_out: i64 = TEST_SCRATCH + 0x3100
+    // tok_encode returns number of tokens (0 if tokenizer not loaded, which is OK)
+    let n_tok = tok_encode(text_buf, 5, tok_out)
+    // Accept either: tokens produced (tokenizer loaded) OR 0 (no tokenizer data)
+    // Both are valid states — we're testing the function doesn't crash
+    if n_tok < 0 {
+        serial_print_str("  llm: tok_encode returned negative (crash)")
+        serial_putchar(10)
+        return 0
+    }
+
+    // 3. Tensor pool: allocate and free a small tensor
+    let slot = tensor_alloc(1, 4)
+    if slot >= 0 {
+        // Write a value via tensor_set and read via tensor_get
+        tensor_set(slot, 0, 0, 0x4045000000000000)  // 42.0 in f64
+        let val = tensor_get(slot, 0, 0)
+        if val != 0x4045000000000000 {
+            serial_print_str("  llm: tensor read/write mismatch")
+            serial_putchar(10)
+            return 0
+        }
+        tensor_free(slot)
+    }
+    // slot == -1 means tensor pool not initialized — acceptable in minimal boot
+
+    ok
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Master Test Runner — cmd_test_all()
 // ═══════════════════════════════════════════════════════════════
 
@@ -493,6 +545,11 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     r = run_test(test_shell_history(), "shell_history", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_init_service_status(), "init_service_status", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("--- LLM Pipeline ---", CYAN_ON_BLACK)
+    r = run_test(test_llm_pipeline_smoke(), "llm_pipeline_smoke", p, f)
     p = r / 0x100000000; f = r % 0x100000000
 
     console_putchar(10, WHITE_ON_BLACK)
