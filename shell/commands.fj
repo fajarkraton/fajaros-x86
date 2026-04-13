@@ -1169,6 +1169,57 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     cprintln("removed", GREEN_ON_BLACK)
 }
 
+// V26 B3.4: df — display filesystem usage statistics
+@kernel fn cmd_df() {
+    cprintln("Filesystem      Files  Used       Free       Total      Use%", WHITE_ON_BLUE)
+
+    // RamFS stats
+    let file_count = volatile_read(FS_BASE)
+    let data_used = volatile_read(FS_BASE + 8) - FS_DATA
+    let data_total: i64 = 0x7E0000 - FS_DATA  // 896 KB
+    let data_free = data_total - data_used
+    let use_pct = if data_total > 0 { data_used * 100 / data_total } else { 0 }
+
+    cprint("ramfs           ", CYAN_ON_BLACK)
+    cprint_decimal(file_count, WHITE_ON_BLACK)
+    cprint("/", WHITE_ON_BLACK)
+    cprint_decimal(FS_MAX_FILES, WHITE_ON_BLACK)
+    cprint("  ", WHITE_ON_BLACK)
+
+    // Used (KB)
+    cprint_decimal(data_used / 1024, WHITE_ON_BLACK)
+    cprint(" KB    ", WHITE_ON_BLACK)
+
+    // Free (KB)
+    cprint_decimal(data_free / 1024, GREEN_ON_BLACK)
+    cprint(" KB    ", WHITE_ON_BLACK)
+
+    // Total (KB)
+    cprint_decimal(data_total / 1024, WHITE_ON_BLACK)
+    cprint(" KB    ", WHITE_ON_BLACK)
+
+    // Use%
+    cprint_decimal(use_pct, if use_pct > 80 { RED_ON_BLACK } else { GREEN_ON_BLACK })
+    cprintln("%", WHITE_ON_BLACK)
+
+    // Heap stats (frame allocator)
+    let free_frames = frames_count_free()
+    let total_frames: i64 = 32768  // 128 MB / 4KB = 32768 frames
+    let used_frames = total_frames - free_frames
+    let heap_pct = used_frames * 100 / total_frames
+
+    cprint("heap            ", CYAN_ON_BLACK)
+    cprint("  -    ", WHITE_ON_BLACK)
+    cprint_decimal(used_frames * 4, WHITE_ON_BLACK)
+    cprint(" KB    ", WHITE_ON_BLACK)
+    cprint_decimal(free_frames * 4, GREEN_ON_BLACK)
+    cprint(" KB    ", WHITE_ON_BLACK)
+    cprint_decimal(total_frames * 4, WHITE_ON_BLACK)
+    cprint(" KB    ", WHITE_ON_BLACK)
+    cprint_decimal(heap_pct, if heap_pct > 80 { RED_ON_BLACK } else { GREEN_ON_BLACK })
+    cprintln("%", WHITE_ON_BLACK)
+}
+
 @kernel fn cmd_mkdir() {
     // mkdir <dirname> — prefix "mkdir " = 6 chars
     let len = cmdbuf_len()
@@ -3056,6 +3107,8 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     // === File commands (ramfs) ===
     // ls (108,115)
     if handled == 0 && len == 2 && volatile_read_u8(0x6F800) == 108 && volatile_read_u8(0x6F801) == 115 { cmd_ls(); handled = 1 }
+    // df (100,102) len=2
+    if handled == 0 && len == 2 && volatile_read_u8(0x6F800) == 100 && volatile_read_u8(0x6F801) == 102 { cmd_df(); handled = 1 }
     // cat (99,97,116) — "cat <file>"
     if handled == 0 && len >= 3 && volatile_read_u8(0x6F800) == 99 && volatile_read_u8(0x6F801) == 97 && volatile_read_u8(0x6F802) == 116 && (len == 3 || volatile_read_u8(0x6F803) == 32) { cmd_cat(); handled = 1 }
     // echo (101,99,104,111) — "echo <text>"
