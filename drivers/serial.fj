@@ -73,9 +73,14 @@ fn serial_data_available(base: i64) -> bool {
     (port_inb(base + 5) & LSR_DATA_READY) != 0
 }
 
-// Send a string
+// Send a string over serial port, byte-by-byte
+// Uses str_len() + str_byte_at() compiler builtins for string iteration
 @kernel
 fn serial_send_str(base: i64, s: str) {
-    // TODO: iterate string bytes and call serial_send for each
-    // This needs string-to-bytes support from the compiler
+    let len = str_len(s)
+    let mut i: i64 = 0
+    while i < len {
+        serial_send(base, str_byte_at(s, i))
+        i = i + 1
+    }
 }
