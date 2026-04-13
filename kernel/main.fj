@@ -112,6 +112,9 @@
     // CPUID check inside handles CPUs without SMAP (graceful no-op).
     security_enable_smap()
 
+    // V26 B4.5: Enable NX enforcement on data pages + log ASLR range
+    nx_enforce_data_pages()
+
     println(13)
     // Stack guard page: SKIP — 2MB huge pages don't support 4KB unmap
     // unmap_page(0x7F0000 - 4096)  // guard page below stack bottom
