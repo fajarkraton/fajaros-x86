@@ -293,7 +293,9 @@ const USER_HEAP_BASE: i64 = 0x2800000
         let mut page = (old + FRAME_SIZE - 1) / FRAME_SIZE * FRAME_SIZE
         while page < new_brk {
             let frame = frame_alloc()
-            if frame != -1 { map_page(page, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) }
+            // V27 B2.1: return -1 (ENOMEM) on OOM instead of silently skipping
+            if frame == -1 { return -1 }
+            map_page(page, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
             page = page + FRAME_SIZE
         }
         volatile_write_u64(brk_addr, new_brk)
@@ -317,7 +319,9 @@ const USER_HEAP_BASE: i64 = 0x2800000
     let mut pg: i64 = 0
     while pg < pages {
         let frame = frame_alloc()
-        if frame != -1 { map_page(base + pg * FRAME_SIZE, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER) }
+        // V27 B2.1: return -1 (MAP_FAILED) on OOM
+        if frame == -1 { return -1 }
+        map_page(base + pg * FRAME_SIZE, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
         pg = pg + 1
     }
     base

@@ -89,10 +89,10 @@ const PH_OFF_MEMSZ: i64 = 40   // Size in memory (8 bytes)
             let mut page_count: i64 = 0
             while pg < end_pg {
                 let frame = frame_alloc()
-                if frame != -1 {
-                    map_page_in(pml4, pg, frame, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
-                    if page_count == 0 { first_phys = frame }
-                }
+                // V27 B2.1: return -5 (ENOMEM) on OOM during ELF load
+                if frame == -1 { return -5 }
+                map_page_in(pml4, pg, frame, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
+                if page_count == 0 { first_phys = frame }
                 pg = pg + FRAME_SIZE
                 page_count = page_count + 1
             }
@@ -147,9 +147,9 @@ const PH_OFF_MEMSZ: i64 = 40   // Size in memory (8 bytes)
             while pg < end_pg {
                 // Allocate frame and map
                 let frame = frame_alloc()
-                if frame != -1 {
-                    map_page(pg, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
-                }
+                // V27 B2.1: return -5 (ENOMEM) on OOM during ELF load
+                if frame == -1 { return -5 }
+                map_page(pg, frame * FRAME_SIZE, PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER)
                 pg = pg + FRAME_SIZE
             }
 
