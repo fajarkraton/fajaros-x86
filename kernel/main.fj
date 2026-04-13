@@ -105,6 +105,13 @@
     // CPUs that don't support SMEP (graceful no-op).
     security_enable_smep()
 
+    // V26 B4.4: Enable SMAP (Supervisor Mode Access Prevention).
+    // Prevents kernel from accidentally reading/writing user pages.
+    // FajarOS uses identity mapping, so syscall handlers that access
+    // user buffers must wrap access with smap_disable()/smap_enable().
+    // CPUID check inside handles CPUs without SMAP (graceful no-op).
+    security_enable_smap()
+
     println(13)
     // Stack guard page: SKIP — 2MB huge pages don't support 4KB unmap
     // unmap_page(0x7F0000 - 4096)  // guard page below stack bottom

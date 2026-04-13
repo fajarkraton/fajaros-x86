@@ -92,6 +92,15 @@ const USER_HEAP_BASE: i64 = 0x2800000
 
 // Main dispatcher — called from linker __syscall_entry via indirect call
 @kernel fn syscall_dispatch(num: i64, arg0: i64, arg1: i64, arg2: i64) -> i64 {
+    // V26 B4.4: disable SMAP for duration of syscall (user buffer access).
+    // Re-enabled before return. CR4 toggle until STAC/CLAC intrinsics available.
+    smap_disable()
+    let result = syscall_dispatch_inner(num, arg0, arg1, arg2)
+    smap_enable()
+    result
+}
+
+@kernel fn syscall_dispatch_inner(num: i64, arg0: i64, arg1: i64, arg2: i64) -> i64 {
     // Core (F1)
     if num == SYS_WRITE { return sys_write(arg0, arg1, arg2) }
     if num == SYS_READ { return sys_read(arg0, arg1, arg2) }

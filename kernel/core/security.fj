@@ -57,6 +57,29 @@ const FEAT_RDRAND: i64 = 8       // bit 3
     security_enable_smap()
 }
 
+// V26 B4.4: SMAP disable/enable via CR4 toggle for user memory access.
+// Ideally we'd use STAC/CLAC (single-instruction AC flag set/clear),
+// but Fajar Lang doesn't expose RFLAGS intrinsics yet. CR4 toggle is
+// slower but functionally equivalent for our identity-mapped kernel.
+// Usage: smap_disable(); ... access user buffer ...; smap_enable()
+// On CPUs without SMAP, these are no-ops (CR4.SMAP already 0).
+@kernel fn smap_disable() {
+    let cr4 = read_cr4()
+    if (cr4 & CR4_SMAP) != 0 {
+        write_cr4(cr4 & (0 - 1 - CR4_SMAP))
+    }
+}
+
+@kernel fn smap_enable() {
+    let features = security_check_cpu_features()
+    if (features & FEAT_SMAP) != 0 {
+        let cr4 = read_cr4()
+        if (cr4 & CR4_SMAP) == 0 {
+            write_cr4(cr4 | CR4_SMAP)
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // Stack Canary — detect stack smashing on context switch
 //
