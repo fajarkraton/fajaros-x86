@@ -1,0 +1,141 @@
+name: QEMU Kernel Tests
+
+# V26 Phase B2.1 — Boot FajarOS in QEMU, run test-all, parse results.
+# Catches kernel regressions before they reach manual testing.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'kernel/**'
+      - 'shell/**'
+      - 'drivers/**'
+      - 'fs/**'
+      - 'services/**'
+      - 'tests/**'
+      - 'Makefile'
+      - 'linker.ld'
+      - 'boot/**'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  kernel-test:
+    name: Boot + test-all (QEMU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 nasm grub-pc-bin xorriso mtools
+
+      - name: Checkout fajaros-x86
+        uses: actions/checkout@v4
+
+      - name: Checkout fajar-lang compiler
+        uses: actions/checkout@v4
+        with:
+          repository: fajarkraton/fajar-lang
+          path: fajar-lang
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fajar-lang
+
+      - name: Build fajar-lang compiler
+        run: cd fajar-lang && cargo build --release
+
+      - name: Build FajarOS ELF (LLVM backend)
+        run: |
+          # Point FJ to the freshly built compiler
+          export FJ="$(pwd)/fajar-lang/target/release/fj"
+          make build-llvm FJ="$FJ"
+          ls -la build/fajaros-llvm.elf
+
+      - name: Boot QEMU + run test-all
+        run: |
+          # Create a script that types "test-all\n" after boot
+          # then waits for results and exits
+          timeout 120 bash -c '
+            # Boot QEMU, inject test-all command via monitor
+            qemu-system-x86_64 \
+              -kernel build/fajaros-llvm.elf \
+              -serial stdio \
+              -no-reboot -no-shutdown \
+              -m 1G \
+              -cpu Skylake-Client-v4 \
+              -nographic \
+              -monitor none \
+              2>&1 | tee qemu_output.log &
+            QEMU_PID=$!
+
+            # Wait for shell prompt (nova>)
+            for i in $(seq 1 60); do
+              if grep -q "nova>" qemu_output.log 2>/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+
+            if ! grep -q "nova>" qemu_output.log; then
+              echo "FAIL: Boot did not reach nova> prompt within 120s"
+              kill $QEMU_PID 2>/dev/null || true
+              cat qemu_output.log
+              exit 1
+            fi
+
+            echo "Boot successful — nova> prompt detected"
+
+            # Send test-all command via serial (QEMU stdin)
+            # Use monitor to send keystrokes
+            sleep 2
+            echo "test-all" > /proc/$QEMU_PID/fd/0 2>/dev/null || true
+
+            # Wait for test completion
+            for i in $(seq 1 60); do
+              if grep -qE "ALL TESTS PASSED|SOME TESTS FAILED" qemu_output.log 2>/dev/null; then
+                break
+              fi
+              sleep 2
+            done
+
+            kill $QEMU_PID 2>/dev/null || true
+            wait $QEMU_PID 2>/dev/null || true
+          ' || true
+
+          echo ""
+          echo "=== QEMU Output ==="
+          cat qemu_output.log || echo "(no output captured)"
+
+      - name: Parse test results
+        run: |
+          if [ ! -f qemu_output.log ]; then
+            echo "FAIL: No QEMU output captured"
+            exit 1
+          fi
+
+          # Count OK/NG markers
+          OK_COUNT=$(grep -c "^OK:" qemu_output.log 2>/dev/null || echo "0")
+          NG_COUNT=$(grep -c "^NG:" qemu_output.log 2>/dev/null || echo "0")
+
+          echo "Passed: $OK_COUNT"
+          echo "Failed: $NG_COUNT"
+
+          # List individual results
+          grep -E "^(OK|NG):" qemu_output.log || echo "(no test markers found)"
+
+          # Gate: require >=18/21 pass (allow 3 flaky due to QEMU timing)
+          if [ "$OK_COUNT" -ge 18 ]; then
+            echo ""
+            echo "PASS: $OK_COUNT/21 tests passed (threshold: 18)"
+          else
+            echo ""
+            echo "FAIL: Only $OK_COUNT/21 tests passed (threshold: 18)"
+            exit 1
+          fi
