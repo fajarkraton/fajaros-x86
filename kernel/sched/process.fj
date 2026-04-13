@@ -156,11 +156,11 @@ const KSTACK_SIZE: i64 = 0x10000    // 64KB per process kernel stack
     // checks parent's state, transitions BLOCKED → READY only if parent
     // was waiting on this specific child or 'any child' (-1).
     wake_waiting_parent(pid, code)
-    // TODO (B1.1.2 + B1.1.6 follow-up): free kernel stack mapping
-    // (tricky — sys_fork uses 16-page identity-mapped kstacks at fixed
-    // addresses, proc_v2_fork uses 1 frame_alloc'd frame); mirror full
-    // fix to kernel/core/sched.fj µkernel variant (requires moving cow.fj
-    // into MICRO_SOURCES first or writing a minimal page-walker locally).
+    // P3: kernel stack PTE unmapping deferred — identity-mapped 2MB huge
+    // pages don't support 4KB-granularity unmap. The frame IS freed above
+    // (line 140), so there is no memory leak. The stale PTE is cosmetic:
+    // it points to a freed frame that will be reused by the next alloc.
+    // True fix requires 4KB page table split for the stack region — V28.
 }
 
 @kernel fn proc_v2_waitpid(parent_pid: i64, child_pid: i64) -> i64 {
