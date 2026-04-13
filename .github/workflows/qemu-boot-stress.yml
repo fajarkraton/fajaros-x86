@@ -1,0 +1,115 @@
+name: QEMU Boot Stress
+
+# V26 Phase B2.6 — Boot FajarOS 10x consecutive, assert each reaches nova>.
+# Catches non-deterministic boot regressions (memory init races, timing bugs).
+# Mirrors fajar-lang flake-stress pattern from V26 A1.4.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'kernel/**'
+      - 'boot/**'
+      - 'Makefile'
+      - 'linker.ld'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  boot-stress:
+    name: Boot x10 stress test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 nasm
+
+      - name: Checkout fajaros-x86
+        uses: actions/checkout@v4
+
+      - name: Checkout fajar-lang compiler
+        uses: actions/checkout@v4
+        with:
+          repository: fajarkraton/fajar-lang
+          path: fajar-lang
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fajar-lang
+
+      - name: Build fajar-lang compiler
+        run: cd fajar-lang && cargo build --release
+
+      - name: Build FajarOS ELF
+        run: |
+          export FJ="$(pwd)/fajar-lang/target/release/fj"
+          make build-llvm FJ="$FJ"
+          ls -la build/fajaros-llvm.elf
+
+      - name: Boot stress test (10 consecutive boots)
+        run: |
+          PASS=0
+          FAIL=0
+          TOTAL=10
+
+          for i in $(seq 1 $TOTAL); do
+            echo "--- Boot $i/$TOTAL ---"
+            BOOT_OK=0
+
+            # Boot QEMU with 30s timeout, look for nova> prompt
+            timeout 30 bash -c '
+              qemu-system-x86_64 \
+                -kernel build/fajaros-llvm.elf \
+                -serial stdio \
+                -no-reboot -no-shutdown \
+                -m 1G \
+                -cpu Skylake-Client-v4 \
+                -nographic \
+                -monitor none \
+                2>&1
+            ' > boot_${i}.log 2>&1 &
+            QEMU_PID=$!
+
+            # Wait for nova> prompt (max 30s)
+            for t in $(seq 1 15); do
+              if grep -q "nova>" boot_${i}.log 2>/dev/null; then
+                BOOT_OK=1
+                break
+              fi
+              sleep 2
+            done
+
+            # Kill QEMU
+            kill $QEMU_PID 2>/dev/null || true
+            wait $QEMU_PID 2>/dev/null || true
+
+            if [ "$BOOT_OK" = "1" ]; then
+              echo "  PASS: nova> reached"
+              PASS=$((PASS + 1))
+            else
+              echo "  FAIL: nova> not reached within 30s"
+              echo "  Last 10 lines:"
+              tail -10 boot_${i}.log 2>/dev/null || echo "  (no output)"
+              FAIL=$((FAIL + 1))
+            fi
+          done
+
+          echo ""
+          echo "=== Boot Stress Results ==="
+          echo "Passed: $PASS/$TOTAL"
+          echo "Failed: $FAIL/$TOTAL"
+
+          # Gate: all 10 must pass
+          if [ "$PASS" -eq "$TOTAL" ]; then
+            echo "PASS: $TOTAL/$TOTAL consecutive boots reached nova>"
+          else
+            echo "FAIL: Only $PASS/$TOTAL boots succeeded"
+            exit 1
+          fi
