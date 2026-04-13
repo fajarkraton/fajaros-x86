@@ -780,9 +780,84 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     cprint_decimal(pci_count, CYAN_ON_BLACK)
     cprintln(" devices", WHITE_ON_BLACK)
 
+    // Security features
+    cprint("Security: ", WHITE_ON_BLACK)
+    let cr4 = read_cr4()
+    if (cr4 & (1 << 20)) != 0 { cprint("SMEP ", GREEN_ON_BLACK) }
+    else { cprint("smep- ", YELLOW_ON_BLACK) }
+    if (cr4 & (1 << 21)) != 0 { cprint("SMAP ", GREEN_ON_BLACK) }
+    else { cprint("smap- ", YELLOW_ON_BLACK) }
+    let efer = read_msr(0xC0000080)
+    if (efer & (1 << 11)) != 0 { cprint("NX ", GREEN_ON_BLACK) }
+    console_putchar(10, WHITE_ON_BLACK)
+
     // Shell
     cprint("Shell:    ", WHITE_ON_BLACK)
     cprintln("100 commands", CYAN_ON_BLACK)
+}
+
+// V26 B4.3: detailed CPU feature detection
+@kernel fn cmd_cpufeatures() {
+    cprintln("=== CPU Feature Detection ===", WHITE_ON_BLUE)
+    let edx1 = cpuid_edx(1)
+    let ecx1 = cpuid_ecx(1)
+    let ebx7 = cpuid_ebx(7)
+    let cr4 = read_cr4()
+    let efer = read_msr(0xC0000080)
+
+    cprintln("Compute:", YELLOW_ON_BLACK)
+    cprint("  SSE:      ", WHITE_ON_BLACK)
+    if (edx1 & (1 << 25)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("  SSE2:     ", WHITE_ON_BLACK)
+    if (edx1 & (1 << 26)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("  AVX:      ", WHITE_ON_BLACK)
+    if (ecx1 & (1 << 28)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("  AVX2:     ", WHITE_ON_BLACK)
+    if (ebx7 & (1 << 5)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("  FMA:      ", WHITE_ON_BLACK)
+    if (ecx1 & (1 << 12)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("  POPCNT:   ", WHITE_ON_BLACK)
+    if (ecx1 & (1 << 23)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprintln("Security:", YELLOW_ON_BLACK)
+    cprint("  SMEP:     ", WHITE_ON_BLACK)
+    if (ebx7 & (1 << 7)) != 0 {
+        cprint("supported", CYAN_ON_BLACK)
+        if (cr4 & (1 << 20)) != 0 { cprintln(" [ACTIVE]", GREEN_ON_BLACK) }
+        else { cprintln(" [disabled]", YELLOW_ON_BLACK) }
+    } else { cprintln("not supported", RED_ON_BLACK) }
+    cprint("  SMAP:     ", WHITE_ON_BLACK)
+    if (ebx7 & (1 << 20)) != 0 {
+        cprint("supported", CYAN_ON_BLACK)
+        if (cr4 & (1 << 21)) != 0 { cprintln(" [ACTIVE]", GREEN_ON_BLACK) }
+        else { cprintln(" [disabled]", YELLOW_ON_BLACK) }
+    } else { cprintln("not supported", RED_ON_BLACK) }
+    cprint("  NX:       ", WHITE_ON_BLACK)
+    if (efer & (1 << 11)) != 0 { cprintln("ACTIVE", GREEN_ON_BLACK) }
+    else { cprintln("disabled", YELLOW_ON_BLACK) }
+    cprint("  AES-NI:   ", WHITE_ON_BLACK)
+    if (ecx1 & (1 << 25)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("  RDRAND:   ", WHITE_ON_BLACK)
+    if (ecx1 & (1 << 30)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+
+    cprintln("Platform:", YELLOW_ON_BLACK)
+    cprint("  APIC:     ", WHITE_ON_BLACK)
+    if (edx1 & (1 << 9)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("  x2APIC:   ", WHITE_ON_BLACK)
+    if (ecx1 & (1 << 21)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
+    cprint("  TSC:      ", WHITE_ON_BLACK)
+    if (edx1 & (1 << 4)) != 0 { cprintln("YES", GREEN_ON_BLACK) }
+    else { cprintln("no", RED_ON_BLACK) }
 }
 
 @kernel fn cmd_logo() {
@@ -2957,6 +3032,8 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 4 && buf_eq4(102, 114, 101, 101) == 1 { cmd_free(); handled = 1 }
     // sysinfo (115,121,115,105...)
     if handled == 0 && len == 7 && buf_eq4(115, 121, 115, 105) == 1 { cmd_sysinfo(); handled = 1 }
+    // cpufeatures (99,112,117,102...) len=11
+    if handled == 0 && len == 11 && buf_eq4(99, 112, 117, 102) == 1 { cmd_cpufeatures(); handled = 1 }
     // logo (108,111,103,111)
     if handled == 0 && len == 4 && buf_eq4(108, 111, 103, 111) == 1 { cmd_logo(); handled = 1 }
     // color (99,111,108,111,114)
