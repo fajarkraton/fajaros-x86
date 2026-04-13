@@ -209,3 +209,58 @@ const EXT2_FILE_BUF: i64 = 0xA03000
         idx = idx + 1
     }
 }
+
+// V26 B3.3: ext2-write <name> <text> — create file with content
+@kernel fn cmd_ext2write() {
+    if volatile_read_u64(EXT2_STATE) != 1 { cprintln("ext2 not mounted", RED_ON_BLACK); return }
+
+    // Parse: skip "ext2-write " (11 chars), get filename until space, rest is content
+    let cmd_len = cmdbuf_len()
+    if cmd_len <= 11 { cprintln("Usage: ext2-write <file> <text>", YELLOW_ON_BLACK); return }
+
+    let name_buf: i64 = 0x830000
+    let mut pos: i64 = 11
+    let mut name_len: i64 = 0
+    while pos < cmd_len {
+        let ch = volatile_read_u8(0x6F800 + pos)
+        if ch == 0 || ch == 32 { pos = cmd_len }
+        else { volatile_write_u8(name_buf + name_len, ch); name_len = name_len + 1; pos = pos + 1 }
+    }
+    volatile_write_u8(name_buf + name_len, 0)
+    if name_len == 0 { cprintln("Usage: ext2-write <file> <text>", YELLOW_ON_BLACK); return }
+
+    // Content starts after filename + space
+    let content_start = 11 + name_len + 1
+    let mut content_len: i64 = 0
+    while content_start + content_len < cmd_len {
+        if volatile_read_u8(0x6F800 + content_start + content_len) == 0 { content_len = cmd_len }
+        else { content_len = content_len + 1 }
+    }
+    if content_len <= 0 { cprintln("No content", YELLOW_ON_BLACK); return }
+
+    let content_buf: i64 = 0x831000
+    let mut i: i64 = 0
+    while i < content_len { volatile_write_u8(content_buf + i, volatile_read_u8(0x6F800 + content_start + i)); i = i + 1 }
+
+    // Create file in ext2 root directory
+    let inode = ext2_create(EXT2_ROOT_INODE, name_buf, name_len, 0x81A4)  // regular file, 0644
+    if inode < 0 {
+        cprint("ext2-write: create failed (", RED_ON_BLACK)
+        cprint_decimal(inode, RED_ON_BLACK)
+        cprintln(")", RED_ON_BLACK)
+        return
+    }
+
+    // Write content
+    let r = ext2_write_file(inode, content_buf, content_len)
+    if r == 0 {
+        cprint("Created: ", GREEN_ON_BLACK)
+        let mut k: i64 = 0
+        while k < name_len { console_putchar(volatile_read_u8(name_buf + k), CYAN_ON_BLACK); k = k + 1 }
+        cprint(" (", WHITE_ON_BLACK)
+        cprint_decimal(content_len, CYAN_ON_BLACK)
+        cprintln(" bytes)", WHITE_ON_BLACK)
+    } else {
+        cprintln("ext2-write: write failed", RED_ON_BLACK)
+    }
+}
