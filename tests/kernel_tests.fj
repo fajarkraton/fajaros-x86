@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 23  // V26 B2.3 added test_o2_sentry_vecmat
+const TEST_TOTAL: i64 = 24  // V26 B2.7 added test_o2_sentry_4bit_argmax
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -491,6 +491,80 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     1
 }
 
+@kernel fn test_o2_sentry_4bit_argmax() -> i64 {
+    // Class A site #2+#3: v5 4-bit LM head argmax loop pattern.
+    // Historical bug: LLVM O2 wild pointer in deeply nested vocab loop
+    // with 4-bit packed read + codebook lookup + argmax accumulation.
+    // Sentry: reproduce the loop pattern at small scale (vocab=8, d=4).
+
+    let scratch = TEST_SCRATCH + 0x5000
+
+    // x_addr: input vector [100, 200, 300, 400] (integer-scale)
+    let x_addr = scratch
+    volatile_write_u64(x_addr, 100)
+    volatile_write_u64(x_addr + 8, 200)
+    volatile_write_u64(x_addr + 16, 300)
+    volatile_write_u64(x_addr + 24, 400)
+
+    // packed weights: 8 vocab rows, 4 dims each, 4-bit packed (2 bytes/row)
+    let packed_addr = scratch + 256
+    // Row 0: [0,0,0,0] → sum=0
+    volatile_write_u8(packed_addr, 0x00)
+    volatile_write_u8(packed_addr + 1, 0x00)
+    // Row 1: [1,0,0,0] → sum=100*cb[1]
+    volatile_write_u8(packed_addr + 2, 0x01)
+    volatile_write_u8(packed_addr + 3, 0x00)
+    // Row 2: [1,1,0,0] → sum=100*cb[1]+200*cb[1]
+    volatile_write_u8(packed_addr + 4, 0x11)
+    volatile_write_u8(packed_addr + 5, 0x00)
+    // Row 3: [1,1,1,1] → sum=100+200+300+400=1000 (should win argmax)
+    volatile_write_u8(packed_addr + 6, 0x11)
+    volatile_write_u8(packed_addr + 7, 0x11)
+    // Rows 4-7: all zeros
+    let mut z: i64 = 0
+    while z < 8 { volatile_write_u8(packed_addr + 8 + z, 0); z = z + 1 }
+
+    // Codebook: cb[0]=0, cb[1]=1, rest=0
+    let cb_addr = scratch + 512
+    volatile_write_u64(cb_addr, 0)  // cb[0] = 0
+    volatile_write_u64(cb_addr + 8, 1)  // cb[1] = 1
+    z = 2
+    while z < 16 { volatile_write_u64(cb_addr + z * 8, 0); z = z + 1 }
+
+    // Reproduce the argmax loop pattern from mdl_ram_lmhead_argmax_v5_4bit
+    let vocab_size: i64 = 8
+    let d_model: i64 = 4
+    let row_bytes: i64 = d_model / 2  // 4-bit: 2 per byte
+    let mut best_token: i64 = 0
+    let mut best_score: i64 = -999999999
+    let mut v: i64 = 0
+
+    while v < vocab_size {
+        let row_addr = packed_addr + v * row_bytes
+        let mut sum: i64 = 0
+        let mut j: i64 = 0
+        while j < d_model {
+            let x_val = volatile_read_u64(x_addr + j * 8)
+            let byte_idx = j / 2
+            let bit_off = (j % 2) * 4
+            let raw = volatile_read_u8(row_addr + byte_idx)
+            let idx = (raw >> bit_off) & 15
+            let w = volatile_read_u64(cb_addr + idx * 8)
+            sum = sum + x_val * w
+            j = j + 1
+        }
+        if sum > best_score {
+            best_score = sum
+            best_token = v
+        }
+        v = v + 1
+    }
+
+    // Expected: row 3 has all-1 weights → sum = 100+200+300+400 = 1000
+    // So best_token should be 3
+    if best_token == 3 && best_score == 1000 { 1 } else { 0 }
+}
+
 // ═══════════════════════════════════════════════════════════════
 // LLM Pipeline Smoke Test (V26 B2.2)
 // Validates tokenizer, model loader state, tensor pool — no weights needed.
@@ -617,6 +691,8 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     console_putchar(10, WHITE_ON_BLACK)
     cprintln("--- LLVM O2 Sentry ---", CYAN_ON_BLACK)
     r = run_test(test_o2_sentry_vecmat(), "o2_sentry_vecmat", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_o2_sentry_4bit_argmax(), "o2_sentry_4bit_argmax", p, f)
     p = r / 0x100000000; f = r % 0x100000000
 
     console_putchar(10, WHITE_ON_BLACK)
