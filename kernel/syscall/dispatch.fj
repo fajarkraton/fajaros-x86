@@ -203,8 +203,16 @@ const USER_HEAP_BASE: i64 = 0x2800000
         let idx = data & 0xFFFFFFFF
         let offset = (data >> 32) & 0xFFFFFFFF
         let entry_addr = ramfs_entry_addr(idx)
-        let data_ptr = volatile_read(entry_addr + 40)
-        if data_ptr == 0 { return -1 }
+        let mut data_ptr = volatile_read(entry_addr + 40)
+        // V26 B3.1: allocate data buffer on first write (new file from O_CREAT)
+        if data_ptr == 0 {
+            let fs_data_off = volatile_read(FS_BASE + 8)
+            if fs_data_off + 4096 > 0x7E0000 { return -1 }  // no space
+            data_ptr = fs_data_off
+            volatile_write(entry_addr + 40, data_ptr)
+            volatile_write(FS_BASE + 8, fs_data_off + 4096)  // reserve 4KB
+        }
+        if offset + len > 4096 { return -1 }  // single-block limit for now
         let mut i: i64 = 0
         while i < len { volatile_write_u8(data_ptr + offset + i, volatile_read_u8(buf_addr + i)); i = i + 1 }
         let new_offset = offset + len
@@ -315,17 +323,40 @@ const USER_HEAP_BASE: i64 = 0x2800000
     base
 }
 
+// V26 B3.1: O_CREAT flag for sys_open — create RamFS file if it doesn't exist
+const O_RDONLY: i64 = 0
+const O_WRONLY: i64 = 1
+const O_RDWR: i64 = 2
+const O_CREAT: i64 = 64     // 0x40
+const O_TRUNC: i64 = 512    // 0x200
+
 @kernel fn sys_open(path_addr: i64, flags: i64) -> i64 {
     let pid = volatile_read_u64(0x6FE00)
     let fd = fd_v2_alloc(pid)
     if fd == -1 { return -1 }
-    let idx = ramfs_find_by_addr(path_addr)
+    let mut idx = ramfs_find_by_addr(path_addr)
     if idx >= 0 {
         let entry_addr = ramfs_entry_addr(idx)
-        if volatile_read(entry_addr + 48) != 1 { return -1 }
+        if volatile_read(entry_addr + 48) != 1 {
+            fd_v2_set(pid, fd, FD_CLOSED, 0)
+            return -1
+        }
+        // O_TRUNC: reset file size to 0
+        if (flags & O_TRUNC) != 0 {
+            volatile_write(entry_addr + 32, 0)
+        }
         fd_v2_set(pid, fd, FD_RAMFS, idx)
         return fd
     }
+    // File not found — create if O_CREAT
+    if (flags & O_CREAT) != 0 {
+        idx = ramfs_create_at(path_addr, 1)  // 1 = regular file
+        if idx >= 0 {
+            fd_v2_set(pid, fd, FD_RAMFS, idx)
+            return fd
+        }
+    }
+    fd_v2_set(pid, fd, FD_CLOSED, 0)
     -1
 }
 

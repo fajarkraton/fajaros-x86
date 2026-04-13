@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 24  // V26 B2.7 added test_o2_sentry_4bit_argmax
+const TEST_TOTAL: i64 = 25  // V26 B3.1 added test_vfs_write_roundtrip
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -425,6 +425,67 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 }
 
 // ═══════════════════════════════════════════════════════════════
+// VFS Write Roundtrip (V26 B3.1)
+// Create file → write → read back → verify contents match.
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn test_vfs_write_roundtrip() -> i64 {
+    // Create a test file via ramfs_create_at
+    let name_buf = TEST_SCRATCH + 0x6000
+    // Write "/tmp/b3test" to name buffer
+    volatile_write_u8(name_buf, 98)      // 'b'
+    volatile_write_u8(name_buf + 1, 51)  // '3'
+    volatile_write_u8(name_buf + 2, 116) // 't'
+    volatile_write_u8(name_buf + 3, 101) // 'e'
+    volatile_write_u8(name_buf + 4, 115) // 's'
+    volatile_write_u8(name_buf + 5, 116) // 't'
+    volatile_write_u8(name_buf + 6, 0)   // null terminator
+
+    // Write "hello" as data
+    let data_buf = TEST_SCRATCH + 0x6100
+    volatile_write_u8(data_buf, 104)     // 'h'
+    volatile_write_u8(data_buf + 1, 101) // 'e'
+    volatile_write_u8(data_buf + 2, 108) // 'l'
+    volatile_write_u8(data_buf + 3, 108) // 'l'
+    volatile_write_u8(data_buf + 4, 111) // 'o'
+
+    // Use ramfs_write_at instead of syscall (kernel-level test)
+    let idx = ramfs_create_at(name_buf, 1)
+    if idx < 0 {
+        // File might already exist from a previous test run
+        let idx2 = ramfs_find_at(name_buf)
+        if idx2 < 0 { return 0 }
+        // Write to existing
+        let r = ramfs_write_at(idx2, data_buf, 5)
+        if r != 0 { return 0 }
+        // Read back
+        let ea = ramfs_entry_addr(idx2)
+        let dp = volatile_read(ea + 40)
+        if dp == 0 { return 0 }
+        if volatile_read_u8(dp) != 104 { return 0 }     // 'h'
+        if volatile_read_u8(dp + 4) != 111 { return 0 }  // 'o'
+        return 1
+    }
+    let r = ramfs_write_at(idx, data_buf, 5)
+    if r != 0 { return 0 }
+
+    // Read back via ramfs_entry_addr
+    let ea = ramfs_entry_addr(idx)
+    let size = volatile_read(ea + 32)
+    if size != 5 { return 0 }
+    let dp = volatile_read(ea + 40)
+    if dp == 0 { return 0 }
+    // Verify "hello"
+    if volatile_read_u8(dp) != 104 { return 0 }      // 'h'
+    if volatile_read_u8(dp + 1) != 101 { return 0 }   // 'e'
+    if volatile_read_u8(dp + 4) != 111 { return 0 }   // 'o'
+
+    // Clean up
+    ramfs_delete_at(idx)
+    1
+}
+
+// ═══════════════════════════════════════════════════════════════
 // LLVM O2 Sentry Tests (V26 B2.3)
 // Exercises known fragile hot paths that have historically produced
 // wild pointers or data corruption under LLVM O2. If codegen
@@ -680,6 +741,8 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     r = run_test(test_vfs_open_read_close(), "vfs_open_read_close", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_blk_ramdisk_rw(), "blk_ramdisk_rw", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_vfs_write_roundtrip(), "vfs_write_roundtrip", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_net_socket_lifecycle(), "net_socket_lifecycle", p, f)
     p = r / 0x100000000; f = r % 0x100000000
