@@ -22,9 +22,16 @@ v8 binary format (differences from v7):
 
   Per-matrix layout (replaces the old codebook at section end):
     [packed 4-bit indices: ceil(n_elems/2) bytes]
-    [scales: 4 B × n_groups (f32 little-endian)]
+    [scales: 4 B × n_groups (INT32 LE, value = round(scale_real × 1_000_000))]
     [zero_points: 1 B × n_groups (u8, range 0..15)]
     n_groups = ceil(n_elems / group_size)
+
+  Scales are stored as integer ×1,000,000 so the kernel hot paths stay
+  pure integer (@kernel = no float). Max scale ~0.15 × 1e6 = 150,000
+  fits in i32. Dequant: x = (q - zero) × (scale_int / 1_000_000).
+  For kernel fixed-point: w_x_million = (q - zero) × scale_int, then
+  sum += (x_val × w_x_million) / 1_000_000 (matches existing ×1000 convention
+  scaled up by 1000 because w is ×1M not ×1K).
 
   Per-group quantization (asymmetric 4-bit):
     min_v, max_v = min(group), max(group)
@@ -97,22 +104,25 @@ def resolve_safetensors_path() -> str:
 # Group-wise 4-bit quantization (V28.2 core)
 # ═══════════════════════════════════════════════════════════════════════
 
+SCALE_FIXED_POINT = 1_000_000  # scale stored as int32(round(scale_real × 1M))
+
+
 def groupwise_quantize_4bit(data: np.ndarray, group_size: int = GROUP_SIZE):
     """Asymmetric per-group 4-bit quantization.
 
     Returns:
-        indices: np.uint8 array, shape = data.shape flattened, values 0..15
-        scales:  np.float32 array, shape = (n_groups,)
-        zeros:   np.uint8 array, shape = (n_groups,), values 0..15
+        indices:    np.uint8, shape = (n,), values 0..15
+        scales_int: np.int32, shape = (n_groups,), = round(scale × 1_000_000)
+        zeros:      np.uint8, shape = (n_groups,), values 0..15
 
-    The last group may be padded in the flat view — we still store a
-    scale+zero for it covering whatever elements are actually present.
+    Scales are stored as int32 fixed-point so the kernel can do pure-
+    integer dequant (no float support in @kernel context).
     """
     flat = data.astype(np.float32).flatten()
     n = len(flat)
     n_groups = (n + group_size - 1) // group_size
 
-    scales = np.empty(n_groups, dtype=np.float32)
+    scales_int = np.empty(n_groups, dtype=np.int32)
     zeros = np.empty(n_groups, dtype=np.uint8)
     indices = np.empty(n, dtype=np.uint8)
 
@@ -124,35 +134,35 @@ def groupwise_quantize_4bit(data: np.ndarray, group_size: int = GROUP_SIZE):
         mx = float(grp.max())
         rng = mx - mn
         if rng < 1e-9:
-            # Constant group — scale=1, zero maps to the constant value
-            scale = 1.0
+            # Constant group — scale=1 (arbitrary), all indices = zero
+            scale_real = 1.0
             zero = int(round(-mn))
             zero = max(0, min(15, zero))
             q = np.full(e - s, zero, dtype=np.uint8)
         else:
-            scale = rng / 15.0
-            zero_f = -mn / scale
+            scale_real = rng / 15.0
+            zero_f = -mn / scale_real
             zero = int(round(zero_f))
             zero = max(0, min(15, zero))
-            q = np.round(grp / scale + zero).astype(np.int32)
+            q = np.round(grp / scale_real + zero).astype(np.int32)
             q = np.clip(q, 0, 15).astype(np.uint8)
         indices[s:e] = q
-        scales[g] = scale
+        scales_int[g] = int(round(scale_real * SCALE_FIXED_POINT))
         zeros[g] = zero
 
-    return indices, scales, zeros
+    return indices, scales_int, zeros
 
 
-def dequantize_4bit_groupwise(indices: np.ndarray, scales: np.ndarray,
+def dequantize_4bit_groupwise(indices: np.ndarray, scales_int: np.ndarray,
                                zeros: np.ndarray, group_size: int = GROUP_SIZE) -> np.ndarray:
-    """Inverse of groupwise_quantize_4bit. Used for round-trip validation."""
+    """Inverse of groupwise_quantize_4bit. scales_int is int32 ×1e6."""
     n = len(indices)
     out = np.empty(n, dtype=np.float32)
-    n_groups = len(scales)
+    n_groups = len(scales_int)
     for g in range(n_groups):
         s = g * group_size
         e = min(s + group_size, n)
-        scale = float(scales[g])
+        scale = float(scales_int[g]) / SCALE_FIXED_POINT
         zero = int(zeros[g])
         out[s:e] = (indices[s:e].astype(np.float32) - zero) * scale
     return out
@@ -171,9 +181,10 @@ def pack_indices_4bit(indices: np.ndarray) -> bytes:
     return out.tobytes()
 
 
-def serialize_matrix_v8(indices: np.ndarray, scales: np.ndarray, zeros: np.ndarray) -> bytes:
-    """v8 per-matrix payload: [packed indices] [scales f32] [zeros u8]."""
-    return pack_indices_4bit(indices) + scales.tobytes() + zeros.tobytes()
+def serialize_matrix_v8(indices: np.ndarray, scales_int: np.ndarray, zeros: np.ndarray) -> bytes:
+    """v8 per-matrix payload: [packed indices] [scales int32 ×1e6] [zeros u8]."""
+    assert scales_int.dtype == np.int32, f"scales must be int32, got {scales_int.dtype}"
+    return pack_indices_4bit(indices) + scales_int.tobytes() + zeros.tobytes()
 
 
 def serialize_norm(arr) -> bytes:

@@ -763,6 +763,68 @@ const KM_TILE_SIZE: i64 = 64
 }
 
 // ═══════════════════════════════════════════════════════════════
+// V28.2 — Group-wise 4-bit vector × matrix multiply (GPTQ/AWQ-style)
+// ═══════════════════════════════════════════════════════════════
+//
+// y[n] = x[m] @ dequant(W[m,n]) where W is stored as:
+//   [packed 4-bit indices: m*n/2 bytes, row-major, 2 elems per byte, LSN first]
+//   [scales_int32: n_groups × 4 bytes, each = round(scale_real × 1_000_000)]
+//   [zeros_u8:    n_groups × 1 byte,  each = zero_point 0..15]
+//   n_groups = (m * n + group_size - 1) / group_size
+//
+// Dequant per element: w_real = (q - zero) × scale_real
+// Kernel fixed-point:
+//   w_x_1M = (q - zero) × scale_int     # w × 1_000_000
+//   x_val is × 1000 (existing convention)
+//   sum += (x_val × w_x_1M) / 1_000_000 # result × 1000
+//
+// NO hot-path branches beyond the sum accumulation — LLVM O2 is fragile
+// on inner branches (V28.1 lesson from mdl_ram_lmhead_argmax_v5_4bit).
+//
+// Hardcoded group_size=128 for now — matches all V28.2 exports. Changing
+// requires bumping GROUP_SIZE_SHIFT (log2) / GROUP_SIZE_MASK too.
+
+const V8_GROUP_SIZE: i64 = 128
+const V8_GROUP_SHIFT: i64 = 7   // log2(128) — hot loop uses shift, not div
+const V8_SCALE_FP: i64 = 1000000  // scales stored as int32(round(scale × this))
+
+@kernel fn km_vecmat_packed_v8(x_addr: i64, mat_addr: i64, m: i64, n: i64,
+                                 out_addr: i64) {
+    // Bounds: we trust the caller on sizes. Addresses are kernel-region
+    // identity-mapped (up to 1 GB via extend_identity_mapping_512).
+    let total_elems = m * n
+    let packed_bytes = total_elems / 2  // 4-bit: 2 elems per byte
+    let n_groups = (total_elems + V8_GROUP_SIZE - 1) >> V8_GROUP_SHIFT
+    let scales_base = mat_addr + packed_bytes
+    let zeros_base = scales_base + n_groups * 4
+
+    let mut j: i64 = 0
+    while j < n {
+        let mut sum: i64 = 0
+        let mut k: i64 = 0
+        while k < m {
+            let flat_idx = k * n + j
+            let byte_idx = flat_idx >> 1            // /2
+            let bit_off = (flat_idx & 1) * 4        // 0 or 4
+            let raw_byte = volatile_read_u8(mat_addr + byte_idx)
+            let q = (raw_byte >> bit_off) & 15
+
+            let g = flat_idx >> V8_GROUP_SHIFT      // / 128
+            let scale = mdl_read_u32(scales_base + g * 4)
+            let zero = volatile_read_u8(zeros_base + g)
+
+            let w_x_1M = (q - zero) * scale         // w × 1_000_000
+
+            let v = volatile_read_u64(x_addr + k * 8)
+            sum = sum + (v * w_x_1M) / V8_SCALE_FP
+            k = k + 1
+        }
+        volatile_write_u64(out_addr + j * 8, sum)
+        j = j + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Residual Add: out = a + b (element-wise, in-place on a)
 // ═══════════════════════════════════════════════════════════════
 

@@ -1283,8 +1283,11 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 
     cprintln("]", WHITE_ON_BLACK)
 
-    // v5: extract embed codebook from end of loaded data
-    if mdl_get_version() >= 5 {
+    // v5: extract embed codebook from end of loaded data.
+    // V28.2 v8: SKIP codebook extraction — v8 stores per-group scales+zeros
+    // inline and the hot path (mdl_stream_embed_lookup_raw_v8) reads them
+    // directly from STREAM_EMBED_BASE + packed_bytes. No standalone codebook.
+    if mdl_get_version() >= 5 && mdl_is_groupwise() == 0 {
         let eb = mdl_get_embed_bits()
         let vocab_size = mdl_get_vocab_size()
         let d_model = mdl_get_d_model()
@@ -1292,8 +1295,6 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
         let n_centroids = 1 << eb
         let cb_size = n_centroids * 8
         let cb_src = STREAM_EMBED_BASE + packed_size
-        // 2-bit (32B) → MDL_EMBED_CB (existing area, hot path uses this)
-        // 4-bit (128B) → MDL_EMBED_CB_V5 (separate area, requires v5 hot path)
         if eb <= 2 {
             mdl_memcpy(MDL_EMBED_CB, cb_src, cb_size)
         } else {
@@ -1407,31 +1408,45 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     STREAM_LAYER_BUF
 }
 
-// Get Q weight size for GQA: d_model × (n_heads × d_head) × bits/8
+// V28.2: per-matrix byte size.
+// v7: m × n × bits / 8 (just packed).
+// v8: packed (m*n/2) + scales (n_groups × 4) + zeros (n_groups × 1),
+//     where n_groups = ceil(m*n / 128).
+//     Net: m*n × 69/128 for 4-bit group-wise.
+@kernel fn mdl_matrix_size(m: i64, n: i64) -> i64 {
+    let total = m * n
+    if mdl_is_groupwise() == 1 {
+        let packed = total / 2   // 4-bit v8
+        let n_groups = (total + 127) / 128
+        packed + n_groups * 5    // 4 B scale + 1 B zero per group
+    } else {
+        let bits = mdl_get_quant_bits()
+        total * bits / 8
+    }
+}
+
+// Get Q weight size for GQA: d_model × (n_heads × d_head)
 @kernel fn mdl_stream_q_size() -> i64 {
     let d_model = mdl_get_d_model()
     let n_heads = mdl_get_n_heads()
     let d_head = mdl_get_d_head()
-    let bits = mdl_get_quant_bits()
-    d_model * n_heads * d_head * bits / 8
+    mdl_matrix_size(d_model, n_heads * d_head)
 }
 
-// Get K/V weight size for GQA: d_model × (n_kv_heads × d_head) × bits/8
+// Get K/V weight size for GQA: d_model × (n_kv_heads × d_head)
 @kernel fn mdl_stream_kv_size() -> i64 {
     let d_model = mdl_get_d_model()
     let n_kv = mdl_get_n_kv_heads()
     let d_head = mdl_get_d_head()
-    let bits = mdl_get_quant_bits()
-    d_model * n_kv * d_head * bits / 8
+    mdl_matrix_size(d_model, n_kv * d_head)
 }
 
-// O projection size: (n_heads × d_head) × d_model × bits/8
+// O projection size: (n_heads × d_head) × d_model
 @kernel fn mdl_stream_o_size() -> i64 {
     let d_model = mdl_get_d_model()
     let n_heads = mdl_get_n_heads()
     let d_head = mdl_get_d_head()
-    let bits = mdl_get_quant_bits()
-    n_heads * d_head * d_model * bits / 8
+    mdl_matrix_size(n_heads * d_head, d_model)
 }
 
 // QKVO total packed size (Q + K + V + O)
@@ -1449,14 +1464,14 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     STREAM_LAYER_BUF + mdl_stream_qkv_total()
 }
 
-// Get FFN total size for gated: 3 × d_model × ffn_dim × bits/8
+// Get FFN total size for gated: gate (d_model × ffn_dim) + up (d_model × ffn_dim)
+// + down (ffn_dim × d_model) = 3 matrices, symmetric sizes.
 @kernel fn mdl_stream_ffn_total() -> i64 {
     let d_model = mdl_get_d_model()
     let ffn_dim = mdl_get_ffn_dim()
-    let bits = mdl_get_quant_bits()
     let ffn_type = mdl_get_ffn_type()
-    let matrices = if ffn_type == 1 { 3 } else { 2 }  // gated=3, standard=2
-    matrices * d_model * ffn_dim * bits / 8
+    let matrices = if ffn_type == 1 { 3 } else { 2 }
+    matrices * mdl_matrix_size(d_model, ffn_dim)
 }
 
 // Get norm params address in streaming buffer (after QKV + FFN)
@@ -1776,9 +1791,11 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     let hot_path_addr = if tied_lmhead == 1 { STREAM_EMBED_BASE } else { actual_lmhead_addr }
     volatile_write_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD, hot_path_addr)
     volatile_write_u64(MDL_RAM_STATE + MDL_RAM_TIED, tied_lmhead)
-    // For tied models, copy embedding codebook to LM head codebook slot so
-    // the generic hot-path can read `MDL_LMHEAD_CB_V5` directly.
-    if tied_lmhead == 1 && mdl_get_version() >= 5 {
+    // For tied v5/v6/v7 models, copy embedding codebook to LM head codebook
+    // slot so the generic hot-path can read `MDL_LMHEAD_CB_V5` directly.
+    // V28.2 v8: SKIP — v8 tied lmhead (mdl_ram_lmhead_argmax_v8_tied) reads
+    // scales+zeros directly from STREAM_EMBED_BASE; no codebook needed.
+    if tied_lmhead == 1 && mdl_get_version() >= 5 && mdl_is_groupwise() == 0 {
         let eb = mdl_get_embed_bits()
         let n_centroids = 1 << eb
         let cb_size = n_centroids * 8
@@ -2083,6 +2100,89 @@ const LM_TOPK_K: i64 = 8
         i = i + 1
     }
     0
+}
+
+// V28.2 v8 — group-wise 4-bit embedding lookup.
+// STREAM_EMBED_BASE has layout [packed: vocab*d/2 B][scales: n_groups*4 B][zeros: n_groups B]
+// Writes d_model values to out_addr as i64 × 1000 fixed-point (matches v5_4bit
+// convention so downstream RMSNorm + layer code needs no change).
+@kernel fn mdl_stream_embed_lookup_raw_v8(token_id: i64, out_addr: i64) -> i64 {
+    if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 { return -1 }
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    if token_id < 0 || token_id >= vocab_size { return -2 }
+
+    let total_elems = vocab_size * d_model
+    let packed_bytes = total_elems / 2
+    let n_groups = (total_elems + 127) / 128  // group_size=128 hardcoded for v8
+    let scales_base = STREAM_EMBED_BASE + packed_bytes
+    let zeros_base = scales_base + n_groups * 4
+
+    let row_start = token_id * d_model  // flat-index start of this token's row
+    let mut i: i64 = 0
+    while i < d_model {
+        let flat_idx = row_start + i
+        let byte_idx = flat_idx >> 1
+        let bit_off = (flat_idx & 1) * 4
+        let raw = volatile_read_u8(STREAM_EMBED_BASE + byte_idx)
+        let q = (raw >> bit_off) & 15
+
+        let g = flat_idx >> 7   // / 128
+        let scale = mdl_read_u32(scales_base + g * 4)
+        let zero = volatile_read_u8(zeros_base + g)
+        let w_x_1M = (q - zero) * scale
+        // Convert ×1e6 → ×1000 to match existing fixed-point convention
+        volatile_write_u64(out_addr + i * 8, w_x_1M / 1000)
+        i = i + 1
+    }
+    0
+}
+
+// V28.2 v8 — tied LM head argmax. Reads from STREAM_EMBED_BASE since
+// Gemma 3 ties input embedding with LM head. Uses the same group-wise
+// format as mdl_stream_embed_lookup_raw_v8.
+// x_addr: hidden state (d_model × i64 fixed-point ×1000)
+// Returns: best_token (argmax over vocab_size).
+@kernel fn mdl_ram_lmhead_argmax_v8_tied(x_addr: i64) -> i64 {
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+
+    let total_elems = vocab_size * d_model
+    let packed_bytes = total_elems / 2
+    let n_groups = (total_elems + 127) / 128
+    let scales_base = STREAM_EMBED_BASE + packed_bytes
+    let zeros_base = scales_base + n_groups * 4
+
+    let mut best_token: i64 = 0
+    let mut best_score: i64 = -999999999
+    let mut v: i64 = 0
+    while v < vocab_size {
+        let row_start = v * d_model
+        let mut sum: i64 = 0
+        let mut i: i64 = 0
+        while i < d_model {
+            let flat_idx = row_start + i
+            let byte_idx = flat_idx >> 1
+            let bit_off = (flat_idx & 1) * 4
+            let raw = volatile_read_u8(STREAM_EMBED_BASE + byte_idx)
+            let q = (raw >> bit_off) & 15
+
+            let g = flat_idx >> 7
+            let scale = mdl_read_u32(scales_base + g * 4)
+            let zero = volatile_read_u8(zeros_base + g)
+            let w_x_1M = (q - zero) * scale
+
+            let x_val = volatile_read_u64(x_addr + i * 8)
+            sum = sum + (x_val * w_x_1M) / 1000000
+            i = i + 1
+        }
+        if sum > best_score {
+            best_score = sum
+            best_token = v
+        }
+        v = v + 1
+    }
+    best_token
 }
 
 // Shell command: ram-load

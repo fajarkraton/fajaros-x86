@@ -432,15 +432,27 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 // out_addr:      output vector (d_model elements)
 // gate_buf/up_buf: pre-allocated ffn_dim buffers (frame-allocated)
 
+// V28.2 v8 dispatcher: routes to group-wise or single-codebook vecmat based
+// on the currently-loaded model's quant_format byte. Dispatch happens ONCE per
+// matmul (not per element) — safe for LLVM O2 per the V28.1 hot-path lesson.
+@kernel fn tfm_vecmat_auto(x_addr: i64, mat_addr: i64, m: i64, n: i64,
+                            bits: i64, cb_addr: i64, out_addr: i64) {
+    if mdl_is_groupwise() == 1 {
+        km_vecmat_packed_v8(x_addr, mat_addr, m, n, out_addr)
+    } else {
+        km_vecmat_packed_raw(x_addr, mat_addr, m, n, bits, cb_addr, out_addr)
+    }
+}
+
 @kernel fn tfm_ffn_gated(x_addr: i64, gate_w_addr: i64, up_w_addr: i64, down_w_addr: i64,
                           d_model: i64, ffn_dim: i64, bits: i64,
                           cb_gate: i64, cb_up: i64, cb_down: i64,
                           out_addr: i64, gate_buf: i64, up_buf: i64) {
     // Step 1: gate = gate_proj(x) → ffn_dim
-    km_vecmat_packed_raw(x_addr, gate_w_addr, d_model, ffn_dim, bits, cb_gate, gate_buf)
+    tfm_vecmat_auto(x_addr, gate_w_addr, d_model, ffn_dim, bits, cb_gate, gate_buf)
 
     // Step 2: up = up_proj(x) → ffn_dim
-    km_vecmat_packed_raw(x_addr, up_w_addr, d_model, ffn_dim, bits, cb_up, up_buf)
+    tfm_vecmat_auto(x_addr, up_w_addr, d_model, ffn_dim, bits, cb_up, up_buf)
 
     // Step 3: gate = GELU(gate)
     km_gelu_tanh(gate_buf, ffn_dim)
@@ -449,7 +461,7 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
     km_mul_raw(gate_buf, up_buf, ffn_dim)
 
     // Step 5: out = down_proj(gate) → d_model
-    km_vecmat_packed_raw(gate_buf, down_w_addr, ffn_dim, d_model, bits, cb_down, out_addr)
+    tfm_vecmat_auto(gate_buf, down_w_addr, ffn_dim, d_model, bits, cb_down, out_addr)
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1415,22 +1427,25 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     km_rmsnorm(x_addr, d_model, norm_addr)
 
     // === QKV Projections with per-matrix codebooks ===
+    // V28.2: tfm_vecmat_auto dispatches to km_vecmat_packed_v8 (group-wise)
+    // when the loaded model is v8, otherwise uses the original single-codebook
+    // path. Dispatch is per-matmul, never per-element.
     let q_out = km_data_ptr(TFM_Q)
-    km_vecmat_packed_raw(x_addr, qkv_addr, d_model, q_dim, bits, cb_q, q_out)
+    tfm_vecmat_auto(x_addr, qkv_addr, d_model, q_dim, bits, cb_q, q_out)
     let q_base = km_large_addr(TFM_Q)
     volatile_write_u64(q_base + KM_HDR_ROWS, 1)
     volatile_write_u64(q_base + KM_HDR_COLS, q_dim)
 
     let k_off = mdl_stream_q_size()
     let k_out = km_data_ptr(TFM_K)
-    km_vecmat_packed_raw(x_addr, qkv_addr + k_off, d_model, kv_d, bits, cb_k, k_out)
+    tfm_vecmat_auto(x_addr, qkv_addr + k_off, d_model, kv_d, bits, cb_k, k_out)
     let k_base = km_large_addr(TFM_K)
     volatile_write_u64(k_base + KM_HDR_ROWS, 1)
     volatile_write_u64(k_base + KM_HDR_COLS, kv_d)
 
     let v_off = k_off + mdl_stream_kv_size()
     let v_out = km_data_ptr(TFM_V)
-    km_vecmat_packed_raw(x_addr, qkv_addr + v_off, d_model, kv_d, bits, cb_v, v_out)
+    tfm_vecmat_auto(x_addr, qkv_addr + v_off, d_model, kv_d, bits, cb_v, v_out)
     let v_base = km_large_addr(TFM_V)
     volatile_write_u64(v_base + KM_HDR_ROWS, 1)
     volatile_write_u64(v_base + KM_HDR_COLS, kv_d)
@@ -1449,7 +1464,7 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     // === O Projection with O codebook ===
     let o_addr = mdl_stream_o_addr()
     let attn_data = km_data_ptr(TFM_ATTN)
-    km_vecmat_packed_raw(attn_data, o_addr, q_dim, d_model, bits, cb_o, STFM_FFN_OUT)
+    tfm_vecmat_auto(attn_data, o_addr, q_dim, d_model, bits, cb_o, STFM_FFN_OUT)
 
     // === Residual + Projected Attention ===
     mdl_memcpy(x_addr, STFM_RES, d_model * 8)
@@ -1461,8 +1476,10 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     km_rmsnorm(x_addr, d_model, ln2_gamma)
 
     // === Gated FFN with per-matrix codebooks (gate=4, up=5, down=6) ===
+    // V28.2: v8 matrices carry inline scales+zeros so mat_size depends on
+    // quant_format. mdl_matrix_size handles both paths.
     let ffn_dim = mdl_get_ffn_dim()
-    let mat_size = d_model * ffn_dim * bits / 8
+    let mat_size = mdl_matrix_size(d_model, ffn_dim)
     tfm_ffn_gated(x_addr, ffn_addr, ffn_addr + mat_size, ffn_addr + mat_size * 2,
                    d_model, ffn_dim, bits,
                    cb_gate, cb_up, cb_down,
@@ -1493,12 +1510,17 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     }
 
     // Step 1: Embedding lookup → STFM_X (raw address, supports d > 1024)
-    // v5 4-bit dispatch (mixed precision)
-    let v5_embed_4bit = mdl_get_version() >= 5 && mdl_get_embed_bits() == 4
-    if v5_embed_4bit {
-        mdl_stream_embed_lookup_raw_v5_4bit(token_id, STFM_X)
+    // V28.2: v8 dispatch first (group-wise), then v5 4-bit, else generic.
+    // Group-wise reads [packed][scales][zeros] inline at STREAM_EMBED_BASE.
+    if mdl_is_groupwise() == 1 {
+        mdl_stream_embed_lookup_raw_v8(token_id, STFM_X)
     } else {
-        mdl_stream_embed_lookup_raw(token_id, STFM_X)
+        let v5_embed_4bit = mdl_get_version() >= 5 && mdl_get_embed_bits() == 4
+        if v5_embed_4bit {
+            mdl_stream_embed_lookup_raw_v5_4bit(token_id, STFM_X)
+        } else {
+            mdl_stream_embed_lookup_raw(token_id, STFM_X)
+        }
     }
 
     // Step 1.5: Gemma 3 embed scaling — hidden_states = inputs_embeds * sqrt(d_model)
@@ -1531,23 +1553,26 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
         km_rmsnorm(STFM_X, d_model, STREAM_FINAL_NORM)
     }
 
-    // Step 3: LM head — v5 4-bit dispatch + sampling/argmax
-    // NOTE: v5 4-bit sample function triggers LLVM O2 wild pointer (top-k loop too complex).
-    // Workaround: v5 4-bit always uses argmax even when temp is set.
+    // Step 3: LM head — v8 tied group-wise > v5 4-bit > generic
     let temp = volatile_read_u64(TFM_STATE + TFM_ST_TEMPERATURE)
     let v5_lmhead_4bit = mdl_get_version() >= 5 && mdl_get_lmhead_bits() == 4
-    let next_token = if mdl_ram_active() == 1 {
-        if v5_lmhead_4bit {
-            mdl_ram_lmhead_argmax_v5_4bit(STFM_X)
-        } else {
-            if temp > 0 && temp < 1000 {
-                mdl_ram_lmhead_sample(STFM_X, temp)
-            } else {
-                mdl_ram_lmhead_argmax(STFM_X)
-            }
-        }
+    let next_token = if mdl_is_groupwise() == 1 {
+        // V28.2: v8 is always tied (Gemma 3); argmax over STREAM_EMBED_BASE.
+        mdl_ram_lmhead_argmax_v8_tied(STFM_X)
     } else {
-        mdl_stream_lmhead_argmax(STFM_X)  // NVMe: argmax only
+        if mdl_ram_active() == 1 {
+            if v5_lmhead_4bit {
+                mdl_ram_lmhead_argmax_v5_4bit(STFM_X)
+            } else {
+                if temp > 0 && temp < 1000 {
+                    mdl_ram_lmhead_sample(STFM_X, temp)
+                } else {
+                    mdl_ram_lmhead_argmax(STFM_X)
+                }
+            }
+        } else {
+            mdl_stream_lmhead_argmax(STFM_X)  // NVMe: argmax only
+        }
     }
 
     // Update state
