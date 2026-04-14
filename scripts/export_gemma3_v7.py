@@ -65,7 +65,16 @@ ROPE_THETA_LOCAL = 10_000
 SLIDING_WINDOW = 512
 SLIDING_PATTERN = 6  # globals at layers 5, 11, 17, 23 (0-indexed)
 EOS_TOKEN = 106
-MODEL_TYPE = 3  # Gemma 3 (SmolLM=1, Gemma v2=2, Gemma 3=3)
+# Kernel label map (model_loader.fj mdl_print_model_type + gamma-mode branch):
+#   0  = test
+#   1  = SmolLM-135M
+#   2  = TinyLlama
+#   3  = SmolLM-360M        (direct-scale RMSNorm)
+#   10 = Gemma3-1B          (zero-centered (1+γ)·x RMSNorm)   ← Gemma 3 uses this
+#   11 = Gemma3-4B / future Gemma3 variants
+# MUST use 10 for Gemma 3, not 3. Using 3 puts gamma in the wrong convention and
+# the first RMSNorm output drifts, breaking all downstream attention.
+MODEL_TYPE = 10  # Gemma3-1B
 
 GEMMA3_SNAPSHOT_DIR = os.path.expanduser(
     "~/.cache/huggingface/hub/models--unsloth--gemma-3-1b-it/snapshots"
