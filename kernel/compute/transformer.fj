@@ -1409,6 +1409,23 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
         mdl_stream_embed_lookup_raw(token_id, STFM_X)
     }
 
+    // Step 1.5: Gemma 3 embed scaling — hidden_states = inputs_embeds * sqrt(d_model)
+    // Gemma 3 HF reference: Gemma3TextModel.forward scales by config.hidden_size**0.5.
+    // Without this, hidden-state magnitudes are ~34× too small and everything
+    // downstream (norms, attention, logits) degenerates toward token 0 / <pad>.
+    // Guard by model_type 10/11 (Gemma 3) — SmolLM/Llama do not scale embeds.
+    let mt = mdl_get_model_type()
+    if mt == 10 || mt == 11 {
+        // sqrt(d_model) in ×1000 fixed-point: sqrt(d_model * 1_000_000)
+        let scale_x1000 = km_isqrt(d_model * 1000000)
+        let mut si: i64 = 0
+        while si < d_model {
+            let v = volatile_read_u64(STFM_X + si * 8)
+            volatile_write_u64(STFM_X + si * 8, v * scale_x1000 / 1000)
+            si = si + 1
+        }
+    }
+
     // Step 2: Process all layers (stream each from NVMe)
     let mut layer: i64 = 0
     while layer < n_layers {
