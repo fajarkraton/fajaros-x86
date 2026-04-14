@@ -1,10 +1,12 @@
 # FajarOS Nova -- x86_64 Operating System Written 100% in Fajar Lang
 
-[![Version](https://img.shields.io/badge/version-v3.0.0_Nusantara-blue)](https://github.com/fajarkraton/fajaros-x86/releases/tag/v3.0.0)
+[![Version](https://img.shields.io/badge/version-v3.3.0_V28_Foundation-blue)](https://github.com/fajarkraton/fajaros-x86/releases/tag/v3.3.0)
 [![Files](https://img.shields.io/badge/modules-163_.fj_files-green)](https://github.com/fajarkraton/fajaros-x86)
-[![LOC](https://img.shields.io/badge/LOC-47%2C821-orange)](https://github.com/fajarkraton/fajaros-x86)
-[![Compiler](https://img.shields.io/badge/compiler-Fajar_Lang_v26.1.0--phase--a-blueviolet)](https://github.com/fajarkraton/fajar-lang)
-[![Shell](https://img.shields.io/badge/shell-119_commands_(14_LLM)-purple)](https://github.com/fajarkraton/fajaros-x86)
+[![LOC](https://img.shields.io/badge/LOC-106K-orange)](https://github.com/fajarkraton/fajaros-x86)
+[![Compiler](https://img.shields.io/badge/compiler-Fajar_Lang_v27.5.0-blueviolet)](https://github.com/fajarkraton/fajar-lang)
+[![Shell](https://img.shields.io/badge/shell-302_commands-purple)](https://github.com/fajarkraton/fajaros-x86)
+[![Kernel Tests](https://img.shields.io/badge/kernel_tests-26-brightgreen)](https://github.com/fajarkraton/fajaros-x86)
+[![Security](https://img.shields.io/badge/security-SMEP%2BSMAP%2BNX%2BASLR-success)](https://github.com/fajarkraton/fajaros-x86)
 [![LLM E2E](https://img.shields.io/badge/LLM_E2E-SmolLM--135M_v5%2Fv6_in_kernel-success)](https://github.com/fajarkraton/fajaros-x86)
 [![Ring 3](https://img.shields.io/badge/Ring_3-user_mode_works-success)](https://github.com/fajarkraton/fajaros-x86)
 [![FajarQuant](https://img.shields.io/badge/FajarQuant-Phase_1%2B2_kernel_native-orange)](https://github.com/fajarkraton/fajaros-x86)
