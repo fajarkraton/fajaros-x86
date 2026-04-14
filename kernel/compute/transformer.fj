@@ -197,7 +197,13 @@ const TFM_FVEC_MAX: i64 = 16
 // Memory:
 //   ROPE_FREQ at 0xBE7C00: 128 inv_freq values (max d_head/2=128 pairs)
 
-const ROPE_FREQ_BASE: i64 = 0xBE7C00
+const ROPE_FREQ_BASE: i64 = 0xBE7C00     // "local" theta table — ROPE_MAX_PAIRS × 8
+// V28.1: second freq table for Gemma 3 dual-theta RoPE.
+// Local layers (sliding window) use theta=10K → ROPE_FREQ_BASE.
+// Global layers (every Nth layer, pattern-dependent) use theta=1M → ROPE_FREQ_GLOBAL.
+// Placed at 0xBEF800 (gap between MDL_V7_EXTRA @ 0xBEF200+16 and RECENT_BITSET
+// already above it). 1024 bytes = ROPE_MAX_PAIRS × 8 B.
+const ROPE_FREQ_GLOBAL: i64 = 0xBEF800   // "global" theta table — ROPE_MAX_PAIRS × 8
 const ROPE_MAX_PAIRS: i64 = 128
 const ROPE_PI: i64 = 3142       // π in milliradians (x1000)
 const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
@@ -242,7 +248,10 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 // Pre-compute inv_freq[i] = 1000 / theta^(2i/d_head) in milliradians-per-position
 // Stored as: stepping through 1 position adds inv_freq[i] milliradians of angle
 
-@kernel fn rope_init_freq(d_head: i64, theta: i64) {
+// V28.1: base-parameterized variant so Gemma 3 can init both local and global
+// theta tables. Legacy single-base rope_init_freq (below) writes to
+// ROPE_FREQ_BASE to keep SmolLM/Llama callers unchanged.
+@kernel fn rope_init_freq_at(base: i64, d_head: i64, theta: i64) {
     // For each pair i=0..d_head/2-1:
     //   freq = 1.0 / theta^(2i/d_head)
     //   In milliradians: freq_mrad = 1000 / theta^(2i/d_head)
@@ -279,10 +288,16 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
     while i < n_pairs {
         // inv_freq = 1000 * exp(-log_acc/1000)
         let inv_freq = rope_exp_neg(log_acc)
-        volatile_write_u64(ROPE_FREQ_BASE + i * 8, inv_freq)
+        volatile_write_u64(base + i * 8, inv_freq)
         log_acc = log_acc + step_x1000
         i = i + 1
     }
+}
+
+// Legacy single-table init — writes to ROPE_FREQ_BASE. Used by SmolLM/Llama
+// (non-Gemma) call sites that pre-date the dual-theta design.
+@kernel fn rope_init_freq(d_head: i64, theta: i64) {
+    rope_init_freq_at(ROPE_FREQ_BASE, d_head, theta)
 }
 
 // Natural log approximation for integers (output x1000)
@@ -320,14 +335,12 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 }
 
 // Apply RoPE to a vector in-place (Q or K, one head at a time)
-// data_addr: pointer to d_head contiguous i64 values
-// pos: sequence position
-// d_head: head dimension (pairs = d_head/2)
-@kernel fn tfm_rope_apply_head(data_addr: i64, pos: i64, d_head: i64) {
+// V28.1: freq_base parameterized so Gemma 3 can select local vs global table.
+@kernel fn tfm_rope_apply_head_at(data_addr: i64, pos: i64, d_head: i64, freq_base: i64) {
     let n_pairs = d_head / 2
     let mut i: i64 = 0
     while i < n_pairs {
-        let inv_freq = volatile_read_u64(ROPE_FREQ_BASE + i * 8)
+        let inv_freq = volatile_read_u64(freq_base + i * 8)
         // angle in milliradians = pos * inv_freq
         let angle = pos * inv_freq
 
@@ -347,22 +360,53 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
     }
 }
 
-// Apply RoPE to all heads in Q and K vectors
-// q_data: n_heads * d_head elements
-// k_data: n_kv_heads * d_head elements
-@kernel fn tfm_rope_apply(q_data: i64, k_data: i64, pos: i64,
-                           n_heads: i64, n_kv_heads: i64, d_head: i64) {
+// Legacy wrapper — uses ROPE_FREQ_BASE (local). Kept for non-Gemma callers.
+@kernel fn tfm_rope_apply_head(data_addr: i64, pos: i64, d_head: i64) {
+    tfm_rope_apply_head_at(data_addr, pos, d_head, ROPE_FREQ_BASE)
+}
+
+// Apply RoPE to all heads in Q and K vectors using an explicit freq table.
+// V28.1: freq_base is the inv_freq table to use for this layer. For Gemma 3,
+// caller picks ROPE_FREQ_BASE (local, 10K) or ROPE_FREQ_GLOBAL (global, 1M)
+// based on the layer's position in the sliding_pattern cycle.
+@kernel fn tfm_rope_apply_at(q_data: i64, k_data: i64, pos: i64,
+                              n_heads: i64, n_kv_heads: i64, d_head: i64,
+                              freq_base: i64) {
     // Apply to each Q head
     let mut h: i64 = 0
     while h < n_heads {
-        tfm_rope_apply_head(q_data + h * d_head * 8, pos, d_head)
+        tfm_rope_apply_head_at(q_data + h * d_head * 8, pos, d_head, freq_base)
         h = h + 1
     }
     // Apply to each KV head
     h = 0
     while h < n_kv_heads {
-        tfm_rope_apply_head(k_data + h * d_head * 8, pos, d_head)
+        tfm_rope_apply_head_at(k_data + h * d_head * 8, pos, d_head, freq_base)
         h = h + 1
+    }
+}
+
+// Legacy wrapper — uses ROPE_FREQ_BASE (local) for all layers.
+@kernel fn tfm_rope_apply(q_data: i64, k_data: i64, pos: i64,
+                           n_heads: i64, n_kv_heads: i64, d_head: i64) {
+    tfm_rope_apply_at(q_data, k_data, pos, n_heads, n_kv_heads, d_head,
+                      ROPE_FREQ_BASE)
+}
+
+// V28.1: Gemma 3 per-layer RoPE table selector.
+// sliding_pattern=6 → globals at layers 5, 11, 17, 23 (layer_idx % 6 == 5).
+// For v<7 / non-Gemma models, returns ROPE_FREQ_BASE unconditionally.
+@kernel fn tfm_rope_freq_for_layer(layer_idx: i64) -> i64 {
+    if mdl_get_version() < 7 { return ROPE_FREQ_BASE }
+    let mt = mdl_get_model_type()
+    if mt != 10 && mt != 11 { return ROPE_FREQ_BASE }
+    let pattern = mdl_get_sliding_pattern()
+    if pattern <= 0 { return ROPE_FREQ_BASE }
+    // Global when (layer_idx % pattern) == (pattern - 1)
+    if (layer_idx % pattern) == (pattern - 1) {
+        ROPE_FREQ_GLOBAL
+    } else {
+        ROPE_FREQ_BASE
     }
 }
 
@@ -628,8 +672,10 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
     tfm_vecmat_packed(x_slot, qkv_addr + wv_off, d_model, kv_d, quant_bits, cb_addr, TFM_V)
 
     // === RoPE ===
-    tfm_rope_apply(km_data_ptr(TFM_Q), km_data_ptr(TFM_K), pos,
-                    n_heads, n_kv_heads, d_head)
+    // V28.1: dual-theta for Gemma 3; legacy ROPE_FREQ_BASE for everything else.
+    let rope_base_l = tfm_rope_freq_for_layer(layer)
+    tfm_rope_apply_at(km_data_ptr(TFM_Q), km_data_ptr(TFM_K), pos,
+                       n_heads, n_kv_heads, d_head, rope_base_l)
 
     // === Attention (GQA + sliding window) ===
     let window = tfm_attn_window(layer)
@@ -855,6 +901,14 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
     tfm_alloc_slots(mdl_get_d_model(), mdl_get_vocab_size())
     let theta = mdl_get_rope_theta()
     if theta > 0 { rope_init_freq(mdl_get_d_head(), theta) }
+    // V28.1: init global theta table for Gemma 3
+    if mdl_get_version() >= 7 {
+        let mt = mdl_get_model_type()
+        if mt == 10 || mt == 11 {
+            let tg = mdl_get_rope_global()
+            if tg > 0 { rope_init_freq_at(ROPE_FREQ_GLOBAL, mdl_get_d_head(), tg) }
+        }
+    }
     tfm_clear_kv()
 
     // Process all prompt tokens (prefill)
@@ -980,6 +1034,14 @@ const TFM_EOS_TOKEN: i64 = 2
     tfm_alloc_slots(mdl_get_d_model(), mdl_get_vocab_size())
     let theta = mdl_get_rope_theta()
     if theta > 0 { rope_init_freq(mdl_get_d_head(), theta) }
+    // V28.1: init global theta table for Gemma 3
+    if mdl_get_version() >= 7 {
+        let mt = mdl_get_model_type()
+        if mt == 10 || mt == 11 {
+            let tg = mdl_get_rope_global()
+            if tg > 0 { rope_init_freq_at(ROPE_FREQ_GLOBAL, mdl_get_d_head(), tg) }
+        }
+    }
     tfm_clear_kv()
 
     let t_start = rdtsc()
@@ -1348,7 +1410,11 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     volatile_write_u64(v_base + KM_HDR_COLS, kv_d)
 
     // === RoPE ===
-    tfm_rope_apply(q_out, k_out, pos, n_heads, n_kv, d_head)
+    // V28.1: Gemma 3 dual theta — pick local (10K) or global (1M) table per layer.
+    // tfm_rope_freq_for_layer returns ROPE_FREQ_BASE for non-Gemma / v<7 models,
+    // keeping SmolLM/Llama paths bit-identical.
+    let rope_base = tfm_rope_freq_for_layer(layer)
+    tfm_rope_apply_at(q_out, k_out, pos, n_heads, n_kv, d_head, rope_base)
 
     // === Attention → ATTN slot ===
     let window = tfm_attn_window(layer)
@@ -1492,9 +1558,23 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     tfm_set_slot_dim(TFM_V, 1, kv_d)
     tfm_set_slot_dim(TFM_ATTN, 1, q_dim)
 
-    // Init RoPE frequencies
+    // Init RoPE frequencies.
+    // Legacy path: single theta → ROPE_FREQ_BASE.
     let theta = mdl_get_rope_theta()
     if theta > 0 { rope_init_freq(d_head, theta) }
+    // V28.1 Gemma 3: dual theta — populate both tables.
+    // rope_theta  (FJM_OFF_ROPE_THETA / 1000): local theta (e.g., 10_000)
+    // rope_global (FJM_OFF_ROPE_GLOBAL in MDL_V7_EXTRA): global theta (e.g., 1_000_000)
+    // Non-Gemma models leave ROPE_FREQ_GLOBAL unused and harmless.
+    if mdl_get_version() >= 7 {
+        let mt = mdl_get_model_type()
+        if mt == 10 || mt == 11 {
+            let theta_global = mdl_get_rope_global()
+            if theta_global > 0 {
+                rope_init_freq_at(ROPE_FREQ_GLOBAL, d_head, theta_global)
+            }
+        }
+    }
     tfm_clear_kv()
 
     let eos = mdl_get_eos_token()
