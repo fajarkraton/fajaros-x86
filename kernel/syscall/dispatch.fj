@@ -361,7 +361,7 @@ const O_TRUNC: i64 = 512    // 0x200
         }
     }
     fd_v2_set(pid, fd, FD_CLOSED, 0)
-    -1
+    return -1
 }
 
 @kernel fn sys_close(fd: i64) -> i64 {

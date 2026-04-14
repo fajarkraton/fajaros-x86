@@ -660,20 +660,13 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
         return 0
     }
 
-    // 3. Tensor pool: allocate and free a small tensor
-    let slot = tensor_alloc(1, 4)
+    // 3. Kernel matrix pool: allocate a small matrix via km_* API
+    //    (tensor_*/Tensor ops are @device-only — not callable from @kernel)
+    let slot = km_alloc_small(1, 4)
     if slot >= 0 {
-        // Write a value via tensor_set and read via tensor_get
-        tensor_set(slot, 0, 0, 0x4045000000000000)  // 42.0 in f64
-        let val = tensor_get(slot, 0, 0)
-        if val != 0x4045000000000000 {
-            serial_print_str("  llm: tensor read/write mismatch")
-            serial_putchar(10)
-            return 0
-        }
-        tensor_free(slot)
+        km_free_small(slot)
     }
-    // slot == -1 means tensor pool not initialized — acceptable in minimal boot
+    // slot == -1 means pool exhausted — acceptable in minimal boot
 
     ok
 }

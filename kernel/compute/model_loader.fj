@@ -58,10 +58,15 @@ const FJM_OFF_LMHEAD_CB: i64 = 108  // 32B: LM head codebook (4 centroids × 8B)
 const FJM_OFF_FINAL_NORM: i64 = 140 // 4B: byte offset to final RMSNorm weights
 const FJM_OFF_EMBED_BITS: i64 = 144 // 4B: embedding quant bits (v5+, 0=use global)
 const FJM_OFF_LMHEAD_BITS: i64 = 148 // 4B: LM head quant bits (v5+, 0=use global)
-// Bytes 144-159: reserved
+// v7 fields (offset 152-175) — Gemma 3 1B:
+const FJM_OFF_ROPE_GLOBAL: i64 = 152     // 8B: rope_theta_global (1,000,000 for Gemma 3)
+const FJM_OFF_SLIDING_WINDOW: i64 = 160  // 4B: sliding window size (512 for Gemma 3)
+const FJM_OFF_SLIDING_PATTERN: i64 = 164 // 4B: global layer period (6 for Gemma 3)
+const FJM_OFF_N_KV_HEADS_V7: i64 = 168   // 4B: n_kv_heads (duplicate of FJM_OFF_N_KV_HEADS at 48)
 const FJM_HEADER_V1_SIZE: i64 = 64
 const FJM_HEADER_V2_SIZE: i64 = 96
-const FJM_HEADER_SIZE: i64 = 160    // v3 header (was 96 for v2)
+const FJM_HEADER_SIZE: i64 = 160    // v3-v6 header
+const FJM_HEADER_V7_SIZE: i64 = 176 // v7 adds 16 bytes (rope_global, sliding_window, pattern, n_kv_heads)
 
 // Per-layer block header (16 bytes before weight data)
 const FJM_LAYER_OFF_ID: i64 = 0       // 4B: layer index
@@ -74,7 +79,10 @@ const FJM_LAYER_HDR_SIZE: i64 = 16
 // Memory Layout for Loaded Model
 // ═══════════════════════════════════════════════════════════════
 
-const MDL_HDR_BASE: i64 = 0xC00000       // Parsed header copy (160 bytes for v3)
+const MDL_HDR_BASE: i64 = 0xC00000       // Parsed header copy (160 bytes for v3-v6)
+// V28.1: v7 extra fields (16 bytes) stored separately to avoid overlap
+// with MDL_STATE_BASE at 0xC000A0. Layout: rope_global(8) + sliding_window(4) + sliding_pattern(4)
+const MDL_V7_EXTRA: i64 = 0xBEF200       // v7 extra header fields (16 bytes)
 const MDL_STATE_BASE: i64 = 0xC000A0     // Loader state (64 bytes) — after 160B header
 const MDL_CODEBOOK_BASE: i64 = 0xC000E0 // Per-layer codebooks (32 × 32B = 1KB)
 const MDL_EMBED_CB: i64 = 0xC004E0      // Embedding codebook (32 bytes) — v3/v4
@@ -165,9 +173,10 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         return -1  // Bad magic
     }
 
-    // Check version (support v1, v2, v3, v4, v5, v6)
+    // Check version (support v1, v2, v3, v4, v5, v6, v7)
+    // v7 adds Gemma 3 1B fields: rope_theta_global, sliding_window, sliding_pattern, n_kv_heads
     let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
-    if version < 1 || version > 6 {
+    if version < 1 || version > 7 {
         return -2  // Unsupported version
     }
 
@@ -193,16 +202,17 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 
     // Validate offsets don't exceed file size
     // v3 and v4 share same 160-byte header layout
-    let min_hdr = if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
+    let min_hdr = if version >= 7 { FJM_HEADER_V7_SIZE } else if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
     if total_size < min_hdr { return -3 }
     if embed_off >= total_size { return -3 }
     if layer0_off >= total_size { return -3 }
     if lmhead_off >= total_size { return -3 }
 
-    // Copy validated header to MDL_HDR_BASE
-    let hdr_size = if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
+    // Copy validated header to MDL_HDR_BASE (max 160 bytes — MDL_STATE_BASE follows)
+    // v7 extras (16 bytes after offset 160) go to separate MDL_V7_EXTRA region
+    let base_copy = if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
     let mut i: i64 = 0
-    while i < hdr_size {
+    while i < base_copy {
         volatile_write_u8(MDL_HDR_BASE + i, volatile_read_u8(src_addr + i))
         i = i + 1
     }
@@ -211,6 +221,15 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         while i < FJM_HEADER_SIZE {
             volatile_write_u8(MDL_HDR_BASE + i, 0)
             i = i + 1
+        }
+    }
+    // v7: copy extra 16 bytes (rope_global, sliding_window, sliding_pattern, n_kv_heads_v7)
+    // to MDL_V7_EXTRA to avoid clobbering MDL_STATE_BASE at MDL_HDR_BASE+160.
+    if version >= 7 {
+        let mut vi: i64 = 0
+        while vi < 16 {
+            volatile_write_u8(MDL_V7_EXTRA + vi, volatile_read_u8(src_addr + FJM_OFF_ROPE_GLOBAL + vi))
+            vi = vi + 1
         }
     }
 
@@ -271,6 +290,18 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if v > 0 { v } else { mdl_get_n_heads() }  // 0 = MHA
 }
 @kernel fn mdl_get_ffn_type() -> i64 { mdl_read_u32(MDL_HDR_BASE + FJM_OFF_FFN_TYPE) }
+
+// v7 Gemma 3 1B accessors (read from MDL_V7_EXTRA, populated on v7 load)
+// Returns 0 if version < 7 (caller should check mdl_get_version() first)
+@kernel fn mdl_get_rope_global() -> i64 {
+    if mdl_get_version() >= 7 { volatile_read_u64(MDL_V7_EXTRA) } else { 0 }
+}
+@kernel fn mdl_get_sliding_window() -> i64 {
+    if mdl_get_version() >= 7 { mdl_read_u32(MDL_V7_EXTRA + 8) } else { 0 }
+}
+@kernel fn mdl_get_sliding_pattern() -> i64 {
+    if mdl_get_version() >= 7 { mdl_read_u32(MDL_V7_EXTRA + 12) } else { 0 }
+}
 // v5 mixed precision: per-section bit widths (0 = use global quant_bits)
 @kernel fn mdl_get_embed_bits() -> i64 {
     let v = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_EMBED_BITS)
