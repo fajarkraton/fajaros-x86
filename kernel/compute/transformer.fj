@@ -460,21 +460,47 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 // all others are local sliding window (512 tokens).
 // sliding_window_pattern = 6 → globals at layers 5, 11, 17, 23 (0-indexed)
 
-const TFM_SLIDING_WINDOW: i64 = 512    // local attention window size
-const TFM_GLOBAL_PATTERN: i64 = 6      // every Nth layer is global
+const TFM_SLIDING_WINDOW: i64 = 512    // fallback local attention window size
+const TFM_GLOBAL_PATTERN: i64 = 6      // fallback: every Nth layer is global
+
+// V28.1: read pattern from v7 header so Gemma 3 variants (1B pattern=6,
+// future 4B/12B potentially different) pick up the right schedule.
+// Non-v7 / non-Gemma models fall through to the compiled-in defaults.
+@kernel fn tfm_sliding_pattern() -> i64 {
+    if mdl_get_version() >= 7 {
+        let mt = mdl_get_model_type()
+        if mt == 10 || mt == 11 {
+            let p = mdl_get_sliding_pattern()
+            if p > 0 { return p }
+        }
+    }
+    TFM_GLOBAL_PATTERN
+}
+
+@kernel fn tfm_sliding_window_size() -> i64 {
+    if mdl_get_version() >= 7 {
+        let mt = mdl_get_model_type()
+        if mt == 10 || mt == 11 {
+            let w = mdl_get_sliding_window()
+            if w > 0 { return w }
+        }
+    }
+    TFM_SLIDING_WINDOW
+}
 
 // Returns 1 if layer is global attention, 0 if local sliding window
+// Pattern: first global at (pattern-1), then every pattern layers.
+// For pattern=6: globals at 5, 11, 17, 23 (matches Gemma 3 1B exactly).
 @kernel fn tfm_is_global_layer(layer: i64) -> i64 {
-    // Pattern: first global at (pattern-1), then every pattern layers
-    // For pattern=6: globals at 5, 11, 17, 23
-    if ((layer + 1) % TFM_GLOBAL_PATTERN) == 0 { 1 } else { 0 }
+    let pattern = tfm_sliding_pattern()
+    if ((layer + 1) % pattern) == 0 { 1 } else { 0 }
 }
 
 // Get attention window size for a given layer
 // Global layers: attend to all positions (return 0 = no limit)
-// Local layers: attend to last 512 positions
+// Local layers: attend to last `window` positions (512 for Gemma 3 1B)
 @kernel fn tfm_attn_window(layer: i64) -> i64 {
-    if tfm_is_global_layer(layer) == 1 { 0 } else { TFM_SLIDING_WINDOW }
+    if tfm_is_global_layer(layer) == 1 { 0 } else { tfm_sliding_window_size() }
 }
 
 // ═══════════════════════════════════════════════════════════════
