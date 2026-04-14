@@ -248,10 +248,149 @@ def main():
     if not args.output:
         parser.error("-o required unless --validate")
 
-    # Full export — implemented in Day 2 once kernel v8 branch is in place.
-    print("Full v8 export will be implemented after Day 2 kernel updates.")
-    print("Run with --validate to exercise the Day 1 single-matrix gate.")
-    sys.exit(1)
+    full_export(args.output, args.write_disk, args.lba)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Full v8 export (Day 2)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _qm(f, key: str):
+    """Load a weight as float32 numpy."""
+    import torch
+    return f.get_tensor(key).to(torch.float32).numpy()
+
+
+def quantize_matrix_v8(w: np.ndarray) -> bytes:
+    """Group-wise quant + serialize a full weight matrix to v8 bytes."""
+    idx, scales, zeros = groupwise_quantize_4bit(w, GROUP_SIZE)
+    return serialize_matrix_v8(idx, scales, zeros)
+
+
+def full_export(output_path: str, disk_path: str | None, lba: int) -> None:
+    """Produce a full .fjm v8 file for Gemma 3 1B."""
+    st_path = resolve_safetensors_path()
+    print(f"Loading Gemma 3 1B from: {st_path}")
+
+    import torch
+    from safetensors import safe_open
+    f_torch = safe_open(st_path, framework="pt")
+
+    class _W:
+        def get_tensor(self, key):
+            return f_torch.get_tensor(key).to(torch.float32).numpy()
+    f = _W()
+
+    print(f"  v8 group-wise 4-bit (group={GROUP_SIZE}), Gemma 3 1B, {N_LAYERS} layers")
+
+    # === Embedding ===
+    embed_w = f.get_tensor("model.embed_tokens.weight")  # [vocab, d_model]
+    print(f"  Embedding: {embed_w.shape}")
+    embed_bytes = quantize_matrix_v8(embed_w)
+    print(f"    → {len(embed_bytes)} bytes ({len(embed_bytes)/1024/1024:.1f} MB)")
+
+    # === Layers ===
+    layer_blocks = []
+    for li in range(N_LAYERS):
+        prefix = f"model.layers.{li}"
+
+        q_w = f.get_tensor(f"{prefix}.self_attn.q_proj.weight").T
+        k_w = f.get_tensor(f"{prefix}.self_attn.k_proj.weight").T
+        v_w = f.get_tensor(f"{prefix}.self_attn.v_proj.weight").T
+        o_w = f.get_tensor(f"{prefix}.self_attn.o_proj.weight").T
+        g_w = f.get_tensor(f"{prefix}.mlp.gate_proj.weight").T
+        u_w = f.get_tensor(f"{prefix}.mlp.up_proj.weight").T
+        d_w = f.get_tensor(f"{prefix}.mlp.down_proj.weight").T
+
+        q_b = quantize_matrix_v8(q_w)
+        k_b = quantize_matrix_v8(k_w)
+        v_b = quantize_matrix_v8(v_w)
+        o_b = quantize_matrix_v8(o_w)
+        g_b = quantize_matrix_v8(g_w)
+        u_b = quantize_matrix_v8(u_w)
+        d_b = quantize_matrix_v8(d_w)
+
+        qkv_packed = q_b + k_b + v_b + o_b
+        ffn_packed = g_b + u_b + d_b
+
+        # 4 RMSNorms + 2 head norms (same as v7)
+        norms = b""
+        for k in ("input_layernorm", "post_attention_layernorm",
+                  "pre_feedforward_layernorm", "post_feedforward_layernorm"):
+            norms += serialize_norm(f.get_tensor(f"{prefix}.{k}.weight").astype(np.float64))
+        norms += serialize_norm(f.get_tensor(f"{prefix}.self_attn.q_norm.weight").astype(np.float64))
+        norms += serialize_norm(f.get_tensor(f"{prefix}.self_attn.k_norm.weight").astype(np.float64))
+
+        # v8 has NO trailing codebook section — scales+zeros are inline per matrix.
+        weight_data = qkv_packed + ffn_packed + norms
+        # v8 layer header: index, block_size, qkv_size, ffn_size, norm_size
+        hdr = struct.pack("<iiiii", li, 20 + len(weight_data),
+                          len(qkv_packed), len(ffn_packed), len(norms))
+        layer_blocks.append(hdr + weight_data)
+        if li == 0:
+            print(f"  Layer 0: QKV={len(qkv_packed)} FFN={len(ffn_packed)} NORM={len(norms)}")
+        elif li == 1:
+            print(f"  Layer 1..{N_LAYERS-1}: (same structure)")
+
+    # === Final RMSNorm ===
+    final_norm = f.get_tensor("model.norm.weight").astype(np.float64)
+    final_norm_data = serialize_norm(final_norm)
+
+    # === Assemble ===
+    embed_off = FJM_HEADER_SIZE
+    layer0_off = embed_off + len(embed_bytes)
+    layers_total = sum(len(b) for b in layer_blocks)
+    final_norm_off = layer0_off + layers_total
+    lmhead_off = embed_off  # tied
+    total_size = final_norm_off + len(final_norm_data)
+
+    # v8 header — re-uses the 176 B v7 slot but:
+    #   * version field = 8
+    #   * quant_format @ 172 = 1 (group-wise)
+    #   * group_size @ 174 = 128
+    # Kernel v7 code already reads MDL_V7_EXTRA for rope_global/sliding/pattern —
+    # we keep those bytes identical so v7 accessors still return correct values
+    # when a v8 model is loaded. The only behavioral switch is indexed by version.
+    header = struct.pack("<19I",
+        FJM_MAGIC, FJM_VERSION,
+        MODEL_TYPE, N_LAYERS, D_MODEL, N_HEADS, D_HEAD,
+        VOCAB_SIZE, 4, total_size, embed_off, layer0_off, lmhead_off,
+        N_KV_HEADS, 1, 1, FFN_DIM,
+        ROPE_THETA_LOCAL // 1000, EOS_TOKEN,
+    )
+    header += b"\x00" * 32   # 76-107
+    header += b"\x00" * 32   # 108-139
+    header += struct.pack("<I", final_norm_off)  # 140-143
+    header += struct.pack("<I", 4)               # 144-147 embed_bits
+    header += struct.pack("<I", 4)               # 148-151 lmhead_bits
+    header += struct.pack("<Q", ROPE_THETA_GLOBAL)  # 152-159
+    header += struct.pack("<I", SLIDING_WINDOW)     # 160-163
+    header += struct.pack("<I", SLIDING_PATTERN)    # 164-167
+    header += struct.pack("<I", N_KV_HEADS)         # 168-171
+    header += struct.pack("<HH", QUANT_FORMAT_GROUPWISE, GROUP_SIZE)  # 172-175
+    assert len(header) == FJM_HEADER_SIZE
+
+    fjm = header + embed_bytes
+    for blk in layer_blocks:
+        fjm += blk
+    fjm += final_norm_data
+
+    assert len(fjm) == total_size, f"{len(fjm)} vs {total_size}"
+
+    with open(output_path, "wb") as out:
+        out.write(fjm)
+
+    print(f"\nSaved: {output_path} ({total_size} bytes, {total_size/1024/1024:.1f} MB)")
+
+    if disk_path:
+        with open(disk_path, "r+b") as disk:
+            disk.seek(lba * 512)
+            disk.write(fjm)
+            rem = len(fjm) % 512
+            if rem:
+                disk.write(b"\x00" * (512 - rem))
+        sectors = (len(fjm) + 511) // 512
+        print(f"Written to {disk_path} at LBA {lba} ({sectors} sectors)")
 
 
 if __name__ == "__main__":
