@@ -1466,13 +1466,36 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     let attn_data = km_data_ptr(TFM_ATTN)
     tfm_vecmat_auto(attn_data, o_addr, q_dim, d_model, bits, cb_o, STFM_FFN_OUT)
 
-    // === Residual + Projected Attention ===
+    // === V28.2 BUG FIX: post_attention_layernorm (Gemma 3 only) ===
+    // Gemma 3 applies FOUR RMSNorms per block:
+    //   input_layernorm → attention → post_attention_layernorm → + residual
+    //   pre_feedforward_layernorm → FFN → post_feedforward_layernorm → + residual
+    // V28.1 kernel only applied 2 (input + pre-FFN) because SmolLM/Llama have 2.
+    // Without post-norm, attention/FFN outputs accumulate unbounded and magnitudes
+    // explode geometrically through 26 layers. v7 quantization noise masked the
+    // error; v8 (which preserves weight fidelity) exposes it.
+    let mt_for_norms = mdl_get_model_type()
+    if mt_for_norms == 10 || mt_for_norms == 11 {
+        let post_attn_ln = norm_addr + d_model * 8   // norm 2 of 4
+        km_rmsnorm(STFM_FFN_OUT, d_model, post_attn_ln)
+    }
+
+    // === Residual + (post-norm'd) Projected Attention ===
     mdl_memcpy(x_addr, STFM_RES, d_model * 8)
     km_add_raw(x_addr, STFM_FFN_OUT, d_model)
 
     // === Pre-FFN RMSNorm ===
     mdl_memcpy(STFM_RES, x_addr, d_model * 8)
-    let ln2_gamma = norm_addr + d_model * 8
+    // V28.2 BUG FIX: Gemma 3 norm #3 of 4 is pre_feedforward_layernorm at
+    // offset 2*d_model*8. SmolLM/Llama have only 2 norms so #2 (pre-FFN)
+    // is at offset d_model*8. Mis-indexing caused Gemma 3 to apply the
+    // wrong gamma weights → small magnitude errors that compounded under
+    // v8's accurate quantization.
+    let ln2_gamma = if mt_for_norms == 10 || mt_for_norms == 11 {
+        norm_addr + 2 * d_model * 8
+    } else {
+        norm_addr + d_model * 8
+    }
     km_rmsnorm(x_addr, d_model, ln2_gamma)
 
     // === Gated FFN with per-matrix codebooks (gate=4, up=5, down=6) ===
@@ -1485,7 +1508,13 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
                    cb_gate, cb_up, cb_down,
                    STFM_FFN_OUT, STFM_FFN_GATE, STFM_FFN_UP)
 
-    // === Residual + FFN ===
+    // === V28.2 BUG FIX: post_feedforward_layernorm (Gemma 3 only) ===
+    if mt_for_norms == 10 || mt_for_norms == 11 {
+        let post_ffn_ln = norm_addr + 3 * d_model * 8   // norm 4 of 4
+        km_rmsnorm(STFM_FFN_OUT, d_model, post_ffn_ln)
+    }
+
+    // === Residual + (post-norm'd) FFN ===
     mdl_memcpy(x_addr, STFM_RES, d_model * 8)
     km_add_raw(x_addr, STFM_FFN_OUT, d_model)
 }
