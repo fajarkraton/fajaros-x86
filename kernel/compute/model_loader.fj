@@ -1143,7 +1143,11 @@ const STREAM_LMHEAD_CHUNK: i64 = 0x100000   // 1 MB per LM head chunk
 const STREAM_FINAL_NORM: i64 = 0xD530000    // Final RMSNorm gamma (d_model × 8 bytes)
 
 // RAM-resident mode: load ALL weights to RAM (no NVMe per-token)
-const RAM_LAYERS_BASE: i64 = 0x10000000    // 256 MB — 26 layers contiguous
+const RAM_LAYERS_BASE: i64 = 0x14000000    // 320 MB — 26 layers contiguous.
+// V28.1: bumped from 0x10000000 (256 MB) to avoid overlap with STREAM_EMBED
+// region 0x8000000..0x11000000 (144 MB embed for Gemma 3 1B). SmolLM-135M
+// had ~75 MB embed so 256 MB was safe; Gemma 3's 262K vocab pushes it over.
+// Guard: layer region ends at 0x14000000 + 335 MB = ~0x28F00000 (~655 MB).
 const RAM_LMHEAD_BASE: i64 = 0x1AF00000   // ~431 MB — LM head (adjusted at load time)
 const MDL_RAM_STATE: i64 = 0xC00540       // RAM-resident state (24 bytes)
 const MDL_RAM_ACTIVE: i64 = 0             // offset: 1 if RAM mode active
@@ -1445,7 +1449,7 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 { return -1 }
     let vocab_size = mdl_get_vocab_size()
     let d_model = mdl_get_d_model()
-    let bits = mdl_get_quant_bits()
+    let bits = mdl_get_embed_bits()  // V28.1: embed-specific bits (v5+)
     if token_id < 0 || token_id >= vocab_size { return -2 }
 
     let bytes_per_row = d_model * bits / 8
@@ -1457,7 +1461,7 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 
     let elems_per_byte = 8 / bits
     let mask = (1 << bits) - 1
-    let cb_addr = MDL_EMBED_CB
+    let cb_addr = mdl_get_embed_cb()  // V28.1: v5+ uses MDL_EMBED_CB_V5
 
     let mut i: i64 = 0
     while i < d_model {
@@ -1478,14 +1482,18 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 { return -1 }
     let vocab_size = mdl_get_vocab_size()
     let d_model = mdl_get_d_model()
-    let bits = mdl_get_quant_bits()
+    // V28.1: v5+ embeddings use their own bit width + dedicated codebook.
+    // For Gemma 3: embed is 4-bit with 128-byte codebook at MDL_EMBED_CB_V5.
+    // Previously hardcoded `bits = mdl_get_quant_bits()` + MDL_EMBED_CB which
+    // works for v3/v4 but reads stale 32-byte cb for v5 4-bit models.
+    let bits = mdl_get_embed_bits()
     if token_id < 0 || token_id >= vocab_size { return -2 }
 
     let bytes_per_row = d_model * bits / 8
     let src = STREAM_EMBED_BASE + token_id * bytes_per_row
     let elems_per_byte = 8 / bits
     let mask = (1 << bits) - 1
-    let cb_addr = MDL_EMBED_CB
+    let cb_addr = mdl_get_embed_cb()
 
     let mut i: i64 = 0
     while i < d_model {
@@ -1709,12 +1717,27 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
         }
     }
 
-    // Activate RAM-resident mode. For tied models, actual_lmhead_addr points
-    // past the layers — but logits code must read from STREAM_EMBED instead.
-    // Downstream lmhead argmax/sample functions branch on MDL_RAM_TIED.
+    // Activate RAM-resident mode. For tied models, point lmhead_addr directly
+    // at STREAM_EMBED_BASE so hot-path functions (argmax/sample) can read it
+    // without any branch. Branching inside the inner vocab loop triggered
+    // LLVM O2 wild pointer crashes.
     volatile_write_u64(MDL_RAM_STATE + MDL_RAM_ACTIVE, 1)
-    volatile_write_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD, actual_lmhead_addr)
+    let hot_path_addr = if tied_lmhead == 1 { STREAM_EMBED_BASE } else { actual_lmhead_addr }
+    volatile_write_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD, hot_path_addr)
     volatile_write_u64(MDL_RAM_STATE + MDL_RAM_TIED, tied_lmhead)
+    // For tied models, copy embedding codebook to LM head codebook slot so
+    // the generic hot-path can read `MDL_LMHEAD_CB_V5` directly.
+    if tied_lmhead == 1 && mdl_get_version() >= 5 {
+        let eb = mdl_get_embed_bits()
+        let n_centroids = 1 << eb
+        let cb_size = n_centroids * 8
+        let src_cb = mdl_get_embed_cb()
+        if eb <= 2 {
+            mdl_memcpy(MDL_LMHEAD_CB, src_cb, cb_size)
+        } else {
+            mdl_memcpy(MDL_LMHEAD_CB_V5, src_cb, cb_size)
+        }
+    }
     0
 }
 
@@ -1764,7 +1787,9 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 @kernel fn mdl_ram_lmhead_argmax(x_addr: i64) -> i64 {
     let vocab_size = mdl_get_vocab_size()
     let d_model = mdl_get_d_model()
-    let bits = mdl_get_quant_bits()
+    // V28.1: tied LM head — lmhead_addr + codebook already redirected by
+    // ram-load for tied models. No branch needed here.
+    let bits = mdl_get_lmhead_bits()
     let lmhead_addr = volatile_read_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD)
     let cb_addr = MDL_LMHEAD_CB
 
@@ -1808,7 +1833,9 @@ const LM_TOPK_K: i64 = 8
 @kernel fn mdl_ram_lmhead_sample(x_addr: i64, temperature: i64) -> i64 {
     let vocab_size = mdl_get_vocab_size()
     let d_model = mdl_get_d_model()
-    let bits = mdl_get_quant_bits()
+    // V28.1: tied LM head — lmhead_addr + codebook already redirected by
+    // ram-load; just read. No branch in hot path.
+    let bits = mdl_get_lmhead_bits()
     let lmhead_addr = volatile_read_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD)
     let cb_addr = MDL_LMHEAD_CB
 
@@ -1893,6 +1920,9 @@ const LM_TOPK_K: i64 = 8
 @kernel fn mdl_ram_lmhead_argmax_v5_4bit(x_addr: i64) -> i64 {
     let vocab_size = mdl_get_vocab_size()
     let d_model = mdl_get_d_model()
+    // V28.1: tied LM head → MDL_RAM_LMHEAD already points at STREAM_EMBED_BASE
+    // and MDL_LMHEAD_CB_V5 already contains the embedding codebook. No branch
+    // needed in hot path (branches triggered LLVM O2 wild pointer crashes).
     let lmhead_addr = volatile_read_u64(MDL_RAM_STATE + MDL_RAM_LMHEAD)
     let cb_addr = MDL_LMHEAD_CB_V5
 
