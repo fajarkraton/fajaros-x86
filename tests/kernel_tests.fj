@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 25  // V26 B3.1 added test_vfs_write_roundtrip
+const TEST_TOTAL: i64 = 26  // V28.1 added test_gemma_pool_alloc
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -679,6 +679,52 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 }
 
 // ═══════════════════════════════════════════════════════════════
+// V28.1 Gemma Pool Test — validates 1152-dim support
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn test_gemma_pool_alloc() -> i64 {
+    // Allocate a 1152-dim vector (Gemma 3 1B d_model) — must fit
+    let slot = km_alloc_gemma(1, 1152)
+    if slot < 0 {
+        serial_print_str("  gemma: 1152-dim alloc failed")
+        serial_putchar(10)
+        return 0
+    }
+    // Allocate a 1280-dim (max) — must fit
+    let slot2 = km_alloc_gemma(1, 1280)
+    if slot2 < 0 {
+        km_free_gemma(slot)
+        serial_print_str("  gemma: 1280-dim alloc failed")
+        serial_putchar(10)
+        return 0
+    }
+    // 1281-dim must fail (exceeds max)
+    let slot3 = km_alloc_gemma(1, 1281)
+    if slot3 >= 0 {
+        km_free_gemma(slot)
+        km_free_gemma(slot2)
+        km_free_gemma(slot3)
+        serial_print_str("  gemma: 1281-dim should have failed")
+        serial_putchar(10)
+        return 0
+    }
+    // Verify separate from KM_LARGE pool (different base address)
+    let gemma_addr = km_gemma_addr(0)
+    let large_addr = km_large_addr(0)
+    if gemma_addr == large_addr {
+        km_free_gemma(slot)
+        km_free_gemma(slot2)
+        serial_print_str("  gemma: pool overlaps large pool")
+        serial_putchar(10)
+        return 0
+    }
+    // Clean up
+    km_free_gemma(slot)
+    km_free_gemma(slot2)
+    1
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Master Test Runner — cmd_test_all()
 // ═══════════════════════════════════════════════════════════════
 
@@ -761,6 +807,8 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     console_putchar(10, WHITE_ON_BLACK)
     cprintln("--- LLM Pipeline ---", CYAN_ON_BLACK)
     r = run_test(test_llm_pipeline_smoke(), "llm_pipeline_smoke", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_gemma_pool_alloc(), "gemma_pool_alloc", p, f)
     p = r / 0x100000000; f = r % 0x100000000
 
     console_putchar(10, WHITE_ON_BLACK)

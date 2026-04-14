@@ -28,6 +28,14 @@ const KM_LARGE_SLOTS: i64 = 16
 const KM_LARGE_DIM: i64 = 1024
 const KM_LARGE_SLOT_SIZE: i64 = 8224  // 32B header + 1024*8B data
 
+// V28.1: Gemma pool (d_model=1152 for Gemma 3 1B, head_dim=256)
+// 8 slots × (32 + 1280*8) = 8 × 10,272 = 82,176 bytes = 80.25 KB
+// Placed at 0xB70000 to avoid overlap with KM_SCRATCH at 0xB62000
+const KM_GEMMA_BASE: i64 = 0xB70000
+const KM_GEMMA_SLOTS: i64 = 8
+const KM_GEMMA_DIM: i64 = 1280  // Supports 1152-dim Gemma 3 1B with margin
+const KM_GEMMA_SLOT_SIZE: i64 = 10272  // 32B header + 1280*8B data
+
 // Header offsets (same for both pools)
 const KM_HDR_ROWS: i64 = 0
 const KM_HDR_COLS: i64 = 8
@@ -116,6 +124,48 @@ const KM_SCRATCH: i64 = 0xB62000
 @kernel fn km_free(slot: i64) {
     if slot < 0 || slot >= KM_LARGE_SLOTS { return }
     let addr = km_large_addr(slot)
+    volatile_write_u64(addr + KM_HDR_ROWS, 0)
+    volatile_write_u64(addr + KM_HDR_COLS, 0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pool Management — Gemma (8 slots × 1280 elements for d_model=1152)
+// V28.1: dedicated pool for Gemma 3 1B (head_dim=256, d_model=1152)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_gemma_addr(slot: i64) -> i64 {
+    KM_GEMMA_BASE + slot * KM_GEMMA_SLOT_SIZE
+}
+
+@kernel fn km_alloc_gemma(rows: i64, cols: i64) -> i64 {
+    // Allocate from Gemma pool (supports up to 1280 elements per slot)
+    if rows * cols > KM_GEMMA_DIM { return -1 }
+    let mut i: i64 = 0
+    while i < KM_GEMMA_SLOTS {
+        let addr = km_gemma_addr(i)
+        let r = volatile_read_u64(addr + KM_HDR_ROWS)
+        let c = volatile_read_u64(addr + KM_HDR_COLS)
+        if r == 0 && c == 0 {
+            volatile_write_u64(addr + KM_HDR_ROWS, rows)
+            volatile_write_u64(addr + KM_HDR_COLS, cols)
+            volatile_write_u64(addr + KM_HDR_FLAGS, 0)
+            volatile_write_u64(addr + KM_HDR_BITS, 0)
+            let total = rows * cols
+            let mut j: i64 = 0
+            while j < total {
+                volatile_write_u64(addr + KM_DATA_OFF + j * 8, 0)
+                j = j + 1
+            }
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+@kernel fn km_free_gemma(slot: i64) {
+    if slot < 0 || slot >= KM_GEMMA_SLOTS { return }
+    let addr = km_gemma_addr(slot)
     volatile_write_u64(addr + KM_HDR_ROWS, 0)
     volatile_write_u64(addr + KM_HDR_COLS, 0)
 }

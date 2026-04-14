@@ -106,8 +106,10 @@
 |-------|-----|------|-------|------|
 | 0xB20000 | 0xB21FFF | 8 KB | Model metadata | kernel/compute/inference.fj |
 | 0xB22A20 | 0xB3FFFF | ~116 KB | FajarQuant scratch | kernel/compute/fajarquant.fj |
-| 0xB40000 | 0xB61FFF | 136 KB | KMatrix large buffer | kernel/compute/kmatrix.fj |
-| 0xB62000 | 0xBDFFFF | ~504 KB | KMatrix scratch | kernel/compute/kmatrix.fj |
+| 0xB40000 | 0xB61FFF | 136 KB | KMatrix large buffer (16 × 1024-dim) | kernel/compute/kmatrix.fj |
+| 0xB62000 | 0xB6FFFF | 56 KB | KMatrix scratch (reduced from 504 KB) | kernel/compute/kmatrix.fj |
+| 0xB70000 | 0xB842FF | 80 KB | V28.1: Gemma pool (8 × 1280-dim) | kernel/compute/kmatrix.fj |
+| 0xB84300 | 0xBDFFFF | ~368 KB | Available for V28 extensions | — |
 | 0xBE0000 | 0xBE7BFF | 31 KB | Transformer scratch | kernel/compute/transformer.fj |
 | 0xBE7C00 | 0xBE7FFF | 1 KB | RoPE frequency table | kernel/compute/transformer.fj |
 | 0xBE8000 | 0xBEBFFF | 16 KB | Transformer state | kernel/compute/transformer.fj |
