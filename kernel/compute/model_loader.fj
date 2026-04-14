@@ -63,10 +63,16 @@ const FJM_OFF_ROPE_GLOBAL: i64 = 152     // 8B: rope_theta_global (1,000,000 for
 const FJM_OFF_SLIDING_WINDOW: i64 = 160  // 4B: sliding window size (512 for Gemma 3)
 const FJM_OFF_SLIDING_PATTERN: i64 = 164 // 4B: global layer period (6 for Gemma 3)
 const FJM_OFF_N_KV_HEADS_V7: i64 = 168   // 4B: n_kv_heads (duplicate of FJM_OFF_N_KV_HEADS at 48)
+// v8 fields (in the last 4 bytes of the 176-byte v7 slot — no header size change):
+const FJM_OFF_QUANT_FORMAT: i64 = 172    // 2B: 0=single-codebook (v7), 1=group-wise (v8)
+const FJM_OFF_GROUP_SIZE: i64 = 174      // 2B: group size (0 for v7, 128 for v8 Gemma 3)
+const FJM_QUANT_GROUPWISE: i64 = 1       // quant_format value for v8 group-wise
+const FJM_GROUP_SIZE_V8: i64 = 128       // expected group size (hot paths hardcode this)
 const FJM_HEADER_V1_SIZE: i64 = 64
 const FJM_HEADER_V2_SIZE: i64 = 96
 const FJM_HEADER_SIZE: i64 = 160    // v3-v6 header
 const FJM_HEADER_V7_SIZE: i64 = 176 // v7 adds 16 bytes (rope_global, sliding_window, pattern, n_kv_heads)
+const FJM_HEADER_V8_SIZE: i64 = 176 // v8 reuses v7 slot; quant_format/group_size in last 4 B
 
 // Per-layer block header (16 bytes before weight data)
 const FJM_LAYER_OFF_ID: i64 = 0       // 4B: layer index
@@ -82,7 +88,13 @@ const FJM_LAYER_HDR_SIZE: i64 = 16
 const MDL_HDR_BASE: i64 = 0xC00000       // Parsed header copy (160 bytes for v3-v6)
 // V28.1: v7 extra fields (16 bytes) stored separately to avoid overlap
 // with MDL_STATE_BASE at 0xC000A0. Layout: rope_global(8) + sliding_window(4) + sliding_pattern(4)
-const MDL_V7_EXTRA: i64 = 0xBEF200       // v7 extra header fields (16 bytes)
+const MDL_V7_EXTRA: i64 = 0xBEF200       // v7+v8 extra header fields (24 bytes).
+// Layout: rope_global(8) + sliding_window(4) + sliding_pattern(4) +
+//         n_kv_heads_v7(4) + quant_format(2) + group_size(2) = 24 B.
+// V28.1 sized this at 16 B (v7 was fine without n_kv_heads_v7 duplicate);
+// V28.2 v8 adds 4 B at the end for quant_format + group_size fields, and
+// we copy 24 B from src so n_kv_heads_v7 becomes addressable too.
+// Next landmark at 0xBEF300 — plenty of headroom.
 const MDL_STATE_BASE: i64 = 0xC000A0     // Loader state (64 bytes) — after 160B header
 const MDL_CODEBOOK_BASE: i64 = 0xC000E0 // Per-layer codebooks (32 × 32B = 1KB)
 const MDL_EMBED_CB: i64 = 0xC004E0      // Embedding codebook (32 bytes) — v3/v4
@@ -173,10 +185,11 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         return -1  // Bad magic
     }
 
-    // Check version (support v1, v2, v3, v4, v5, v6, v7)
+    // Check version (support v1, v2, v3, v4, v5, v6, v7, v8)
     // v7 adds Gemma 3 1B fields: rope_theta_global, sliding_window, sliding_pattern, n_kv_heads
+    // v8 reuses v7 header slot + adds quant_format (group-wise 4-bit) at offset 172
     let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
-    if version < 1 || version > 7 {
+    if version < 1 || version > 8 {
         return -2  // Unsupported version
     }
 
@@ -201,7 +214,7 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if quant_bits < 1 || quant_bits > 8 { return -3 }
 
     // Validate offsets don't exceed file size
-    // v3 and v4 share same 160-byte header layout
+    // v3 and v4 share same 160-byte header layout. v7 and v8 share 176 B.
     let min_hdr = if version >= 7 { FJM_HEADER_V7_SIZE } else if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
     if total_size < min_hdr { return -3 }
     if embed_off >= total_size { return -3 }
@@ -223,11 +236,17 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
             i = i + 1
         }
     }
-    // v7: copy extra 16 bytes (rope_global, sliding_window, sliding_pattern, n_kv_heads_v7)
-    // to MDL_V7_EXTRA to avoid clobbering MDL_STATE_BASE at MDL_HDR_BASE+160.
+    // v7/v8: copy extra 24 bytes from src[152..176] to MDL_V7_EXTRA so we don't
+    // clobber MDL_STATE_BASE at MDL_HDR_BASE+160. Layout after copy:
+    //   MDL_V7_EXTRA[ 0..8 ] = rope_global (u64)
+    //   MDL_V7_EXTRA[ 8..12] = sliding_window (u32)
+    //   MDL_V7_EXTRA[12..16] = sliding_pattern (u32)
+    //   MDL_V7_EXTRA[16..20] = n_kv_heads_v7 (u32, duplicate of offset 48)
+    //   MDL_V7_EXTRA[20..22] = quant_format (u16) — V28.2 v8 (0=v7, 1=group-wise)
+    //   MDL_V7_EXTRA[22..24] = group_size (u16) — V28.2 v8 (128 for Gemma 3)
     if version >= 7 {
         let mut vi: i64 = 0
-        while vi < 16 {
+        while vi < 24 {
             volatile_write_u8(MDL_V7_EXTRA + vi, volatile_read_u8(src_addr + FJM_OFF_ROPE_GLOBAL + vi))
             vi = vi + 1
         }
@@ -301,6 +320,30 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 }
 @kernel fn mdl_get_sliding_pattern() -> i64 {
     if mdl_get_version() >= 7 { mdl_read_u32(MDL_V7_EXTRA + 12) } else { 0 }
+}
+
+// V28.2 v8: group-wise 4-bit quantization.
+// Source offsets: QF @ 172, GS @ 174. Copy starts at src+152 (FJM_OFF_ROPE_GLOBAL),
+// so QF lands at MDL_V7_EXTRA + (172-152) = +20; GS at +22.
+@kernel fn mdl_get_quant_format() -> i64 {
+    if mdl_get_version() < 8 { return 0 }
+    let lo = volatile_read_u8(MDL_V7_EXTRA + 20)
+    let hi = volatile_read_u8(MDL_V7_EXTRA + 21)
+    lo | (hi << 8)
+}
+
+@kernel fn mdl_get_group_size() -> i64 {
+    if mdl_get_version() < 8 { return 0 }
+    let lo = volatile_read_u8(MDL_V7_EXTRA + 22)
+    let hi = volatile_read_u8(MDL_V7_EXTRA + 23)
+    lo | (hi << 8)
+}
+
+// True iff the currently-loaded model uses group-wise quantization.
+// Hot paths dispatch on this at layer/matrix level — never inside vocab
+// loops (lesson from V28.1: LLVM O2 wild pointers with inner branches).
+@kernel fn mdl_is_groupwise() -> i64 {
+    if mdl_get_quant_format() == FJM_QUANT_GROUPWISE { 1 } else { 0 }
 }
 // v5 mixed precision: per-section bit widths (0 = use global quant_bits)
 @kernel fn mdl_get_embed_bits() -> i64 {
@@ -1007,6 +1050,14 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
             cprint_decimal(rt / 1000, CYAN_ON_BLACK)
             cprintln("K", CYAN_ON_BLACK)
         }
+    }
+    // V28.2 v8: show quant format
+    if mdl_get_version() >= 8 && mdl_is_groupwise() == 1 {
+        cprint("  Quant:      ", WHITE_ON_BLACK)
+        cprint_decimal(mdl_get_quant_bits(), CYAN_ON_BLACK)
+        cprint("-bit group-wise (g=", CYAN_ON_BLACK)
+        cprint_decimal(mdl_get_group_size(), CYAN_ON_BLACK)
+        cprintln(")", CYAN_ON_BLACK)
     }
 }
 
