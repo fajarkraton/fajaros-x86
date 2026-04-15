@@ -556,48 +556,75 @@ const KM_TILE_SIZE: i64 = 64
 // Works on raw memory address (for frame-allocated vectors with d > 1024).
 
 @kernel fn km_rmsnorm(data_addr: i64, dim: i64, gamma_addr: i64) {
-    // Safety: reject invalid dimensions or addresses
-    if dim <= 0 || dim > 4096 { return }
-    if data_addr <= 0 || data_addr > 0x20000000 { return }
-    if gamma_addr != 0 && gamma_addr > 0x20000000 { return }
-    // Step 1: compute mean(x²) = sum(x²) / dim
-    // Direct accumulation: sum += x² / dim (overflow-safe for |x| < 3×10^9)
-    // Old chunked formula `(x/dim)*(x/1000)` truncated to 0 for |x| < dim,
-    // causing RMS=0 and normalization explosion on first layer embeddings.
-    let mut rms_sum: i64 = 0
+    // V28.2: max-abs rescaling approach for robust integer-math RMSNorm.
+    //
+    // RMSNorm math: y[i] = x[i] / rms(x) × (1 + γ[i])   (Gemma 3)
+    //           or: y[i] = x[i] / rms(x) × γ[i]         (Llama/SmolLM)
+    //
+    // Key insight: rms is scale-invariant — rms(α·x) = α·rms(x) — so
+    // x[i] / rms(x) == (α·x[i]) / rms(α·x). We rescale x by K/max|x|
+    // before accumulating x² so all intermediate values stay bounded:
+    //   * x_rs = x × K / max_abs, in range [-K, K]
+    //   * x_rs × x_rs ≤ K² (no overflow)
+    //   * sum of dim such terms / dim ≤ K² (no overflow)
+    //   * rms_rs = sqrt(mean(x_rs²)), in [0, K]
+    //   * normed[i] = x_rs[i] × 1000 / rms_rs  (result in ×1000 fp)
+    //
+    // Chose K = 10000 → 0.01% relative precision, plenty for LLM inference.
+    //
+    // Old formula accumulated x²/dim directly, which truncated to 0 for
+    // |x| < sqrt(dim) ≈ 34 — losing small values entirely and distorting
+    // rms when the input distribution had mixed magnitudes. V28.2 v8's
+    // accurate dequant exposed this truncation as magnitude-explosion.
+    //
+    // Safety: reject invalid dimensions or addresses.
+    if dim <= 0 || dim > 8192 { return }
+    // Data/gamma addresses must be within the 1 GB identity-mapped region
+    // (V28.1 extended from 512 MB to 1 GB for v7+ layouts).
+    if data_addr <= 0 || data_addr > 0x40000000 { return }
+    if gamma_addr != 0 && gamma_addr > 0x40000000 { return }
+
+    // Pass 1: find max|x|
+    let mut max_abs: i64 = 0
     let mut i: i64 = 0
     while i < dim {
         let x = volatile_read_u64(data_addr + i * 8)
-        // For large |x| > 1000000: use safe chunking to avoid x*x overflow
-        if x > 1000000 || x < -1000000 {
-            rms_sum = rms_sum + (x / 1000) * (x / 1000) * 1000000 / dim
-        } else {
-            rms_sum = rms_sum + (x * x) / dim
-        }
+        let ax = if x < 0 { 0 - x } else { x }
+        if ax > max_abs { max_abs = ax }
         i = i + 1
     }
-    // rms_sum ≈ mean(x²) in x1000² scale
-    let rms_val = if rms_sum < 0 { 0 - rms_sum } else { rms_sum }
-    // eps = 1 to prevent division by zero
-    let rms = km_isqrt(rms_val + 1)
-    if rms == 0 { return }
+    if max_abs <= 0 { return }   // all zero — nothing to normalize
 
-    // Step 2: normalize and apply gamma
-    // Gamma convention set by model loader at MDL_GAMMA_MODE (0xC00558):
-    //   mode 0 (Gemma): zero-centered gamma, apply as (1+g)*x
-    //   mode 1 (Llama/SmolLM): direct-scale gamma, apply as g*x
+    // K chosen so K*K*dim fits in i64 safely.
+    // K=10000 → K²=1e8 × dim=8192 → 8.2e11, well under i64 max.
+    let k_scale: i64 = 10000
+
+    // Pass 2: accumulate sum((x × K / max_abs)² / dim)
+    let mut rss: i64 = 0
+    i = 0
+    while i < dim {
+        let x = volatile_read_u64(data_addr + i * 8)
+        let x_rs = x * k_scale / max_abs    // in [-K, K]
+        rss = rss + (x_rs * x_rs) / dim
+        i = i + 1
+    }
+
+    let rms_rs = km_isqrt(rss + 1)          // in [1, K]
+    if rms_rs <= 0 { return }
+
+    // Pass 3: normalize and apply gamma
     let gamma_mode = volatile_read_u64(0xC00558)
     i = 0
     while i < dim {
         let x = volatile_read_u64(data_addr + i * 8)
-        let normed = (x * 1000) / rms
+        let x_rs = x * k_scale / max_abs    // recompute (cheap vs storing)
+        // normed (×1000 fp) = x_rs / rms_rs × 1000 = x_rs × 1000 / rms_rs
+        let normed = (x_rs * 1000) / rms_rs
         if gamma_addr != 0 {
             let g = volatile_read_u64(gamma_addr + i * 8)
             if gamma_mode == 1 {
-                // Llama/SmolLM: g = weight×1000, formula = g * x / 1000
                 volatile_write_u64(data_addr + i * 8, (normed * g) / 1000)
             } else {
-                // Gemma: g = (weight-1)×1000, formula = (1+g/1000) * x
                 volatile_write_u64(data_addr + i * 8, (normed * (1000 + g)) / 1000)
             }
         } else {

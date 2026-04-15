@@ -334,9 +334,11 @@ def full_export(output_path: str, disk_path: str | None, lba: int) -> None:
 
         # v8 has NO trailing codebook section — scales+zeros are inline per matrix.
         weight_data = qkv_packed + ffn_packed + norms
-        # v8 layer header: index, block_size, qkv_size, ffn_size, norm_size
-        hdr = struct.pack("<iiiii", li, 20 + len(weight_data),
-                          len(qkv_packed), len(ffn_packed), len(norms))
+        # v8 layer header: 16 bytes = 4 × u32 (matches kernel FJM_LAYER_HDR_SIZE).
+        # Kernel reads: id, total_size, qkv_size, ffn_size. No separate norm_size
+        # field — kernel derives norm addr as (base + qkv_total + ffn_total).
+        hdr = struct.pack("<iiii", li, 16 + len(weight_data),
+                          len(qkv_packed), len(ffn_packed))
         layer_blocks.append(hdr + weight_data)
         if li == 0:
             print(f"  Layer 0: QKV={len(qkv_packed)} FFN={len(ffn_packed)} NORM={len(norms)}")
