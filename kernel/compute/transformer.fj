@@ -1450,6 +1450,13 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     volatile_write_u64(v_base + KM_HDR_ROWS, 1)
     volatile_write_u64(v_base + KM_HDR_COLS, kv_d)
 
+    // === V28.2 P2: Gemma 3 q_norm / k_norm ===
+    // Per-head RMSNorm on Q/K before RoPE (Gemma3Attention reference flow)
+    // caused K magnitudes to collapse to ~20 fp×1000 (0.02 real), producing
+    // degenerate softmax. Skipped until we diagnose whether it's a gamma
+    // layout issue or our integer-math RMSNorm diverging for d_head=256.
+    let mt_for_norms = mdl_get_model_type()
+
     // === RoPE ===
     // V28.1: Gemma 3 dual theta — pick local (10K) or global (1M) table per layer.
     // tfm_rope_freq_for_layer returns ROPE_FREQ_BASE for non-Gemma / v<7 models,
@@ -1471,10 +1478,6 @@ const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
     //   input_layernorm → attention → post_attention_layernorm → + residual
     //   pre_feedforward_layernorm → FFN → post_feedforward_layernorm → + residual
     // V28.1 kernel only applied 2 (input + pre-FFN) because SmolLM/Llama have 2.
-    // Without post-norm, attention/FFN outputs accumulate unbounded and magnitudes
-    // explode geometrically through 26 layers. v7 quantization noise masked the
-    // error; v8 (which preserves weight fidelity) exposes it.
-    let mt_for_norms = mdl_get_model_type()
     if mt_for_norms == 10 || mt_for_norms == 11 {
         let post_attn_ln = norm_addr + d_model * 8   // norm 2 of 4
         km_rmsnorm(STFM_FFN_OUT, d_model, post_attn_ln)
