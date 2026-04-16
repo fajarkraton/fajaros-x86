@@ -148,6 +148,125 @@
 }
 
 // ───────────────────────────────────────────────────────────────
+// V29.P3.P1 — Full 4-level walker with per-level USER-bit reporting.
+//
+// Motivation: the SMEP-only walker above checks USER only at leaves
+// (4KB PT, 2MB PD-huge, 1GB PDPT-huge). SMAP hypothesis H2 posits
+// that non-leaf USER bits (PML4 / PDPT-non-huge / PD-non-huge) can
+// cause a SMAP-enabled CPU to fault on kernel page-table reads even
+// when every leaf has USER=0. This walker reports intermediate-level
+// USER leaks so P1.4 can build a level-by-level leak table and P1.5
+// can strip any non-leaf leaks found.
+//
+// Output format for non-leaf leaks (distinct prefix from PLK so
+// bisect-log grep can separate leaf vs intermediate):
+//
+//   PLKNL L<level> V<hex-16> E<hex-16>\n
+//
+// level: 4 = PML4 entry, 3 = PDPT non-huge, 2 = PD non-huge
+// (leaf entries continue to use the existing PLK prefix, levels 1-3).
+// ───────────────────────────────────────────────────────────────
+@kernel fn pte_report_leak_nonleaf(vaddr: i64, entry: i64, level: i64) {
+    port_outb(0x3F8, 80)   // 'P'
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 75)   // 'K'
+    port_outb(0x3F8, 78)   // 'N'
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 32)   // ' '
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 48 + level)   // '2' | '3' | '4'
+    port_outb(0x3F8, 32)   // ' '
+    port_outb(0x3F8, 86)   // 'V'
+    pte_serial_hex16(vaddr)
+    port_outb(0x3F8, 32)   // ' '
+    port_outb(0x3F8, 69)   // 'E'
+    pte_serial_hex16(entry)
+    port_outb(0x3F8, 10)   // '\n'
+}
+
+// Check a non-leaf (intermediate) entry. Returns 1 if leak, 0 otherwise.
+// Same kernel-range gating as pte_check_leaf: report only when the
+// region-start vaddr falls below KERNEL_VIRT_BOUNDARY, matching the
+// existing leaf-walker semantics.
+@kernel fn pte_check_nonleaf(vaddr: i64, entry: i64, level: i64) -> i64 {
+    if (entry & PAGE_USER) == 0 { return 0 }
+    if vaddr < KERNEL_VIRT_BOUNDARY {
+        pte_report_leak_nonleaf(vaddr, entry, level)
+        return 1
+    }
+    0
+}
+
+// Full 4-level walker. Visits every present entry at PML4, PDPT, PD,
+// and PT, and checks USER bit at each descent point. Returns the
+// combined leak count (leaf + non-leaf). Non-destructive.
+//
+// Level coding in output:
+//   PLKNL L4 = PML4 entry with USER=1 covering kernel region
+//   PLKNL L3 = PDPT non-huge entry with USER=1
+//   PLKNL L2 = PD non-huge entry with USER=1
+//   PLK   L1 = PT 4KB leaf with USER=1          (existing prefix)
+//   PLK   L2 = PD 2MB-huge leaf with USER=1     (existing prefix)
+//   PLK   L3 = PDPT 1GB-huge leaf with USER=1   (existing prefix)
+@kernel fn pte_walk_find_u_leaks_full() -> i64 {
+    let mut count: i64 = 0
+    let mut pml4_idx: i64 = 0
+    while pml4_idx < 512 {
+        let pml4_entry = page_table_entry(PML4_BASE, pml4_idx)
+        if (pml4_entry & PAGE_PRESENT) != 0 {
+            let pml4_vaddr = pml4_idx << 39
+            count = count + pte_check_nonleaf(pml4_vaddr, pml4_entry, 4)
+            let pdpt = pml4_entry & 0xFFFFFFFFF000
+            let mut pdpt_idx: i64 = 0
+            while pdpt_idx < 512 {
+                let pdpt_entry = page_table_entry(pdpt, pdpt_idx)
+                if (pdpt_entry & PAGE_PRESENT) != 0 {
+                    if (pdpt_entry & PAGE_HUGE) != 0 {
+                        // 1 GB leaf
+                        let vaddr = (pml4_idx << 39) | (pdpt_idx << 30)
+                        count = count + pte_check_leaf(vaddr, pdpt_entry, 3)
+                    } else {
+                        // Non-huge: descend + check intermediate USER
+                        let pdpt_vaddr = (pml4_idx << 39) | (pdpt_idx << 30)
+                        count = count + pte_check_nonleaf(pdpt_vaddr, pdpt_entry, 3)
+                        let pd = pdpt_entry & 0xFFFFFFFFF000
+                        let mut pd_idx: i64 = 0
+                        while pd_idx < 512 {
+                            let pd_entry = page_table_entry(pd, pd_idx)
+                            if (pd_entry & PAGE_PRESENT) != 0 {
+                                if (pd_entry & PAGE_HUGE) != 0 {
+                                    // 2 MB leaf
+                                    let vaddr = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21)
+                                    count = count + pte_check_leaf(vaddr, pd_entry, 2)
+                                } else {
+                                    // Non-huge: descend + check intermediate USER
+                                    let pd_vaddr = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21)
+                                    count = count + pte_check_nonleaf(pd_vaddr, pd_entry, 2)
+                                    let pt = pd_entry & 0xFFFFFFFFF000
+                                    let mut pt_idx: i64 = 0
+                                    while pt_idx < 512 {
+                                        let pt_entry = page_table_entry(pt, pt_idx)
+                                        if (pt_entry & PAGE_PRESENT) != 0 {
+                                            let vaddr = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21) | (pt_idx << 12)
+                                            count = count + pte_check_leaf(vaddr, pt_entry, 1)
+                                        }
+                                        pt_idx = pt_idx + 1
+                                    }
+                                }
+                            }
+                            pd_idx = pd_idx + 1
+                        }
+                    }
+                }
+                pdpt_idx = pdpt_idx + 1
+            }
+        }
+        pml4_idx = pml4_idx + 1
+    }
+    count
+}
+
+// ───────────────────────────────────────────────────────────────
 // Shell command: on-demand page-table audit. Useful for:
 //   1. Manual verification after touching map_page() call sites
 //   2. Diagnosing SMEP-hang regressions before re-enabling security
