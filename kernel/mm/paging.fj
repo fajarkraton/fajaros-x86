@@ -252,6 +252,44 @@ const KERNEL_VIRT_BOUNDARY: i64 = 0xC00000
     write_cr3(read_cr3())
 }
 
+// V29.P2.SMEP step 3: strip PAGE_USER from kernel-range identity map
+// entries. boot/startup.S:118 seeds all 64 entries of PD[0..63] with
+// flag 0x87 (PRESENT|WRITABLE|USER|HUGE), which leaks the USER bit
+// onto the kernel .text page (0x00100000 is inside entry 0 = first
+// 2 MB). SMEP faults on ring-0 instruction fetch from any page with
+// USER set, so this leak is the root cause of the documented
+// "write_cr4(cr4 | CR4_SMEP) hangs the kernel after EFER NX set"
+// failure at kernel/main.fj:105-111.
+//
+// Scope of the clear: entries 0-5 (virt 0x0..0xBFFFFF = 0..12 MB)
+// matches KERNEL_VIRT_BOUNDARY. Entries 6-63 (12..128 MB) retain
+// PAGE_USER so ASLR-placed user processes (V26 B4.1 documents a
+// 16-48 MB range) continue to execute at ring 3. Those 58 entries
+// are NOT reported as leaks by pte_walk_find_u_leaks because their
+// virtual address is >= KERNEL_VIRT_BOUNDARY.
+//
+// Post-condition: boot-time walker should report PTE_LEAKS=0x0,
+// unblocking SMEP+SMAP+NX re-enable in the next step.
+//
+// Idempotent: running this function twice is a no-op (the second
+// call sees entry.USER already cleared and skips the write).
+@kernel fn strip_user_from_kernel_identity() {
+    let pd_addr: i64 = 0x72000
+    let mut i: i64 = 0
+    while i < 6 {
+        let entry = page_table_entry(pd_addr, i)
+        if (entry & PAGE_USER) != 0 {
+            // Clear bit 2 (USER). All other flags (PRESENT, WRITABLE,
+            // HUGE, ACCESSED, DIRTY, physical frame) preserved.
+            page_table_set(pd_addr, i, entry - PAGE_USER)
+        }
+        i = i + 1
+    }
+    // Flush TLB — mandatory after PDE mutation or CPU keeps stale
+    // translations that still treat the pages as USER-accessible.
+    write_cr3(read_cr3())
+}
+
 // Extend identity mapping to full 1 GB for RAM-resident model inference.
 // PD at 0x72000 has 512 entries × 2MB = 1GB capacity.
 // Entries 0-63: boot (128 MB), 64-127: extend_identity_mapping (256 MB).

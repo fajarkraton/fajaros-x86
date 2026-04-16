@@ -117,11 +117,19 @@
     // security_enable_smap()
     // nx_enforce_data_pages()
 
+    // V29.P2.SMEP step 3: strip PAGE_USER from kernel-range identity
+    // map entries 0-5 (virt 0-12 MB). boot/startup.S seeds PD[0..63]
+    // with flag 0x87 (includes PAGE_USER) indiscriminately; this pass
+    // undoes the bit on the kernel-only range before SMEP enable.
+    // See kernel/mm/paging.fj:strip_user_from_kernel_identity.
+    strip_user_from_kernel_identity()
+
     // V29.P2.SMEP step 2: auto-scan page tables for PAGE_USER leaks in
-    // kernel range. Emits "PLK L<d> V<hex16> E<hex16>\n" per leak to COM1
-    // (one per leaked leaf entry) and a summary "PTE_LEAKS=<count>\n"
-    // line. CI + manual grep both land on these markers. Runs BEFORE
-    // the (currently disabled) SMEP enable would have been called, so
+    // kernel range. After step 3, this should report PTE_LEAKS=0x0.
+    // Emits "PLK L<d> V<hex16> E<hex16>\n" per leak to COM1 (one per
+    // leaked leaf entry) and a summary "PTE_LEAKS=<count>\n" line.
+    // CI + manual grep both land on these markers. Runs BEFORE the
+    // (currently disabled) SMEP enable would have been called, so
     // the state inspected is the state SMEP would have faulted on.
     let pte_leaks = pte_walk_find_u_leaks()
     port_outb(0x3F8, 80)   // 'P'
