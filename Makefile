@@ -246,6 +246,13 @@ $(RUNTIME_O): $(RUNTIME_S)
 
 # Build kernel with LLVM backend (optimized, uses hardware features)
 # Auto-generates startup.S + linker script internally
+#
+# V29.P1.P3 prevention layer: after `fj build`, verify that the ELF
+# was actually produced. The fj binary may exit 0 on certain error
+# paths (e.g., LE001 "unknown annotation") without emitting the
+# output file. Before V29.P1 this was invisible — the Makefile
+# unconditionally echoed `[OK] LLVM kernel built` even when no ELF
+# existed. The `test -f` guard makes such failures loud and fast.
 build-llvm: $(COMBINED) $(RUNTIME_O)
 	@$(FJ) build --no-std --backend llvm \
 		--opt-level $(LLVM_OPT) \
@@ -256,6 +263,20 @@ build-llvm: $(COMBINED) $(RUNTIME_O)
 		--reloc static \
 		--extra-objects $(RUNTIME_O) \
 		$(COMBINED) -o $(KERNEL_LLVM) 2>&1 | { grep -v "SE009\|SE010\|prefix with underscore\|unused variable\|^  " || true; }
+	@test -f $(KERNEL_LLVM) || { \
+		echo ""; \
+		echo "[FAIL] $(KERNEL_LLVM) not produced despite fj build exit 0."; \
+		echo ""; \
+		echo "Likely causes:"; \
+		echo "  1. fj compiler built without required features:"; \
+		echo "     cd \"$$(dirname $(FJ))/../..\" && cargo build --release --features llvm,native"; \
+		echo "  2. Lexer error (LE001) — re-run without the grep filter to see:"; \
+		echo "     $(FJ) build ... $(COMBINED) -o $(KERNEL_LLVM) 2>&1 | grep -E 'LE|SE|error'"; \
+		echo "  3. Missing @noinline/@inline/@cold in ANNOTATIONS — rebuild fj after pulling"; \
+		echo "     Fajar Lang v29.P1+. See fajar-lang/docs/V29_P1_COMPILER_ENHANCEMENT_PLAN.md"; \
+		echo ""; \
+		exit 1; \
+	}
 	@echo "[OK] LLVM kernel built: $(KERNEL_LLVM) (O$(LLVM_OPT), $(LLVM_CPU))"
 	@size $(KERNEL_LLVM) 2>/dev/null || true
 

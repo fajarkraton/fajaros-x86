@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# fajaros-x86 pre-commit hook — V26 Phase B2.5
+# fajaros-x86 pre-commit hook — V26 Phase B2.5 + V28.5 + V29.P1
 #
 # Rejects commits that:
-#   1. Break `make build-llvm` (kernel must always compile)
+#   1. Break `make build-llvm` (kernel must always compile; since V29.P1
+#      this also catches silent-build-failure — fj exits 0 without
+#      producing an ELF — via the Makefile's test -f $(KERNEL_LLVM) gate)
 #   2. Add new @unsafe annotations without a `// SAFETY:` comment
 #   3. Add new TODO comments without a severity tag (P0/P1/P2/P3)
+#   4. Introduce memory-map region overlaps (V28.5 prevention layer)
+#   5. Remove the Makefile silent-build-failure gate itself (V29.P1
+#      meta-check — prevents the prevention layer from being
+#      accidentally deleted)
 #
 # Bypass with --no-verify if absolutely necessary (discouraged — leaves
 # the kernel in an unverified state). Per CLAUDE.md §6 + V26 §B2.5.
@@ -25,7 +31,7 @@ STAGED_BUILD=$(echo "$STAGED_ALL" | grep -E '\.(fj|S|ld)$|^Makefile$' || true)
 # Check 1: make build-llvm (skip if nothing build-affecting is staged)
 # ─────────────────────────────────────────────────────────────────
 if [ -n "$STAGED_BUILD" ]; then
-    printf '[1/3] make build-llvm ... '
+    printf '[1/5] make build-llvm ... '
     if ! make build-llvm > /tmp/fajaros_precommit_build.log 2>&1; then
         echo "❌"
         echo ""
@@ -38,7 +44,7 @@ if [ -n "$STAGED_BUILD" ]; then
     fi
     echo "✅"
 else
-    echo "[1/3] make build-llvm ... SKIPPED (no .fj/Makefile/.S/.ld changes)"
+    echo "[1/5] make build-llvm ... SKIPPED (no .fj/Makefile/.S/.ld changes)"
 fi
 
 # ─────────────────────────────────────────────────────────────────
@@ -47,7 +53,7 @@ fi
 # violations don't block unrelated commits.
 # ─────────────────────────────────────────────────────────────────
 if [ -n "$STAGED_FJ" ]; then
-    printf '[2/3] @unsafe needs // SAFETY: ... '
+    printf '[2/5] @unsafe needs // SAFETY: ...'
     UNSAFE_VIOLATIONS=0
     UNSAFE_REPORT=""
     while IFS= read -r f; do
@@ -84,7 +90,7 @@ if [ -n "$STAGED_FJ" ]; then
     fi
     echo "✅"
 else
-    echo "[2/3] @unsafe SAFETY ... SKIPPED (no .fj changes)"
+    echo "[2/5] @unsafe SAFETY ... SKIPPED (no .fj changes)"
 fi
 
 # ─────────────────────────────────────────────────────────────────
@@ -92,7 +98,7 @@ fi
 # Same approach: only flag ADDED TODO lines, not pre-existing ones.
 # ─────────────────────────────────────────────────────────────────
 if [ -n "$STAGED_FJ" ]; then
-    printf '[3/3] TODOs need P0/P1/P2/P3 severity ... '
+    printf '[3/5] TODOs need P0/P1/P2/P3 severity ... '
     TODO_VIOLATIONS=0
     TODO_REPORT=""
     while IFS= read -r f; do
@@ -126,7 +132,7 @@ if [ -n "$STAGED_FJ" ]; then
     fi
     echo "✅"
 else
-    echo "[3/3] TODO severity ... SKIPPED (no .fj changes)"
+    echo "[3/5] TODO severity ... SKIPPED (no .fj changes)"
 fi
 
 # ─────────────────────────────────────────────────────────────────
@@ -135,7 +141,7 @@ fi
 # ─────────────────────────────────────────────────────────────────
 STAGED_MEM=$(echo "$STAGED_ALL" | grep -E 'model_loader\.fj|transformer\.fj|kmatrix\.fj' || true)
 if [ -n "$STAGED_MEM" ]; then
-    printf '[4/4] memory map collisions ... '
+    printf '[4/5] memory map collisions ... '
     if python3 scripts/check_memory_map.py > /tmp/fajaros_memmap.log 2>&1; then
         echo "✅"
     else
@@ -148,8 +154,41 @@ if [ -n "$STAGED_MEM" ]; then
         exit 1
     fi
 else
-    echo "[4/4] memory map collisions ... SKIPPED (no layout files changed)"
+    echo "[4/5] memory map collisions ... SKIPPED (no layout files changed)"
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# Check 5: Makefile silent-build-failure gate must remain in place
+# (V29.P1 meta-check — prevents removal of the prevention layer itself)
+# Only runs if the Makefile is staged; otherwise the existing gate is
+# safe and the check is unnecessary.
+# ─────────────────────────────────────────────────────────────────
+STAGED_MAKEFILE=$(echo "$STAGED_ALL" | grep -E '^Makefile$' || true)
+if [ -n "$STAGED_MAKEFILE" ]; then
+    printf '[5/5] Makefile ELF-gate intact ... '
+    # The gate is: `test -f $(KERNEL_LLVM)` immediately after the
+    # `fj build ... -o $(KERNEL_LLVM)` command in the build-llvm
+    # target. Removing this re-enables the silent-build-failure bug
+    # class that V29.P1 was created to close.
+    if grep -qE 'test -f \$\(KERNEL_LLVM\)' Makefile; then
+        echo "✅"
+    else
+        echo "❌"
+        echo ""
+        echo "Makefile is missing the V29.P1 silent-build-failure gate."
+        echo ""
+        echo "The 'build-llvm' target must contain a 'test -f \$(KERNEL_LLVM)'"
+        echo "guard after 'fj build' to catch cases where fj exits 0 without"
+        echo "emitting the output ELF. Removing this gate reopens the bug"
+        echo "class documented in fajar-lang/docs/V29_P1_COMPILER_ENHANCEMENT_PLAN.md"
+        echo ""
+        echo "Restore the guard or explain in the commit message why it's"
+        echo "being removed. Use --no-verify to force (strongly discouraged)."
+        exit 1
+    fi
+else
+    echo "[5/5] Makefile ELF-gate ... SKIPPED (Makefile not staged)"
 fi
 
 echo ""
-echo "✅ fajaros-x86 pre-commit OK (build, @unsafe SAFETY, TODO severity, memory map)"
+echo "✅ fajaros-x86 pre-commit OK (build, @unsafe SAFETY, TODO severity, memory map, ELF gate)"
