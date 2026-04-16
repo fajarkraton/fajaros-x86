@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 30  // V28.2 added 4 v8 infrastructure tests
+const TEST_TOTAL: i64 = 32  // V29.P2.SMEP added 2 security invariant tests
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -833,6 +833,58 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 // Master Test Runner — cmd_test_all()
 // ═══════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════
+// V29.P2.SMEP Security Invariant Tests — V29.P2.SMEP step 5
+// ═══════════════════════════════════════════════════════════════
+
+// Test 1: kernel-range identity map has no PAGE_USER leaks.
+// Runtime check that strip_user_from_kernel_identity() ran at boot
+// and that no subsequent code re-introduced PAGE_USER on entries 0-5.
+// Fails fast if the step 3 leak fix regresses.
+@kernel fn test_no_user_leaks_in_kernel_range() -> i64 {
+    let leaks = pte_walk_find_u_leaks()
+    if leaks != 0 {
+        serial_print_str("  smep: pte_walk_find_u_leaks returned ")
+        // No easy decimal helper in tests ctx; use simple byte for count
+        if leaks < 10 {
+            serial_putchar(48 + leaks)
+        } else {
+            serial_putchar(57)  // '9' for any count ≥ 10
+        }
+        serial_putchar(10)
+        return 0
+    }
+    1
+}
+
+// Test 2: SMEP is either enabled or the CPU doesn't support it.
+// On CPUs without SMEP support (CPUID leaf 7 EBX bit 7 = 0), pass
+// trivially — security_enable_smep() is a graceful no-op in that
+// case. On CPUs with support, CR4 bit 20 must be set.
+//
+// Rationale: the regression test must pass on BOTH SMEP-supporting
+// hardware (QEMU -cpu host on Intel i9-14900HX) and SMEP-unsupporting
+// hardware (older VMs, QEMU -cpu qemu64). What we assert is the
+// invariant "SMEP is active wherever possible" — not a hardcoded
+// CR4 bit pattern.
+@kernel fn test_smep_enabled_or_unsupported() -> i64 {
+    let features = security_check_cpu_features()
+    let smep_supported = (features & FEAT_SMEP) != 0
+    let cr4 = read_cr4()
+    let smep_active = (cr4 & CR4_SMEP) != 0
+    // If CPU supports SMEP but CR4.SMEP is 0 → regression (boot
+    // forgot to call security_enable_smep or strip_user failed and
+    // enable was silently skipped).
+    if smep_supported && smep_active == false {
+        serial_print_str("  smep: supported but CR4.SMEP=0 (regression)")
+        serial_putchar(10)
+        return 0
+    }
+    // If CPU doesn't support SMEP, CR4.SMEP=0 is expected.
+    // If CPU supports AND active, the full invariant holds.
+    1
+}
+
 @kernel fn run_test(result: i64, name: str, p: i64, f: i64) -> i64 {
     // Returns packed: high 32 = new_passed, low 32 = new_failed
     let pass = result == 1
@@ -845,7 +897,7 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 
 @kernel fn cmd_test_all() {
     cprintln("=== FajarOS Kernel Test Suite ===", YELLOW_ON_BLACK)
-    cprintln("Running 20 tests...", WHITE_ON_BLACK)
+    cprintln("Running 32 tests...", WHITE_ON_BLACK)
     console_putchar(10, WHITE_ON_BLACK)
     let mut p: i64 = 0
     let mut f: i64 = 0
@@ -925,6 +977,13 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     r = run_test(test_v8_rmsnorm_robust(), "v8_rmsnorm_robust", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_v8_group_constants(), "v8_group_constants", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("--- V29.P2.SMEP Security ---", CYAN_ON_BLACK)
+    r = run_test(test_no_user_leaks_in_kernel_range(), "pte_no_user_leaks", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_smep_enabled_or_unsupported(), "smep_enabled", p, f)
     p = r / 0x100000000; f = r % 0x100000000
 
     console_putchar(10, WHITE_ON_BLACK)
