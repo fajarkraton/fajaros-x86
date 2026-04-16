@@ -3,6 +3,22 @@
 **Date:** 2026-04-14 13:10
 **Status:** ✅ Gemma 3 1B running end-to-end in FajarOS kernel, generating real 262K-vocab text.
 
+> **2026-04-16 retroactive update:** This v7 milestone was achieved
+> with a latent 4-byte file-header bug (exporter wrote 20-byte
+> per-layer header, kernel expected 16). The bug shifted every
+> downstream matrix pointer +4 bytes, corrupting gamma reads. It was
+> masked by 4-bit Lloyd-Max quantization noise being the dominant
+> signal-degradation source — output looked equally diverse with or
+> without the bug. Fixed in commit `695ede5` and re-verified in
+> `V28_2_V7_HEADER_RETEST.md`. The "first token" achievement remains
+> valid as a kernel-pipeline milestone (the kernel WAS doing real
+> inference, just on slightly-shifted data). Subsequent V28.2 work
+> caught and fixed this bug + several others (STFM↔embed memory
+> overlap, missing Gemma 3 4-norm layer flow, missing UTF-8 byte
+> printing). See `V28_2_CLOSED_PARTIAL.md` for the full V28.2
+> infrastructure delivery and `V28_2_V7_HEADER_RETEST.md` for the
+> fixed-v7 retest.
+
 ## The Moment
 
 ```
