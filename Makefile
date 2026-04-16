@@ -313,9 +313,13 @@ build-fjtrace:
 #   build/fjtrace-capture.stats  — record count + op histogram
 FJTRACE_DISK     ?= disk_v8.img
 FJTRACE_PROMPT   ?= ask hello
-FJTRACE_TIMEOUT  ?= 180
-FJTRACE_BOOT_WAIT?= 10
-FJTRACE_RUN_WAIT ?= 150
+FJTRACE_TIMEOUT  ?= 300
+FJTRACE_BOOT_WAIT?= 6
+FJTRACE_LOAD_WAIT?= 4
+FJTRACE_EMBED_WAIT?= 12
+FJTRACE_RAM_WAIT ?= 45
+FJTRACE_ASK_WAIT ?= 120
+FJTRACE_MEM      ?= -m 2G
 
 .PHONY: test-fjtrace-capture
 test-fjtrace-capture:
@@ -326,29 +330,53 @@ test-fjtrace-capture:
 		echo "  Or override: make test-fjtrace-capture FJTRACE_DISK=/path/to/model.img"; \
 		exit 1; \
 	}
-	@echo "[FJTRACE] Step 1/3: building FJTRACE=1 kernel..."
-	@$(MAKE) -s build-fjtrace
-	@echo "[FJTRACE] Step 2/3: booting QEMU ($(FJTRACE_TIMEOUT)s max), feeding '$(FJTRACE_PROMPT)'..."
-	@(sleep $(FJTRACE_BOOT_WAIT); printf '$(FJTRACE_PROMPT)\r'; sleep $(FJTRACE_RUN_WAIT)) | \
-		timeout $(FJTRACE_TIMEOUT) $(QEMU) -kernel $(KERNEL_LLVM) \
-			-serial stdio -no-reboot -no-shutdown \
-			$(QEMU_MEM) $(QEMU_KVM) \
+	@echo "[FJTRACE] Step 1/3: building FJTRACE=1 ISO..."
+	@# Put BOTH build-llvm and iso-llvm under a single trap so the
+	@# sed-restore happens AFTER the ISO is packaged. Otherwise the
+	@# restore re-touches fjtrace.fj, triggers a fresh FJTRACE=0
+	@# combined.fj regeneration, and the ISO ends up with the
+	@# tracing disabled. Confirmed by ELF size: FJTRACE=0 builds
+	@# produce .text = 1416751; FJTRACE=1 = 1419903.
+	@sed -i 's|^const FJTRACE_ENABLED: i64 = 0$$|const FJTRACE_ENABLED: i64 = 1|' \
+		kernel/compute/fjtrace.fj
+	@trap 'sed -i "s|^const FJTRACE_ENABLED: i64 = 1\$$|const FJTRACE_ENABLED: i64 = 0|" kernel/compute/fjtrace.fj; echo "[FJTRACE] restored FJTRACE_ENABLED=0"' EXIT; \
+		$(MAKE) build-llvm && $(MAKE) iso-llvm
+	@echo "[FJTRACE] Step 2/3: booting QEMU ($(FJTRACE_TIMEOUT)s max)..."
+	@# Full Gemma-3 v8 workflow (matches docs/V28_5_RETEST.md §Methodology):
+	@#   boot → model-load nvme 0 → embed-load → ram-load → $(FJTRACE_PROMPT)
+	@# Uses ISO (multiboot) not -kernel direct (FajarOS ELF lacks PVH note).
+	@# chardev/stdio pattern mirrors test-smep-regression. 2G memory needed
+	@# for 155 MB embeddings + 359 MB ram-loaded layer weights.
+	@(sleep $(FJTRACE_BOOT_WAIT);      printf 'model-load nvme 0\r'; \
+	  sleep $(FJTRACE_LOAD_WAIT);      printf 'embed-load\r';        \
+	  sleep $(FJTRACE_EMBED_WAIT);     printf 'ram-load\r';          \
+	  sleep $(FJTRACE_RAM_WAIT);       printf '$(FJTRACE_PROMPT)\r'; \
+	  sleep $(FJTRACE_ASK_WAIT);       printf '\r') | \
+		timeout $(FJTRACE_TIMEOUT) $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+			-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
+			-no-reboot -no-shutdown -display none \
+			$(FJTRACE_MEM) $(QEMU_KVM) \
 			-drive file=$(FJTRACE_DISK),if=none,id=nvme0,format=raw \
 			-device nvme,serial=fajaros,drive=nvme0 \
-			-display none 2>/dev/null > $(BUILD_DIR)/fjtrace-capture.log \
+			> $(BUILD_DIR)/fjtrace-capture.log 2>&1 \
 		|| true
 	@echo "[FJTRACE] Step 3/3: parsing captured serial log..."
 	@python3 scripts/parse_kernel_trace.py \
 		-i $(BUILD_DIR)/fjtrace-capture.log \
 		-o $(BUILD_DIR)/fjtrace-capture.jsonl \
-		2> $(BUILD_DIR)/fjtrace-capture.stats
+		2> $(BUILD_DIR)/fjtrace-capture.stats || true
 	@echo ""
 	@cat $(BUILD_DIR)/fjtrace-capture.stats
-	@n=$$(wc -l < $(BUILD_DIR)/fjtrace-capture.jsonl); \
+	@n=$$(wc -l < $(BUILD_DIR)/fjtrace-capture.jsonl 2>/dev/null || echo 0); \
 		if [ "$$n" -lt 17 ]; then \
 			echo ""; \
-			echo "[WARN] only $$n records — likely boot did not reach inference."; \
-			echo "  Grep build/fjtrace-capture.log for '[BOOT]' / 'nova>' to diagnose."; \
+			echo "[WARN] only $$n records captured."; \
+			echo "  Log tail ($(BUILD_DIR)/fjtrace-capture.log):"; \
+			tail -20 $(BUILD_DIR)/fjtrace-capture.log 2>/dev/null | sed 's/^/    /'; \
+			echo ""; \
+			echo "  Diagnose:"; \
+			echo "    grep -c 'nova>' $(BUILD_DIR)/fjtrace-capture.log   (boot reached shell?)"; \
+			echo "    grep -c '^{\"schema_version' $(BUILD_DIR)/fjtrace-capture.log  (FJTRACE emitted?)"; \
 			exit 2; \
 		else \
 			echo ""; \
