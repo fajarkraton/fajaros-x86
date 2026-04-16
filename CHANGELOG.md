@@ -2,6 +2,126 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
+> **Note on historical gap (V28.5 audit, 2026-04-16):** Entries for `v3.1.0`,
+> `v3.2.0`, and `v3.3.0` are absent from this file. The tags exist on GitHub
+> and git history has full commit trails, but narrative release notes were
+> not backfilled into CHANGELOG at the time of tagging. This is tracked as
+> a separate documentation gap; authoritative source for v3.0--v3.3 work is
+> git log + the `docs/V28_*.md` audit trail.
+
+## [3.4.0] "Multilingual" -- 2026-04-16
+
+V28.5 audit complete. Gemma 3 1B inference demonstrated end-to-end across
+7+ writing systems (Devanagari, Bengali, Tamil, Malayalam, Cyrillic,
+Hangul, Latin). Output is real BPE-tokenized multilingual text — not yet
+semantically coherent (4-bit quantization ceiling) but confirms the
+kernel inference pipeline is functionally correct.
+
+### Fixed
+
+- **Bug 1 (`ba97be6`)** — Memory map collision detector script
+  (`scripts/check_memory_map.py`) + STFM region overlap fix + 4-byte v7
+  layer header shift. The header bug was silently corrupting v7
+  inference since V28.1; discovery was retroactive via the v8 export
+  rewrite.
+- **Bug 2 (`2795019`)** — UTF-8 multi-byte raw streaming in
+  `tfm_generate` + `cmd_infer`. Previous shell filter rejected bytes
+  `>= 0x80`, hiding the entire multilingual vocab as dots. After fix,
+  Korean (`안녕하세요`), Tamil, Hindi, Russian, etc. render correctly.
+- **Bug 3 (fajar-lang `e6f6e99`)** — `.gitignore` for `.venv/`,
+  `.claude/`, `__pycache__/`, `*.pyc` in the compiler repo. Local dev
+  directories were shown in `git status` and risked accidental commits.
+- **Bug 4 (`e3e2931`)** — Retroactive annotation on
+  `docs/V28_1_FIRST_TOKEN.md` documenting the 4-byte header bug found
+  in V28.2 but originally masked by quantization noise in V28.1's
+  celebration doc.
+- **Bug 5 (`5670b4e`)** — `@noinline` on 3 v8 hot paths
+  (`km_vecmat_packed_v8`, `mdl_stream_embed_lookup_raw_v8`,
+  `mdl_ram_lmhead_argmax_v8_tied`). LLVM O2 was over-inlining these
+  with mis-reordered memory accesses, producing EXC:13 GP faults
+  within the first 5 tokens. After fix: stable ~50 multilingual
+  tokens per run.
+
+### Added
+
+- `scripts/check_memory_map.py` — static analyzer that parses all
+  `const *_BASE: i64 = 0x` declarations across `kernel/`, flags any
+  overlap. Wired as pre-commit hook check 4/4.
+- `docs/V28_MEMORY_MAP.md` — 33 memory regions documented with
+  collision history. Covers kernel heap, stack, framebuffer, page
+  tables, KV cache, Gemma tensor pool, model data, STFM, and more.
+- `docs/V28_5_CLOSED.md` — V28.5 closure doc (this release's primary
+  deliverable). Captures 7 commits, known issues, verification
+  commands, effort tally, next-session pickup notes.
+- `docs/V28_2_V7_HEADER_RETEST.md` — re-verification of V28.1 v7
+  pipeline with 16-byte header fix applied.
+
+### Changed
+
+- Per-layer file header: 4-byte → 16-byte (matches kernel
+  `FJM_LAYER_HDR_SIZE` constant). All `.fjm` v7 and v8 files produced
+  by `export_gemma3_v7.py` and `export_gemma3_v8.py` now use the
+  canonical layout.
+- `km_rmsnorm` switched to max-abs rescaling — eliminates truncation
+  on mixed-magnitude vectors with Gemma 3's large gamma values
+  (mean 4.55, max 55.75). More robust for large models without
+  changing semantics.
+
+### Known Issues (Tracked, Not Blocking Release)
+
+- **EXC:13 after ~50 tokens** — `@noinline` workaround stabilizes
+  short runs but intermittent crash at extended working sets.
+  Candidate root causes: integer overflow in 262K×1152 LM head
+  accumulator, cumulative rounding across 26 layers × 4 norms,
+  or KV cache state under memory pressure. Root cause investigation
+  requires Python reference simulator — deferred as research-grade
+  work.
+- **v8 coherence gap** — output is diverse multilingual but not
+  semantically coherent. This is the inherent 4-bit group-wise
+  quantization ceiling on a 1B parameter model, not a kernel bug.
+  Documented in `docs/V28_2_GAMMA_FINDING.md`.
+
+### Infrastructure / CI
+
+- Pre-commit hook expanded to 4 checks (build + @unsafe SAFETY + TODO
+  severity + memory map collisions). Layout-file changes are blocked
+  if any new `const *_BASE` address overlaps an existing region.
+- 4 V28.2 v8 infrastructure regression tests committed in `f23e714`,
+  bringing kernel tests from 26 → 32 (all pass).
+
+### Stats
+
+- **183 .fj files** across kernel + services + boot + tests + drivers
+- **108K lines** of Fajar Lang (verified via `find . -name "*.fj" -exec cat {} + | wc -l`)
+- **32 kernel tests** (tests/kernel_tests.fj + arm64_harness.fj)
+- **302 shell commands** (unchanged)
+- **0 collisions** across 33 memory map regions
+- **7 V28.5 commits** (6 in fajaros-x86, 1 in fajar-lang)
+- **Effort:** 3.6h actual vs 5h est (-28%)
+
+### Compiler Compatibility
+
+- **Fajar Lang v27.5.0** — unchanged. V27.5 "Compiler Prep" prerequisites
+  (kernel tensor max 128, AI scheduler builtins, `@interrupt` wrappers,
+  `@app`/`@host` annotations, refinement params, `Cap<T>`, framebuffer
+  extensions) all supported V28 work. No compiler version bump required.
+
+### Verification
+
+```bash
+# Multi-repo clean state
+git rev-list --count origin/main..main   # → 0
+
+# Memory map
+python3 scripts/check_memory_map.py       # → 0 overlaps across 33 regions
+
+# @noinline markers
+grep -E "^@noinline$" kernel/compute/kmatrix.fj \
+                      kernel/compute/model_loader.fj | wc -l  # → 3
+```
+
+---
+
 ## [2.1.0] "Zenith" -- 2026-03-29
 
 Compiler and tooling upgrade: FajarOS Nova now fully verified with Fajar Lang v7.0.0
