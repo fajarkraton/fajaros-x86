@@ -285,8 +285,25 @@ const KERNEL_VIRT_BOUNDARY: i64 = 0xC00000
         }
         i = i + 1
     }
-    // Flush TLB — mandatory after PDE mutation or CPU keeps stale
-    // translations that still treat the pages as USER-accessible.
+    // V29.P3.P1.5: also strip USER from non-leaf entries PML4[0] and
+    // PDPT[0]. boot/startup.S seeds these with USER=1 alongside the leaf
+    // PD entries; the leaf-only strip above left them intact. SMAP
+    // AND-chains USER bits across the 4-level walk, so non-leaf USER=1
+    // makes kernel data reads double-fault when SMAP is enabled even
+    // though every leaf has USER=0. See V29.P3.P1 findings commit
+    // d84235b §10.4 for the empirical evidence (PTE_LEAKS_FULL=2 with
+    // PLKNL L4 E0x71027 + PLKNL L3 E0x72027). Also idempotent.
+    let pml4_entry = page_table_entry(PML4_BASE, 0)
+    if (pml4_entry & PAGE_USER) != 0 {
+        page_table_set(PML4_BASE, 0, pml4_entry - PAGE_USER)
+    }
+    let pdpt_addr: i64 = 0x71000
+    let pdpt_entry = page_table_entry(pdpt_addr, 0)
+    if (pdpt_entry & PAGE_USER) != 0 {
+        page_table_set(pdpt_addr, 0, pdpt_entry - PAGE_USER)
+    }
+    // Flush TLB — mandatory after PDE/PDPTE/PML4E mutation or CPU keeps
+    // stale translations that still treat the pages as USER-accessible.
     write_cr3(read_cr3())
 }
 
