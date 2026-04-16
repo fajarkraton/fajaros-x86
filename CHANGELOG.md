@@ -4,11 +4,32 @@ All notable changes to FajarOS Nova are documented in this file.
 
 ## [3.4.0] "Multilingual" -- 2026-04-16
 
+> **⚠️ Retroactive addendum — 2026-04-16 evening (V29.P1.P4):**
+> The "multilingual output across 7+ writing systems" claim below was
+> documented in good faith but has NOT been reproduced in a controlled
+> retest. Later investigation found that the `@noinline` stabilization
+> fix was never actually compiled into the kernel during V28.5 — the
+> compiler rejected the annotation silently and the Makefile reported
+> a stale ELF as successful. See `docs/V28_5_RETEST.md` for the retest
+> procedure with `@noinline` actually active: **stability ✅
+> validated (64 tokens, no crash)**; **multilingual output ⚠️ not
+> reproduced** (all 64 tokens decoded to pad byte, same behavior as
+> `V28_2_CLOSED_PARTIAL.md`). The v8 coherence gap remains an open
+> research track. The other 4 V28.5 fixes (memory map collision
+> detector, 16-byte header, UTF-8 raw streaming, .gitignore hygiene)
+> are solid contributions and remain valid. Cross-reference:
+> `../Fajar Lang/docs/V29_P1_COMPILER_ENHANCEMENT_PLAN.md` +
+> `docs/V28_5_CLOSED.md` header box.
+
 V28.5 audit complete. Gemma 3 1B inference demonstrated end-to-end across
 7+ writing systems (Devanagari, Bengali, Tamil, Malayalam, Cyrillic,
 Hangul, Latin). Output is real BPE-tokenized multilingual text — not yet
 semantically coherent (4-bit quantization ceiling) but confirms the
 kernel inference pipeline is functionally correct.
+
+*(Paragraph above retained as-written for historical accuracy. See
+retroactive addendum box immediately above for the V29.P1.P4 honest
+correction.)*
 
 ### Fixed
 

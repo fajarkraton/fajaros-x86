@@ -1,8 +1,53 @@
 # V28.5 — CLOSED (2026-04-16)
 
+> **⚠️ RETROACTIVE CORRECTION — 2026-04-16 (V29.P1.P4 retrospective)**
+>
+> V29.P1 discovered that the `@noinline` fix in commit `5670b4e` was
+> NEVER actually compiled into the FajarOS kernel binary during V28.5.
+> The Fajar Lang compiler binary at the time lacked lexer support for
+> `@noinline` (`ANNOTATIONS` table entry missing), so `fj build` emitted
+> a silent LE001 "unknown annotation" error and produced no output ELF.
+> The FajarOS Makefile then printed `[OK] LLVM kernel built`
+> unconditionally, masking the failure. Every `make run-kvm-llvm`
+> during the V28.5 session ran a stale ELF from BEFORE the
+> `@noinline` directives were added.
+>
+> On 2026-04-16 afternoon, V29.P1 Phases P0–P3 closed:
+>   - lexer: `@noinline/@inline/@cold` added to ANNOTATIONS
+>   - compiler: rebuilt, codegen now applies NoInline LLVM attribute
+>   - Makefile: added `test -f $(KERNEL_LLVM)` gate
+>   - pre-commit: new check 5/5 prevents gate removal
+>   - install-git-hooks: refactored to single source of truth
+>
+> V29.P1.P4.3 retest ran QEMU with `@noinline` ACTUALLY compiled in.
+> Observed outcomes:
+>   - **Stability claim (~50 stable tokens): ✅ VALIDATED** —
+>     64 tokens generated cleanly, no EXC:13, no crash
+>   - **Multilingual claim (Devanagari, Bengali, Tamil, Hangul,
+>     Cyrillic…): ⚠️ NOT REPRODUCED** — all 64 output tokens
+>     decoded to pad byte 0x00 (same steady-state behavior as
+>     `V28_2_CLOSED_PARTIAL.md` pre-V28.5 run)
+>
+> The 7-writing-system sample in `5670b4e`'s commit message was
+> likely a transient-state outlier (different argmax seed, NVMe
+> cache, or run-to-run variance). The v8 coherence gap remains
+> open as a separate research track, NOT a V29.P1 regression.
+>
+> Detailed retest procedure + raw bytes + interpretation in
+> `docs/V28_5_RETEST.md`. Decision rationale in
+> `../../Fajar Lang/docs/V29_P1_DECISION.md`.
+>
+> V28.5 stability claim = KEPT. V28.5 multilingual claim = CORRECTED
+> (not reproduced in retest; remains open under coherence gap track).
+> The other 4 V28.5 fixes (memory map detector, 16-byte header,
+> UTF-8 raw streaming, .gitignore hygiene) remain valid contributions.
+
 **Decision:** V28.5 audit closed as COMPLETE. All 5 identified gaps addressed;
 multilingual Gemma 3 inference demonstrated end-to-end across 7+ writing
 systems. Release-ready.
+
+*(Header above kept for historical accuracy. See retroactive
+correction box immediately above for the honest post-V29.P1 update.)*
 
 ## What V28.5 Delivered (7 commits, 2026-04-16)
 

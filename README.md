@@ -7,7 +7,7 @@
 [![Shell](https://img.shields.io/badge/shell-302_commands-purple)](https://github.com/fajarkraton/fajaros-x86)
 [![Kernel Tests](https://img.shields.io/badge/kernel_tests-32-brightgreen)](https://github.com/fajarkraton/fajaros-x86)
 [![Security](https://img.shields.io/badge/security-SMEP%2BSMAP%2BNX%2BASLR-success)](https://github.com/fajarkraton/fajaros-x86)
-[![LLM E2E](https://img.shields.io/badge/LLM_E2E-Gemma_3_1B_multilingual_7%2B_scripts-success)](https://github.com/fajarkraton/fajaros-x86)
+[![LLM E2E](https://img.shields.io/badge/LLM_E2E-Gemma_3_1B_stable_64_tokens-success)](https://github.com/fajarkraton/fajaros-x86/blob/main/docs/V28_5_RETEST.md)
 [![Ring 3](https://img.shields.io/badge/Ring_3-user_mode_works-success)](https://github.com/fajarkraton/fajaros-x86)
 [![FajarQuant](https://img.shields.io/badge/FajarQuant-Phase_1%2B2_kernel_native-orange)](https://github.com/fajarkraton/fajaros-x86)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
