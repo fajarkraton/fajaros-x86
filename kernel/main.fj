@@ -117,6 +117,26 @@
     // security_enable_smap()
     // nx_enforce_data_pages()
 
+    // V29.P2.SMEP step 2: auto-scan page tables for PAGE_USER leaks in
+    // kernel range. Emits "PLK L<d> V<hex16> E<hex16>\n" per leak to COM1
+    // (one per leaked leaf entry) and a summary "PTE_LEAKS=<count>\n"
+    // line. CI + manual grep both land on these markers. Runs BEFORE
+    // the (currently disabled) SMEP enable would have been called, so
+    // the state inspected is the state SMEP would have faulted on.
+    let pte_leaks = pte_walk_find_u_leaks()
+    port_outb(0x3F8, 80)   // 'P'
+    port_outb(0x3F8, 84)   // 'T'
+    port_outb(0x3F8, 69)   // 'E'
+    port_outb(0x3F8, 95)   // '_'
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 69)   // 'E'
+    port_outb(0x3F8, 65)   // 'A'
+    port_outb(0x3F8, 75)   // 'K'
+    port_outb(0x3F8, 83)   // 'S'
+    port_outb(0x3F8, 61)   // '='
+    pte_serial_hex16(pte_leaks)
+    port_outb(0x3F8, 10)   // '\n'
+
     println(13)
     // Stack guard page: SKIP — 2MB huge pages don't support 4KB unmap
     // unmap_page(0x7F0000 - 4096)  // guard page below stack bottom
