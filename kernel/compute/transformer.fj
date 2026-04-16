@@ -450,18 +450,38 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
                           out_addr: i64, gate_buf: i64, up_buf: i64) {
     // Step 1: gate = gate_proj(x) → ffn_dim
     tfm_vecmat_auto(x_addr, gate_w_addr, d_model, ffn_dim, bits, cb_gate, gate_buf)
+    if FJTRACE_ENABLED == 1 {
+        let tok = volatile_read_u64(TFM_STATE + TFM_ST_POS)
+        fjtrace_emit_mem_i64("gate_proj", gate_buf, ffn_dim, tok, fjtrace_current_layer(),
+                             ffn_dim, "", 0, "", 0)
+    }
 
     // Step 2: up = up_proj(x) → ffn_dim
     tfm_vecmat_auto(x_addr, up_w_addr, d_model, ffn_dim, bits, cb_up, up_buf)
+    if FJTRACE_ENABLED == 1 {
+        let tok = volatile_read_u64(TFM_STATE + TFM_ST_POS)
+        fjtrace_emit_mem_i64("up_proj", up_buf, ffn_dim, tok, fjtrace_current_layer(),
+                             ffn_dim, "", 0, "", 0)
+    }
 
     // Step 3: gate = GELU(gate)
     km_gelu_tanh(gate_buf, ffn_dim)
 
     // Step 4: gate = gate * up (element-wise)
     km_mul_raw(gate_buf, up_buf, ffn_dim)
+    if FJTRACE_ENABLED == 1 {
+        let tok = volatile_read_u64(TFM_STATE + TFM_ST_POS)
+        fjtrace_emit_mem_i64("ffn_hidden", gate_buf, ffn_dim, tok, fjtrace_current_layer(),
+                             ffn_dim, "", 0, "", 0)
+    }
 
     // Step 5: out = down_proj(gate) → d_model
     tfm_vecmat_auto(gate_buf, down_w_addr, ffn_dim, d_model, bits, cb_down, out_addr)
+    if FJTRACE_ENABLED == 1 {
+        let tok = volatile_read_u64(TFM_STATE + TFM_ST_POS)
+        fjtrace_emit_mem_i64("down_proj", out_addr, d_model, tok, fjtrace_current_layer(),
+                             d_model, "", 0, "", 0)
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1432,9 +1452,17 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
         cb_down = mdl_stream_codebook_n(6)
     }
 
+    // V30.SIM P2.3: publish layer for FFN tracer (see fjtrace.fj header)
+    if FJTRACE_ENABLED == 1 { fjtrace_set_layer(layer) }
+    let tok_pos = volatile_read_u64(TFM_STATE + TFM_ST_POS)
+
     // === Pre-attention RMSNorm ===
     mdl_memcpy(STFM_RES, x_addr, d_model * 8)
     km_rmsnorm(x_addr, d_model, norm_addr)
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("pre_attn_rmsnorm", x_addr, d_model,
+                             tok_pos, layer, d_model, "", 0, "", 0)
+    }
 
     // === QKV Projections with per-matrix codebooks ===
     // V28.2: tfm_vecmat_auto dispatches to km_vecmat_packed_v8 (group-wise)
@@ -1445,6 +1473,10 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     let q_base = km_large_addr(TFM_Q)
     volatile_write_u64(q_base + KM_HDR_ROWS, 1)
     volatile_write_u64(q_base + KM_HDR_COLS, q_dim)
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("q_proj", q_out, q_dim, tok_pos, layer,
+                             q_dim, "", 0, "", 0)
+    }
 
     let k_off = mdl_stream_q_size()
     let k_out = km_data_ptr(TFM_K)
@@ -1452,6 +1484,10 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     let k_base = km_large_addr(TFM_K)
     volatile_write_u64(k_base + KM_HDR_ROWS, 1)
     volatile_write_u64(k_base + KM_HDR_COLS, kv_d)
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("k_proj", k_out, kv_d, tok_pos, layer,
+                             kv_d, "", 0, "", 0)
+    }
 
     let v_off = k_off + mdl_stream_kv_size()
     let v_out = km_data_ptr(TFM_V)
@@ -1459,6 +1495,10 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     let v_base = km_large_addr(TFM_V)
     volatile_write_u64(v_base + KM_HDR_ROWS, 1)
     volatile_write_u64(v_base + KM_HDR_COLS, kv_d)
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("v_proj", v_out, kv_d, tok_pos, layer,
+                             kv_d, "", 0, "", 0)
+    }
 
     // === V28.2 P2: Gemma 3 q_norm / k_norm ===
     // Per-head RMSNorm on Q/K before RoPE (Gemma3Attention reference flow)
@@ -1482,6 +1522,10 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     let o_addr = mdl_stream_o_addr()
     let attn_data = km_data_ptr(TFM_ATTN)
     tfm_vecmat_auto(attn_data, o_addr, q_dim, d_model, bits, cb_o, STFM_FFN_OUT)
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("attn_out", STFM_FFN_OUT, d_model, tok_pos, layer,
+                             d_model, "", 0, "", 0)
+    }
 
     // === V28.2 BUG FIX: post_attention_layernorm (Gemma 3 only) ===
     // Gemma 3 applies FOUR RMSNorms per block:
@@ -1491,11 +1535,19 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     if mt_for_norms == 10 || mt_for_norms == 11 {
         let post_attn_ln = norm_addr + d_model * 8   // norm 2 of 4
         km_rmsnorm(STFM_FFN_OUT, d_model, post_attn_ln)
+        if FJTRACE_ENABLED == 1 {
+            fjtrace_emit_mem_i64("post_attn_rmsnorm", STFM_FFN_OUT, d_model,
+                                 tok_pos, layer, d_model, "", 0, "", 0)
+        }
     }
 
     // === Residual + (post-norm'd) Projected Attention ===
     mdl_memcpy(x_addr, STFM_RES, d_model * 8)
     km_add_raw(x_addr, STFM_FFN_OUT, d_model)
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("attn_residual", x_addr, d_model, tok_pos, layer,
+                             d_model, "", 0, "", 0)
+    }
 
     // === Pre-FFN RMSNorm ===
     mdl_memcpy(STFM_RES, x_addr, d_model * 8)
@@ -1510,6 +1562,10 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
         norm_addr + d_model * 8
     }
     km_rmsnorm(x_addr, d_model, ln2_gamma)
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("pre_ffn_rmsnorm", x_addr, d_model, tok_pos, layer,
+                             d_model, "", 0, "", 0)
+    }
 
     // === Gated FFN with per-matrix codebooks (gate=4, up=5, down=6) ===
     // V28.2: v8 matrices carry inline scales+zeros so mat_size depends on
@@ -1525,11 +1581,19 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     if mt_for_norms == 10 || mt_for_norms == 11 {
         let post_ffn_ln = norm_addr + 3 * d_model * 8   // norm 4 of 4
         km_rmsnorm(STFM_FFN_OUT, d_model, post_ffn_ln)
+        if FJTRACE_ENABLED == 1 {
+            fjtrace_emit_mem_i64("post_ffn_rmsnorm", STFM_FFN_OUT, d_model,
+                                 tok_pos, layer, d_model, "", 0, "", 0)
+        }
     }
 
     // === Residual + (post-norm'd) FFN ===
     mdl_memcpy(x_addr, STFM_RES, d_model * 8)
     km_add_raw(x_addr, STFM_FFN_OUT, d_model)
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("ffn_residual", x_addr, d_model, tok_pos, layer,
+                             d_model, "", 0, "", 0)
+    }
 
 }
 
@@ -1565,6 +1629,10 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
             mdl_stream_embed_lookup_raw(token_id, STFM_X)
         }
     }
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("embed_lookup", STFM_X, d_model, pos, -1,
+                             d_model, "token_id", token_id, "", 0)
+    }
 
     // Step 1.5: Gemma 3 embed scaling — hidden_states = inputs_embeds * sqrt(d_model)
     // Gemma 3 HF reference: Gemma3TextModel.forward scales by config.hidden_size**0.5.
@@ -1595,6 +1663,10 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     if fnorm_off > 0 {
         km_rmsnorm(STFM_X, d_model, STREAM_FINAL_NORM)
     }
+    if FJTRACE_ENABLED == 1 {
+        fjtrace_emit_mem_i64("final_rmsnorm", STFM_X, d_model, pos, -1,
+                             d_model, "", 0, "", 0)
+    }
 
     // Step 3: LM head — v8 tied group-wise > v5 4-bit > generic
     let temp = volatile_read_u64(TFM_STATE + TFM_ST_TEMPERATURE)
@@ -1623,6 +1695,18 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     let gen = volatile_read_u64(TFM_STATE + TFM_ST_TOKENS_GEN)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, gen + 1)
 
+    // V30.SIM P2.3: argmax record — emits the winning token + vocab_size
+    // in `extra`, with shape=[1] (the argmax reduces to a scalar).
+    if FJTRACE_ENABLED == 1 {
+        // Stash `next_token` in a scratch slot so the tracer can read
+        // an i64 region of size 1 rather than growing the emit API to
+        // accept a bare value.
+        volatile_write_u64(FJTRACE_STATE + 56, next_token)
+        fjtrace_emit_mem_i64("argmax", FJTRACE_STATE + 56, 1, pos, -1, 1,
+                             "best_score", 0,
+                             "vocab_size", mdl_get_vocab_size())
+    }
+
     // Repetition penalty: track this token in recent buffer
     // (only checked by v5_4bit argmax; v4 path ignores buffer)
     recent_token_push(next_token)
@@ -1638,6 +1722,9 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     volatile_write_u64(TFM_STATE + TFM_ST_POS, 0)
     volatile_write_u64(TFM_STATE + TFM_ST_ACTIVE, 1)
     volatile_write_u64(TFM_STATE + TFM_ST_TOKENS_GEN, 0)
+
+    // V30.SIM P2.3: reset trace step counter at start of each generate
+    if FJTRACE_ENABLED == 1 { fjtrace_reset() }
 
     // Initialize repetition penalty buffer (clear last-N token history)
     recent_token_init()

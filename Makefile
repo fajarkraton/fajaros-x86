@@ -107,6 +107,7 @@ SOURCES := \
 	kernel/compute/kmatrix.fj \
 	kernel/compute/model_loader.fj \
 	kernel/compute/tokenizer.fj \
+	kernel/compute/fjtrace.fj \
 	kernel/compute/transformer.fj \
 	kernel/compute/pipeline.fj \
 	fs/ramfs.fj \
@@ -279,6 +280,20 @@ build-llvm: $(COMBINED) $(RUNTIME_O)
 	}
 	@echo "[OK] LLVM kernel built: $(KERNEL_LLVM) (O$(LLVM_OPT), $(LLVM_CPU))"
 	@size $(KERNEL_LLVM) 2>/dev/null || true
+
+# ─── V30.SIM P2.3: build with FJTRACE enabled ──────────────────────
+# Toggles FJTRACE_ENABLED in kernel/compute/fjtrace.fj via sed, runs
+# the LLVM build, then restores the source (even if build failed).
+# Plan: fajarquant/docs/V30_SIM_PLAN.md §P2.3
+# Gate: `make build-fjtrace && make run-nvme-llvm` → serial log has
+# JSONL `{"schema_version":1,"step":...,"op":"..."}` lines.
+.PHONY: build-fjtrace
+build-fjtrace:
+	@echo "[FJTRACE] flipping FJTRACE_ENABLED=1..."
+	@sed -i 's|^const FJTRACE_ENABLED: i64 = 0$$|const FJTRACE_ENABLED: i64 = 1|' \
+		kernel/compute/fjtrace.fj
+	@trap 'sed -i "s|^const FJTRACE_ENABLED: i64 = 1\$$|const FJTRACE_ENABLED: i64 = 0|" kernel/compute/fjtrace.fj; echo "[FJTRACE] restored FJTRACE_ENABLED=0"' EXIT; \
+		$(MAKE) build-llvm
 
 # Build with custom startup.S (manual link — for advanced use)
 $(STARTUP_O): $(STARTUP_S)

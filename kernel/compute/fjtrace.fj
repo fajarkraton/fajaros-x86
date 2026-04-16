@@ -1,0 +1,287 @@
+// ═══════════════════════════════════════════════════════════════════
+// FJTRACE — kernel-side per-op JSONL trace emitter
+// ═══════════════════════════════════════════════════════════════════
+//
+// Part of V30.SIM Phase P2.3. Emits one JSON record per op boundary
+// in the transformer forward pass to COM1 serial, so the resulting
+// log can be parsed (P2.4) into the same schema produced by the
+// Python sim (P2.2, `fajarquant/tools/kernel_sim/trace.py`) and the
+// HuggingFace float reference (P2.5).
+//
+// Why serial (not VGA): 17 records/layer × 26 layers × prompt-len
+// would flood the VGA console and prevent reading normal `ask`
+// output. COM1 is captured by QEMU `-serial file:...` so the trace
+// lands in a file for offline analysis.
+//
+// Why the check at call site (not inside this module): when FJTRACE
+// is disabled we want LLVM to DCE the entire emit call. Guarding at
+// the call site with `if FJTRACE_ENABLED == 1 { ... }` lets the
+// O2 compiler constant-fold the branch and eliminate both the stats
+// computation and the serial output. Inside-the-callee guarding
+// still forces argument evaluation at the call site.
+//
+// Schema produced per line (matches kernel_sim.trace v1):
+//
+//   {"schema_version":1,"step":N,"op":"NAME","token_idx":T,"layer":L,
+//    "shape":[S],"dtype":"i64","min":M,"max":X,"mean":U,"nnz":Z,
+//    "top5_abs":[],"hash":"0x...","extra":{...}}
+//
+// `top5_abs` is emitted as `[]` in v1 of the kernel emitter to keep
+// code size small; hash equality is the primary divergence gate.
+// The Python sim still captures real top5_abs, so when hash differs
+// the tooling can drill into Python's top5 to localize the diverging
+// indices. Adding kernel-side top5 is a follow-up if P3 needs it.
+//
+// ── Toggling ─────────────────────────────────────────────────────
+//
+//   FJTRACE_ENABLED = 0  → default. All emit sites DCE away.
+//   FJTRACE_ENABLED = 1  → flip via `make build-fjtrace`, which
+//                          seds this const, builds, then restores.
+//
+// ── Invariants ───────────────────────────────────────────────────
+//
+// 1. Emit must NOT mutate inference state. Stats read only.
+// 2. Step counter lives at FJTRACE_STATE + FJTRACE_ST_STEP (8 bytes),
+//    reset at the start of each `tfm_generate_stream` invocation.
+// 3. Output is one JSONL line terminated by '\n' (byte 10).
+// 4. No floats. All fields are integers. `mean` is trunc-toward-zero.
+// ═══════════════════════════════════════════════════════════════════
+
+// Master toggle — flip to 1 before building to enable trace emission.
+// Kept at top so a single sed replacement does the job.
+const FJTRACE_ENABLED: i64 = 0
+
+// Dedicated state region. 0xBE9000..0xBEA000 is unused per kernel
+// layout audit (neighbors RECENT_BITSET @ 0xBEC000, MDL_EMBED_CB_V5 @
+// 0xBEE000 — see kernel/compute/model_loader.fj).
+const FJTRACE_STATE: i64 = 0xBE9000
+const FJTRACE_ST_STEP: i64 = 0          // u64: monotonic record counter
+const FJTRACE_ST_LAYER: i64 = 8         // i64: current layer index
+                                        // (set by tfm_layer_stream so
+                                        //  tfm_ffn_gated can read it
+                                        //  without threading the param
+                                        //  through the signature — the
+                                        //  FFN helper has two call sites
+                                        //  and param addition would be
+                                        //  more invasive than a state
+                                        //  cell)
+
+// FNV-1a 64-bit constants — MUST match fajarquant/tools/kernel_sim/trace.py
+// to produce identical hashes for identical tensor bytes. Do NOT tweak.
+const FJTRACE_FNV_OFFSET: i64 = 0xCBF29CE484222325
+const FJTRACE_FNV_PRIME: i64 = 0x100000001B3
+
+// ── Step counter ─────────────────────────────────────────────────
+
+@kernel fn fjtrace_reset() {
+    volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_STEP, 0)
+    volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_LAYER, 0)
+}
+
+@kernel fn fjtrace_set_layer(layer: i64) {
+    volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_LAYER, layer)
+}
+
+@kernel fn fjtrace_current_layer() -> i64 {
+    volatile_read_u64(FJTRACE_STATE + FJTRACE_ST_LAYER)
+}
+
+@kernel fn fjtrace_next_step() -> i64 {
+    let s = volatile_read_u64(FJTRACE_STATE + FJTRACE_ST_STEP)
+    volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_STEP, s + 1)
+    s
+}
+
+// ── Serial helpers (bypass VGA to keep screen clean) ─────────────
+//
+// Routes through drivers/serial.fj `serial_send*` rather than
+// kernel/stubs/console.fj `x86_serial_send*` — the console stub is
+// only built into MICRO_SOURCES, not the full SOURCES list. The
+// COM1 base (0x3F8) is fixed to avoid a forward-ref to
+// SERIAL_COM1_BASE, which is declared later in the combined file.
+
+@kernel fn fjtrace_ser_byte(b: i64) {
+    serial_send(0x3F8, b)
+}
+
+@kernel fn fjtrace_ser_str(s: str) {
+    serial_send_str(0x3F8, s)
+}
+
+// Emit signed int64 as decimal. Handles negatives, -2^63, 0.
+@kernel fn fjtrace_ser_i64(v: i64) {
+    if v == 0 { fjtrace_ser_byte(48); return }
+    let mut n = v
+    let mut neg: i64 = 0
+    if n < 0 {
+        neg = 1
+        // -2^63 wraps; handle it explicitly by splitting one digit first
+        if n == -9223372036854775808 {
+            fjtrace_ser_str("-9223372036854775808")
+            return
+        }
+        n = -n
+    }
+    let mut buf: [i64; 24] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                              0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    let mut len: i64 = 0
+    while n > 0 {
+        buf[len] = 48 + (n % 10)
+        n = n / 10
+        len = len + 1
+    }
+    if neg == 1 { fjtrace_ser_byte(45) }
+    let mut i: i64 = 0
+    while i < len { fjtrace_ser_byte(buf[len - 1 - i]); i = i + 1 }
+}
+
+// Emit u64 as 16-char zero-padded hex with "0x" prefix.
+@kernel fn fjtrace_ser_u64_hex(v: i64) {
+    fjtrace_ser_byte(48)     // '0'
+    fjtrace_ser_byte(120)    // 'x'
+    let mut i: i64 = 15
+    while i >= 0 {
+        let n = (v >> (i * 4)) & 0xF
+        if n < 10 { fjtrace_ser_byte(48 + n) }
+        else { fjtrace_ser_byte(87 + n) }    // 'a'..'f' lowercase
+        i = i - 1
+    }
+}
+
+// ── FNV-1a 64-bit over a memory region of i64 values ─────────────
+//
+// Matches `fnv1a_u64_bytes(_i64_to_bytes_le(values))` in the Python
+// sim byte-for-byte. Each i64 contributes 8 bytes, little-endian
+// two's-complement. Fajar Lang `>>` on i64 is LLVM `ashr`, which is
+// arithmetic — sign-extending. For unsigned byte-level access we mask
+// with 0xFF after shifting, so high-bit sign extension is irrelevant.
+@noinline
+@kernel fn fjtrace_hash_i64_region(addr: i64, n: i64) -> i64 {
+    let mut h: i64 = FJTRACE_FNV_OFFSET
+    let mut i: i64 = 0
+    while i < n {
+        let v = volatile_read_u64(addr + i * 8)
+        let mut s: i64 = 0
+        while s < 64 {
+            let b = (v >> s) & 0xFF
+            h = (h ^ b) * FJTRACE_FNV_PRIME
+            s = s + 8
+        }
+        i = i + 1
+    }
+    h
+}
+
+// ── Tensor stats over i64 region ─────────────────────────────────
+//
+// Writes min/max/sum/nnz to scratch slots in FJTRACE_STATE so the
+// caller can read them out after one pass. Using state cells instead
+// of a multi-return tuple keeps the Fajar Lang ABI simple.
+const FJTRACE_ST_MIN: i64 = 24
+const FJTRACE_ST_MAX: i64 = 32
+const FJTRACE_ST_SUM: i64 = 40
+const FJTRACE_ST_NNZ: i64 = 48
+
+@noinline
+@kernel fn fjtrace_stats_i64_region(addr: i64, n: i64) {
+    if n == 0 {
+        volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_MIN, 0)
+        volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_MAX, 0)
+        volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_SUM, 0)
+        volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_NNZ, 0)
+        return
+    }
+    let mut vmin: i64 = volatile_read_u64(addr)
+    let mut vmax: i64 = vmin
+    let mut vsum: i64 = 0
+    let mut nnz: i64 = 0
+    let mut i: i64 = 0
+    while i < n {
+        let v = volatile_read_u64(addr + i * 8)
+        if v < vmin { vmin = v }
+        if v > vmax { vmax = v }
+        vsum = vsum + v
+        if v != 0 { nnz = nnz + 1 }
+        i = i + 1
+    }
+    volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_MIN, vmin)
+    volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_MAX, vmax)
+    volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_SUM, vsum)
+    volatile_write_u64(FJTRACE_STATE + FJTRACE_ST_NNZ, nnz)
+}
+
+// ── Main emitter ─────────────────────────────────────────────────
+//
+// Emits one JSONL record for an i64 tensor stored at `addr` with `n`
+// values. Pass `shape_dim` as the single-dim length (schema emits
+// [shape_dim]; for higher-dim tensors the caller can pre-flatten —
+// none of the current op boundaries need multi-dim shapes).
+//
+// `extra_k1`/`extra_v1` and `extra_k2`/`extra_v2` are optional extras.
+// Empty `extra_k1` ("") disables the `extra` field entirely.
+//
+// Marked @noinline so register pressure in the caller is unchanged
+// (plan §risks mitigation). When FJTRACE_ENABLED==0 the caller-side
+// `if` folds out and the call never happens.
+@noinline
+@kernel fn fjtrace_emit_mem_i64(
+    op_name: str, addr: i64, n: i64, token_idx: i64, layer: i64,
+    shape_dim: i64,
+    extra_k1: str, extra_v1: i64,
+    extra_k2: str, extra_v2: i64,
+) {
+    if FJTRACE_ENABLED == 0 { return }
+
+    fjtrace_stats_i64_region(addr, n)
+    let vmin = volatile_read_u64(FJTRACE_STATE + FJTRACE_ST_MIN)
+    let vmax = volatile_read_u64(FJTRACE_STATE + FJTRACE_ST_MAX)
+    let vsum = volatile_read_u64(FJTRACE_STATE + FJTRACE_ST_SUM)
+    let nnz = volatile_read_u64(FJTRACE_STATE + FJTRACE_ST_NNZ)
+
+    // trunc-toward-zero mean; matches Python sim int semantics.
+    let vmean = if n == 0 { 0 } else { vsum / n }
+    let h = fjtrace_hash_i64_region(addr, n)
+    let step = fjtrace_next_step()
+
+    // Emit: {"schema_version":1,"step":S,"op":"NAME","token_idx":T,
+    //        "layer":L,"shape":[D],"dtype":"i64","min":M,"max":X,
+    //        "mean":U,"nnz":Z,"top5_abs":[],"hash":"0x...","extra":{...}}
+    fjtrace_ser_str("{\"schema_version\":1,\"step\":")
+    fjtrace_ser_i64(step)
+    fjtrace_ser_str(",\"op\":\"")
+    fjtrace_ser_str(op_name)
+    fjtrace_ser_str("\",\"token_idx\":")
+    fjtrace_ser_i64(token_idx)
+    fjtrace_ser_str(",\"layer\":")
+    fjtrace_ser_i64(layer)
+    fjtrace_ser_str(",\"shape\":[")
+    fjtrace_ser_i64(shape_dim)
+    fjtrace_ser_str("],\"dtype\":\"i64\",\"min\":")
+    fjtrace_ser_i64(vmin)
+    fjtrace_ser_str(",\"max\":")
+    fjtrace_ser_i64(vmax)
+    fjtrace_ser_str(",\"mean\":")
+    fjtrace_ser_i64(vmean)
+    fjtrace_ser_str(",\"nnz\":")
+    fjtrace_ser_i64(nnz)
+    fjtrace_ser_str(",\"top5_abs\":[],\"hash\":\"")
+    fjtrace_ser_u64_hex(h)
+    fjtrace_ser_str("\"")
+
+    if str_len(extra_k1) > 0 {
+        fjtrace_ser_str(",\"extra\":{\"")
+        fjtrace_ser_str(extra_k1)
+        fjtrace_ser_str("\":")
+        fjtrace_ser_i64(extra_v1)
+        if str_len(extra_k2) > 0 {
+            fjtrace_ser_str(",\"")
+            fjtrace_ser_str(extra_k2)
+            fjtrace_ser_str("\":")
+            fjtrace_ser_i64(extra_v2)
+        }
+        fjtrace_ser_byte(125)  // '}'
+    }
+
+    fjtrace_ser_byte(125)      // '}'
+    fjtrace_ser_byte(10)       // '\n'
+}
