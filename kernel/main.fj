@@ -133,6 +133,32 @@
     pte_serial_hex16(pte_leaks)
     port_outb(0x3F8, 10)   // '\n'
 
+    // V29.P3.P1: full 4-level walker — reports PAGE_USER at every descent
+    // point (PML4, PDPT non-huge, PD non-huge, plus all leaf types), not
+    // just leaves. Emits "PTE_LEAKS_FULL=<hex16>\n" marker to COM1 so
+    // bisect logs can diff (full - leaf) = non-leaf leak count. SMAP
+    // hypothesis H2 (non-leaf USER bits) predicts non-zero diff here even
+    // when PTE_LEAKS=0. Per-entry detail emitted as "PLKNL L<d> ..." lines.
+    // See kernel/mm/pte_audit.fj:pte_walk_find_u_leaks_full.
+    let pte_leaks_full = pte_walk_find_u_leaks_full()
+    port_outb(0x3F8, 80)   // 'P'
+    port_outb(0x3F8, 84)   // 'T'
+    port_outb(0x3F8, 69)   // 'E'
+    port_outb(0x3F8, 95)   // '_'
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 69)   // 'E'
+    port_outb(0x3F8, 65)   // 'A'
+    port_outb(0x3F8, 75)   // 'K'
+    port_outb(0x3F8, 83)   // 'S'
+    port_outb(0x3F8, 95)   // '_'
+    port_outb(0x3F8, 70)   // 'F'
+    port_outb(0x3F8, 85)   // 'U'
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 61)   // '='
+    pte_serial_hex16(pte_leaks_full)
+    port_outb(0x3F8, 10)   // '\n'
+
     // V29.P2.SMEP step 4: enable SMEP (kernel-mode execution protection).
     // SMAP and NX re-enable deferred to a follow-up sub-phase — initial
     // bisect (V29.P2.SMEP step 4 analysis, 2026-04-16) found SMAP alone

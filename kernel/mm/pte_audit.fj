@@ -284,7 +284,7 @@
     cprint_decimal(KERNEL_VIRT_BOUNDARY / 1024 / 1024, CYAN_ON_BLACK)
     cprintln(" MB)", WHITE_ON_BLACK)
     let leaks = pte_walk_find_u_leaks()
-    cprint("  PAGE_USER leaks in kernel range: ", WHITE_ON_BLACK)
+    cprint("  Leaf PAGE_USER leaks: ", WHITE_ON_BLACK)
     if leaks == 0 {
         cprint_decimal(leaks, GREEN_ON_BLACK)
         cprintln(" (SMEP-safe)", GREEN_ON_BLACK)
@@ -292,5 +292,17 @@
         cprint_decimal(leaks, RED_ON_BLACK)
         cprintln(" (SMEP WOULD HANG)", RED_ON_BLACK)
         cprintln("  See COM1 'PLK ' lines for vaddr/entry details.", WHITE_ON_BLACK)
+    }
+    // V29.P3.P1: full 4-level walker — includes intermediate USER bits
+    // that leaf-only walker misses. Diff (full - leaf) ≈ non-leaf leaks.
+    let full_leaks = pte_walk_find_u_leaks_full()
+    cprint("  All-level PAGE_USER leaks (4-level walk): ", WHITE_ON_BLACK)
+    if full_leaks == 0 {
+        cprint_decimal(full_leaks, GREEN_ON_BLACK)
+        cprintln(" (SMAP-clean)", GREEN_ON_BLACK)
+    } else {
+        cprint_decimal(full_leaks, RED_ON_BLACK)
+        cprintln(" (non-leaf USER bits present)", RED_ON_BLACK)
+        cprintln("  See COM1 'PLKNL ' lines for intermediate-level details.", WHITE_ON_BLACK)
     }
 }
