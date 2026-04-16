@@ -159,21 +159,34 @@
     pte_serial_hex16(pte_leaks_full)
     port_outb(0x3F8, 10)   // '\n'
 
-    // V29.P2.SMEP step 4: enable SMEP (kernel-mode execution protection).
-    // SMAP and NX re-enable deferred to a follow-up sub-phase — initial
-    // bisect (V29.P2.SMEP step 4 analysis, 2026-04-16) found SMAP alone
-    // double-faults after CR4 enable, suggesting a secondary U-bit path
-    // or AC-flag interaction the walker didn't catch. SMEP works cleanly
-    // and provides the primary SMEP-era protection (ring-0 instruction
-    // fetch from USER pages blocked), so shipping it alone closes the
-    // V26 B4.2 blocker while SMAP+NX stay in a separate investigation
-    // track documented in docs/V29_P2_SMEP_STEP4_BISECT.md.
+    // V29.P3.P4: SMEP + SMAP re-enabled. NX deferred — separate fault
+    // path unrelated to the non-leaf USER leak closed in V29.P3.P1.5.
     //
-    // Boot log on supported CPUs (i9-14900HX, QEMU -cpu host):
+    // V29.P2 shipped SMEP-only after SMAP double-faulted on the same
+    // strip pass. V29.P3.P1 walker found 2 non-leaf USER leaks at
+    // PML4[0]+PDPT[0] that the leaf-only walker missed (PLKNL L4/L3,
+    // flags 0x027). P1.5 (commit 690124b) extended
+    // strip_user_from_kernel_identity() to clear those entries. With
+    // that fix, SMAP+SMEP co-exist cleanly (boot reaches `nova>`).
+    //
+    // P4 isolation bisect (2026-04-16): SMEP+SMAP boots clean;
+    // SMEP+SMAP+NX hangs silently at println(16) with no EXC marker
+    // (triple-fault → CPU shutdown). NX hang is a distinct issue —
+    // likely a kernel code page incorrectly marked NX=1 somewhere in
+    // `nx_enforce_data_pages()` classification or in
+    // `extend_identity_mapping_*` flag computation. Tracked as
+    // V29.P3.P6 / TODO-P2-security: grep `PAGE_NX` writes, add a
+    // post-enforce walker that reports any NX=1 page whose physical
+    // frame lies in the kernel text/rodata range.
+    //
+    // Expected boot markers on supported CPUs:
+    //   PTE_LEAKS=0000000000000000
+    //   PTE_LEAKS_FULL=0000000000000000
     //   SMEP (CR4.20): ENABLED
+    //   SMAP (CR4.21): ENABLED
     security_enable_smep()
-    // security_enable_smap()    // DEFERRED — double-faults (see bisect doc)
-    // nx_enforce_data_pages()   // DEFERRED — pairs with SMAP work
+    security_enable_smap()
+    // TODO(P2-security, V29.P3.P6): nx_enforce_data_pages() — triple-faults.
 
     println(13)
     // Stack guard page: SKIP — 2MB huge pages don't support 4KB unmap
