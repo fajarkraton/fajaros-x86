@@ -1,0 +1,27 @@
+[BOOT] FajarOS Nova v3.5.0 starting
+[MEM] heap 16 MB initialized
+[PCIE] enumerating devices
+{"schema_version":1,"step":0,"op":"embed_lookup","token_idx":0,"layer":-1,"shape":[1152],"dtype":"i64","min":-1000,"max":2000,"mean":100,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbeef","extra":{"token_id":42}}
+{"schema_version":1,"step":1,"op":"pre_attn_rmsnorm","token_idx":0,"layer":0,"shape":[1152],"dtype":"i64","min":-1001,"max":2001,"mean":101,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbf00"}
+{"schema_version":1,"step":2,"op":"q_proj","token_idx":0,"layer":0,"shape":[1152],"dtype":"i64","min":-1002,"max":2002,"mean":102,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbf11"}
+{"schema_version":1,"step":3,"op":"k_proj","token_idx":0,"layer":0,"shape":[256],"dtype":"i64","min":-1003,"max":2003,"mean":103,"nnz":255,"top5_abs":[],"hash":"0x00000000deadbf22"}
+{"schema_version":1,"step":4,"op":"v_proj","token_idx":0,"layer":0,"shape":[256],"dtype":"i64","min":-1004,"max":2004,"mean":104,"nnz":255,"top5_abs":[],"hash":"0x00000000deadbf33"}
+{"schema_version":1,"step":5,"op":"attn_out","token_idx":0,"layer":0,"shape":[1152],"dtype":"i64","min":-1005,"max":2005,"mean":105,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbf44"}
+{"schema_version":1,"step":6,"op":"post_attn_rmsnorm","token_idx":0,"layer":0,"shape":[1152],"dtype":"i64","min":-1006,"max":2006,"mean":106,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbf55"}
+{"schema_version":1,"step":7,"op":"attn_residual","token_idx":0,"layer":0,"shape":[1152],"dtype":"i64","min":-1007,"max":2007,"mean":107,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbf66"}
+[SMEP] enabled (CR4.SMEP=1)
+{"schema_version":1,"step":8,"op":"pre_ffn_rmsnorm","token_idx":0,"layer":0,"shape":[1152],"dtype":"i64","min":-1008,"max":2008,"mean":108,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbf77"}
+{"schema_version":1,"step":9,"op":"gate_proj","token_idx":0,"layer":0,"shape":[6912],"dtype":"i64","min":-1009,"max":2009,"mean":109,"nnz":6911,"top5_abs":[],"hash":"0x00000000deadbf88"}
+{"schema_version":1,"step":10,"op":"up_proj","token_idx":0,"layer":0,"shape":[6912],"dtype":"i64","min":-1010,"max":2010,"mean":110,"nnz":6911,"top5_abs":[],"hash":"0x00000000deadbf99"}
+{"schema_version":1,"step":11,"op":"ffn_hidden","token_idx":0,"layer":0,"shape":[6912],"dtype":"i64","min":-1011,"max":2011,"mean":111,"nnz":6911,"top5_abs":[],"hash":"0x00000000deadbfaa"}
+{"schema_version":1,"step":12,"op":"down_proj","token_idx":0,"layer":0,"shape":[6912],"dtype":"i64","min":-1012,"max":2012,"mean":112,"nnz":6911,"top5_abs":[],"hash":"0x00000000deadbfbb"}
+{"schema_version":1,"step":13,"op":"post_ffn_rmsnorm","token_idx":0,"layer":0,"shape":[1152],"dtype":"i64","min":-1013,"max":2013,"mean":113,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbfcc"}
+{"schema_version":1,"step":14,"op":"ffn_residual","token_idx":0,"layer":0,"shape":[1152],"dtype":"i64","min":-1014,"max":2014,"mean":114,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbfdd"}
+{"schema_version":1,"step":15,"op":"final_rmsnorm","token_idx":0,"layer":-1,"shape":[1152],"dtype":"i64","min":-1015,"max":2015,"mean":115,"nnz":1151,"top5_abs":[],"hash":"0x00000000deadbfee"}
+{"schema_version":1,"step":16,"op":"argmax","token_idx":0,"layer":-1,"shape":[1],"dtype":"i64","min":-1016,"max":2016,"mean":116,"nnz":0,"top5_abs":[],"hash":"0x00000000deadbfff","extra":{"best_score":123456,"vocab_size":262144}}
+{"schema_version":1,"step":99,"op":"embed_lookup",
+{"schema_version":2,"step":100,"op":"embed_lookup","token_idx":0,"layer":-1,"shape":[4],"dtype":"i64","min":0,"max":0,"mean":0,"nnz":0,"top5_abs":[],"hash":"0x0"}
+{"schema_version":1,"step":101,"op":"bogus_op","token_idx":0,"layer":-1,"shape":[4],"dtype":"i64","min":0,"max":0,"mean":0,"nnz":0,"top5_abs":[],"hash":"0x0"}
+[SMAP] enabled (CR4.SMAP=1)
+[NX ] enabled (EFER.NXE=1)
+nova>
