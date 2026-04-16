@@ -1527,6 +1527,7 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     // === Residual + (post-norm'd) FFN ===
     mdl_memcpy(x_addr, STFM_RES, d_model * 8)
     km_add_raw(x_addr, STFM_FFN_OUT, d_model)
+
 }
 
 // ── Streaming forward pass (single token) ──

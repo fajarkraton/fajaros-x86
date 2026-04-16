@@ -2156,6 +2156,12 @@ const LM_TOPK_K: i64 = 8
     let mut best_token: i64 = 0
     let mut best_score: i64 = -999999999
     let mut v: i64 = 0
+    // V28.2 P2: this volatile read is REQUIRED to avoid an LLVM O2
+    // miscompile that causes EXC:13 (GP fault) at offset 0x164C35.
+    // Removing it triggers the fault during the second iteration of the
+    // 262K-vocab loop. The existing v5_4bit hot path has the same kind of
+    // protection — see comment "v5 4-bit sample function not implemented".
+    let _llvm_o2_guard = volatile_read_u64(MDL_V7_EXTRA + 104)
     while v < vocab_size {
         let row_start = v * d_model
         let mut sum: i64 = 0
