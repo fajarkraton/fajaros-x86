@@ -13,7 +13,7 @@
 
 V29.P2.SMEP step 4 shipped SMEP enabled, PTE_LEAKS=0 invariant, walker
 permanent. **SMAP and NX were deferred** because uncommenting
-`security_enable_smap()` in `kernel/core/main.fj` triggers an immediate
+`security_enable_smap()` in `kernel/main.fj` triggers an immediate
 double fault (EXC:8 → PANIC:8) the moment `write_cr4(cr4 | CR4_SMAP)`
 executes at `kernel/core/security.fj:60`.
 
@@ -64,7 +64,7 @@ re-introducing a USER-flagged read). This plan adds both.
 | `kernel/core/mm_advanced.fj` (walker) | Extend `pte_walk_find_u_leaks` to report PDPT + PML4 USER bits in addition to leaf PTE. New leak counter: `PTE_LEAKS_INTERMEDIATE` |
 | `kernel/core/irq.fj` (or double-fault handler site) | Add `record_double_fault_rip(rip: u64)` — capture faulting RIP into a well-known buffer, print at panic |
 | `kernel/core/security.fj:51-66` | Add `security_enable_smap_with_bisect()` helper that logs `pre-write_cr4` marker + reads back CR4 + confirms set before proceeding |
-| `kernel/core/main.fj` | Uncomment `security_enable_smap()` + `nx_enforce_data_pages()` after root-cause fix ships |
+| `kernel/main.fj` | Uncomment `security_enable_smap()` + `nx_enforce_data_pages()` after root-cause fix ships |
 | `kernel/shell/commands.fj` (`cmd_pte_audit`) | Also surface intermediate-level leak count |
 | `tests/kernel/test_smap_regression.fj` (new) | Boot-time assertion: CR4.SMAP=1, CR4.NX=1, boot reaches `nova>` |
 | `Makefile` | New target `test-smap-regression` paralleling `test-smep-regression` |
@@ -193,7 +193,7 @@ Fix branches by hypothesis:
 
 | # | Task | Verification | Est |
 |---|------|--------------|-----|
-| P4.1 | Uncomment `security_enable_smap()` in `kernel/core/main.fj` | diff shows uncommenting only | 0.02h |
+| P4.1 | Uncomment `security_enable_smap()` in `kernel/main.fj` | diff shows uncommenting only | 0.02h |
 | P4.2 | Uncomment `nx_enforce_data_pages()` | same | 0.02h |
 | P4.3 | `make clean && make iso-llvm` | `ls -la build/fajaros-llvm.iso` — file exists | 0.1h |
 | P4.4 | Boot test: reach `nova>`, run `version`, confirm no EXC | `grep -E 'nova>\|EXC:' /tmp/smap-enabled.log` → `nova>` matches ≥ 1, `EXC:` matches = 0 | 0.1h |
@@ -292,7 +292,7 @@ Each phase installs at least one durable prevention mechanism:
 | Phase closure | handoff | `docs/V29_P3_CLOSED.md` (P5.4) |
 
 Pre-commit hook check 6/6 blocks any commit touching
-`kernel/core/main.fj` that disables SMAP/NX without a matching
+`kernel/main.fj` that disables SMAP/NX without a matching
 `V29_P*_DECISION.md` file in the same commit.
 
 ---
