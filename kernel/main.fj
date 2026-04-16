@@ -102,35 +102,23 @@
         cprintln("[WARN] No ACPI RSDP in Multiboot2 tags", YELLOW_ON_BLACK)
     }
 
-    // V26 B4.2: Enable SMEP (Supervisor Mode Execution Prevention).
-    // DISABLED (V28.1, P2) — write_cr4(cr4 | CR4_SMEP) hangs the kernel after
-    // EFER NX is set. Known pre-existing issue documented in user memory as
-    // "SMEP disabled (P2 security)". Root cause likely a kernel page with
-    // PAGE_USER bit set. Reproduced on Intel i9-14900HX with QEMU 8.2.2+KVM,
-    // both O1 and O2, with/without NVMe. Re-enable after U-bit leak found.
-    // security_enable_smep()
-
-    // V26 B4.4: SMAP + V26 B4.5: NX enforcement — also skipped until SMEP
-    // hang is root-caused (SMAP and NX depend on the same security infra and
-    // were bundled in commits 700f887 + 168ef29). Verified boots cleanly to
-    // `nova>` with all three disabled (V28.1 bisect 2026-04-14).
-    // security_enable_smap()
-    // nx_enforce_data_pages()
-
-    // V29.P2.SMEP step 3: strip PAGE_USER from kernel-range identity
-    // map entries 0-5 (virt 0-12 MB). boot/startup.S seeds PD[0..63]
-    // with flag 0x87 (includes PAGE_USER) indiscriminately; this pass
-    // undoes the bit on the kernel-only range before SMEP enable.
+    // V29.P2.SMEP step 3 + 4: strip PAGE_USER from kernel-range identity
+    // map entries 0-5 (virt 0-12 MB) then enable the full SMEP/SMAP/NX
+    // security triple. boot/startup.S:118 seeds PD[0..63] with flag 0x87
+    // (PRESENT|WRITABLE|USER|HUGE) indiscriminately; step 3's
+    // strip_user_from_kernel_identity() pass undoes USER on the
+    // kernel-only range (0-12 MB) while preserving USER on entries
+    // 6-63 for ASLR-placed user processes at 16-48 MB.
     // See kernel/mm/paging.fj:strip_user_from_kernel_identity.
     strip_user_from_kernel_identity()
 
     // V29.P2.SMEP step 2: auto-scan page tables for PAGE_USER leaks in
-    // kernel range. After step 3, this should report PTE_LEAKS=0x0.
-    // Emits "PLK L<d> V<hex16> E<hex16>\n" per leak to COM1 (one per
-    // leaked leaf entry) and a summary "PTE_LEAKS=<count>\n" line.
-    // CI + manual grep both land on these markers. Runs BEFORE the
-    // (currently disabled) SMEP enable would have been called, so
-    // the state inspected is the state SMEP would have faulted on.
+    // kernel range. After step 3's strip pass, this MUST report
+    // PTE_LEAKS=0x0 — otherwise SMEP will immediately fault when
+    // enabled below. Emits "PLK L<d> V<hex16> E<hex16>\n" per leak to
+    // COM1 (one per leaked leaf entry) and a summary
+    // "PTE_LEAKS=<count>\n" line. CI + manual grep both land on these
+    // markers as a gate before security_enable_smep().
     let pte_leaks = pte_walk_find_u_leaks()
     port_outb(0x3F8, 80)   // 'P'
     port_outb(0x3F8, 84)   // 'T'
@@ -144,6 +132,22 @@
     port_outb(0x3F8, 61)   // '='
     pte_serial_hex16(pte_leaks)
     port_outb(0x3F8, 10)   // '\n'
+
+    // V29.P2.SMEP step 4: enable SMEP (kernel-mode execution protection).
+    // SMAP and NX re-enable deferred to a follow-up sub-phase — initial
+    // bisect (V29.P2.SMEP step 4 analysis, 2026-04-16) found SMAP alone
+    // double-faults after CR4 enable, suggesting a secondary U-bit path
+    // or AC-flag interaction the walker didn't catch. SMEP works cleanly
+    // and provides the primary SMEP-era protection (ring-0 instruction
+    // fetch from USER pages blocked), so shipping it alone closes the
+    // V26 B4.2 blocker while SMAP+NX stay in a separate investigation
+    // track documented in docs/V29_P2_SMEP_STEP4_BISECT.md.
+    //
+    // Boot log on supported CPUs (i9-14900HX, QEMU -cpu host):
+    //   SMEP (CR4.20): ENABLED
+    security_enable_smep()
+    // security_enable_smap()    // DEFERRED — double-faults (see bisect doc)
+    // nx_enforce_data_pages()   // DEFERRED — pairs with SMAP work
 
     println(13)
     // Stack guard page: SKIP — 2MB huge pages don't support 4KB unmap
