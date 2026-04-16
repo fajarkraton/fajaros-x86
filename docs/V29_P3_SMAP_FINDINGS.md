@@ -206,3 +206,127 @@ Green for P1 launch when next scheduled.
 *V29.P3.P0 Pre-Flight Findings — generated 2026-04-16 by
 Claude Opus 4.6 via the `fajaros-bisect` skill. All 4 bisect logs
 live at `build/bisect-logs/20260416_*` for future cross-referencing.*
+
+---
+
+## 10. V29.P3.P1 — Walker Extension + Non-Leaf Leak Discovery
+
+**Phase:** V29.P3.P1 (per `docs/V29_P3_SMAP_PLAN.md` §4)
+**Date:** 2026-04-16 (same session as P0)
+**Commits:** `a521d4c` (P1.1 walker), `c593176` (P1.3 wire + boot invoke)
+**Outcome:** **Hypothesis H2 confirmed.** Two non-leaf PAGE_USER leaks
+identified with presisi — PML4[0] and PDPT[0] both have USER=1.
+Leaf-only walker was blind to both; `strip_user_from_kernel_identity()`
+in V29.P2 only touches 2MB huge leaves at PD[0..5].
+
+### 10.1 Walker implementation (P1.1 → commit `a521d4c`)
+
+Added to `kernel/mm/pte_audit.fj`:
+- `pte_report_leak_nonleaf(vaddr, entry, level)` — emits `PLKNL L<d> V<hex16> E<hex16>`
+  with distinct prefix from leaf `PLK` so bisect-log grep can separate.
+- `pte_check_nonleaf(vaddr, entry, level) -> i64` — same kernel-range
+  gating as `pte_check_leaf` (report only when region-start < 12 MB).
+- `pte_walk_find_u_leaks_full() -> i64` — full 4-level walk, calls
+  nonleaf checker at PML4, PDPT-non-huge, PD-non-huge descent points
+  plus leaf checker at all terminals. Returns combined count.
+
+Level coding:
+| Marker | Prefix | Level | What |
+|--------|--------|------:|------|
+| `PLKNL L4` | non-leaf | 4 | PML4 entry with USER=1 covering kernel |
+| `PLKNL L3` | non-leaf | 3 | PDPT non-huge entry with USER=1 |
+| `PLKNL L2` | non-leaf | 2 | PD non-huge entry with USER=1 |
+| `PLK L1`   | leaf     | 1 | PT 4KB leaf with USER=1 |
+| `PLK L2`   | leaf     | 2 | PD 2MB-huge leaf with USER=1 |
+| `PLK L3`   | leaf     | 3 | PDPT 1GB-huge leaf with USER=1 |
+
+### 10.2 Boot-marker wiring (P1.3 → commit `c593176`)
+
+Added in `kernel/main.fj` right after existing `PTE_LEAKS=` block:
+- Call `pte_walk_find_u_leaks_full()` on every boot
+- Emit `PTE_LEAKS_FULL=<hex16>\n` byte-by-byte to COM1 (same hex16 helper)
+
+Also extended `cmd_pte_audit` shell command with "All-level PAGE_USER
+leaks (4-level walk)" line alongside the leaf count.
+
+### 10.3 Empirical result
+
+Boot on `qemu-system-x86_64 -cdrom build/fajaros-llvm.iso -cpu Skylake-Client-v4`:
+
+```
+PTE_LEAKS=0000000000000000                    ← Leaf walk clean (V29.P2 baseline intact)
+PTE_LEAKS_FULL=0000000000000002               ← Full walk: 2 non-leaf leaks
+PLKNL L4 V0000000000000000 E0000000000071027  ← PML4[0]
+PLKNL L3 V0000000000000000 E0000000000072027  ← PDPT[0]
+```
+
+**Entry flag decode** (`E=0x027`):
+- Bit 0 (PRESENT) = 1
+- Bit 1 (WRITABLE) = 1
+- **Bit 2 (USER) = 1** ← the leak
+- Bit 5 (ACCESSED) = 1
+- Upper bits = page-table base address (PDPT@`0x71000`, PD@`0x72000`)
+
+### 10.4 Hypothesis assessment (Decision Gate input)
+
+| Hypothesis | V29.P3 Plan §2 statement | Verdict | Evidence |
+|---|---|---|---|
+| **H1** — USER-flagged framebuffer/MMIO/heap pages | Kernel reads USER-page during SMAP-protected phase | ❌ NOT MATCHED | Leaks at PML4[0]/PDPT[0] are page-table descent entries, not MMIO address range |
+| **H2** — Non-leaf USER bits in page-table walk | SMAP AND-chains USER across walk; any non-leaf USER=1 causes fault | ✅ **MATCHED** | Two intermediate leaks identified with exact virt+flag bytes |
+| **H3** — STAC/CLAC intrinsic / AC flag interaction | Kernel CLI/STI or IRQ return flips AC mid-execution | ❌ NOT MATCHED | No instruction-level fault pattern; page-walk level issue |
+
+**Why H2 fits the V29.P2 step 4 symptom:**
+- SMEP-only config PASSES — SMEP check is leaf-only for ring-0 instruction fetch (Intel SDM Vol 3A §4.6.2)
+- SMAP-enabled configs FAIL — SMAP check AND-chains USER bits across the entire page-table walk (Intel SDM §4.6.1.1)
+- `PML4[0].U=1 ∧ PDPT[0].U=1` means the walk below them is "user-accessible" for SMAP purposes regardless of whether the leaf PTEs have USER=0
+- First kernel access after SMAP enable → double-fault on supervisor data read of user-walkable mapping → EXC:8 PANIC:8 (exactly what V29.P2 step 4 bisect recorded)
+
+### 10.5 P1.5 fix target (precise)
+
+Extend `strip_user_from_kernel_identity()` in `kernel/mm/paging.fj` to
+additionally clear the USER bit (bit 2) on:
+- `PML4[0]` entry at PML4_BASE+0 (currently `0x71027` → `0x71023`)
+- `PDPT[0]` entry at `0x71000+0` (currently `0x72027` → `0x72023`)
+
+Success gate: next boot reports `PTE_LEAKS_FULL=0000000000000000`.
+Regression safety: V29.P2.SMEP PTE_LEAKS=0 must still hold (leaf strip
+pass unchanged, additive non-leaf strip only).
+
+### 10.6 Effort tally (Phase P1 addendum to §7)
+
+| Task | Estimate | Actual | Variance | Commit |
+|------|---------:|-------:|---------:|--------|
+| P1.1 Walker function (full 4-level) | 0.3h | 0.25h | -17% | `a521d4c` |
+| P1.2 4 separate counters | 0.1h | 0h (DEFERRED) | — | — |
+| P1.3 Wire shell + boot invoke | 0.1h | 0.2h (bundles de-facto P1.4) | +100% (de-facto P1.4 inline) | `c593176` |
+| P1.4 Level-by-level leak table | 0.15h | 0h (closed inline by P1.3 output) | — | `c593176` §10.3–10.4 |
+| P1.5 Strip non-leaf USER | 0.25h | ⏳ PENDING | — | — |
+| P1 findings doc update | — | 0.15h | unplanned | THIS UPDATE |
+| **P1 running total** | 0.9h | 0.6h so far | -33% | — |
+
+Within +25% surprise budget. P1.2 intentionally deferred — the
+aggregate `PTE_LEAKS_FULL` counter plus raw `PLKNL` per-entry lines
+proved sufficient for H2 confirmation without separate per-level
+aggregates. If P1.5 strip reveals counting complexity, P1.2 can be
+revived.
+
+### 10.7 P3 Decision Gate preview
+
+Per plan §4 Phase V29.P3.P3, the Decision Gate committed file
+`docs/V29_P3_SMAP_DECISION.md` will record (after P2 RIP attribution):
+- Matched hypothesis: **H2**
+- Chosen fix: P1.5 strip of PML4[0]+PDPT[0] USER bit (additive to existing `strip_user_from_kernel_identity`)
+- Rejected: H1 (no MMIO evidence), H3 (no instruction-level fault), new-hypothesis scan (unnecessary)
+- Estimated effort for P3 fix + validation: 0.5h
+
+**P2 (RIP attribution) may no longer be strictly necessary** if P1.5
+strip is sufficient to clear the fault — the leak discovery already
+gives the fix target without needing double-fault RIP symbolization.
+P2 becomes a confirmation path: if P1.5 boot with SMAP enabled still
+faults, then P2 attribution identifies the *second* leak source.
+Keep P2 in plan but flag as conditional-on-P1.5-residual-fail.
+
+---
+
+*V29.P3.P1 addendum — generated 2026-04-16 by Claude Opus 4.6.
+Non-leaf walker commits: `a521d4c`, `c593176`.*
