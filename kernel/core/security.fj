@@ -231,9 +231,20 @@ const KERNEL_TEXT_END: i64 = 0x120000
     let pdpt_entry = page_table_entry(pdpt_addr, 0)
     if (pdpt_entry & PAGE_PRESENT) == 0 { return }
     let pd_addr = pdpt_entry & 0xFFFFF000
-    // PD entries 1-63 (2MB-128MB): set NX on data regions
-    // Skip PD[0] (first 2MB contains kernel .text — must stay executable)
-    let mut pd_idx: i64 = 1
+    // V29.P3.P6.P3: PD entries 2-63 (4MB-128MB) set NX on data regions.
+    // Kernel image (.text + .rodata + .data + .bss) spans
+    // 0x101000-0x25e007, which straddles PD[0] (0-2MB) AND PD[1] (2-4MB).
+    // Skip both to keep kernel instructions executable. Verified via
+    // `objdump -h build/fajaros-llvm.elf` against kernel .text end at
+    // 0x248297. Previous `pd_idx = 1` marked PD[1] NX, causing silent
+    // triple-fault when CPU fetched instructions from 2-2.285 MB
+    // (#PF → handler also NX → #DF → #DF handler also NX → CPU halt).
+    // See V29_P3_P6_NX_FINDINGS.md §3 + V29_P3_P6_NX_DECISION.md §2 H3.
+    //
+    // TODO(P3, V30+): replace hardcoded `2` with dynamic __kernel_end
+    // symbol lookup so future kernel growth past 4 MB auto-handles.
+    // Current headroom: 4 MB - 2.285 MB = 1.72 MB before recurrence.
+    let mut pd_idx: i64 = 2
     while pd_idx < 64 {
         let entry = page_table_entry(pd_addr, pd_idx)
         if (entry & PAGE_PRESENT) != 0 {
