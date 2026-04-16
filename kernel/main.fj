@@ -183,6 +183,29 @@
     security_enable_smap()
     nx_enforce_data_pages()
 
+    // V29.P3.P6.P4: emit NX_ENFORCED marker with EFER.NXE bit value for
+    // test-security-triple-regression gate. EFER MSR = 0xC0000080, bit 11
+    // = NXE. Expected value when enforced: 0x800. Regression target greps
+    // this exact pattern; a future edit that (a) comments out
+    // nx_enforce_data_pages() or (b) removes the EFER write would produce
+    // NX_ENFORCED=0x0 and fail the gate.
+    let nx_efer = read_msr(0xC0000080)
+    let nxe = nx_efer & 0x800
+    port_outb(0x3F8, 78)   // 'N'
+    port_outb(0x3F8, 88)   // 'X'
+    port_outb(0x3F8, 95)   // '_'
+    port_outb(0x3F8, 69)   // 'E'
+    port_outb(0x3F8, 78)   // 'N'
+    port_outb(0x3F8, 70)   // 'F'
+    port_outb(0x3F8, 79)   // 'O'
+    port_outb(0x3F8, 82)   // 'R'
+    port_outb(0x3F8, 67)   // 'C'
+    port_outb(0x3F8, 69)   // 'E'
+    port_outb(0x3F8, 68)   // 'D'
+    port_outb(0x3F8, 61)   // '='
+    pte_serial_hex16(nxe)
+    port_outb(0x3F8, 10)   // '\n'
+
     println(13)
     // Stack guard page: SKIP — 2MB huge pages don't support 4KB unmap
     // unmap_page(0x7F0000 - 4096)  // guard page below stack bottom

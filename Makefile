@@ -449,43 +449,51 @@ test-smep-regression: iso-llvm
 	@echo ""
 	@echo "✅ V29.P2.SMEP regression gate: all invariants hold"
 
-# V29.P3.P5 SMAP regression test — verify non-leaf USER strip holds and
-# SMAP stays enabled without double-fault. Mirrors test-smep-regression
-# but gates on the PTE_LEAKS_FULL=0 invariant introduced by V29.P3.P1's
-# `pte_walk_find_u_leaks_full`. Commit f2dd682 shipped SMEP+SMAP;
-# NX remains deferred per TODO(P2-security, V29.P3.P6).
+# V29.P3.P6.P4 security-triple regression test — verify non-leaf USER
+# strip holds, SMAP stays enabled without double-fault, AND NX (EFER.NXE)
+# is enforced without triple-fault. Supersedes V29.P3.P5 smap-regression
+# by adding the NX_ENFORCED=0x800 invariant after V29.P3.P6 NX fix
+# (commit 540743b) closed V26 B4.2 security triple 3/3.
 #
 # Invariants:
 #   1. PTE_LEAKS=0x0            (leaf walker — V29.P2 invariant)
-#   2. PTE_LEAKS_FULL=0x0       (non-leaf walker — V29.P3 invariant, NEW)
-#   3. No EXC:8 / PANIC:8       (SMAP did not double-fault)
-#   4. `nova>` reached          (kernel boot path not hung)
-#   5. No PLKNL lines           (zero non-leaf USER leaks in kernel range)
-test-smap-regression: iso-llvm
-	@echo "[TEST] V29.P3.SMAP regression — SMEP+SMAP invariants..."
+#   2. PTE_LEAKS_FULL=0x0       (non-leaf walker — V29.P3 invariant)
+#   3. No PLKNL lines           (zero non-leaf USER leaks in kernel range)
+#   4. No EXC / PANIC           (no fault of any kind)
+#   5. `nova>` reached          (kernel boot path not hung)
+#   6. NX_ENFORCED=0x800        (EFER.NXE bit 11 set — V29.P3.P6 invariant, NEW)
+test-security-triple-regression: iso-llvm
+	@echo "[TEST] V29.P3.P6 security triple regression — SMEP+SMAP+NX invariants..."
 	@(sleep 6; printf 'test-all\r'; sleep 3) | \
 		timeout 15 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
 		-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
 		-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) 2>/dev/null \
-		> $(BUILD_DIR)/test-smap-regression.log || true
+		> $(BUILD_DIR)/test-security-triple-regression.log || true
 	@echo ""
-	@grep -q "PTE_LEAKS=0000000000000000" $(BUILD_DIR)/test-smap-regression.log \
+	@grep -q "PTE_LEAKS=0000000000000000" $(BUILD_DIR)/test-security-triple-regression.log \
 		&& echo "[PASS] PTE_LEAKS=0x0 (V29.P2 leaf strip intact)" \
 		|| { echo "[FAIL] PTE_LEAKS nonzero or missing — leaf-walker regression"; exit 1; }
-	@grep -q "PTE_LEAKS_FULL=0000000000000000" $(BUILD_DIR)/test-smap-regression.log \
+	@grep -q "PTE_LEAKS_FULL=0000000000000000" $(BUILD_DIR)/test-security-triple-regression.log \
 		&& echo "[PASS] PTE_LEAKS_FULL=0x0 (V29.P3.P1.5 non-leaf strip intact)" \
 		|| { echo "[FAIL] PTE_LEAKS_FULL nonzero or missing — non-leaf regression"; exit 1; }
-	@grep -q "PLKNL L" $(BUILD_DIR)/test-smap-regression.log \
+	@grep -q "PLKNL L" $(BUILD_DIR)/test-security-triple-regression.log \
 		&& { echo "[FAIL] PLKNL lines present — non-leaf leaks leaked past strip"; exit 1; } \
 		|| echo "[PASS] no PLKNL lines (no non-leaf USER leaks)"
-	@grep -q "EXC:8\|PANIC:8" $(BUILD_DIR)/test-smap-regression.log \
-		&& { echo "[FAIL] EXC:8/PANIC:8 in log — SMAP double-faulted"; exit 1; } \
-		|| echo "[PASS] no double-fault markers (SMAP enable clean)"
-	@grep -q "nova>" $(BUILD_DIR)/test-smap-regression.log \
-		&& echo "[PASS] nova> reached (SMAP+SMEP did not hang kernel)" \
-		|| { echo "[FAIL] No shell prompt — SMAP/SMEP crashed kernel"; exit 1; }
+	@grep -qE "EXC:|PANIC:" $(BUILD_DIR)/test-security-triple-regression.log \
+		&& { echo "[FAIL] EXC/PANIC in log — fault occurred"; exit 1; } \
+		|| echo "[PASS] no fault markers (security triple enable clean)"
+	@grep -q "nova>" $(BUILD_DIR)/test-security-triple-regression.log \
+		&& echo "[PASS] nova> reached (SMEP+SMAP+NX did not hang kernel)" \
+		|| { echo "[FAIL] No shell prompt — security enable crashed kernel"; exit 1; }
+	@grep -q "NX_ENFORCED=0000000000000800" $(BUILD_DIR)/test-security-triple-regression.log \
+		&& echo "[PASS] NX_ENFORCED=0x800 (EFER.NXE bit 11 set — V29.P3.P6 fix intact)" \
+		|| { echo "[FAIL] NX_ENFORCED missing or wrong — NX enforce regression"; exit 1; }
 	@echo ""
-	@echo "✅ V29.P3.SMAP regression gate: all 5 invariants hold"
+	@echo "✅ V29.P3.P6 security triple regression gate: all 6 invariants hold"
+
+# Backward-compat alias — will be removed in a future version after
+# CI jobs are updated to use test-security-triple-regression.
+test-smap-regression: test-security-triple-regression
 
 # Mass-test shell commands — 2 batches × 45 commands = 90 total
 test-commands: iso-llvm
