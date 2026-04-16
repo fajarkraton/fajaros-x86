@@ -2,13 +2,6 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
-> **Note on historical gap (V28.5 audit, 2026-04-16):** Entries for `v3.1.0`,
-> `v3.2.0`, and `v3.3.0` are absent from this file. The tags exist on GitHub
-> and git history has full commit trails, but narrative release notes were
-> not backfilled into CHANGELOG at the time of tagging. This is tracked as
-> a separate documentation gap; authoritative source for v3.0--v3.3 work is
-> git log + the `docs/V28_*.md` audit trail.
-
 ## [3.4.0] "Multilingual" -- 2026-04-16
 
 V28.5 audit complete. Gemma 3 1B inference demonstrated end-to-end across
@@ -119,6 +112,265 @@ python3 scripts/check_memory_map.py       # → 0 overlaps across 33 regions
 grep -E "^@noinline$" kernel/compute/kmatrix.fj \
                       kernel/compute/model_loader.fj | wc -l  # → 3
 ```
+
+---
+
+## [3.3.0] "V28 Foundation" -- 2026-04-14
+
+Paired with Fajar Lang v27.5.0 "Compiler Prep". Pre-flight audit for V28
+"Intelligence" complete; Gemma 3 1B tensor pool infrastructure landed.
+80% of originally-planned V28 scope was found to already exist in the
+kernel — revised V28 plan narrows real work to the Gemma 3 1B model port.
+
+### Added
+
+- **V28.1 Gemma 3 tensor pool** (`b5aa70e`) — new `KM_GEMMA_BASE` at
+  `0xB70000` (80 KB, 8 slots × 1280-dim). Covers Gemma 3 1B
+  `d_model=1152` with 11% margin. New API: `km_alloc_gemma`,
+  `km_free_gemma`, `km_gemma_addr`.
+- **Pool regression test** — `test_gemma_pool_alloc` validates 1152 OK,
+  1280 max, 1281 rejected.
+- **V28.0 pre-flight audit** (`6507c4f`) — 7 baselines verified,
+  revised V28 scope documented in `docs/V28_STATUS.md`.
+
+### Existing V28 Infrastructure (Discovered in Audit)
+
+Much of the originally-planned V28 scope was already built:
+
+- **ml_scheduler.fj** — attention-based process scoring (covers V28.4).
+- **services/display/** — 2,047 LOC framebuffer + fonts (covers V28.3).
+- **kmatrix.fj** — Gemma 3 RMSNorm dual-mode already present.
+- **V27.5 CI gates** — prevention layer already covers V28.5 scope.
+
+### Remaining V28.1 Work (Deferred as Dedicated Sprint)
+
+Full Gemma 3 1B model port requires multi-week effort:
+- HuggingFace weight export pipeline
+- GQA (4 Q heads : 1 KV head) attention
+- RoPE dual theta (local 10K / global 1M)
+- Sliding window attention (512-token local)
+- 262K vocab table (vs current 32K)
+- 32K KV cache (vs current 2K)
+- Per-layer numerical validation vs HF reference
+
+### Stats
+
+- **26 kernel tests** (was 25)
+- **106,825 LOC** across **163 .fj files**
+- **Kernel ELF:** 1.38 MB (unchanged — pool is bss/heap)
+- **0 clippy warnings**, clean build in <10s
+
+### Companion Releases
+
+- [Fajar Lang v27.5.0](https://github.com/fajarkraton/fajar-lang/releases/tag/v27.5.0)
+- [FajarQuant v0.3.0](https://github.com/fajarkraton/fajarquant/releases/tag/v0.3.0-fajarquant-v3.1)
+
+---
+
+## [3.2.0] "V27 Hardened" -- 2026-04-14
+
+Deep re-audit found 11 gaps (2 P0, 3 P1, 4 P2, 2 P3). All P0--P2 closed.
+Serial string output restored, OOM paths hardened across 4 frame_alloc
+call sites, unified memory map documented.
+
+### Fixed (P0 Critical)
+
+- **`serial_send_str()` implemented** — was a TODO stub since v0.5;
+  serial string output now works for boot diagnostics.
+- **Kernel stack leak** reclassified as P3 — frame IS freed
+  (`main.fj:140`); the PTE-leak report was cosmetic (2 MB huge page,
+  unmapping deferred to V28).
+
+### Fixed (P1 High)
+
+- **OOM hardening** — 4 `frame_alloc()` sites (`sys_brk`, `sys_mmap`,
+  two ELF load paths) now return `-1/ENOMEM` on OOM instead of
+  silently skipping.
+- **Unified memory map** — `docs/MEMORY_MAP.md` with 60+ address
+  allocations and 3 past collision incidents documented.
+- **Boot init probes** — 5 critical subsystems (frames, heap, slab,
+  ipc, ramfs) now emit `[BOOT] X OK` after init.
+
+### Fixed (P2 Medium)
+
+- **Multiboot2 validation** — `[WARN]` emitted on missing ACPI RSDP tag.
+- **SMEP/SMAP warnings** — `[SEC]` warning when CPU doesn't support
+  SMEP/SMAP (was silent no-op).
+- **SMAP contract** — documented in `security.fj` header: all
+  user-buffer access must use `smap_disable`/`smap_enable` bracket.
+- **Dead code** — `cmd_type()` wired to dispatcher, `cmd_yes_arg()`
+  removed.
+
+### Stats
+
+- **25 kernel tests** | SMEP+SMAP+NX+ASLR | `serial_send_str` working
+- Boot output: `[BOOT] frames OK`, `[BOOT] heap OK`, etc.
+- Memory map: 60+ allocations documented in `docs/MEMORY_MAP.md`
+
+---
+
+## [3.1.0] "V26 Phase B Complete" -- 2026-04-14
+
+Security hardening milestone. SMEP + SMAP + NX + ASLR + stack canaries
++ capability auditing all enabled. VFS write support added for RamFS,
+FAT32, and ext2. 4 new kernel tests, QEMU test CI, pre-commit hooks.
+
+### Security Hardening
+
+- **SMEP** enabled at boot (Supervisor Mode Execution Prevention).
+- **SMAP** enabled at boot + syscall STAC/CLAC wrappers.
+- **NX enforcement** on all data pages (kernel `.text` stays executable).
+- **ASLR** for user processes (16--48 MB range, RDRAND/TSC entropy).
+- **Stack canaries** on every context switch.
+- **Capability auditing** — per-process privilege isolation.
+
+### Kernel Infrastructure
+
+- **25 kernel tests** (was 21): `vfs_write_roundtrip`,
+  `o2_sentry_vecmat`, `o2_sentry_4bit_argmax`, `llm_pipeline_smoke`.
+- **QEMU test CI** — boot + `test-all` + parse `OK:`/`NG:` markers
+  (≥18/25 gate).
+- **Boot-stress CI** — 10 consecutive boots, all must reach `nova>`.
+- **Pre-commit hook** — build check + `@unsafe` SAFETY + TODO severity.
+
+### VFS Write Support
+
+- **RamFS write** — O_CREAT + O_TRUNC + first-write 4 KB alloc.
+- **FAT32 write** — `fat32_create_file`, `fatwrite`/`fatrm` shell
+  commands (752 LOC).
+- **ext2 write** — `ext2_create` + `ext2_write_file` +
+  `ext2-write`/`ext2-ls` commands.
+- **`df` command** — RamFS + heap usage statistics, color-coded.
+
+### New Shell Commands
+
+- `cpufeatures` — 15 CPU features (SSE/AVX/SMEP/SMAP/NX/AES-NI/RDRAND/…)
+- `df` — filesystem usage statistics
+- `ext2-ls` / `ext2-write` — ext2 directory listing and file creation
+- `sec-status` — full security hardening status
+
+### Process Management (from prior B1 session)
+
+- Process exit frees page tables, kernel stack, fd table.
+- Parent wakeup on child exit (`waitpid` unblocking).
+- `fork`+`exit` ×100 stress test passes with ≤5 frame leak.
+
+### Stats
+
+- **25 kernel tests** | **~48 K LOC** across **163 .fj files**
+- **Security:** SMEP + SMAP + NX + ASLR + Canaries + Capabilities
+- **Phase B effort:** ~18h actual vs 105h budgeted (-83%)
+
+---
+
+## [3.0.0] "Nusantara" -- 2026-04-11
+
+**First FajarOS release with kernel-native end-to-end LLM inference.**
+SmolLM-135M v5/v6 quantized models run entirely in Ring 0 `@kernel`
+context — no userspace, no syscall overhead, no shared library. The
+Gemma 3 architecture is also implemented (Phase A--H complete). 14 new
+LLM shell commands wired into the existing 105-command shell.
+
+### Highlights
+
+- **End-to-end LLM inference in kernel** — SmolLM-135M v5 mixed
+  precision (52 MB, 4-bit embed/lmhead + 2-bit layers) and v6 full
+  4-bit (78 MB) generate diverse text in QEMU.
+- **Repetition penalty via O(1) bitset** (K=8 window) for v5/v6 4-bit
+  lmhead — prevents token loops, replaces inline scan that triggered
+  LLVM O2 wild-pointer crash.
+- **FajarQuant Phase 1+2 ported to bare metal** —
+  `kernel/compute/fajarquant.fj` (708 LOC) + `kmatrix.fj` (1,035 LOC),
+  all `@kernel`-safe with AVX2-enabled hot paths.
+- **Gemma 3 architecture** — Phases A--H complete: 5 audit fixes,
+  RMSNorm + GELU-tanh + frame-vectors + gated FFN, GQA, RoPE, hybrid
+  sliding/global attention, 256 MB memory mapping, NVMe tokenizer,
+  `.fjm` v2 format, `tfm_layer` dispatching v2 paths.
+- **RAM-resident mode** — load all 310 MB to RAM once, no per-token
+  NVMe access (eliminates I/O latency in inference loop).
+- **14 new LLM shell commands** — `model-load`, `model-info`,
+  `embed-load`, `layer-load`, `ram-load`, `weight-status`, `tokenize`,
+  `tok-info`, `tok-load`, `tok-reset`, `infer`, `ask`, `gen`,
+  `tfm-info`.
+
+### Added
+
+- **Phase 1 — Bare-metal FajarQuant** (`5b64cd5`): 3 innovations (PCA
+  rotation, fused attention, hierarchical bit allocation) ported to
+  `@kernel`.
+- **Phase 2 — Kernel matrix engine** (`c32a5c0`): 768-dim transformer
+  support, AVX2 hot paths, all kernels `@kernel`-safe.
+- **Phase 3 — Model weight loader** (`40ece8e`): `.fjm` format reader,
+  RamFS + NVMe support, ELF section mapping.
+- **Phase 4 — Kernel tokenizer** (`83d84fd`): byte-level + BPE merges,
+  runs entirely in `@kernel`.
+- **Phase 5 — Transformer forward pass** (`3082d5d`): quantized
+  inference engine, attention + FFN + LayerNorm.
+- **Phase 6 — Autoregressive generation** (`3a7b8a2`): `ask`/`gen`
+  commands with KV cache management.
+- **Phase 7 — ML scheduler** (`ea3ff01`): attention-based process
+  scheduling.
+- **Phase 8 — Edge AI pipeline** (`267653e`): sensor → classify →
+  actuate at kernel speed.
+- **SmolLM-135M v3--v6 formats** — v3 (shared codebook), v4 (per-matrix
+  codebooks, 7 per layer), v5 (mixed 4-bit/2-bit), v6 (full 4-bit).
+- **Gemma 3 1B support** — `.fjm` v2 format, 256 MB memory mapping,
+  26-layer streaming forward pass.
+- **BOS token prepend** + E2E verified output diversity.
+
+### Fixed
+
+- **3 critical inference bugs** (`ffeb95c`): RMSNorm normalization,
+  gamma convention, exp approximation.
+- **6 safety hardening fixes** (`8aaf2c6`): inference E2E stable, no
+  kernel panics under load.
+- **Frame allocator overlap** (`d4e578c`, `a1e2a6e`, `f156d6d`):
+  `model_loader` marks frames used, kernel static data region
+  reserved, NVMe frame reservation, `TOK_META` relocation.
+- **v5 4-bit sample workaround** (`1c82596`): fall back to argmax to
+  dodge LLVM O2 wild-pointer crash with inline loops.
+- **Header/state overlap** (`9044dac`): v3 header 160 B vs state at
+  `0x60` — third time this class of bug, now sentry-tested.
+- **NVMe PRP fix + 512 MB mapping** (`7a7c35b`): layer-streaming
+  weight loader works under PRP1+PRP2 contiguous-page constraint.
+- **Chunked Lloyd-Max quantization + header struct fix** (`4a87f02`).
+
+### Changed
+
+- **Boot:** 61 → 62 init stages, all reach `nova>` reliably in
+  QEMU + KVM.
+- **QEMU RAM:** 512 MB → 1 GB for Gemma 3 1B model support (`f81e230`).
+- **Compiler:** Fajar Lang v23.0.0 → **v26.1.0-phase-a** (Phase A
+  production complete).
+
+### Stats
+
+| Metric | Value |
+|---|---|
+| FajarOS LOC | **47,821** (was 41,400, +15.5%) |
+| .fj files | **163** (was 154, +9 LLM modules) |
+| Shell commands | **119** (105 base + 14 LLM) |
+| Compiler | Fajar Lang v26.1.0-phase-a |
+| Boot stages | **62** (was 61, +1 LLM init) |
+| Kernel compute LOC | 708 (fajarquant.fj) + 1,035 (kmatrix.fj) = **1,743** |
+| LLM models | SmolLM-135M v3--v6, Gemma 3 270M, Gemma 3 1B (in progress) |
+| LLVM backend | v26 (30 enhancements + 4 string-display fixes) |
+
+### Known Limitations
+
+- **v5_4bit sample** triggers LLVM O2 wild-pointer crash with inline
+  loops → workaround: dispatch to argmax (`1c82596`).
+- **Output coherence** — SmolLM-135M @ 2-bit/4-bit produces diverse
+  but not coherent sentences (model size limit, not bug). V26 Phase B5
+  evaluates SmolLM-360M upgrade.
+- **`fork()` syscall** doesn't return PID from scheduler yet (V26
+  Phase B1 — see `docs/V26_PRODUCTION_PLAN.md` in fajar-lang repo).
+- **Process exit** doesn't free resources (V26 Phase B1 leak).
+- **SMEP** disabled (V26 Phase B4 security — closed in v3.1.0).
+
+### Full Changelog
+
+https://github.com/fajarkraton/fajaros-x86/compare/v2.1.0...v3.0.0
 
 ---
 
