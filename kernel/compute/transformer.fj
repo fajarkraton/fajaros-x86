@@ -1113,12 +1113,15 @@ const TFM_EOS_TOKEN: i64 = 2
                 let mut j: i64 = 0
                 while j < dec_len {
                     let ch = volatile_read_u8(dec_buf + j)
+                    // V28.5 Bug 2 fix: print UTF-8 multi-byte sequences raw
                     if ch >= 32 && ch < 127 {
                         console_putchar(ch, GREEN_ON_BLACK)
                     } else if ch == 10 {
                         console_putchar(10, WHITE_ON_BLACK)
+                    } else if ch >= 0x80 {
+                        console_putchar(ch, GREEN_ON_BLACK)  // UTF-8 byte, raw
                     } else {
-                        console_putchar(46, YELLOW_ON_BLACK)  // non-printable → dot
+                        console_putchar(46, YELLOW_ON_BLACK)  // control char
                     }
                     j = j + 1
                 }
@@ -1701,12 +1704,19 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
             let mut j: i64 = 0
             while j < dec_len {
                 let ch = volatile_read_u8(dec_buf + j)
+                // V28.5 Bug 2 fix: print UTF-8 multi-byte sequences raw.
+                // Old filter rejected bytes >= 127, hiding most Gemma 3 vocab
+                // (Chinese, emoji, Latin-1, etc.) as dots. Now: ASCII printable
+                // in green, newline in white, UTF-8 continuation/leading bytes
+                // (0x80+) printed raw — terminal will assemble multibyte chars.
                 if ch >= 32 && ch < 127 {
                     console_putchar(ch, GREEN_ON_BLACK)
                 } else if ch == 10 {
                     console_putchar(10, WHITE_ON_BLACK)
+                } else if ch >= 0x80 {
+                    console_putchar(ch, GREEN_ON_BLACK)  // UTF-8 byte, raw
                 } else {
-                    console_putchar(46, YELLOW_ON_BLACK)
+                    console_putchar(46, YELLOW_ON_BLACK)  // truly non-printable (control char)
                 }
                 j = j + 1
             }
