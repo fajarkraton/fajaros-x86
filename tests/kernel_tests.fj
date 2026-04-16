@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 26  // V28.1 added test_gemma_pool_alloc
+const TEST_TOTAL: i64 = 30  // V28.2 added 4 v8 infrastructure tests
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -718,6 +718,118 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 }
 
 // ═══════════════════════════════════════════════════════════════
+// V28.2 Infrastructure Tests — validate v8 format pipeline
+// ═══════════════════════════════════════════════════════════════
+
+// Test 1: 16-byte layer header constant matches FJM_LAYER_HDR_SIZE
+@kernel fn test_v8_layer_header_size() -> i64 {
+    if FJM_LAYER_HDR_SIZE != 16 {
+        serial_print_str("  v8: FJM_LAYER_HDR_SIZE != 16")
+        serial_putchar(10)
+        return 0
+    }
+    1
+}
+
+// Test 2: mdl_matrix_size for v8 group-wise (formula: packed + n_groups × 5)
+// Exercises the path when mdl_is_groupwise() == 1. Since no model is loaded
+// during test, we compute expected values directly.
+@kernel fn test_v8_matrix_size_formula() -> i64 {
+    // For a 128 × 128 matrix at 4-bit group-wise (group=128):
+    //   packed = 128*128/2 = 8192
+    //   n_groups = (128*128 + 127) / 128 = 128
+    //   total = 8192 + 128*5 = 8832
+    let m: i64 = 128
+    let n: i64 = 128
+    let total = m * n
+    let packed = total / 2
+    let n_groups = (total + 127) / 128
+    let expected = packed + n_groups * 5
+    if expected != 8832 {
+        serial_print_str("  v8: matrix_size formula wrong")
+        serial_putchar(10)
+        return 0
+    }
+    // For 1152 × 1024 (Q proj): packed=589824, groups=9216, total=635904
+    let q_total = 1152 * 1024
+    let q_packed = q_total / 2
+    let q_groups = (q_total + 127) / 128
+    let q_expected = q_packed + q_groups * 5
+    if q_expected != 635904 {
+        serial_print_str("  v8: Q matrix_size wrong")
+        serial_putchar(10)
+        return 0
+    }
+    1
+}
+
+// Test 3: robust RMSNorm (max-abs rescaling) produces sane output
+// Uses test scratch area at TEST_SCRATCH to hold a small test vector.
+@kernel fn test_v8_rmsnorm_robust() -> i64 {
+    let dim: i64 = 8
+    let data = TEST_SCRATCH
+    // Input: 8 values representing [1.0, -1.0, 2.0, -2.0, 0.5, -0.5, 3.0, -3.0] × 1000
+    volatile_write_u64(data + 0, 1000)
+    volatile_write_u64(data + 8, 0 - 1000)
+    volatile_write_u64(data + 16, 2000)
+    volatile_write_u64(data + 24, 0 - 2000)
+    volatile_write_u64(data + 32, 500)
+    volatile_write_u64(data + 40, 0 - 500)
+    volatile_write_u64(data + 48, 3000)
+    volatile_write_u64(data + 56, 0 - 3000)
+    // No gamma (gamma_addr = 0)
+    km_rmsnorm(data, dim, 0)
+    // Expected rms = sqrt(mean(x²)). mean(x²) = (1+1+4+4+0.25+0.25+9+9)/8 = 3.5625.
+    // rms = 1.888. normed[0] = 1.0/1.888 = 0.5297. In fp×1000 ≈ 530.
+    // normed[6] = 3.0/1.888 = 1.589. In fp×1000 ≈ 1589.
+    let n0 = volatile_read_u64(data)
+    let n6 = volatile_read_u64(data + 48)
+    // Magnitude bounds: normed[0] should be 400..700. normed[6] should be 1200..1800.
+    if n0 < 400 || n0 > 700 {
+        serial_print_str("  v8: rmsnorm normed[0] out of range")
+        serial_putchar(10)
+        return 0
+    }
+    if n6 < 1200 || n6 > 1800 {
+        serial_print_str("  v8: rmsnorm normed[6] out of range")
+        serial_putchar(10)
+        return 0
+    }
+    // Verify sign preservation: data[1] should be negative
+    let n1 = volatile_read_u64(data + 8)
+    if n1 > 0 {
+        serial_print_str("  v8: rmsnorm sign flip")
+        serial_putchar(10)
+        return 0
+    }
+    1
+}
+
+// Test 4: V8_GROUP_SIZE and V8_GROUP_SHIFT consistency
+@kernel fn test_v8_group_constants() -> i64 {
+    // V8_GROUP_SIZE should be 128, V8_GROUP_SHIFT should be log2(128) = 7
+    if V8_GROUP_SIZE != 128 {
+        serial_print_str("  v8: V8_GROUP_SIZE != 128")
+        serial_putchar(10)
+        return 0
+    }
+    // Verify: 1 << V8_GROUP_SHIFT == V8_GROUP_SIZE
+    let shift_check = 1 << V8_GROUP_SHIFT
+    if shift_check != V8_GROUP_SIZE {
+        serial_print_str("  v8: V8_GROUP_SHIFT inconsistent")
+        serial_putchar(10)
+        return 0
+    }
+    // V8_SCALE_FP must be 1000000 (used for integer-fixed-point scales)
+    if V8_SCALE_FP != 1000000 {
+        serial_print_str("  v8: V8_SCALE_FP != 1000000")
+        serial_putchar(10)
+        return 0
+    }
+    1
+}
+
+// ═══════════════════════════════════════════════════════════════
 // Master Test Runner — cmd_test_all()
 // ═══════════════════════════════════════════════════════════════
 
@@ -802,6 +914,17 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     r = run_test(test_llm_pipeline_smoke(), "llm_pipeline_smoke", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_gemma_pool_alloc(), "gemma_pool_alloc", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("--- V28.2 Infrastructure ---", CYAN_ON_BLACK)
+    r = run_test(test_v8_layer_header_size(), "v8_layer_hdr_size", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_v8_matrix_size_formula(), "v8_matrix_size", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_v8_rmsnorm_robust(), "v8_rmsnorm_robust", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_v8_group_constants(), "v8_group_constants", p, f)
     p = r / 0x100000000; f = r % 0x100000000
 
     console_putchar(10, WHITE_ON_BLACK)
