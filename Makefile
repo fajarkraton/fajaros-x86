@@ -42,6 +42,7 @@ SOURCES := \
 	kernel/mm/demand_paging.fj \
 	kernel/mm/oom.fj \
 	kernel/mm/mmap.fj \
+	kernel/mm/pte_audit.fj \
 	kernel/auth/users.fj \
 	kernel/auth/permissions.fj \
 	kernel/auth/sessions.fj \

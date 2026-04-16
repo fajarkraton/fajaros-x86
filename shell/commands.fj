@@ -3420,6 +3420,8 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 7 && buf_eq4(101, 120, 116, 50) == 1 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 108 && volatile_read_u8(0x6F806) == 115 { cmd_ext2ls(); handled = 1 }
     // ext2-write — "ext2-write ..." (101,120,116,50,45,119...) len>=12
     if handled == 0 && len >= 12 && buf_eq4(101, 120, 116, 50) == 1 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 119 { cmd_ext2write(); handled = 1 }
+    // pteaudit — "pteaudit" (112,116,101,97,117,100,105,116) len=8, V29.P2.SMEP U-bit leak scan
+    if handled == 0 && len == 8 && buf_eq4(112, 116, 101, 97) == 1 && volatile_read_u8(0x6F804) == 117 && volatile_read_u8(0x6F805) == 100 && volatile_read_u8(0x6F806) == 105 && volatile_read_u8(0x6F807) == 116 { cmd_pte_audit(); handled = 1 }
     // mounts — "mounts" (109,111,117,110,116,115)
     if handled == 0 && len == 6 && buf_eq4(109, 111, 117, 110) == 1 && volatile_read_u8(0x6F804) == 116 && volatile_read_u8(0x6F805) == 115 { cmd_vfs_mounts(); handled = 1 }
     // devtest — "devtest" (100,101,118,116,101,115,116)

@@ -1,0 +1,177 @@
+// FajarOS Nova — PTE Audit (V29.P2.SMEP step 1)
+// Part of the modular kernel build (concatenated by Makefile)
+//
+// Walks the active page-table tree (PML4 → PDPT → PD → PT) at 0x70000
+// and reports any leaf entry (4KB, 2MB huge, or 1GB huge) whose virtual
+// address falls below KERNEL_VIRT_BOUNDARY (12 MB) AND has the PAGE_USER
+// bit set. Such entries are the root cause of the SMEP hang documented
+// at kernel/main.fj:105-113: when SMEP is enabled, the CPU faults on
+// any kernel-mode instruction fetch from a PAGE_USER page.
+//
+// This is the STATE inspector. kernel/mm/paging.fj:41-58
+// (`b4_assert_no_user_on_kernel_addr`) is the MAP-TIME check. Both are
+// needed because map-time assertion only catches NEW mappings from
+// map_page() call sites — any pre-existing mapping installed before
+// B4.1.3 landed, or any direct write to page tables bypassing
+// map_page(), slips through.
+//
+// Output format on leak detection, byte-by-byte to COM1 (0x3F8) to
+// avoid the LLVM string-literal hazard (audit/B0_hotpath_matrix.md
+// Class B sites):
+//
+//   PLK L<level> V<hex-16> E<hex-16>\n
+//
+// where level ∈ {1, 2, 3} for PT / PD-huge / PDPT-huge respectively.
+// Console wrapper `cmd_pte_audit` prints a human-readable summary.
+
+// KERNEL_VIRT_BOUNDARY + PAGE_USER + PAGE_PRESENT + PAGE_HUGE +
+// PML4_BASE are already defined in kernel/mm/paging.fj (concatenated
+// before this file per Makefile order).
+
+// ───────────────────────────────────────────────────────────────
+// Serial hex printer (16 hex digits, uppercase, byte-by-byte).
+// Avoids any shared string buffer. Used exclusively by the leak
+// reporter so audit output is robust even if the console state is
+// corrupted.
+// ───────────────────────────────────────────────────────────────
+@kernel fn pte_serial_hex16(value: i64) {
+    let mut shift: i64 = 60
+    while shift >= 0 {
+        let nibble = (value >> shift) & 0xF
+        let ch = if nibble < 10 { 48 + nibble } else { 55 + nibble }
+        port_outb(0x3F8, ch)
+        shift = shift - 4
+    }
+}
+
+// ───────────────────────────────────────────────────────────────
+// Emit one leak report line: "PLK L<d> V<hex16> E<hex16>\n"
+// level: 1 = 4KB PT entry, 2 = 2MB PD huge, 3 = 1GB PDPT huge
+// ───────────────────────────────────────────────────────────────
+@kernel fn pte_report_leak(vaddr: i64, entry: i64, level: i64) {
+    port_outb(0x3F8, 80)   // 'P'
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 75)   // 'K'
+    port_outb(0x3F8, 32)   // ' '
+    port_outb(0x3F8, 76)   // 'L'
+    port_outb(0x3F8, 48 + level)   // '1' | '2' | '3'
+    port_outb(0x3F8, 32)   // ' '
+    port_outb(0x3F8, 86)   // 'V'
+    pte_serial_hex16(vaddr)
+    port_outb(0x3F8, 32)   // ' '
+    port_outb(0x3F8, 69)   // 'E'
+    pte_serial_hex16(entry)
+    port_outb(0x3F8, 10)   // '\n'
+}
+
+// ───────────────────────────────────────────────────────────────
+// Check a single leaf entry. Returns 1 if leak detected, 0 otherwise.
+// A leak = PAGE_USER set AND virtual address is in the guaranteed-kernel
+// region (< 12 MB per KERNEL_VIRT_BOUNDARY).
+// ───────────────────────────────────────────────────────────────
+@kernel fn pte_check_leaf(vaddr: i64, entry: i64, level: i64) -> i64 {
+    if (entry & PAGE_USER) == 0 { return 0 }
+    if vaddr < KERNEL_VIRT_BOUNDARY {
+        pte_report_leak(vaddr, entry, level)
+        return 1
+    }
+    0
+}
+
+// ───────────────────────────────────────────────────────────────
+// Walk the active page-table tree starting from PML4_BASE (0x70000).
+// Returns the total number of leaks found. Non-destructive — only
+// reads page table entries, never writes.
+//
+// Iteration bounds:
+//   PML4: 0..512 entries (each = 512 GB)
+//   PDPT: 0..512 entries (each = 1 GB)
+//   PD:   0..512 entries (each = 2 MB)
+//   PT:   0..512 entries (each = 4 KB)
+//
+// A 1GB huge page at PDPT level maps 512×512 = 262,144 4KB frames.
+// A 2MB huge page at PD level maps 512 4KB frames.
+// A 4KB PT entry maps 1 4KB frame.
+//
+// For the kernel identity map at low memory, we expect 2MB huge pages
+// in PML4[0] → PDPT[0] → PD[0..6] (covers 12 MB). Higher-half kernel
+// (0xFFFFFF80...) lives at PML4[511].
+// ───────────────────────────────────────────────────────────────
+@kernel fn pte_walk_find_u_leaks() -> i64 {
+    let mut count: i64 = 0
+    let mut pml4_idx: i64 = 0
+    while pml4_idx < 512 {
+        let pml4_entry = page_table_entry(PML4_BASE, pml4_idx)
+        if (pml4_entry & PAGE_PRESENT) != 0 {
+            let pdpt = pml4_entry & 0xFFFFFFFFF000
+            let mut pdpt_idx: i64 = 0
+            while pdpt_idx < 512 {
+                let pdpt_entry = page_table_entry(pdpt, pdpt_idx)
+                if (pdpt_entry & PAGE_PRESENT) != 0 {
+                    if (pdpt_entry & PAGE_HUGE) != 0 {
+                        // 1 GB huge page at PDPT level
+                        let vaddr = (pml4_idx << 39) | (pdpt_idx << 30)
+                        count = count + pte_check_leaf(vaddr, pdpt_entry, 3)
+                    } else {
+                        let pd = pdpt_entry & 0xFFFFFFFFF000
+                        let mut pd_idx: i64 = 0
+                        while pd_idx < 512 {
+                            let pd_entry = page_table_entry(pd, pd_idx)
+                            if (pd_entry & PAGE_PRESENT) != 0 {
+                                if (pd_entry & PAGE_HUGE) != 0 {
+                                    // 2 MB huge page at PD level
+                                    let vaddr = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21)
+                                    count = count + pte_check_leaf(vaddr, pd_entry, 2)
+                                } else {
+                                    let pt = pd_entry & 0xFFFFFFFFF000
+                                    let mut pt_idx: i64 = 0
+                                    while pt_idx < 512 {
+                                        let pt_entry = page_table_entry(pt, pt_idx)
+                                        if (pt_entry & PAGE_PRESENT) != 0 {
+                                            let vaddr = (pml4_idx << 39) | (pdpt_idx << 30) | (pd_idx << 21) | (pt_idx << 12)
+                                            count = count + pte_check_leaf(vaddr, pt_entry, 1)
+                                        }
+                                        pt_idx = pt_idx + 1
+                                    }
+                                }
+                            }
+                            pd_idx = pd_idx + 1
+                        }
+                    }
+                }
+                pdpt_idx = pdpt_idx + 1
+            }
+        }
+        pml4_idx = pml4_idx + 1
+    }
+    count
+}
+
+// ───────────────────────────────────────────────────────────────
+// Shell command: on-demand page-table audit. Useful for:
+//   1. Manual verification after touching map_page() call sites
+//   2. Diagnosing SMEP-hang regressions before re-enabling security
+//   3. CI regression check (grep 'PLK ' in serial log = fail)
+//
+// Prints human-readable summary to console and raw machine-parseable
+// 'PLK ' lines to COM1 (one per leak). Returns nothing; count is
+// emitted on-screen only.
+// ───────────────────────────────────────────────────────────────
+@kernel fn cmd_pte_audit() {
+    cprintln("Page-table audit (V29.P2.SMEP step 1)...", YELLOW_ON_BLACK)
+    cprint("  Kernel boundary: virt < 0x", WHITE_ON_BLACK)
+    cprint_hex(KERNEL_VIRT_BOUNDARY, 8, CYAN_ON_BLACK)
+    cprint("  (", WHITE_ON_BLACK)
+    cprint_decimal(KERNEL_VIRT_BOUNDARY / 1024 / 1024, CYAN_ON_BLACK)
+    cprintln(" MB)", WHITE_ON_BLACK)
+    let leaks = pte_walk_find_u_leaks()
+    cprint("  PAGE_USER leaks in kernel range: ", WHITE_ON_BLACK)
+    if leaks == 0 {
+        cprint_decimal(leaks, GREEN_ON_BLACK)
+        cprintln(" (SMEP-safe)", GREEN_ON_BLACK)
+    } else {
+        cprint_decimal(leaks, RED_ON_BLACK)
+        cprintln(" (SMEP WOULD HANG)", RED_ON_BLACK)
+        cprintln("  See COM1 'PLK ' lines for vaddr/entry details.", WHITE_ON_BLACK)
+    }
+}
