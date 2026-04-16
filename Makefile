@@ -295,6 +295,66 @@ build-fjtrace:
 	@trap 'sed -i "s|^const FJTRACE_ENABLED: i64 = 1\$$|const FJTRACE_ENABLED: i64 = 0|" kernel/compute/fjtrace.fj; echo "[FJTRACE] restored FJTRACE_ENABLED=0"' EXIT; \
 		$(MAKE) build-llvm
 
+# ─── V30.SIM P3.2: FJTRACE capture via QEMU + parse ────────────────
+# End-to-end workflow: build FJTRACE kernel → boot QEMU with NVMe
+# disk (Gemma-3 v8 model) → feed `ask hello` → capture serial log
+# → parse into clean JSONL via scripts/parse_kernel_trace.py.
+#
+# Model expected at FJTRACE_DISK (override to point at your export):
+#   make test-fjtrace-capture FJTRACE_DISK=disk_v8.img
+#
+# Runtime ~3 min in QEMU (Gemma-3 prefill + argmax per token is
+# slow without KVM passthrough for INT-heavy kernels). Override
+# FJTRACE_TIMEOUT to allow longer runs.
+#
+# Output:
+#   build/fjtrace-capture.log    — raw serial log
+#   build/fjtrace-capture.jsonl  — parsed records
+#   build/fjtrace-capture.stats  — record count + op histogram
+FJTRACE_DISK     ?= disk_v8.img
+FJTRACE_PROMPT   ?= ask hello
+FJTRACE_TIMEOUT  ?= 180
+FJTRACE_BOOT_WAIT?= 10
+FJTRACE_RUN_WAIT ?= 150
+
+.PHONY: test-fjtrace-capture
+test-fjtrace-capture:
+	@test -f $(FJTRACE_DISK) || { \
+		echo "[FAIL] $(FJTRACE_DISK) not found."; \
+		echo "  Export a Gemma-3 v8 model first:"; \
+		echo "    python scripts/export_gemma3_v8.py <path> $(FJTRACE_DISK)"; \
+		echo "  Or override: make test-fjtrace-capture FJTRACE_DISK=/path/to/model.img"; \
+		exit 1; \
+	}
+	@echo "[FJTRACE] Step 1/3: building FJTRACE=1 kernel..."
+	@$(MAKE) -s build-fjtrace
+	@echo "[FJTRACE] Step 2/3: booting QEMU ($(FJTRACE_TIMEOUT)s max), feeding '$(FJTRACE_PROMPT)'..."
+	@(sleep $(FJTRACE_BOOT_WAIT); printf '$(FJTRACE_PROMPT)\r'; sleep $(FJTRACE_RUN_WAIT)) | \
+		timeout $(FJTRACE_TIMEOUT) $(QEMU) -kernel $(KERNEL_LLVM) \
+			-serial stdio -no-reboot -no-shutdown \
+			$(QEMU_MEM) $(QEMU_KVM) \
+			-drive file=$(FJTRACE_DISK),if=none,id=nvme0,format=raw \
+			-device nvme,serial=fajaros,drive=nvme0 \
+			-display none 2>/dev/null > $(BUILD_DIR)/fjtrace-capture.log \
+		|| true
+	@echo "[FJTRACE] Step 3/3: parsing captured serial log..."
+	@python3 scripts/parse_kernel_trace.py \
+		-i $(BUILD_DIR)/fjtrace-capture.log \
+		-o $(BUILD_DIR)/fjtrace-capture.jsonl \
+		2> $(BUILD_DIR)/fjtrace-capture.stats
+	@echo ""
+	@cat $(BUILD_DIR)/fjtrace-capture.stats
+	@n=$$(wc -l < $(BUILD_DIR)/fjtrace-capture.jsonl); \
+		if [ "$$n" -lt 17 ]; then \
+			echo ""; \
+			echo "[WARN] only $$n records — likely boot did not reach inference."; \
+			echo "  Grep build/fjtrace-capture.log for '[BOOT]' / 'nova>' to diagnose."; \
+			exit 2; \
+		else \
+			echo ""; \
+			echo "[OK] $$n JSONL records in $(BUILD_DIR)/fjtrace-capture.jsonl"; \
+		fi
+
 # Build with custom startup.S (manual link — for advanced use)
 $(STARTUP_O): $(STARTUP_S)
 	@mkdir -p $(BUILD_DIR)
