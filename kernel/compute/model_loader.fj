@@ -2106,6 +2106,8 @@ const LM_TOPK_K: i64 = 8
 // STREAM_EMBED_BASE has layout [packed: vocab*d/2 B][scales: n_groups*4 B][zeros: n_groups B]
 // Writes d_model values to out_addr as i64 × 1000 fixed-point (matches v5_4bit
 // convention so downstream RMSNorm + layer code needs no change).
+// V28.5 audit: @noinline for LLVM O2 stability (same as v8_tied lmhead).
+@noinline
 @kernel fn mdl_stream_embed_lookup_raw_v8(token_id: i64, out_addr: i64) -> i64 {
     if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 { return -1 }
     let vocab_size = mdl_get_vocab_size()
@@ -2143,6 +2145,12 @@ const LM_TOPK_K: i64 = 8
 // format as mdl_stream_embed_lookup_raw_v8.
 // x_addr: hidden state (d_model × i64 fixed-point ×1000)
 // Returns: best_token (argmax over vocab_size).
+//
+// V28.5 audit fix: @noinline prevents LLVM from inlining this 262K×1152
+// loop into call sites where O2 over-aggressively reorders memory accesses,
+// producing the EXC:13 GP fault observed at offset 0x164C35. Same approach
+// is used for the existing v5_4bit hot path.
+@noinline
 @kernel fn mdl_ram_lmhead_argmax_v8_tied(x_addr: i64) -> i64 {
     let vocab_size = mdl_get_vocab_size()
     let d_model = mdl_get_d_model()

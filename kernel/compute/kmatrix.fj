@@ -815,6 +815,11 @@ const V8_GROUP_SIZE: i64 = 128
 const V8_GROUP_SHIFT: i64 = 7   // log2(128) — hot loop uses shift, not div
 const V8_SCALE_FP: i64 = 1000000  // scales stored as int32(round(scale × this))
 
+// V28.5 audit: @noinline for LLVM O2 stability. Inlining this in the
+// 26-layer × 7-matmul × multi-call sites caused EXC:13 GP faults in the
+// v8 lmhead chain. Keeping it as a discrete function with explicit
+// boundaries lets the optimizer reason about each call independently.
+@noinline
 @kernel fn km_vecmat_packed_v8(x_addr: i64, mat_addr: i64, m: i64, n: i64,
                                  out_addr: i64) {
     // Bounds: we trust the caller on sizes. Addresses are kernel-region
