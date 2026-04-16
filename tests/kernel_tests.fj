@@ -2,7 +2,7 @@
 // tests/kernel_tests.fj — 20 kernel tests callable from shell
 // All functions @kernel annotated. cmd_test_all() runs everything.
 
-const TEST_TOTAL: i64 = 32  // V29.P2.SMEP added 2 security invariant tests
+const TEST_TOTAL: i64 = 35  // V29.P2.VFS_TESTS added 3 VFS/RamFS roundtrip tests
 const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overlapped KSTACK_BASE!)
 
 // Bridge stubs for functions that exist in kernel/core/ but not monolithic build
@@ -834,6 +834,160 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 // ═══════════════════════════════════════════════════════════════
 
 // ═══════════════════════════════════════════════════════════════
+// V29.P2.VFS_TESTS — RamFS write/read roundtrip coverage
+// Sub-phase 2 of V29.P2 (planned in V29.P0_FINDINGS.md after SMEP).
+// Scope pinned to RamFS because ext2/FAT32 tests need disk-backed
+// mount which isn't set up at boot-test time; those remain as
+// follow-up when a test harness with pre-populated disk images
+// lands. VFS mount-table coverage via test_vfs_mount_switching.
+// ═══════════════════════════════════════════════════════════════
+
+const VFS_TEST_NAME_BUF: i64 = 0x5A2000   // inside TEST_SCRATCH range
+const VFS_TEST_DATA_BUF: i64 = 0x5A2100
+const VFS_TEST_READ_BUF: i64 = 0x5A2200
+
+// Helper: write a short ASCII string into a buffer, NUL-terminated.
+@kernel fn vfs_test_write_cstr(addr: i64, s: str) {
+    let mut i: i64 = 0
+    let slen = str_len(s)
+    while i < slen {
+        volatile_write_u8(addr + i, str_byte_at(s, i))
+        i = i + 1
+    }
+    volatile_write_u8(addr + slen, 0)
+}
+
+// Test 1: RamFS create + write + find-by-addr + read roundtrip.
+// Writes 16 bytes, looks up by name, reads back, byte-compares.
+@kernel fn test_ramfs_write_roundtrip() -> i64 {
+    // Prepare name "tfw_a" and 16-byte payload
+    vfs_test_write_cstr(VFS_TEST_NAME_BUF, "tfw_a")
+    let mut w: i64 = 0
+    while w < 16 {
+        volatile_write_u8(VFS_TEST_DATA_BUF + w, 65 + (w % 26))  // 'A'..'Z'
+        w = w + 1
+    }
+    let idx = ramfs_create_at(VFS_TEST_NAME_BUF, 1)
+    if idx < 0 {
+        serial_print_str("  vfs: ramfs_create_at failed")
+        serial_putchar(10)
+        return 0
+    }
+    let wrc = ramfs_write_at(idx, VFS_TEST_DATA_BUF, 16)
+    if wrc != 0 {
+        serial_print_str("  vfs: ramfs_write_at failed")
+        serial_putchar(10)
+        return 0
+    }
+    // Lookup by name
+    let found = ramfs_find_at(VFS_TEST_NAME_BUF)
+    if found != idx {
+        serial_print_str("  vfs: ramfs_find_at mismatch")
+        serial_putchar(10)
+        return 0
+    }
+    // Read back via entry record (size at +32, data_ptr at +40)
+    let entry = ramfs_entry_addr(idx)
+    let size = volatile_read(entry + 32)
+    let data_ptr = volatile_read(entry + 40)
+    if size != 16 {
+        serial_print_str("  vfs: wrong size after write")
+        serial_putchar(10)
+        return 0
+    }
+    let mut k: i64 = 0
+    while k < 16 {
+        let expected = 65 + (k % 26)
+        let got = volatile_read_u8(data_ptr + k)
+        if got != expected {
+            serial_print_str("  vfs: byte mismatch in roundtrip")
+            serial_putchar(10)
+            return 0
+        }
+        k = k + 1
+    }
+    // Cleanup
+    ramfs_delete_at(idx)
+    1
+}
+
+// Test 2: RamFS overwrite / truncate semantics — second write_at
+// with different length should replace the file content (not append).
+@kernel fn test_ramfs_overwrite_truncates() -> i64 {
+    vfs_test_write_cstr(VFS_TEST_NAME_BUF, "tfw_b")
+    let idx = ramfs_create_at(VFS_TEST_NAME_BUF, 1)
+    if idx < 0 {
+        serial_print_str("  vfs: create for overwrite failed")
+        serial_putchar(10)
+        return 0
+    }
+    // First write: 32 bytes of 'X'
+    let mut i: i64 = 0
+    while i < 32 { volatile_write_u8(VFS_TEST_DATA_BUF + i, 88); i = i + 1 }
+    ramfs_write_at(idx, VFS_TEST_DATA_BUF, 32)
+    let first_size = volatile_read(ramfs_entry_addr(idx) + 32)
+    if first_size != 32 {
+        serial_print_str("  vfs: first write size wrong")
+        serial_putchar(10)
+        return 0
+    }
+    // Second write: 4 bytes of 'Y' — should replace, not extend
+    i = 0
+    while i < 4 { volatile_write_u8(VFS_TEST_DATA_BUF + i, 89); i = i + 1 }
+    ramfs_write_at(idx, VFS_TEST_DATA_BUF, 4)
+    let second_size = volatile_read(ramfs_entry_addr(idx) + 32)
+    if second_size != 4 {
+        serial_print_str("  vfs: overwrite did not truncate")
+        serial_putchar(10)
+        return 0
+    }
+    // Verify content is 'Y' * 4
+    let dp = volatile_read(ramfs_entry_addr(idx) + 40)
+    let mut j: i64 = 0
+    while j < 4 {
+        if volatile_read_u8(dp + j) != 89 {
+            serial_print_str("  vfs: overwrite content wrong")
+            serial_putchar(10)
+            return 0
+        }
+        j = j + 1
+    }
+    ramfs_delete_at(idx)
+    1
+}
+
+// Test 3: VFS mount-table lookup — register a mount slot, verify
+// find_mount returns it for a matching prefix and not for a
+// non-matching prefix.
+@kernel fn test_vfs_mount_switching() -> i64 {
+    // Register mount at slot 3 ("tfsX" mountpoint, ramfs type = 1)
+    vfs_test_write_cstr(VFS_TEST_NAME_BUF, "/tfsX")
+    vfs_mount_set(3, 1, 0, VFS_TEST_NAME_BUF)
+    // Build lookup path "/tfsX/file"
+    vfs_test_write_cstr(VFS_TEST_DATA_BUF, "/tfsX/file")
+    let slot = vfs_find_mount(VFS_TEST_DATA_BUF)
+    if slot != 3 {
+        serial_print_str("  vfs: find_mount did not return registered slot")
+        serial_putchar(10)
+        // Clean up regardless
+        vfs_mount_set(3, 0, 0, VFS_TEST_NAME_BUF)
+        return 0
+    }
+    // Non-matching lookup "/elsewhere/file" should not return slot 3
+    vfs_test_write_cstr(VFS_TEST_DATA_BUF, "/elsewhere/file")
+    let slot2 = vfs_find_mount(VFS_TEST_DATA_BUF)
+    if slot2 == 3 {
+        serial_print_str("  vfs: find_mount matched wrong slot")
+        serial_putchar(10)
+        vfs_mount_set(3, 0, 0, VFS_TEST_NAME_BUF)
+        return 0
+    }
+    // Unregister (set fs_type = VFS_FS_NONE = 0)
+    vfs_mount_set(3, 0, 0, VFS_TEST_NAME_BUF)
+    1
+}
+
+// ═══════════════════════════════════════════════════════════════
 // V29.P2.SMEP Security Invariant Tests — V29.P2.SMEP step 5
 // ═══════════════════════════════════════════════════════════════
 
@@ -897,7 +1051,7 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
 
 @kernel fn cmd_test_all() {
     cprintln("=== FajarOS Kernel Test Suite ===", YELLOW_ON_BLACK)
-    cprintln("Running 32 tests...", WHITE_ON_BLACK)
+    cprintln("Running 35 tests...", WHITE_ON_BLACK)
     console_putchar(10, WHITE_ON_BLACK)
     let mut p: i64 = 0
     let mut f: i64 = 0
@@ -977,6 +1131,15 @@ const TEST_SCRATCH: i64 = 0x5A0000  // 8KB scratch area (was 0x900000 — overla
     r = run_test(test_v8_rmsnorm_robust(), "v8_rmsnorm_robust", p, f)
     p = r / 0x100000000; f = r % 0x100000000
     r = run_test(test_v8_group_constants(), "v8_group_constants", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+
+    console_putchar(10, WHITE_ON_BLACK)
+    cprintln("--- V29.P2.VFS_TESTS ---", CYAN_ON_BLACK)
+    r = run_test(test_ramfs_write_roundtrip(), "ramfs_write_roundtrip", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_ramfs_overwrite_truncates(), "ramfs_overwrite_trunc", p, f)
+    p = r / 0x100000000; f = r % 0x100000000
+    r = run_test(test_vfs_mount_switching(), "vfs_mount_switching", p, f)
     p = r / 0x100000000; f = r % 0x100000000
 
     console_putchar(10, WHITE_ON_BLACK)
