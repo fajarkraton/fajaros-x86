@@ -2,6 +2,91 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
+## [3.5.0] "Security Triple" -- 2026-04-16
+
+V26 B4.2 "full SMEP+SMAP+NX security triple" = **3/3 CLOSED**. Two
+page-table bugs found and fixed via a single-session investigation
+spanning V29.P3 SMAP closure + V29.P3.P6 NX closure. Boot reaches
+`nova>` with all three bits active simultaneously, no fault markers.
+
+### Added
+
+- **`pte_walk_find_u_leaks_full()`** (V29.P3.P1) — 4-level page-table
+  walker that reports PAGE_USER bit at EVERY descent point (PML4,
+  PDPT non-huge, PD non-huge, plus all leaf types), not just leaves.
+  Emits `PTE_LEAKS_FULL=<hex16>` boot marker + per-entry `PLKNL
+  L<level> V<vaddr> E<entry>` lines to COM1. Prior walker was leaf-only
+  and missed non-leaf USER leaks critical for SMAP enforcement.
+- **`NX_ENFORCED=<hex16>` boot marker** (V29.P3.P6.P4) — emits EFER.NXE
+  bit value after `nx_enforce_data_pages()`. Expected `0x800` (bit 11
+  set) for regression detection.
+- **`make test-security-triple-regression`** (V29.P3.P6.P4) — 6-invariant
+  Makefile target verifying SMEP+SMAP+NX all active. Invariants:
+  PTE_LEAKS=0, PTE_LEAKS_FULL=0, no PLKNL lines, no EXC/PANIC, nova>
+  reached, NX_ENFORCED=0x800. Supersedes `test-smap-regression`
+  (now a backward-compat alias).
+
+### Changed
+
+- **`strip_user_from_kernel_identity()`** (V29.P3.P1.5, `690124b`) —
+  extended from leaf-only strip (PD[0..5]) to also clear USER bit on
+  non-leaf entries PML4[0] and PDPT[0]. Single `write_cr3(read_cr3())`
+  TLB flush covers all 3 levels of mutation. Idempotent.
+- **`nx_enforce_data_pages()`** loop start (V29.P3.P6.P3, `540743b`) —
+  `pd_idx = 1` → `pd_idx = 2`. Kernel `.text` spans 0x101000-0x248297
+  (0-2.285 MB), which straddles PD[0] AND PD[1]. Previous start
+  marked PD[1] NX, causing silent triple-fault on kernel instruction
+  fetch from the 2-2.285 MB range.
+- **`kernel/main.fj`** (V29.P3.P4, `f2dd682` + V29.P3.P6.P3, `540743b`) —
+  uncommented `security_enable_smap()` and `nx_enforce_data_pages()`.
+  All 3 security-triple calls now active after identity-map strip.
+
+### Fixed
+
+- **V29.P3.P1 — SMAP double-fault (H2: non-leaf USER bits)**
+  (`690124b`). Root cause: PML4[0]+PDPT[0] had USER=1 from
+  `boot/startup.S` indiscriminate seeding. SMAP AND-chains USER bits
+  across the 4-level walk (Intel SDM Vol 3A §4.6.1.1), so any
+  non-leaf USER=1 causes fault on kernel data reads regardless of
+  leaf state. V29.P2's leaf-only `strip_user_from_kernel_identity()`
+  missed both entries. Fix: extend strip to the two non-leaf
+  entries. Verified: `PTE_LEAKS_FULL=0x0` + boot reaches `[VFS]`.
+- **V29.P3.P6 — NX silent triple-fault (H3:
+  `nx_enforce_data_pages` stale range assumption)** (`540743b`).
+  Root cause: loop comment assumed kernel `.text` fits in first
+  2 MB, but kernel has grown to 2.285 MB, spilling into PD[1].
+  Previous loop start `pd_idx = 1` NX-marked the 2-4 MB range
+  containing part of `.text`. Instruction fetch → #PF → handler
+  page also NX → #DF → #DF handler also NX → triple-fault → silent
+  CPU halt (no EXC marker). Fix: start loop at `pd_idx = 2`.
+  Verified via boot-test: reaches `nova>` with all 3 bits active.
+- **Hardcoded range assumption hardening** (V29.P3.P6.P3) — added
+  `TODO(P3, V30+)` to replace `pd_idx = 2` with dynamic
+  `__kernel_end` symbol lookup. Current kernel has 1.72 MB headroom
+  before boundary recurrence.
+
+### Stats
+
+- **8 commits** across V29.P3 (`a521d4c`..`34426af`) + **5 commits**
+  across V29.P3.P6 (`17a42b0`..`ac07fc9`) = **13 commits**
+- **3 new plan/findings/decision docs** per track × 2 tracks = 6
+  doc artifacts: `V29_P3_SMAP_{PLAN,FINDINGS,DECISION}.md` +
+  `V29_P3_P6_NX_{PLAN,FINDINGS,DECISION}.md`
+- **Wall clock:** ~3.6h for the full V26 B4.2 closure (SMAP +
+  NX investigations combined), -9% on SMAP track, -19% on NX track
+- **H2 + H3 hypothesis chain:** both matched on first plan, no
+  residual (H1/H4/H5 paths not needed). P1 walkers skipped where
+  static analysis was deterministic.
+
+### Scope (what DID NOT ship)
+
+- **`protect_kernel_data()`** dead code (tracked as V30+
+  `TODO(P3, V30+)`) — would mark PD[0] NX if called (kernel .text
+  range). Not called anywhere, so no runtime impact. Cleanup deferred.
+- **Dynamic `__kernel_end`** symbol export from linker script —
+  hardcoded `pd_idx = 2` requires manual update if kernel grows
+  past 4 MB. Headroom 1.72 MB. Future work.
+
 ## [3.4.0] "Multilingual" -- 2026-04-16
 
 > **⚠️ Retroactive addendum — 2026-04-16 evening (V29.P1.P4):**
