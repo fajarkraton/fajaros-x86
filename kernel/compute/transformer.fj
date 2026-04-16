@@ -1353,11 +1353,18 @@ const TFM_EOS_TOKEN: i64 = 2
 //   STREAM_LAYER_BUF:     layer weights (6 MB from NVMe)
 
 // Work buffer addresses (213-215 MB range, within 512 MB identity mapping)
-const STFM_X: i64 = 0xD500000           // hidden state [d_model] (12 KB)
-const STFM_RES: i64 = 0xD503000         // residual copy (12 KB)
-const STFM_FFN_OUT: i64 = 0xD506000     // FFN output (12 KB)
-const STFM_FFN_GATE: i64 = 0xD510000    // gated FFN gate buf (56 KB)
-const STFM_FFN_UP: i64 = 0xD520000      // gated FFN up buf (56 KB)
+// V28.2 BUG FIX: STFM_X was at 0xD500000 (213 MB), overlapping
+// STREAM_EMBED which spans 0x8000000..0x11B72EC0 (128-284 MB for v8
+// Gemma 3 155 MB embed). Inference writes to STFM_X/RES/FFN_OUT
+// corrupted the tied embedding → lmhead always picked pad=0 → empty output.
+// Moved to 0x12000000 (288 MB) — between STREAM_EMBED end (284 MB) and
+// RAM_LAYERS start (320 MB, 0x14000000). 32 MB gap = plenty for 200 KB
+// of working buffers.
+const STFM_X: i64 = 0x12000000          // hidden state [d_model] (12 KB)
+const STFM_RES: i64 = 0x12003000        // residual copy (12 KB)
+const STFM_FFN_OUT: i64 = 0x12006000    // FFN output (12 KB)
+const STFM_FFN_GATE: i64 = 0x12010000   // gated FFN gate buf (56 KB)
+const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
 
 // ── Streaming layer forward pass ──
 // x_addr: raw address of hidden state (d_model i64 values)

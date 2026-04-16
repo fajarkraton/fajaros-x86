@@ -240,9 +240,11 @@ def main():
                    serialize_codebook(down_cb))
 
         weight_data = qkv_packed + ffn_packed + norm_data + cb_data
-        # v7 layer header: index, block_size, qkv_size, ffn_size, norm_size (+4 for norm count)
-        layer_hdr = struct.pack("<iiiii", li, 20 + len(weight_data),
-                                len(qkv_packed), len(ffn_packed), len(norm_data))
+        # V28.2 FIX: layer header must be 16 bytes (4 × u32) to match kernel
+        # FJM_LAYER_HDR_SIZE=16. Old 20-byte header (5 fields including norm_size)
+        # shifted every downstream matrix pointer +4 bytes → corrupted gamma reads.
+        layer_hdr = struct.pack("<iiii", li, 16 + len(weight_data),
+                                len(qkv_packed), len(ffn_packed))
         layer_blocks.append(layer_hdr + weight_data)
         if li == 0:
             print(f"  Layer 0: QKV={len(qkv_packed)} FFN={len(ffn_packed)} "
