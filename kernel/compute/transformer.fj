@@ -1519,7 +1519,11 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     tfm_attention(TFM_Q, TFM_K, TFM_V, layer, pos, window, TFM_ATTN)
 
     // === O Projection with O codebook ===
-    let o_addr = mdl_stream_o_addr()
+    // V30-P3.3 FIX: O weight address must follow qkv_addr (RAM or stream),
+    // NOT always use mdl_stream_o_addr() which hardcodes STREAM_LAYER_BUF.
+    // In RAM mode, the streaming buffer is stale — producing garbage attn_out
+    // (observed: -194B instead of ±68K, root cause of pad-collapse).
+    let o_addr = qkv_addr + mdl_stream_q_size() + mdl_stream_kv_size() * 2
     let attn_data = km_data_ptr(TFM_ATTN)
     tfm_vecmat_auto(attn_data, o_addr, q_dim, d_model, bits, cb_o, STFM_FFN_OUT)
     if FJTRACE_ENABLED == 1 {
