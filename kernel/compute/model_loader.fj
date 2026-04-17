@@ -1186,14 +1186,17 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 // Requires: extend_identity_mapping_512() called during boot
 
 // Memory layout (streaming mode)
-// V30: STREAM_LAYER_SIZE bumped 8→16 MB for Gemma 3 1B v8 (14.5 MB/layer).
-// Downstream buffers relocated to avoid overlap.
-const STREAM_EMBED_BASE: i64 = 0x8000000    // 128 MB mark
-const STREAM_LAYER_BUF: i64 = 0xCC00000     // 204 MB mark
+// V30: all streaming buffers MUST sit ABOVE the embedding region.
+// Gemma 3 1B v8: embedding = 155 MB starting at 0x8000000, ends at ~0x11B40000.
+// Old layout (0xCC00000) was INSIDE the embedding — caused silent corruption
+// and GPF in LM head argmax. New layout places everything after STFM work
+// buffers (0x12000000–0x12030000), which are themselves above embedding end.
+const STREAM_EMBED_BASE: i64 = 0x8000000    // 128 MB mark (embedding, up to 155 MB)
+const STREAM_LAYER_BUF: i64 = 0x12100000    // 289 MB mark (after STFM work area)
 const STREAM_LAYER_SIZE: i64 = 0x1000000    // 16 MB buffer (Gemma 3 1B v8: 14.5 MB/layer)
-const STREAM_LMHEAD_BUF: i64 = 0xDC00000   // 220 MB mark (after 16 MB layer buf)
+const STREAM_LMHEAD_BUF: i64 = 0x13100000   // 305 MB mark (after 16 MB layer buf)
 const STREAM_LMHEAD_CHUNK: i64 = 0x100000   // 1 MB per LM head chunk
-const STREAM_FINAL_NORM: i64 = 0xDD00000    // 221 MB mark (after LM head buf)
+const STREAM_FINAL_NORM: i64 = 0x13200000    // 306 MB mark (after LM head buf)
 
 // RAM-resident mode: load ALL weights to RAM (no NVMe per-token)
 const RAM_LAYERS_BASE: i64 = 0x14000000    // 320 MB — 26 layers contiguous.
