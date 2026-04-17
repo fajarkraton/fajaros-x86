@@ -1418,7 +1418,11 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
     } else {
         // Streaming: load from NVMe
         if mdl_stream_current_layer() != layer {
-            mdl_stream_load_layer(layer)
+            let load_rc = mdl_stream_load_layer(layer)
+            if load_rc != 0 {
+                cprintln("[ERR] stream_load_layer failed", RED_ON_BLACK)
+                return
+            }
         }
         qkv_addr = mdl_stream_qkv_addr()
         ffn_addr = mdl_stream_ffn_addr()
@@ -1615,7 +1619,11 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
         mdl_memcpy(MDL_CODEBOOK_BASE, mdl_ram_layer_codebook(0), cb_size)
     } else {
         if mdl_stream_current_layer() != 0 {
-            mdl_stream_load_layer(0)
+            let preload_rc = mdl_stream_load_layer(0)
+            if preload_rc != 0 {
+                cprintln("[ERR] stream_load_layer(0) failed for codebook", RED_ON_BLACK)
+                return -1
+            }
         }
         mdl_memcpy(MDL_CODEBOOK_BASE, mdl_stream_codebook_addr(), cb_size)
     }

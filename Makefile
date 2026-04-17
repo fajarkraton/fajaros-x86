@@ -311,15 +311,20 @@ build-fjtrace:
 #   build/fjtrace-capture.log    — raw serial log
 #   build/fjtrace-capture.jsonl  — parsed records
 #   build/fjtrace-capture.stats  — record count + op histogram
-FJTRACE_DISK     ?= disk_v8.img
-FJTRACE_PROMPT   ?= ask hello
-FJTRACE_TIMEOUT  ?= 300
-FJTRACE_BOOT_WAIT?= 6
-FJTRACE_LOAD_WAIT?= 4
-FJTRACE_EMBED_WAIT?= 12
-FJTRACE_RAM_WAIT ?= 45
-FJTRACE_ASK_WAIT ?= 120
-FJTRACE_MEM      ?= -m 2G
+FJTRACE_DISK       ?= disk_v8.img
+FJTRACE_PROMPT     ?= ask hello
+FJTRACE_TIMEOUT    ?= 300
+FJTRACE_BOOT_WAIT  ?= 6
+FJTRACE_LOAD_WAIT  ?= 4
+FJTRACE_EMBED_WAIT ?= 12
+FJTRACE_RAM_WAIT   ?= 45
+FJTRACE_ASK_WAIT   ?= 120
+FJTRACE_MEM        ?= -m 2G
+# Set to 1 to skip ram-load (streaming-only mode for diagnostics).
+# Streaming reads layer weights directly from NVMe per-token instead
+# of copying all weights to RAM first. Useful for isolating ram-load
+# copy corruption bugs (V30 P3.4 gate_proj divergence investigation).
+FJTRACE_SKIP_RAMLOAD ?= 0
 
 .PHONY: test-fjtrace-capture
 test-fjtrace-capture:
@@ -343,15 +348,26 @@ test-fjtrace-capture:
 		$(MAKE) build-llvm && $(MAKE) iso-llvm
 	@echo "[FJTRACE] Step 2/3: booting QEMU ($(FJTRACE_TIMEOUT)s max)..."
 	@# Full Gemma-3 v8 workflow (matches docs/V28_5_RETEST.md §Methodology):
-	@#   boot → model-load nvme 0 → embed-load → ram-load → $(FJTRACE_PROMPT)
+	@#   boot → model-load nvme 0 → embed-load → [ram-load] → $(FJTRACE_PROMPT)
 	@# Uses ISO (multiboot) not -kernel direct (FajarOS ELF lacks PVH note).
 	@# chardev/stdio pattern mirrors test-smep-regression. 2G memory needed
 	@# for 155 MB embeddings + 359 MB ram-loaded layer weights.
-	@(sleep $(FJTRACE_BOOT_WAIT);      printf 'model-load nvme 0\r'; \
-	  sleep $(FJTRACE_LOAD_WAIT);      printf 'embed-load\r';        \
-	  sleep $(FJTRACE_EMBED_WAIT);     printf 'ram-load\r';          \
-	  sleep $(FJTRACE_RAM_WAIT);       printf '$(FJTRACE_PROMPT)\r'; \
-	  sleep $(FJTRACE_ASK_WAIT);       printf '\r') | \
+	@# When FJTRACE_SKIP_RAMLOAD=1, ram-load is skipped — inference uses
+	@# streaming path (reads layer weights from NVMe per-token).
+	@if [ "$(FJTRACE_SKIP_RAMLOAD)" = "1" ]; then \
+		echo "[FJTRACE] mode=STREAMING (ram-load skipped)"; \
+		(sleep $(FJTRACE_BOOT_WAIT);      printf 'model-load nvme 0\r'; \
+		 sleep $(FJTRACE_LOAD_WAIT);      printf 'embed-load\r';        \
+		 sleep $(FJTRACE_EMBED_WAIT);     printf '$(FJTRACE_PROMPT)\r'; \
+		 sleep $(FJTRACE_ASK_WAIT);       printf '\r'); \
+	else \
+		echo "[FJTRACE] mode=RAM (full ram-load)"; \
+		(sleep $(FJTRACE_BOOT_WAIT);      printf 'model-load nvme 0\r'; \
+		 sleep $(FJTRACE_LOAD_WAIT);      printf 'embed-load\r';        \
+		 sleep $(FJTRACE_EMBED_WAIT);     printf 'ram-load\r';          \
+		 sleep $(FJTRACE_RAM_WAIT);       printf '$(FJTRACE_PROMPT)\r'; \
+		 sleep $(FJTRACE_ASK_WAIT);       printf '\r'); \
+	fi | \
 		timeout $(FJTRACE_TIMEOUT) $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
 			-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
 			-no-reboot -no-shutdown -display none \

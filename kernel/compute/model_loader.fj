@@ -1186,12 +1186,14 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 // Requires: extend_identity_mapping_512() called during boot
 
 // Memory layout (streaming mode)
+// V30: STREAM_LAYER_SIZE bumped 8→16 MB for Gemma 3 1B v8 (14.5 MB/layer).
+// Downstream buffers relocated to avoid overlap.
 const STREAM_EMBED_BASE: i64 = 0x8000000    // 128 MB mark
 const STREAM_LAYER_BUF: i64 = 0xCC00000     // 204 MB mark
-const STREAM_LAYER_SIZE: i64 = 0x800000      // 8 MB buffer (fits any layer)
-const STREAM_LMHEAD_BUF: i64 = 0xD400000    // 212 MB mark
+const STREAM_LAYER_SIZE: i64 = 0x1000000    // 16 MB buffer (Gemma 3 1B v8: 14.5 MB/layer)
+const STREAM_LMHEAD_BUF: i64 = 0xDC00000   // 220 MB mark (after 16 MB layer buf)
 const STREAM_LMHEAD_CHUNK: i64 = 0x100000   // 1 MB per LM head chunk
-const STREAM_FINAL_NORM: i64 = 0xD530000    // Final RMSNorm gamma (d_model × 8 bytes)
+const STREAM_FINAL_NORM: i64 = 0xDD00000    // 221 MB mark (after LM head buf)
 
 // RAM-resident mode: load ALL weights to RAM (no NVMe per-token)
 const RAM_LAYERS_BASE: i64 = 0x14000000    // 320 MB — 26 layers contiguous.
@@ -1371,15 +1373,21 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
     let src_lba = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_ADDR)
     let byte_off = layer0_off + layer_n * block_size + FJM_LAYER_HDR_SIZE
     let lba_start = src_lba + byte_off / 512
-    let total_sectors = (data_size + 511) / 512
+    let intra_offset = byte_off % 512
+    let total_sectors = (data_size + intra_offset + 511) / 512
     let mut sect_done: i64 = 0
+    let mut bytes_written: i64 = 0
 
     while sect_done < total_sectors {
         let remaining = total_sectors - sect_done
         let read_count = if remaining > 128 { 128 } else { remaining }
         let rc = nvme_read_sectors(lba_start + sect_done, read_count, NVME_DMA)
         if rc != 0 { return -3 }
-        mdl_memcpy(STREAM_LAYER_BUF + sect_done * 512, NVME_DMA, read_count * 512)
+        let copy_src = if sect_done == 0 { NVME_DMA + intra_offset } else { NVME_DMA }
+        let copy_raw = if sect_done == 0 { read_count * 512 - intra_offset } else { read_count * 512 }
+        let copy_len = if bytes_written + copy_raw > data_size { data_size - bytes_written } else { copy_raw }
+        mdl_memcpy(STREAM_LAYER_BUF + bytes_written, copy_src, copy_len)
+        bytes_written = bytes_written + copy_len
         sect_done = sect_done + read_count
     }
 
