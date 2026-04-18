@@ -254,7 +254,8 @@ $(RUNTIME_O): $(RUNTIME_S)
 # V30 P3.6: compile C vecmat (gcc, bypasses Fajar Lang LLVM codegen bug)
 $(VECMAT_O): $(VECMAT_C)
 	@mkdir -p $(BUILD_DIR)
-	gcc -O3 -march=native -ffreestanding -nostdlib -fno-pic \
+	gcc -O3 -march=native -mno-avx -mno-avx2 -mno-avx512f \
+		-ffreestanding -nostdlib -fno-pic \
 		-mcmodel=small -fcf-protection=none \
 		-c -o $(VECMAT_O) $(VECMAT_C)
 	@echo "[OK] Compiled C vecmat: $(VECMAT_O)"

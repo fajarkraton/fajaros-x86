@@ -555,83 +555,17 @@ const KM_TILE_SIZE: i64 = 64
 // If gamma_addr == 0, skip affine (identity).
 // Works on raw memory address (for frame-allocated vectors with d > 1024).
 
+// V30.GEMMA3: dispatch to gcc-compiled C RMSNorm via mailbox.
+// Avoids LLVM O2 sensitivity that causes different numerical results
+// depending on code context (FJTRACE present vs absent).
+@noinline
 @kernel fn km_rmsnorm(data_addr: i64, dim: i64, gamma_addr: i64) {
-    // V28.2: max-abs rescaling approach for robust integer-math RMSNorm.
-    //
-    // RMSNorm math: y[i] = x[i] / rms(x) × (1 + γ[i])   (Gemma 3)
-    //           or: y[i] = x[i] / rms(x) × γ[i]         (Llama/SmolLM)
-    //
-    // Key insight: rms is scale-invariant — rms(α·x) = α·rms(x) — so
-    // x[i] / rms(x) == (α·x[i]) / rms(α·x). We rescale x by K/max|x|
-    // before accumulating x² so all intermediate values stay bounded:
-    //   * x_rs = x × K / max_abs, in range [-K, K]
-    //   * x_rs × x_rs ≤ K² (no overflow)
-    //   * sum of dim such terms / dim ≤ K² (no overflow)
-    //   * rms_rs = sqrt(mean(x_rs²)), in [0, K]
-    //   * normed[i] = x_rs[i] × 1000 / rms_rs  (result in ×1000 fp)
-    //
-    // Chose K = 10000 → 0.01% relative precision, plenty for LLM inference.
-    //
-    // Old formula accumulated x²/dim directly, which truncated to 0 for
-    // |x| < sqrt(dim) ≈ 34 — losing small values entirely and distorting
-    // rms when the input distribution had mixed magnitudes. V28.2 v8's
-    // accurate dequant exposed this truncation as magnitude-explosion.
-    //
-    // Safety: reject invalid dimensions or addresses.
-    if dim <= 0 || dim > 8192 { return }
-    // Data/gamma addresses must be within the 1 GB identity-mapped region
-    // (V28.1 extended from 512 MB to 1 GB for v7+ layouts).
-    if data_addr <= 0 || data_addr > 0x40000000 { return }
-    if gamma_addr != 0 && gamma_addr > 0x40000000 { return }
-
-    // Pass 1: find max|x|
-    let mut max_abs: i64 = 0
-    let mut i: i64 = 0
-    while i < dim {
-        let x = volatile_read_u64(data_addr + i * 8)
-        let ax = if x < 0 { 0 - x } else { x }
-        if ax > max_abs { max_abs = ax }
-        i = i + 1
-    }
-    if max_abs <= 0 { return }   // all zero — nothing to normalize
-
-    // K chosen so K*K*dim fits in i64 safely.
-    // K=10000 → K²=1e8 × dim=8192 → 8.2e11, well under i64 max.
-    let k_scale: i64 = 10000
-
-    // Pass 2: accumulate sum((x × K / max_abs)² / dim)
-    let mut rss: i64 = 0
-    i = 0
-    while i < dim {
-        let x = volatile_read_u64(data_addr + i * 8)
-        let x_rs = x * k_scale / max_abs    // in [-K, K]
-        rss = rss + (x_rs * x_rs) / dim
-        i = i + 1
-    }
-
-    let rms_rs = km_isqrt(rss + 1)          // in [1, K]
-    if rms_rs <= 0 { return }
-
-    // Pass 3: normalize and apply gamma
-    let gamma_mode = volatile_read_u64(0xC00558)
-    i = 0
-    while i < dim {
-        let x = volatile_read_u64(data_addr + i * 8)
-        let x_rs = x * k_scale / max_abs    // recompute (cheap vs storing)
-        // normed (×1000 fp) = x_rs / rms_rs × 1000 = x_rs × 1000 / rms_rs
-        let normed = (x_rs * 1000) / rms_rs
-        if gamma_addr != 0 {
-            let g = volatile_read_u64(gamma_addr + i * 8)
-            if gamma_mode == 1 {
-                volatile_write_u64(data_addr + i * 8, (normed * g) / 1000)
-            } else {
-                volatile_write_u64(data_addr + i * 8, (normed * (1000 + g)) / 1000)
-            }
-        } else {
-            volatile_write_u64(data_addr + i * 8, normed)
-        }
-        i = i + 1
-    }
+    // Mailbox at 0xBEA200
+    volatile_write_u64(0xBEA200, data_addr)
+    volatile_write_u64(0xBEA208, dim)
+    volatile_write_u64(0xBEA210, gamma_addr)
+    volatile_write_u64(0xBEA218, volatile_read_u64(0xC00558))
+    asm!("movabs $$km_rmsnorm_c_mailbox, %rax; call *%rax")
 }
 
 // Convenience wrapper for km_ slot-based RMSNorm
@@ -661,21 +595,13 @@ const KM_TILE_SIZE: i64 = 64
     else { -1000 }
 }
 
+// V30.GEMMA3: dispatch to gcc-compiled C GELU-tanh via mailbox.
+@noinline
 @kernel fn km_gelu_tanh(data_addr: i64, dim: i64) {
-    let mut i: i64 = 0
-    while i < dim {
-        let x = volatile_read_u64(data_addr + i * 8)
-        // inner = sqrt(2/pi) * (x + 0.044715 * x³)
-        // x³ in fixed-point: (x * x / 1000) * x / 1000
-        let x2 = (x * x) / 1000
-        let x3 = (x2 * x) / 1000
-        let inner = (798 * (x + (45 * x3) / 1000)) / 1000
-        let t = km_tanh_approx(inner)
-        // result = 0.5 * x * (1 + tanh) = x * (1000 + tanh) / 2000
-        let result = (x * (1000 + t)) / 2000
-        volatile_write_u64(data_addr + i * 8, result)
-        i = i + 1
-    }
+    // Mailbox at 0xBEA280
+    volatile_write_u64(0xBEA280, data_addr)
+    volatile_write_u64(0xBEA288, dim)
+    asm!("movabs $$km_gelu_tanh_c_mailbox, %rax; call *%rax")
 }
 
 // Convenience wrapper for km_ slot
@@ -687,30 +613,24 @@ const KM_TILE_SIZE: i64 = 64
 // Raw-address operations (for frame-allocated vectors)
 // ═══════════════════════════════════════════════════════════════
 
-// Element-wise add: a[i] += b[i], both raw addresses
+// V30.GEMMA3: dispatch to gcc-compiled C element-wise add via mailbox.
+@noinline
 @kernel fn km_add_raw(a_addr: i64, b_addr: i64, dim: i64) {
-    if dim <= 0 || dim > 8192 { return }
-    if a_addr <= 0 || b_addr <= 0 { return }
-    let mut i: i64 = 0
-    while i < dim {
-        let a = volatile_read_u64(a_addr + i * 8)
-        let b = volatile_read_u64(b_addr + i * 8)
-        volatile_write_u64(a_addr + i * 8, a + b)
-        i = i + 1
-    }
+    // Mailbox at 0xBEA300
+    volatile_write_u64(0xBEA300, a_addr)
+    volatile_write_u64(0xBEA308, b_addr)
+    volatile_write_u64(0xBEA310, dim)
+    asm!("movabs $$km_add_raw_c_mailbox, %rax; call *%rax")
 }
 
-// Element-wise multiply: out[i] = a[i] * b[i] / 1000, all raw addresses
+// V30.GEMMA3: dispatch to gcc-compiled C element-wise multiply via mailbox.
+@noinline
 @kernel fn km_mul_raw(a_addr: i64, b_addr: i64, dim: i64) {
-    if dim <= 0 || dim > 8192 { return }
-    if a_addr <= 0 || b_addr <= 0 { return }
-    let mut i: i64 = 0
-    while i < dim {
-        let a = volatile_read_u64(a_addr + i * 8)
-        let b = volatile_read_u64(b_addr + i * 8)
-        volatile_write_u64(a_addr + i * 8, (a * b) / 1000)
-        i = i + 1
-    }
+    // Mailbox at 0xBEA340
+    volatile_write_u64(0xBEA340, a_addr)
+    volatile_write_u64(0xBEA348, b_addr)
+    volatile_write_u64(0xBEA350, dim)
+    asm!("movabs $$km_mul_raw_c_mailbox, %rax; call *%rax")
 }
 
 // Copy: dst = src, raw addresses
