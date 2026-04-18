@@ -1243,11 +1243,41 @@ const TFM_EOS_TOKEN: i64 = 2
         let text_addr: i64 = 0x6F800 + 4
         let text_len = len - 4
         let tok_buf = TFM_SCRATCH + 16384
-        let n_prompt = tok_encode(text_addr, text_len, tok_buf)
-        if n_prompt <= 0 {
-            cprintln("Tokenization failed.", RED_ON_BLACK)
-            return
+        let mut n_prompt: i64 = 0
+
+        // Gemma 3 instruction format:
+        //   <start_of_turn>(105) user(2364) \n(107) <user_text> <end_of_turn>(106) \n(107) <start_of_turn>(105) model(4368) \n(107)
+        let mt = mdl_get_model_type()
+        if mt == 10 || mt == 11 {
+            // Prefix: <start_of_turn> user \n
+            volatile_write_u64(tok_buf, 105)
+            volatile_write_u64(tok_buf + 8, 2364)
+            volatile_write_u64(tok_buf + 16, 107)
+            n_prompt = 3
+
+            // Tokenize user text
+            let n_text = tok_encode(text_addr, text_len, tok_buf + n_prompt * 8)
+            if n_text <= 0 {
+                cprintln("Tokenization failed.", RED_ON_BLACK)
+                return
+            }
+            n_prompt = n_prompt + n_text
+
+            // Suffix: <end_of_turn> \n <start_of_turn> model \n
+            volatile_write_u64(tok_buf + n_prompt * 8, 106)
+            volatile_write_u64(tok_buf + (n_prompt + 1) * 8, 107)
+            volatile_write_u64(tok_buf + (n_prompt + 2) * 8, 105)
+            volatile_write_u64(tok_buf + (n_prompt + 3) * 8, 4368)
+            volatile_write_u64(tok_buf + (n_prompt + 4) * 8, 107)
+            n_prompt = n_prompt + 5
+        } else {
+            n_prompt = tok_encode(text_addr, text_len, tok_buf)
+            if n_prompt <= 0 {
+                cprintln("Tokenization failed.", RED_ON_BLACK)
+                return
+            }
         }
+
         cprint("Output: ", WHITE_ON_BLACK)
         let n_gen = tfm_generate_stream(tok_buf, n_prompt, 64)
         tfm_print_perf(n_prompt, n_gen)
