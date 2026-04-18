@@ -6,6 +6,85 @@
 #define V8_GROUP_SHIFT 7
 #define V8_SCALE_FP 1000000LL
 
+/* Read embed_bits directly from kernel model header.
+ * MDL_HDR_BASE (0xC00000) + FJM_OFF_EMBED_BITS (144) = 0xC00090.
+ * This is a u32 field set during model-load. */
+static inline int64_t get_model_embed_bits(void) {
+    return (int64_t)(*(const uint32_t *)(uintptr_t)0xC00090ULL);
+}
+
+/* ── Embedding lookup (C bypass for 8-bit LLVM O2 sensitivity) ───── */
+/* Mailbox at 0xBEA500:
+ *   +0: token_id (i64)
+ *   +8: out_addr (i64)
+ *  +16: embed_base (i64) = STREAM_EMBED_BASE
+ *  +24: vocab_size (i64)
+ *  +32: d_model (i64)
+ */
+#define EMBED_MAILBOX (MAILBOX_ADDR + 0x500ULL)
+
+void mdl_embed_lookup_c_mailbox(void)
+{
+    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)EMBED_MAILBOX;
+    int64_t token_id   = mb[0];
+    int64_t out_addr   = mb[1];
+    int64_t embed_base = mb[2];
+    int64_t vocab_size = mb[3];
+    int64_t d_model    = mb[4];
+    int64_t bits       = get_model_embed_bits();
+
+    if (token_id < 0 || token_id >= vocab_size) return;
+
+    int64_t total = vocab_size * d_model;
+    int64_t packed_bytes = (bits == 8) ? total : total / 2;
+    int64_t n_groups = (total + 127) >> V8_GROUP_SHIFT;
+    int64_t scales_base = embed_base + packed_bytes;
+    int64_t zeros_base = scales_base + n_groups * 4;
+
+    const uint8_t *packed = (const uint8_t *)(uintptr_t)embed_base;
+    const uint32_t *scales = (const uint32_t *)(uintptr_t)scales_base;
+    const uint8_t *zeros_arr = (const uint8_t *)(uintptr_t)zeros_base;
+    int64_t *out = (int64_t *)(uintptr_t)out_addr;
+
+    int64_t row_start = token_id * d_model;
+
+    if (bits == 8) {
+        for (int64_t i = 0; i < d_model; i++) {
+            int64_t fi = row_start + i;
+            int64_t q = packed[fi];
+            int64_t g = fi >> V8_GROUP_SHIFT;
+            int64_t scale = (int64_t)scales[g];
+            int64_t zero = (int64_t)zeros_arr[g];
+            int64_t w_x_1M = (q - zero) * scale;
+            out[i] = w_x_1M / 1000;
+        }
+    } else {
+        for (int64_t i = 0; i < d_model; i++) {
+            int64_t fi = row_start + i;
+            uint8_t raw = packed[fi >> 1];
+            int64_t q = (raw >> ((fi & 1) * 4)) & 15;
+            int64_t g = fi >> V8_GROUP_SHIFT;
+            int64_t scale = (int64_t)scales[g];
+            int64_t zero = (int64_t)zeros_arr[g];
+            int64_t w_x_1M = (q - zero) * scale;
+            out[i] = w_x_1M / 1000;
+        }
+    }
+}
+
+/* Debug: write lmhead results to a fixed memory location (0xBEB000).
+ * The FJ side can read these after the call returns.
+ * [+0] best_token, [+8] best_score, [+16] bits, [+24] call_count */
+#define LMHEAD_DEBUG_ADDR 0xBEB000ULL
+static int64_t _lmhead_call_count = 0;
+static void _debug_lmhead(int64_t tok, int64_t score, int64_t bits) {
+    volatile int64_t *dbg = (volatile int64_t *)(uintptr_t)LMHEAD_DEBUG_ADDR;
+    dbg[0] = tok;
+    dbg[1] = score;
+    dbg[2] = bits;
+    dbg[3] = ++_lmhead_call_count;
+}
+
 /* Non-volatile reads for DATA (weight bytes, input vector).
  * These are safe because the data doesn't change during the vecmat. */
 static inline uint8_t rd8(uint64_t a) { return *(const uint8_t*)(uintptr_t)a; }
@@ -32,9 +111,10 @@ void mdl_lmhead_argmax_v8_tied_mailbox(void)
     int64_t embed_base = mb[1];
     int64_t vocab_size = mb[2];
     int64_t d_model    = mb[3];
+    int64_t bits       = get_model_embed_bits();
 
     int64_t total = vocab_size * d_model;
-    int64_t packed_bytes = total / 2;
+    int64_t packed_bytes = (bits == 8) ? total : total / 2;
     int64_t n_groups = (total + 127) >> V8_GROUP_SHIFT;
     int64_t scales_base = embed_base + packed_bytes;
     int64_t zeros_base = scales_base + n_groups * 4;
@@ -48,27 +128,49 @@ void mdl_lmhead_argmax_v8_tied_mailbox(void)
     int64_t best_score = -999999999LL;
 
     /* Gemma 3 vocab: 255902 real tokens + 6242 <unused> entries.
-     * 4-bit quantization noise on untrained <unused> weights produces
+     * Quantization noise on untrained <unused> weights produces
      * spuriously high scores, drowning out the correct answer.
      * Mask to real tokens only (0..255901). */
     int64_t effective_vocab = vocab_size < 255902 ? vocab_size : 255902;
 
-    for (int64_t v = 0; v < effective_vocab; v++) {
-        int64_t row_start = v * d_model;
-        int64_t sum = 0;
-        for (int64_t i = 0; i < d_model; i++) {
-            int64_t fi = row_start + i;
-            uint8_t raw = packed[fi >> 1];
-            int64_t q = (raw >> ((fi & 1) * 4)) & 15;
-            int64_t g = fi >> V8_GROUP_SHIFT;
-            int64_t scale = (int64_t)scales[g];
-            int64_t zero = (int64_t)zeros_arr[g];
-            int64_t w = (q - zero) * scale;
-            sum += (x[i] * w) / V8_SCALE_FP;
+    if (bits == 8) {
+        /* 8-bit: direct byte read, no nibble unpacking */
+        for (int64_t v = 0; v < effective_vocab; v++) {
+            int64_t row_start = v * d_model;
+            int64_t sum = 0;
+            for (int64_t i = 0; i < d_model; i++) {
+                int64_t fi = row_start + i;
+                int64_t q = packed[fi];
+                int64_t g = fi >> V8_GROUP_SHIFT;
+                int64_t scale = (int64_t)scales[g];
+                int64_t zero = (int64_t)zeros_arr[g];
+                int64_t w = (q - zero) * scale;
+                sum += (x[i] * w) / V8_SCALE_FP;
+            }
+            if (sum > best_score) {
+                best_score = sum;
+                best_token = v;
+            }
         }
-        if (sum > best_score) {
-            best_score = sum;
-            best_token = v;
+    } else {
+        /* 4-bit: nibble unpacking */
+        for (int64_t v = 0; v < effective_vocab; v++) {
+            int64_t row_start = v * d_model;
+            int64_t sum = 0;
+            for (int64_t i = 0; i < d_model; i++) {
+                int64_t fi = row_start + i;
+                uint8_t raw = packed[fi >> 1];
+                int64_t q = (raw >> ((fi & 1) * 4)) & 15;
+                int64_t g = fi >> V8_GROUP_SHIFT;
+                int64_t scale = (int64_t)scales[g];
+                int64_t zero = (int64_t)zeros_arr[g];
+                int64_t w = (q - zero) * scale;
+                sum += (x[i] * w) / V8_SCALE_FP;
+            }
+            if (sum > best_score) {
+                best_score = sum;
+                best_token = v;
+            }
         }
     }
 
@@ -86,9 +188,10 @@ void km_vecmat_packed_v8_mailbox(void)
     int64_t m         = mb[2];
     int64_t n         = mb[3];
     int64_t out_addr  = mb[4];
+    int64_t bits      = get_model_embed_bits();
 
     int64_t total = m * n;
-    int64_t packed_bytes = total / 2;
+    int64_t packed_bytes = (bits == 8) ? total : total / 2;
     int64_t n_groups = (total + 127) >> V8_GROUP_SHIFT;
     int64_t scales_base = mat_addr + packed_bytes;
     int64_t zeros_base = scales_base + n_groups * 4;
@@ -99,20 +202,37 @@ void km_vecmat_packed_v8_mailbox(void)
     const int64_t *x = (const int64_t*)(uintptr_t)x_addr;
     int64_t *out = (int64_t*)(uintptr_t)out_addr;
 
-    for (int64_t j = 0; j < n; j++) {
-        int64_t sum = 0;
-        for (int64_t k = 0; k < m; k++) {
-            int64_t fi = k * n + j;
-            uint8_t raw = packed[fi >> 1];
-            int64_t q = (raw >> ((fi & 1) * 4)) & 15;
-            int64_t g = fi >> V8_GROUP_SHIFT;
-            int64_t scale = (int64_t)scales[g];
-            int64_t zero = (int64_t)zeros[g];
-            int64_t w = (q - zero) * scale;
-            int64_t v = x[k];
-            sum += (v * w) / V8_SCALE_FP;
+    if (bits == 8) {
+        /* 8-bit: direct byte read */
+        for (int64_t j = 0; j < n; j++) {
+            int64_t sum = 0;
+            for (int64_t k = 0; k < m; k++) {
+                int64_t fi = k * n + j;
+                int64_t q = packed[fi];
+                int64_t g = fi >> V8_GROUP_SHIFT;
+                int64_t scale = (int64_t)scales[g];
+                int64_t zero = (int64_t)zeros[g];
+                int64_t w = (q - zero) * scale;
+                sum += (x[k] * w) / V8_SCALE_FP;
+            }
+            out[j] = sum;
         }
-        out[j] = sum;
+    } else {
+        /* 4-bit: nibble unpacking */
+        for (int64_t j = 0; j < n; j++) {
+            int64_t sum = 0;
+            for (int64_t k = 0; k < m; k++) {
+                int64_t fi = k * n + j;
+                uint8_t raw = packed[fi >> 1];
+                int64_t q = (raw >> ((fi & 1) * 4)) & 15;
+                int64_t g = fi >> V8_GROUP_SHIFT;
+                int64_t scale = (int64_t)scales[g];
+                int64_t zero = (int64_t)zeros[g];
+                int64_t w = (q - zero) * scale;
+                sum += (x[k] * w) / V8_SCALE_FP;
+            }
+            out[j] = sum;
+        }
     }
 }
 

@@ -1191,17 +1191,19 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
 // Requires: extend_identity_mapping_512() called during boot
 
 // Memory layout (streaming mode)
-// V30: all streaming buffers MUST sit ABOVE the embedding region.
-// Gemma 3 1B v8: embedding = 155 MB starting at 0x8000000, ends at ~0x11B40000.
-// Old layout (0xCC00000) was INSIDE the embedding — caused silent corruption
-// and GPF in LM head argmax. New layout places everything after STFM work
-// buffers (0x12000000–0x12030000), which are themselves above embedding end.
-const STREAM_EMBED_BASE: i64 = 0x8000000    // 128 MB mark (embedding, up to 155 MB)
-const STREAM_LAYER_BUF: i64 = 0x12100000    // 289 MB mark (after STFM work area)
-const STREAM_LAYER_SIZE: i64 = 0x1000000    // 16 MB buffer (Gemma 3 1B v8: 14.5 MB/layer)
-const STREAM_LMHEAD_BUF: i64 = 0x13100000   // 305 MB mark (after 16 MB layer buf)
+// V30 Path B: all streaming buffers placed at 704+ MB (above STFM work area
+// at 0x2C000000). This layout supports BOTH 4-bit and 8-bit models:
+//   4-bit v8 embedding: 0x8000000..0x11B40000 (128-284 MB, 155 MB)
+//   8-bit v9 embedding: 0x8000000..0x1B4C0000 (128-437 MB, 299 MB)
+// STFM work buffers at 0x2C000000 (704 MB) in transformer.fj.
+// Streaming buffers start at 0x2C100000 (705 MB), after STFM.
+// All within 1 GB identity-mapped range.
+const STREAM_EMBED_BASE: i64 = 0x8000000    // 128 MB mark (embedding)
+const STREAM_LAYER_BUF: i64 = 0x2C100000    // 705 MB mark (after STFM work area)
+const STREAM_LAYER_SIZE: i64 = 0x2000000    // 32 MB buffer (8-bit: ~26 MB/layer)
+const STREAM_LMHEAD_BUF: i64 = 0x2E100000   // 737 MB mark (after 32 MB layer buf)
 const STREAM_LMHEAD_CHUNK: i64 = 0x100000   // 1 MB per LM head chunk
-const STREAM_FINAL_NORM: i64 = 0x13200000    // 306 MB mark (after LM head buf)
+const STREAM_FINAL_NORM: i64 = 0x2E200000    // 738 MB mark (after LM head buf)
 
 // RAM-resident mode: load ALL weights to RAM (no NVMe per-token)
 const RAM_LAYERS_BASE: i64 = 0x14000000    // 320 MB — 26 layers contiguous.
@@ -1432,7 +1434,11 @@ const MDL_ST_STREAM_EMBED: i64 = 56  // 1 = streaming embedding loaded
 @kernel fn mdl_matrix_size(m: i64, n: i64) -> i64 {
     let total = m * n
     if mdl_is_groupwise() == 1 {
-        let packed = total / 2   // 4-bit v8
+        // Group-wise: packed indices + per-group scales (4B) + zeros (1B)
+        // 4-bit: packed = total/2 (nibble-packed)
+        // 8-bit: packed = total (1 byte per element)
+        let bits = mdl_get_embed_bits()
+        let packed = if bits == 8 { total } else { total / 2 }
         let n_groups = (total + 127) / 128
         packed + n_groups * 5    // 4 B scale + 1 B zero per group
     } else {
@@ -2118,11 +2124,13 @@ const LM_TOPK_K: i64 = 8
     0
 }
 
-// V28.2 v8 — group-wise 4-bit embedding lookup.
-// STREAM_EMBED_BASE has layout [packed: vocab*d/2 B][scales: n_groups*4 B][zeros: n_groups B]
-// Writes d_model values to out_addr as i64 × 1000 fixed-point (matches v5_4bit
-// convention so downstream RMSNorm + layer code needs no change).
-// V28.5 audit: @noinline for LLVM O2 stability (same as v8_tied lmhead).
+// V28.2 v8 — group-wise embedding lookup (4-bit or 8-bit).
+// Layout: [packed indices][scales: n_groups*4 B][zeros: n_groups B]
+//   4-bit: packed = vocab*d/2 (nibble-packed, 2 per byte)
+//   8-bit: packed = vocab*d   (1 byte per element)
+// Writes d_model values to out_addr as i64 × 1000 fixed-point.
+// V28.5 audit: @noinline for LLVM O2 stability.
+// V30 Path B: generalized for 8-bit via mdl_get_embed_bits() dispatch.
 @noinline
 @kernel fn mdl_stream_embed_lookup_raw_v8(token_id: i64, out_addr: i64) -> i64 {
     if volatile_read_u64(MDL_STATE_BASE + MDL_ST_STREAM_EMBED) != 1 { return -1 }
@@ -2130,28 +2138,44 @@ const LM_TOPK_K: i64 = 8
     let d_model = mdl_get_d_model()
     if token_id < 0 || token_id >= vocab_size { return -2 }
 
+    let bits = mdl_get_embed_bits()
     let total_elems = vocab_size * d_model
-    let packed_bytes = total_elems / 2
-    let n_groups = (total_elems + 127) / 128  // group_size=128 hardcoded for v8
+    let packed_bytes = if bits == 8 { total_elems } else { total_elems / 2 }
+    let n_groups = (total_elems + 127) / 128
     let scales_base = STREAM_EMBED_BASE + packed_bytes
     let zeros_base = scales_base + n_groups * 4
 
-    let row_start = token_id * d_model  // flat-index start of this token's row
+    let row_start = token_id * d_model
     let mut i: i64 = 0
-    while i < d_model {
-        let flat_idx = row_start + i
-        let byte_idx = flat_idx >> 1
-        let bit_off = (flat_idx & 1) * 4
-        let raw = volatile_read_u8(STREAM_EMBED_BASE + byte_idx)
-        let q = (raw >> bit_off) & 15
+    if bits == 8 {
+        // 8-bit: direct byte read, no nibble unpacking
+        while i < d_model {
+            let flat_idx = row_start + i
+            let q = volatile_read_u8(STREAM_EMBED_BASE + flat_idx)
 
-        let g = flat_idx >> 7   // / 128
-        let scale = mdl_read_u32(scales_base + g * 4)
-        let zero = volatile_read_u8(zeros_base + g)
-        let w_x_1M = (q - zero) * scale
-        // Convert ×1e6 → ×1000 to match existing fixed-point convention
-        volatile_write_u64(out_addr + i * 8, w_x_1M / 1000)
-        i = i + 1
+            let g = flat_idx >> 7
+            let scale = mdl_read_u32(scales_base + g * 4)
+            let zero = volatile_read_u8(zeros_base + g)
+            let w_x_1M = (q - zero) * scale
+            volatile_write_u64(out_addr + i * 8, w_x_1M / 1000)
+            i = i + 1
+        }
+    } else {
+        // 4-bit: nibble unpacking
+        while i < d_model {
+            let flat_idx = row_start + i
+            let byte_idx = flat_idx >> 1
+            let bit_off = (flat_idx & 1) * 4
+            let raw = volatile_read_u8(STREAM_EMBED_BASE + byte_idx)
+            let q = (raw >> bit_off) & 15
+
+            let g = flat_idx >> 7
+            let scale = mdl_read_u32(scales_base + g * 4)
+            let zero = volatile_read_u8(zeros_base + g)
+            let w_x_1M = (q - zero) * scale
+            volatile_write_u64(out_addr + i * 8, w_x_1M / 1000)
+            i = i + 1
+        }
     }
     0
 }

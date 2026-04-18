@@ -1345,19 +1345,19 @@ const TFM_EOS_TOKEN: i64 = 2
 //   TFM_KV_BASE:          KV cache (unchanged)
 //   STREAM_LAYER_BUF:     layer weights (6 MB from NVMe)
 
-// Work buffer addresses (213-215 MB range, within 512 MB identity mapping)
-// V28.2 BUG FIX: STFM_X was at 0xD500000 (213 MB), overlapping
-// STREAM_EMBED which spans 0x8000000..0x11B72EC0 (128-284 MB for v8
-// Gemma 3 155 MB embed). Inference writes to STFM_X/RES/FFN_OUT
-// corrupted the tied embedding → lmhead always picked pad=0 → empty output.
-// Moved to 0x12000000 (288 MB) — between STREAM_EMBED end (284 MB) and
-// RAM_LAYERS start (320 MB, 0x14000000). 32 MB gap = plenty for 200 KB
-// of working buffers.
-const STFM_X: i64 = 0x12000000          // hidden state [d_model] (12 KB)
-const STFM_RES: i64 = 0x12003000        // residual copy (12 KB)
-const STFM_FFN_OUT: i64 = 0x12006000    // FFN output (12 KB)
-const STFM_FFN_GATE: i64 = 0x12010000   // gated FFN gate buf (56 KB)
-const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
+// Work buffer addresses — placed at 704 MB (0x2C000000), safely above:
+//   - 4-bit v8 embedding:    0x8000000..0x11B40000 (128-284 MB)
+//   - 8-bit v9 embedding:    0x8000000..0x1B4C0000 (128-437 MB)
+//   - RAM_LAYERS region:     0x14000000..~0x2BA00000 (320-698 MB for 4-bit)
+// V28.2 history: originally at 0xD500000 (213 MB) which overlapped v8 embed.
+// V30 Path B: moved from 0x12000000 (288 MB) to 0x2C000000 (704 MB) because
+// 8-bit embedding (299 MB) extends to 437 MB, overlapping the old 288 MB addr.
+// The 704 MB address works for BOTH 4-bit and 8-bit models within 1 GB map.
+const STFM_X: i64 = 0x2C000000          // hidden state [d_model] (12 KB)
+const STFM_RES: i64 = 0x2C003000        // residual copy (12 KB)
+const STFM_FFN_OUT: i64 = 0x2C006000    // FFN output (12 KB)
+const STFM_FFN_GATE: i64 = 0x2C010000   // gated FFN gate buf (56 KB)
+const STFM_FFN_UP: i64 = 0x2C020000     // gated FFN up buf (56 KB)
 
 // ── Streaming layer forward pass ──
 // x_addr: raw address of hidden state (d_model i64 values)
