@@ -323,3 +323,75 @@ diagnosis + pad-collapse fix + E2E validation.
 
 **Critical path:** q_norm/k_norm gamma layout diagnosis → fix →
 re-enable → test with v8 model → if coherent, proceed to P10 E2E.
+
+---
+
+## q_norm/k_norm Investigation (Session 2026-04-18)
+
+### Commit `cfd13f9`: q_norm/k_norm RE-ENABLED
+
+Per-head Q/K RMSNorm implemented correctly per HF Gemma3Attention reference:
+- q_norm gamma: `norm_addr + 4 * d_model * 8` (d_head=256 elements)
+- k_norm gamma: `norm_addr + 4 * d_model * 8 + d_head * 8`
+- 4 passes for Q (n_heads=4), 1 pass for K (n_kv_heads=1)
+- gamma_mode = 0 (zero-centered: `(1+g)*x`) matches Gemma 3 convention
+
+Export layout verified in `export_gemma3_v8.py:327-333`:
+```python
+# 4 RMSNorms + 2 head norms
+norms = input_layernorm + post_attention_layernorm +
+        pre_feedforward_layernorm + post_feedforward_layernorm +
+        q_norm + k_norm
+```
+
+Kernel address calculation matches export byte offsets:
+```
+norm_addr + 0 * d_model * 8 = input_layernorm      (1152 elements)
+norm_addr + 1 * d_model * 8 = post_attention_ln     (1152 elements)
+norm_addr + 2 * d_model * 8 = pre_feedforward_ln    (1152 elements)
+norm_addr + 3 * d_model * 8 = post_feedforward_ln   (1152 elements)
+norm_addr + 4 * d_model * 8 = q_norm                 (256 elements)
+norm_addr + 4 * d_model * 8 + 256*8 = k_norm          (256 elements)
+```
+
+### Result: PAD-COLLAPSE PERSISTS
+
+```
+nova> ask hello
+Output:
+
+--- Stats ---
+  Prompt:   5 tokens
+  Generated:64 tokens
+  Per token:2398274 K cycles
+```
+
+64 tokens generated, all decode to empty strings. `best_score=0` pattern
+from Track 3 continues — the LM head argmax finds zero dot product with
+ALL 262K embedding vectors. This means the hidden state vector after 26
+layers + final RMSNorm is effectively zero.
+
+### Updated Hypothesis Tree
+
+| # | Hypothesis | Status | Evidence |
+|---|-----------|--------|----------|
+| H1 | Missing q_norm/k_norm | **ELIMINATED** | Re-enabled, pad-collapse unchanged |
+| H2 | LLVM O2 vecmat bug | **ELIMINATED** | C bypass bit-exact, pad-collapse unchanged |
+| H3 | Wrong gamma layout in export | ELIMINATED for layer norms | 4-norm pattern verified by Track 3 FJTRACE |
+| **H4** | **Degenerate softmax** | **TOP CANDIDATE** | If Q/K dot products are too small or uniform → near-uniform attention → signal decay across 26 layers → hidden state → 0 |
+| H5 | KV cache addressing bug | MEDIUM | Track 3 found attn_out divergence; O-projection fix helped but may not be complete |
+| H6 | Embedding scaling overflow | LOW | Gemma embed ×sqrt(d_model) was fixed in V30.SIM P3.3; verified in FJTRACE |
+| H7 | Temperature/sampling bug | LOW | `ask` uses argmax (no temperature), so sampling is not involved |
+
+### Next Action: Attention Score Diagnosis
+
+The most productive next step is to instrument the attention scores
+(softmax input/output) for a single layer and check:
+
+1. Are Q/K dot products near zero? (magnitude issue)
+2. Is softmax producing uniform distribution? (degeneracy)
+3. Does the V weighted sum produce non-trivial output?
+
+This requires adding FJTRACE-style diagnostic output to `tfm_attention`
+at `transformer.fj:573`. Alternatively, run the Python simulator with
+the real kernel trace to compare attention scores layer by layer.
