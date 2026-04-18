@@ -1504,12 +1504,34 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
                              kv_d, "", 0, "", 0)
     }
 
-    // === V28.2 P2: Gemma 3 q_norm / k_norm ===
-    // Per-head RMSNorm on Q/K before RoPE (Gemma3Attention reference flow)
-    // caused K magnitudes to collapse to ~20 fp×1000 (0.02 real), producing
-    // degenerate softmax. Skipped until we diagnose whether it's a gamma
-    // layout issue or our integer-math RMSNorm diverging for d_head=256.
+    // === Gemma 3 per-head Q/K RMSNorm (before RoPE) ===
+    // HF reference: query_states = self.q_norm(query_states)
+    //               key_states   = self.k_norm(key_states)
+    // Both are Gemma3RMSNorm(d_head) with gamma shape (d_head,).
+    // Norm data layout in .fjm v8:
+    //   norm_addr + 0*d_model*8 = input_layernorm       (d_model)
+    //   norm_addr + 1*d_model*8 = post_attention_ln      (d_model)
+    //   norm_addr + 2*d_model*8 = pre_feedforward_ln     (d_model)
+    //   norm_addr + 3*d_model*8 = post_feedforward_ln    (d_model)
+    //   norm_addr + 4*d_model*8 = q_norm                 (d_head)
+    //   norm_addr + 4*d_model*8 + d_head*8 = k_norm      (d_head)
     let mt_for_norms = mdl_get_model_type()
+    if mt_for_norms == 10 || mt_for_norms == 11 {
+        let qn_gamma = norm_addr + 4 * d_model * 8
+        let kn_gamma = qn_gamma + d_head * 8
+        // Apply q_norm to each query head independently
+        let mut qh: i64 = 0
+        while qh < n_heads {
+            km_rmsnorm(q_out + qh * d_head * 8, d_head, qn_gamma)
+            qh = qh + 1
+        }
+        // Apply k_norm to each KV head independently
+        let mut kh: i64 = 0
+        while kh < n_kv {
+            km_rmsnorm(k_out + kh * d_head * 8, d_head, kn_gamma)
+            kh = kh + 1
+        }
+    }
 
     // === RoPE ===
     // V28.1: Gemma 3 dual theta — pick local (10K) or global (1M) table per layer.
