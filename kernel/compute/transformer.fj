@@ -598,91 +598,31 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // fallback: every Nth layer is global
     let q_data = km_data_ptr(q_slot)
     let seq_len = cur_pos + 1
 
-    // Sliding window: compute attention start position
-    // Global (window=0): attend from position 0
-    // Local (window>0): attend from max(0, cur_pos - window + 1)
+    // Sliding window
     let attn_start = if window > 0 && seq_len > window { seq_len - window } else { 0 }
-    let attn_len = seq_len - attn_start  // number of positions to attend to
+    let attn_len = seq_len - attn_start
 
-    // Pre-compute loop-invariant values
+    // Pre-compute invariants
     let sqrt_dh = km_isqrt(d_head * 1000000)
     let attn_scale = if sqrt_dh > 0 { 1000000 / sqrt_dh } else { 1000 }
     let kv_pos_stride = 2 * kv_d * 8
     let kv_layer_off = TFM_KV_BASE + layer * TFM_KV_MAX_POS * kv_pos_stride
-    let heads_per_kv = n_heads / n_kv_heads
 
-    // Process each query head
-    let mut h: i64 = 0
-    while h < n_heads {
-        let q_head_off = h * d_head
-        let kv_head = h / heads_per_kv
-        let kv_head_off = kv_head * d_head
-
-        // Compute attention scores over windowed positions
-        let scores_addr = TFM_SCRATCH
-        let mut si: i64 = 0  // score index (0..attn_len)
-        let mut p: i64 = attn_start
-        while p < seq_len {
-            let k_cache = kv_layer_off + p * kv_pos_stride
-            let mut dot: i64 = 0
-            let mut d: i64 = 0
-            while d < d_head {
-                let qi = volatile_read_u64(q_data + (q_head_off + d) * 8)
-                let ki = volatile_read_u64(k_cache + (kv_head_off + d) * 8)
-                dot = dot + (qi * ki) / 1000
-                d = d + 1
-            }
-            volatile_write_u64(scores_addr + si * 8, (dot * attn_scale) / 1000)
-            si = si + 1
-            p = p + 1
-        }
-
-        // Softmax over windowed scores (attn_len entries)
-        let mut max_score = volatile_read_u64(scores_addr)
-        si = 1
-        while si < attn_len {
-            let s = volatile_read_u64(scores_addr + si * 8)
-            if s > max_score { max_score = s }
-            si = si + 1
-        }
-        let mut exp_sum: i64 = 0
-        si = 0
-        while si < attn_len {
-            let s = volatile_read_u64(scores_addr + si * 8) - max_score
-            let e = km_exp_approx(s)
-            volatile_write_u64(scores_addr + si * 8, e)
-            exp_sum = exp_sum + e
-            si = si + 1
-        }
-        if exp_sum > 0 {
-            si = 0
-            while si < attn_len {
-                let e = volatile_read_u64(scores_addr + si * 8)
-                volatile_write_u64(scores_addr + si * 8, (e * 1000) / exp_sum)
-                si = si + 1
-            }
-        }
-
-        // Weighted sum of V over windowed positions
-        let mut d: i64 = 0
-        while d < d_head {
-            let mut weighted: i64 = 0
-            si = 0
-            p = attn_start
-            while si < attn_len {
-                let score = volatile_read_u64(scores_addr + si * 8)
-                let v_cache = kv_layer_off + p * kv_pos_stride + kv_d * 8
-                let vi = volatile_read_u64(v_cache + (kv_head_off + d) * 8)
-                weighted = weighted + (score * vi) / 1000
-                si = si + 1
-                p = p + 1
-            }
-            volatile_write_u64(out_data + (q_head_off + d) * 8, weighted)
-            d = d + 1
-        }
-
-        h = h + 1
-    }
+    // V30.GEMMA3: dispatch scoring + softmax + V weighted sum to gcc C
+    // via mailbox at 0xBEA400 (avoids LLVM O2 sensitivity)
+    volatile_write_u64(0xBEA400, q_data)
+    volatile_write_u64(0xBEA408, out_data)
+    volatile_write_u64(0xBEA410, kv_layer_off)
+    volatile_write_u64(0xBEA418, n_heads)
+    volatile_write_u64(0xBEA420, n_kv_heads)
+    volatile_write_u64(0xBEA428, d_head)
+    volatile_write_u64(0xBEA430, attn_start)
+    volatile_write_u64(0xBEA438, attn_len)
+    volatile_write_u64(0xBEA440, attn_scale)
+    volatile_write_u64(0xBEA448, TFM_SCRATCH)
+    volatile_write_u64(0xBEA450, kv_pos_stride)
+    volatile_write_u64(0xBEA458, kv_d)
+    asm!("movabs $$tfm_attention_score_c_mailbox, %rax; call *%rax")
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -306,3 +306,89 @@ void km_mul_raw_c_mailbox(void)
         a[i] = (a[i] * b[i]) / 1000;
     }
 }
+
+/* ── tfm_attention scoring + softmax + V weighted sum ──────────── */
+/* Mailbox at 0xBEA400:
+ *   +0:  q_data          (i64, query vector addr)
+ *   +8:  out_data        (i64, output vector addr)
+ *  +16:  kv_layer_off    (i64, KV cache base for this layer)
+ *  +24:  n_heads         (i64)
+ *  +32:  n_kv_heads      (i64)
+ *  +40:  d_head          (i64)
+ *  +48:  attn_start      (i64)
+ *  +56:  attn_len        (i64)
+ *  +64:  attn_scale      (i64)
+ *  +72:  scores_addr     (i64, TFM_SCRATCH)
+ *  +80:  kv_pos_stride   (i64)
+ *  +88:  kv_d            (i64, n_kv_heads * d_head)
+ */
+#define ATTN_MAILBOX (MAILBOX_ADDR + 0x400ULL)
+
+void tfm_attention_score_c_mailbox(void)
+{
+    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)ATTN_MAILBOX;
+    const int64_t *q_data     = (const int64_t *)(uintptr_t)mb[0];
+    int64_t *out_data         = (int64_t *)(uintptr_t)mb[1];
+    int64_t  kv_layer_off     = mb[2];
+    int64_t  n_heads          = mb[3];
+    int64_t  n_kv_heads       = mb[4];
+    int64_t  d_head           = mb[5];
+    int64_t  attn_start       = mb[6];
+    int64_t  attn_len         = mb[7];
+    int64_t  attn_scale       = mb[8];
+    int64_t *scores           = (int64_t *)(uintptr_t)mb[9];
+    int64_t  kv_pos_stride    = mb[10];
+    int64_t  kv_d             = mb[11];
+
+    int64_t heads_per_kv = n_heads / n_kv_heads;
+    int64_t seq_len = attn_start + attn_len;
+
+    for (int64_t h = 0; h < n_heads; h++) {
+        int64_t q_head_off = h * d_head;
+        int64_t kv_head = h / heads_per_kv;
+        int64_t kv_head_off = kv_head * d_head;
+
+        /* Dot-product scoring: Q · K for each position */
+        for (int64_t si = 0; si < attn_len; si++) {
+            int64_t p = attn_start + si;
+            const int64_t *k_cache = (const int64_t *)(uintptr_t)(
+                kv_layer_off + p * kv_pos_stride);
+            int64_t dot = 0;
+            for (int64_t d = 0; d < d_head; d++) {
+                int64_t qi = q_data[q_head_off + d];
+                int64_t ki = k_cache[kv_head_off + d];
+                dot += (qi * ki) / 1000;
+            }
+            scores[si] = (dot * attn_scale) / 1000;
+        }
+
+        /* Softmax: max → exp → normalize */
+        int64_t max_score = scores[0];
+        for (int64_t si = 1; si < attn_len; si++) {
+            if (scores[si] > max_score) max_score = scores[si];
+        }
+        int64_t exp_sum = 0;
+        for (int64_t si = 0; si < attn_len; si++) {
+            int64_t e = c_exp_approx(scores[si] - max_score);
+            scores[si] = e;
+            exp_sum += e;
+        }
+        if (exp_sum > 0) {
+            for (int64_t si = 0; si < attn_len; si++) {
+                scores[si] = (scores[si] * 1000) / exp_sum;
+            }
+        }
+
+        /* Weighted sum of V */
+        for (int64_t d = 0; d < d_head; d++) {
+            int64_t weighted = 0;
+            for (int64_t si = 0; si < attn_len; si++) {
+                int64_t p = attn_start + si;
+                const int64_t *v_cache = (const int64_t *)(uintptr_t)(
+                    kv_layer_off + p * kv_pos_stride + kv_d * 8);
+                weighted += (scores[si] * v_cache[kv_head_off + d]) / 1000;
+            }
+            out_data[q_head_off + d] = weighted;
+        }
+    }
+}
