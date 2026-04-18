@@ -2161,53 +2161,18 @@ const LM_TOPK_K: i64 = 8
 // loop into call sites where O2 over-aggressively reorders memory accesses,
 // producing the EXC:13 GP fault observed at offset 0x164C35. Same approach
 // is used for the existing v5_4bit hot path.
+// V30 P3.6: dispatch to gcc-compiled C lmhead argmax via mailbox.
+// Same Fajar Lang LLVM codegen bug as km_vecmat_packed_v8.
 @noinline
 @kernel fn mdl_ram_lmhead_argmax_v8_tied(x_addr: i64) -> i64 {
-    let vocab_size = mdl_get_vocab_size()
-    let d_model = mdl_get_d_model()
-
-    let total_elems = vocab_size * d_model
-    let packed_bytes = total_elems / 2
-    let n_groups = (total_elems + 127) / 128
-    let scales_base = STREAM_EMBED_BASE + packed_bytes
-    let zeros_base = scales_base + n_groups * 4
-
-    let mut best_token: i64 = 0
-    let mut best_score: i64 = -999999999
-    let mut v: i64 = 0
-    // V28.2 P2: this volatile read is REQUIRED to avoid an LLVM O2
-    // miscompile that causes EXC:13 (GP fault) at offset 0x164C35.
-    // Removing it triggers the fault during the second iteration of the
-    // 262K-vocab loop. The existing v5_4bit hot path has the same kind of
-    // protection — see comment "v5 4-bit sample function not implemented".
-    let _llvm_o2_guard = volatile_read_u64(MDL_V7_EXTRA + 104)
-    while v < vocab_size {
-        let row_start = v * d_model
-        let mut sum: i64 = 0
-        let mut i: i64 = 0
-        while i < d_model {
-            let flat_idx = row_start + i
-            let byte_idx = flat_idx >> 1
-            let bit_off = (flat_idx & 1) * 4
-            let raw = volatile_read_u8(STREAM_EMBED_BASE + byte_idx)
-            let q = (raw >> bit_off) & 15
-
-            let g = flat_idx >> 7
-            let scale = mdl_read_u32(scales_base + g * 4)
-            let zero = volatile_read_u8(zeros_base + g)
-            let w_x_1M = (q - zero) * scale
-
-            let x_val = volatile_read_u64(x_addr + i * 8)
-            sum = sum + (x_val * w_x_1M) / 1000000
-            i = i + 1
-        }
-        if sum > best_score {
-            best_score = sum
-            best_token = v
-        }
-        v = v + 1
-    }
-    best_token
+    // Mailbox at 0xBEA100 (separate from vecmat mailbox at 0xBEA000)
+    volatile_write_u64(0xBEA100, x_addr)
+    volatile_write_u64(0xBEA108, STREAM_EMBED_BASE)
+    volatile_write_u64(0xBEA110, mdl_get_vocab_size())
+    volatile_write_u64(0xBEA118, mdl_get_d_model())
+    asm!("movabs $$mdl_lmhead_argmax_v8_tied_mailbox, %rax; call *%rax")
+    // Read best_token from mailbox result slot
+    volatile_read_u64(0xBEA120)
 }
 
 // Shell command: ram-load

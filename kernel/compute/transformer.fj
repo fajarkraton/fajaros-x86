@@ -1714,8 +1714,9 @@ const STFM_FFN_UP: i64 = 0x12020000     // gated FFN up buf (56 KB)
         // an i64 region of size 1 rather than growing the emit API to
         // accept a bare value.
         volatile_write_u64(FJTRACE_STATE + 56, next_token)
+        // V30 P3.6: read best_score from C lmhead mailbox result (0xBEA128)
         fjtrace_emit_mem_i64("argmax", FJTRACE_STATE + 56, 1, pos, -1, 1,
-                             "best_score", 0,
+                             "best_score", volatile_read_u64(0xBEA128),
                              "vocab_size", mdl_get_vocab_size())
     }
 
