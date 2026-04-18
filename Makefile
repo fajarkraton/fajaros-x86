@@ -13,6 +13,12 @@ STARTUP_S := boot/startup.S
 STARTUP_O := $(BUILD_DIR)/startup.o
 RUNTIME_S := boot/runtime_stubs.S
 RUNTIME_O := $(BUILD_DIR)/runtime_stubs.o
+# V30 P3.6: gcc-compiled C vecmat bypasses Fajar Lang LLVM codegen bug.
+# The Fajar Lang LLVM backend produces wrong results for km_vecmat_packed_v8
+# (gate_proj max=3949 vs correct max=9251). The C version is bit-exact with
+# the Python reference simulator. See kernel/compute/vecmat_v8.c.
+VECMAT_C   := kernel/compute/vecmat_v8.c
+VECMAT_O   := $(BUILD_DIR)/vecmat_v8_c.o
 LINKER_LD := linker.ld
 ISO_FILE := $(BUILD_DIR)/fajaros.iso
 GRUB_CFG := grub.cfg
@@ -245,16 +251,25 @@ $(RUNTIME_O): $(RUNTIME_S)
 	as --64 -o $(RUNTIME_O) $(RUNTIME_S)
 	@echo "[OK] Assembled runtime stubs: $(RUNTIME_O)"
 
+# V30 P3.6: compile C vecmat (gcc, bypasses Fajar Lang LLVM codegen bug)
+$(VECMAT_O): $(VECMAT_C)
+	@mkdir -p $(BUILD_DIR)
+	gcc -O3 -march=native -ffreestanding -nostdlib -fno-pic \
+		-mcmodel=small -fcf-protection=none \
+		-c -o $(VECMAT_O) $(VECMAT_C)
+	@echo "[OK] Compiled C vecmat: $(VECMAT_O)"
+
 # Build kernel with LLVM backend (optimized, uses hardware features)
 # Auto-generates startup.S + linker script internally
 #
+# V30 P3.6: uses ld-wrapper to capture intermediate .o files, then relinks
+# with the gcc C vecmat object. The C vecmat is bit-exact with the Python
+# reference simulator; the Fajar Lang LLVM version is not (codegen bug).
+#
 # V29.P1.P3 prevention layer: after `fj build`, verify that the ELF
-# was actually produced. The fj binary may exit 0 on certain error
-# paths (e.g., LE001 "unknown annotation") without emitting the
-# output file. Before V29.P1 this was invisible — the Makefile
-# unconditionally echoed `[OK] LLVM kernel built` even when no ELF
-# existed. The `test -f` guard makes such failures loud and fast.
-build-llvm: $(COMBINED) $(RUNTIME_O)
+# was actually produced.
+build-llvm: $(COMBINED) $(RUNTIME_O) $(VECMAT_O)
+	@# Step 1: compile FJ to .o + capture via ld wrapper
 	@$(FJ) build --no-std --backend llvm \
 		--opt-level $(LLVM_OPT) \
 		--target-cpu $(LLVM_CPU) \
@@ -263,7 +278,15 @@ build-llvm: $(COMBINED) $(RUNTIME_O)
 		--code-model kernel \
 		--reloc static \
 		--extra-objects $(RUNTIME_O) \
-		$(COMBINED) -o $(KERNEL_LLVM) 2>&1 | { grep -v "SE009\|SE010\|prefix with underscore\|unused variable\|^  " || true; }
+		--linker scripts/ld-wrapper.sh \
+		$(COMBINED) -o /dev/null 2>&1 | { grep -v "SE009\|SE010\|prefix with underscore\|unused variable\|^  \|undefined reference.*mailbox\|error: linker" || true; }
+	@# Step 2: relink with C vecmat (no gc-sections — C symbol must survive)
+	@ld -T $(LINKER_LD) -nostdlib \
+		$(BUILD_DIR)/combined.start.o.saved \
+		$(VECMAT_O) \
+		$(BUILD_DIR)/combined.o.saved \
+		$(RUNTIME_O) \
+		-o $(KERNEL_LLVM) 2>&1 | { grep -v "missing .note.GNU-stack\|deprecated" || true; }
 	@test -f $(KERNEL_LLVM) || { \
 		echo ""; \
 		echo "[FAIL] $(KERNEL_LLVM) not produced despite fj build exit 0."; \

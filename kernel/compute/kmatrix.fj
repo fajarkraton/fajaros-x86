@@ -819,41 +819,18 @@ const V8_SCALE_FP: i64 = 1000000  // scales stored as int32(round(scale × this)
 // 26-layer × 7-matmul × multi-call sites caused EXC:13 GP faults in the
 // v8 lmhead chain. Keeping it as a discrete function with explicit
 // boundaries lets the optimizer reason about each call independently.
+// V30 P3.6: dispatch to gcc-compiled C vecmat via mailbox.
+// Fajar Lang's LLVM codegen produces wrong gate_proj results.
+// gcc C version produces bit-exact results matching the sim.
 @noinline
 @kernel fn km_vecmat_packed_v8(x_addr: i64, mat_addr: i64, m: i64, n: i64,
                                  out_addr: i64) {
-    // Bounds: we trust the caller on sizes. Addresses are kernel-region
-    // identity-mapped (up to 1 GB via extend_identity_mapping_512).
-    let total_elems = m * n
-    let packed_bytes = total_elems / 2  // 4-bit: 2 elems per byte
-    let n_groups = (total_elems + V8_GROUP_SIZE - 1) >> V8_GROUP_SHIFT
-    let scales_base = mat_addr + packed_bytes
-    let zeros_base = scales_base + n_groups * 4
-
-    let mut j: i64 = 0
-    while j < n {
-        let mut sum: i64 = 0
-        let mut k: i64 = 0
-        while k < m {
-            let flat_idx = k * n + j
-            let byte_idx = flat_idx >> 1            // /2
-            let bit_off = (flat_idx & 1) * 4        // 0 or 4
-            let raw_byte = volatile_read_u8(mat_addr + byte_idx)
-            let q = (raw_byte >> bit_off) & 15
-
-            let g = flat_idx >> V8_GROUP_SHIFT      // / 128
-            let scale = mdl_read_u32(scales_base + g * 4)
-            let zero = volatile_read_u8(zeros_base + g)
-
-            let w_x_1M = (q - zero) * scale         // w × 1_000_000
-
-            let v = volatile_read_u64(x_addr + k * 8)
-            sum = sum + (v * w_x_1M) / V8_SCALE_FP
-            k = k + 1
-        }
-        volatile_write_u64(out_addr + j * 8, sum)
-        j = j + 1
-    }
+    volatile_write_u64(0xBEA000, x_addr)
+    volatile_write_u64(0xBEA008, mat_addr)
+    volatile_write_u64(0xBEA010, m)
+    volatile_write_u64(0xBEA018, n)
+    volatile_write_u64(0xBEA020, out_addr)
+    asm!("movabs $$km_vecmat_packed_v8_mailbox, %rax; call *%rax")
 }
 
 // ═══════════════════════════════════════════════════════════════
