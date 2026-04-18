@@ -301,6 +301,10 @@ const TOK_MAX_OUTPUT: i64 = 2048
             j = j + 1
         }
 
+        // Defensive bounds check before write (loop condition guards this,
+        // but explicit check prevents buffer overrun if loop logic changes)
+        if n_tokens >= TOK_MAX_OUTPUT { break }
+
         if best_id >= 0 {
             volatile_write_u64(out_addr + n_tokens * 8, best_id)
             pos = pos + best_len

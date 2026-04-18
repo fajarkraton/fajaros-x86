@@ -359,17 +359,17 @@ const KM_TILE_SIZE: i64 = 64
     }
     let mean = sum / dim
 
-    // Step 2: compute variance = sum((x - mean)^2) / (dim * 1000)
-    // Accumulate raw diff² first, divide once at end for precision
+    // Step 2: compute variance = sum((x - mean)^2) / dim
+    // Accumulate raw diff² (safe for |diff| < 89M, i.e. |real| < 89K)
+    // Result: raw_var = real_variance * 10^6, so sqrt = real_std * 10^3
     let mut var_sum: i64 = 0
     i = 0
     while i < dim {
         let diff = volatile_read_u64(data + i * 8) - mean
-        // Divide by dim inside loop to prevent overflow for large dim
-        var_sum = var_sum + (diff / dim) * (diff / 1000)
+        var_sum = var_sum + diff * diff
         i = i + 1
     }
-    let variance = if var_sum < 0 { 0 - var_sum } else { var_sum }
+    let variance = (if var_sum < 0 { 0 - var_sum } else { var_sum }) / dim
     // eps = 1 (= 0.001 in original scale)
     let std_dev = km_isqrt(variance + 1)
     if std_dev == 0 { return }

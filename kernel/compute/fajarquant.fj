@@ -172,8 +172,11 @@ const Q3_C7: i64 = 866
         while j < actual_dim {
             let r = volatile_read_u64(FQ_ROTATION_BASE + (i * FQ_ROTATION_DIM + j) * 8)
             let v = volatile_read_u64(input_addr + j * 8)
-            // Divide per-element to prevent overflow (r is x1000 scaled)
-            sum = sum + (r * v) / 1000
+            // Overflow-safe: split r (x1000 scaled) into integer + fractional parts
+            // (r/1000)*v is exact for the integer part; (r%1000)*v/1000 preserves sub-unit
+            let r_int = r / 1000
+            let r_frac = r % 1000
+            sum = sum + r_int * v + (r_frac * v) / 1000
             j = j + 1
         }
         volatile_write_u64(output_addr + i * 8, sum)

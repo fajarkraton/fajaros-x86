@@ -213,10 +213,15 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     if vocab_size <= 0 || vocab_size > MDL_MAX_VOCAB { return -3 }
     if quant_bits < 1 || quant_bits > 8 { return -3 }
 
-    // Validate offsets don't exceed file size
+    // Validate offsets: must be within file and after header
     // v3 and v4 share same 160-byte header layout. v7 and v8 share 176 B.
     let min_hdr = if version >= 7 { FJM_HEADER_V7_SIZE } else if version >= 3 { FJM_HEADER_SIZE } else if version >= 2 { FJM_HEADER_V2_SIZE } else { FJM_HEADER_V1_SIZE }
     if total_size < min_hdr { return -3 }
+    // Offsets must point past the header (data cannot overlap header)
+    if embed_off < min_hdr { return -3 }
+    if layer0_off < min_hdr { return -3 }
+    if lmhead_off < min_hdr { return -3 }
+    // Offsets must be within file bounds
     if embed_off >= total_size { return -3 }
     if layer0_off >= total_size { return -3 }
     if lmhead_off >= total_size { return -3 }
