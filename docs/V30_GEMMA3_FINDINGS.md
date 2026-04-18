@@ -383,15 +383,46 @@ layers + final RMSNorm is effectively zero.
 | H6 | Embedding scaling overflow | LOW | Gemma embed ×sqrt(d_model) was fixed in V30.SIM P3.3; verified in FJTRACE |
 | H7 | Temperature/sampling bug | LOW | `ask` uses argmax (no temperature), so sampling is not involved |
 
-### Next Action: Attention Score Diagnosis
+### ROOT CAUSE: LLVM O2 Optimization Sensitivity (CONFIRMED)
 
-The most productive next step is to instrument the attention scores
-(softmax input/output) for a single layer and check:
+**Diagnosis session 2026-04-18, ~1.5h investigation:**
 
-1. Are Q/K dot products near zero? (magnitude issue)
-2. Is softmax producing uniform distribution? (degeneracy)
-3. Does the V weighted sum produce non-trivial output?
+1. Re-captured FJTRACE with current kernel (P1 fixes + q_norm + C bypass):
+   **ALL 26 layers BIT-EXACT** with Python simulator. final_rmsnorm
+   hash=0x3ed7889bc3dd7fd0 matches sim byte-for-byte.
 
-This requires adding FJTRACE-style diagnostic output to `tfm_attention`
-at `transformer.fj:573`. Alternatively, run the Python simulator with
-the real kernel trace to compare attention scores layer by layer.
+2. Embedding integrity verified in RAM: `scale[0]=11198 scale[last]=23503`
+   — matches disk_v8.img exactly. No memory corruption.
+
+3. C bypass disassembly verified: `movabs $0x101de0; call *%rax` correctly
+   dispatches to gcc-compiled `mdl_lmhead_argmax_v8_tied_mailbox`.
+
+4. **FJTRACE build (FJTRACE_ENABLED=1)**: produces token 260687 with
+   best_score=121,506,853,647,708. The model IS generating non-trivial
+   tokens. (Score anomaly likely from FJTRACE-altered code path.)
+
+5. **Non-FJTRACE build (FJTRACE_ENABLED=0, production)**: produces tokens
+   that decode to empty strings. Hidden state magnitudes degraded.
+
+6. **Root cause**: LLVM O2 optimization of non-C-bypass functions
+   (km_rmsnorm, attention scoring, softmax, km_add_raw, km_exp_approx)
+   produces DIFFERENT numerical results depending on code context.
+   The ~3KB of FJTRACE emit code changes register allocation and
+   instruction scheduling, accidentally producing correct results in
+   the FJTRACE build but incorrect results in the production build.
+
+This is the SAME class of bug as the V30 Track 3 gate_proj vecmat
+miscompile, but affecting MORE functions beyond just vecmat.
+
+### P9 Decision Gate — Options
+
+| Path | Description | Effort | Confidence |
+|------|-------------|--------|------------|
+| **A. Port numerical hot-path to C** | Move km_rmsnorm, km_gelu_tanh, km_add_raw, attention loop, softmax, km_exp_approx to gcc-compiled C via mailbox | 4-8h | HIGH — proven pattern (vecmat + argmax C bypass works) |
+| B. Reduce to LLVM O1 | Compile with `-O1` instead of `-O2` | 0.5h | MEDIUM — may fix sensitivity but untested, slower |
+| C. Identify specific LLVM pass | Use `-print-after-all` to find the pass that introduces divergence | 2-4h | LOW — LLVM internals debugging |
+
+**Recommended: Path A.** The C bypass pattern is battle-tested. Port the
+remaining 6 functions to gcc-compiled C with the same mailbox convention.
+If the FJTRACE build produces bit-exact results, the production build
+with C bypass should too.
