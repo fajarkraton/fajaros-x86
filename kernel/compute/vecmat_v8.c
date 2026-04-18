@@ -47,7 +47,13 @@ void mdl_lmhead_argmax_v8_tied_mailbox(void)
     int64_t best_token = 0;
     int64_t best_score = -999999999LL;
 
-    for (int64_t v = 0; v < vocab_size; v++) {
+    /* Gemma 3 vocab: 255902 real tokens + 6242 <unused> entries.
+     * 4-bit quantization noise on untrained <unused> weights produces
+     * spuriously high scores, drowning out the correct answer.
+     * Mask to real tokens only (0..255901). */
+    int64_t effective_vocab = vocab_size < 255902 ? vocab_size : 255902;
+
+    for (int64_t v = 0; v < effective_vocab; v++) {
         int64_t row_start = v * d_model;
         int64_t sum = 0;
         for (int64_t i = 0; i < d_model; i++) {
