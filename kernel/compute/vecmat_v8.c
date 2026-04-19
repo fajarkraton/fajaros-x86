@@ -23,54 +23,16 @@ static inline int64_t get_model_embed_bits(void) {
  */
 #define EMBED_MAILBOX (MAILBOX_ADDR + 0x500ULL)
 
-void mdl_embed_lookup_c_mailbox(void)
-{
-    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)EMBED_MAILBOX;
-    int64_t token_id   = mb[0];
-    int64_t out_addr   = mb[1];
-    int64_t embed_base = mb[2];
-    int64_t vocab_size = mb[3];
-    int64_t d_model    = mb[4];
-    int64_t bits       = get_model_embed_bits();
-
-    if (token_id < 0 || token_id >= vocab_size) return;
-
-    int64_t total = vocab_size * d_model;
-    int64_t packed_bytes = (bits == 8) ? total : total / 2;
-    int64_t n_groups = (total + 127) >> V8_GROUP_SHIFT;
-    int64_t scales_base = embed_base + packed_bytes;
-    int64_t zeros_base = scales_base + n_groups * 4;
-
-    const uint8_t *packed = (const uint8_t *)(uintptr_t)embed_base;
-    const uint32_t *scales = (const uint32_t *)(uintptr_t)scales_base;
-    const uint8_t *zeros_arr = (const uint8_t *)(uintptr_t)zeros_base;
-    int64_t *out = (int64_t *)(uintptr_t)out_addr;
-
-    int64_t row_start = token_id * d_model;
-
-    if (bits == 8) {
-        for (int64_t i = 0; i < d_model; i++) {
-            int64_t fi = row_start + i;
-            int64_t q = packed[fi];
-            int64_t g = fi >> V8_GROUP_SHIFT;
-            int64_t scale = (int64_t)scales[g];
-            int64_t zero = (int64_t)zeros_arr[g];
-            int64_t w_x_1M = (q - zero) * scale;
-            out[i] = w_x_1M / 1000;
-        }
-    } else {
-        for (int64_t i = 0; i < d_model; i++) {
-            int64_t fi = row_start + i;
-            uint8_t raw = packed[fi >> 1];
-            int64_t q = (raw >> ((fi & 1) * 4)) & 15;
-            int64_t g = fi >> V8_GROUP_SHIFT;
-            int64_t scale = (int64_t)scales[g];
-            int64_t zero = (int64_t)zeros_arr[g];
-            int64_t w_x_1M = (q - zero) * scale;
-            out[i] = w_x_1M / 1000;
-        }
-    }
-}
+/* Embed lookup: reuses vecmat mailbox with special mode flag.
+ * When mb[5] (bits) is negative, mailbox is in embed-lookup mode:
+ *   mb[0] = embed_base (STREAM_EMBED_BASE)
+ *   mb[1] = token_id
+ *   mb[2] = vocab_size
+ *   mb[3] = d_model
+ *   mb[4] = out_addr
+ *   mb[5] = -bits (negative = embed mode; -4 or -8)
+ *
+ * Called via the SAME asm! as km_vecmat_packed_v8_mailbox. */
 
 /* Debug: write lmhead results to a fixed memory location (0xBEB000).
  * The FJ side can read these after the call returns.
@@ -183,6 +145,7 @@ void km_vecmat_packed_v8_mailbox(void)
 {
     /* Read args from mailbox (volatile — FJ just wrote them) */
     volatile int64_t *mb = (volatile int64_t *)(uintptr_t)MAILBOX_ADDR;
+
     int64_t x_addr   = mb[0];
     int64_t mat_addr  = mb[1];
     int64_t m         = mb[2];
