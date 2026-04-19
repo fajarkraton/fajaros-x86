@@ -26,7 +26,7 @@ GRUB_CFG := grub.cfg
 # LLVM backend settings
 LLVM_OPT := 2
 LLVM_CPU := native
-LLVM_FEATURES := +avx2,+fma,+popcnt,+aes
+LLVM_FEATURES := -avx,-avx2,-avx512f,+popcnt,+aes
 
 # Source files in concatenation order (dependencies first)
 # 1. Constants and low-level primitives

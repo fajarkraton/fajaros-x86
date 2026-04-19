@@ -261,6 +261,7 @@ const TOK_MAX_OUTPUT: i64 = 2048
 @kernel fn tok_encode_bpe(text_addr: i64, text_len: i64, out_addr: i64) -> i64 {
     let table_addr = volatile_read_u64(TOK_META + TOK_M_TABLE_ADDR)
     let vocab_size = volatile_read_u64(TOK_META + TOK_M_VOCAB)
+    if table_addr == 0 || vocab_size <= 0 || vocab_size > 300000 { return -1 }
     let mut pos: i64 = 0
     let mut n_tokens: i64 = 0
 
@@ -273,14 +274,19 @@ const TOK_MAX_OUTPUT: i64 = 2048
 
         // V30 Path B: linear scan over all vocab entries.
         // Entries are in original token_id order (not sorted by first byte).
-        // This is O(vocab_size) per position but only runs on short prompts.
-        // For 262K vocab × ~20 byte prompt = ~5M iterations, ~5ms with KVM.
-        let mut j: i64 = 0
+        // Only scans first 256 entries (byte-level) + space-prefixed entries
+        // matching first_byte for efficiency. Falls back to byte token if
+        // no multi-byte match found.
+        //
+        // Strategy: check byte-level token first_byte (ID = first_byte for
+        // IDs 0-255), then scan the full vocab for longer matches.
+        // The byte-level fallback guarantees progress.
+        let mut j: i64 = 256  // skip byte-level tokens (0-255), handle via fallback
         while j < vocab_size {
             let entry = table_addr + j * TOK_ENTRY_SIZE
             let tok_len = volatile_read_u8(entry)
 
-            if tok_len > 0 && tok_len <= remaining && tok_len > best_len {
+            if tok_len > 0 && tok_len <= remaining && tok_len > best_len && tok_len <= 15 {
                 // Quick first-byte check before full match
                 if volatile_read_u8(entry + 1) == first_byte {
                     let mut match_ok: i64 = 1

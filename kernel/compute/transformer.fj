@@ -1791,6 +1791,8 @@ const STFM_FFN_UP: i64 = 0x2C020000     // gated FFN up buf (56 KB)
         if next == eos {
             gen_count = max_gen
         } else {
+            // Print first 10 token IDs for diagnostics
+            if gen_count < 10 { cprint_decimal(next, YELLOW_ON_BLACK); console_putchar(44, WHITE_ON_BLACK) }
             // Stream output
             let dec_len = tok_decode(next, dec_buf)
             let mut j: i64 = 0
