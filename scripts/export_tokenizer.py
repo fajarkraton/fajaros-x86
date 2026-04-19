@@ -96,18 +96,21 @@ def build_fjt(tokens: list) -> bytes:
     if max_len > FJT_MAX_TOKEN_BYTES:
         max_len = FJT_MAX_TOKEN_BYTES
 
-    # Sort by first byte, then by length descending (for greedy longest-match)
-    indexed = list(enumerate(tokens))
-    indexed.sort(key=lambda x: (x[1][0] if x[1] else 0, -len(x[1])))
+    # V30 Path B FIX: entries MUST be in original token_id order for tok_decode.
+    # The kernel's tok_decode_bpe accesses entry = table_addr + token_id * 16,
+    # so position i must hold the string for token_id i. Sorting by first-byte
+    # was an encoding optimization that broke decoding (token 106 = <end_of_turn>
+    # was replaced by Hindi text at position 106 after sort).
+    # BPE encoder (tok_encode) does its own linear search, so sort is not needed.
 
     # Build header
     header = struct.pack("<4sIIII",
         FJT_MAGIC_BYTES, 1, vocab_size, max_len, 0)
     header += b"\x00" * (FJT_HEADER_SIZE - len(header))
 
-    # Build entries (in sorted order — IDs are positional)
+    # Build entries (in original token_id order — position = token_id)
     entries = b""
-    for orig_id, token_bytes in indexed:
+    for token_bytes in tokens:
         tok_len = min(len(token_bytes), FJT_MAX_TOKEN_BYTES)
         entry = bytes([tok_len]) + token_bytes[:tok_len]
         entry += b"\x00" * (FJT_ENTRY_SIZE - len(entry))
@@ -121,7 +124,7 @@ def build_fjt(tokens: list) -> bytes:
 
     # Print first-byte index stats
     fb_counts = {}
-    for _, t in indexed:
+    for t in tokens:
         fb = t[0] if t else 0
         fb_counts[fb] = fb_counts.get(fb, 0) + 1
     printable = sum(1 for fb in fb_counts if 32 <= fb < 127)

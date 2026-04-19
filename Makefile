@@ -255,7 +255,7 @@ $(RUNTIME_O): $(RUNTIME_S)
 $(VECMAT_O): $(VECMAT_C)
 	@mkdir -p $(BUILD_DIR)
 	gcc -O3 -march=native -mno-avx -mno-avx2 -mno-avx512f \
-		-ffreestanding -nostdlib -fno-pic \
+		-ffreestanding -nostdlib -fno-pic -mno-red-zone \
 		-mcmodel=small -fcf-protection=none \
 		-c -o $(VECMAT_O) $(VECMAT_C)
 	@echo "[OK] Compiled C vecmat: $(VECMAT_O)"

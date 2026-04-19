@@ -369,21 +369,20 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 // V28.1: freq_base is the inv_freq table to use for this layer. For Gemma 3,
 // caller picks ROPE_FREQ_BASE (local, 10K) or ROPE_FREQ_GLOBAL (global, 1M)
 // based on the layer's position in the sliding_pattern cycle.
+// V30 Path B: C bypass for RoPE (LLVM O2 sensitivity on 8-bit models).
+// @noinline wrapper calls gcc-compiled tfm_rope_apply_c_mailbox.
+@noinline
 @kernel fn tfm_rope_apply_at(q_data: i64, k_data: i64, pos: i64,
                               n_heads: i64, n_kv_heads: i64, d_head: i64,
                               freq_base: i64) {
-    // Apply to each Q head
-    let mut h: i64 = 0
-    while h < n_heads {
-        tfm_rope_apply_head_at(q_data + h * d_head * 8, pos, d_head, freq_base)
-        h = h + 1
-    }
-    // Apply to each KV head
-    h = 0
-    while h < n_kv_heads {
-        tfm_rope_apply_head_at(k_data + h * d_head * 8, pos, d_head, freq_base)
-        h = h + 1
-    }
+    volatile_write_u64(0xBEA600, q_data)
+    volatile_write_u64(0xBEA608, k_data)
+    volatile_write_u64(0xBEA610, pos)
+    volatile_write_u64(0xBEA618, n_heads)
+    volatile_write_u64(0xBEA620, n_kv_heads)
+    volatile_write_u64(0xBEA628, d_head)
+    volatile_write_u64(0xBEA630, freq_base)
+    asm!("movabs $$tfm_rope_apply_c_mailbox, %rax; call *%rax")
 }
 
 // Legacy wrapper — uses ROPE_FREQ_BASE (local) for all layers.
@@ -1624,7 +1623,10 @@ const STFM_FFN_UP: i64 = 0x2C020000     // gated FFN up buf (56 KB)
     // V28.2: v8 dispatch first (group-wise), then v5 4-bit, else generic.
     // Group-wise reads [packed][scales][zeros] inline at STREAM_EMBED_BASE.
     if mdl_is_groupwise() == 1 {
-        mdl_stream_embed_lookup_raw_v8(token_id, STFM_X)
+        // V30 Path B: C bypass embed lookup for LLVM O2 determinism.
+        // Uses @noinline wrapper (mdl_embed_lookup_c) that calls gcc-compiled
+        // mdl_embed_lookup_c_mailbox. Same pattern as km_vecmat_packed_v8.
+        mdl_embed_lookup_c(token_id, STFM_X)
     } else {
         let v5_embed_4bit = mdl_get_version() >= 5 && mdl_get_embed_bits() == 4
         if v5_embed_4bit {
@@ -1639,19 +1641,18 @@ const STFM_FFN_UP: i64 = 0x2C020000     // gated FFN up buf (56 KB)
     }
 
     // Step 1.5: Gemma 3 embed scaling — hidden_states = inputs_embeds * sqrt(d_model)
-    // Gemma 3 HF reference: Gemma3TextModel.forward scales by config.hidden_size**0.5.
-    // Without this, hidden-state magnitudes are ~34× too small and everything
-    // downstream (norms, attention, logits) degenerates toward token 0 / <pad>.
-    // Guard by model_type 10/11 (Gemma 3) — SmolLM/Llama do not scale embeds.
-    let mt = mdl_get_model_type()
-    if mt == 10 || mt == 11 {
-        // sqrt(d_model) in ×1000 fixed-point: sqrt(d_model * 1_000_000)
-        let scale_x1000 = km_isqrt(d_model * 1000000)
-        let mut si: i64 = 0
-        while si < d_model {
-            let v = volatile_read_u64(STFM_X + si * 8)
-            volatile_write_u64(STFM_X + si * 8, v * scale_x1000 / 1000)
-            si = si + 1
+    // V30 Path B: moved to C embed function (mdl_embed_lookup_c_mailbox) for
+    // group-wise models. Only apply FJ-side scaling for non-group-wise path.
+    if mdl_is_groupwise() == 0 {
+        let mt = mdl_get_model_type()
+        if mt == 10 || mt == 11 {
+            let scale_x1000 = km_isqrt(d_model * 1000000)
+            let mut si: i64 = 0
+            while si < d_model {
+                let v = volatile_read_u64(STFM_X + si * 8)
+                volatile_write_u64(STFM_X + si * 8, v * scale_x1000 / 1000)
+                si = si + 1
+            }
         }
     }
 
@@ -1787,7 +1788,6 @@ const STFM_FFN_UP: i64 = 0x2C020000     // gated FFN up buf (56 KB)
 
     while gen_count < max_gen && pos < TFM_KV_MAX_POS {
         let next = tfm_forward_stream(prev_token, pos)
-
         if next == eos {
             gen_count = max_gen
         } else {

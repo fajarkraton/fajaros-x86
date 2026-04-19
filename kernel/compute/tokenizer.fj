@@ -260,42 +260,41 @@ const TOK_MAX_OUTPUT: i64 = 2048
 // BPE encode: greedy longest-match
 @kernel fn tok_encode_bpe(text_addr: i64, text_len: i64, out_addr: i64) -> i64 {
     let table_addr = volatile_read_u64(TOK_META + TOK_M_TABLE_ADDR)
-    let max_len = volatile_read_u64(TOK_META + TOK_M_MAX_LEN)
+    let vocab_size = volatile_read_u64(TOK_META + TOK_M_VOCAB)
     let mut pos: i64 = 0
     let mut n_tokens: i64 = 0
 
     while pos < text_len && n_tokens < TOK_MAX_OUTPUT {
         let first_byte = volatile_read_u8(text_addr + pos)
-
-        // Look up first-byte index
-        let packed = volatile_read_u64(TOK_FIRST_BYTE + first_byte * 8)
-        let fb_start = (packed >> 32) & 0xFFFFFFFF
-        let fb_count = packed & 0xFFFFFFFF
+        let remaining = text_len - pos
 
         let mut best_id: i64 = -1
         let mut best_len: i64 = 0
 
-        // Search entries for this first byte (sorted longest first)
+        // V30 Path B: linear scan over all vocab entries.
+        // Entries are in original token_id order (not sorted by first byte).
+        // This is O(vocab_size) per position but only runs on short prompts.
+        // For 262K vocab × ~20 byte prompt = ~5M iterations, ~5ms with KVM.
         let mut j: i64 = 0
-        while j < fb_count {
-            let entry = table_addr + (fb_start + j) * TOK_ENTRY_SIZE
-            let tok_len = volatile_read_u8(entry)  // length at offset 0
-            let remaining = text_len - pos
+        while j < vocab_size {
+            let entry = table_addr + j * TOK_ENTRY_SIZE
+            let tok_len = volatile_read_u8(entry)
 
-            if tok_len <= remaining && tok_len > best_len {
-                // Try to match
-                let mut match_ok: i64 = 1
-                let mut k: i64 = 0
-                while k < tok_len && match_ok == 1 {
-                    if volatile_read_u8(entry + 1 + k) != volatile_read_u8(text_addr + pos + k) {
-                        match_ok = 0
+            if tok_len > 0 && tok_len <= remaining && tok_len > best_len {
+                // Quick first-byte check before full match
+                if volatile_read_u8(entry + 1) == first_byte {
+                    let mut match_ok: i64 = 1
+                    let mut k: i64 = 1
+                    while k < tok_len && match_ok == 1 {
+                        if volatile_read_u8(entry + 1 + k) != volatile_read_u8(text_addr + pos + k) {
+                            match_ok = 0
+                        }
+                        k = k + 1
                     }
-                    k = k + 1
-                }
-                if match_ok == 1 {
-                    best_id = fb_start + j
-                    best_len = tok_len
-                    j = fb_count  // found longest match, stop
+                    if match_ok == 1 {
+                        best_id = j
+                        best_len = tok_len
+                    }
                 }
             }
             j = j + 1

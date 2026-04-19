@@ -2124,6 +2124,22 @@ const LM_TOPK_K: i64 = 8
     0
 }
 
+// V30 Path B: C bypass for embed lookup.
+// @noinline wrapper matches the proven pattern from km_vecmat_packed_v8
+// and mdl_ram_lmhead_argmax_v8_tied — the asm! call is in its own
+// @noinline function to avoid LLVM register-pressure interference.
+// EXC:14 was observed when asm! was placed directly in tfm_forward_stream.
+@noinline
+@kernel fn mdl_embed_lookup_c(token_id: i64, out_addr: i64) {
+    volatile_write_u64(0xBEA500, token_id)
+    volatile_write_u64(0xBEA508, out_addr)
+    volatile_write_u64(0xBEA510, STREAM_EMBED_BASE)
+    volatile_write_u64(0xBEA518, mdl_get_vocab_size())
+    volatile_write_u64(0xBEA520, mdl_get_d_model())
+    volatile_write_u64(0xBEA528, mdl_get_model_type())  // for Gemma sqrt scaling
+    asm!("movabs $$mdl_embed_lookup_c_mailbox, %rax; call *%rax")
+}
+
 // V28.2 v8 — group-wise embedding lookup (4-bit or 8-bit).
 // Layout: [packed indices][scales: n_groups*4 B][zeros: n_groups B]
 //   4-bit: packed = vocab*d/2 (nibble-packed, 2 per byte)

@@ -6,6 +6,9 @@
 #define V8_GROUP_SHIFT 7
 #define V8_SCALE_FP 1000000LL
 
+/* Forward declarations for functions defined later in this file */
+static int64_t c_isqrt(int64_t x);
+
 /* Read embed_bits directly from kernel model header.
  * MDL_HDR_BASE (0xC00000) + FJM_OFF_EMBED_BITS (144) = 0xC00090.
  * This is a u32 field set during model-load. */
@@ -23,28 +26,144 @@ static inline int64_t get_model_embed_bits(void) {
  */
 #define EMBED_MAILBOX (MAILBOX_ADDR + 0x500ULL)
 
-/* Embed lookup: reuses vecmat mailbox with special mode flag.
- * When mb[5] (bits) is negative, mailbox is in embed-lookup mode:
- *   mb[0] = embed_base (STREAM_EMBED_BASE)
- *   mb[1] = token_id
- *   mb[2] = vocab_size
- *   mb[3] = d_model
- *   mb[4] = out_addr
- *   mb[5] = -bits (negative = embed mode; -4 or -8)
- *
- * Called via the SAME asm! as km_vecmat_packed_v8_mailbox. */
+void mdl_embed_lookup_c_mailbox(void)
+{
+    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)EMBED_MAILBOX;
+    int64_t token_id   = mb[0];
+    int64_t out_addr   = mb[1];
+    int64_t embed_base = mb[2];
+    int64_t vocab_size = mb[3];
+    int64_t d_model    = mb[4];
+    int64_t model_type = mb[5];  /* 10/11 = Gemma 3 (apply sqrt scaling) */
+    int64_t bits       = get_model_embed_bits();
 
-/* Debug: write lmhead results to a fixed memory location (0xBEB000).
- * The FJ side can read these after the call returns.
- * [+0] best_token, [+8] best_score, [+16] bits, [+24] call_count */
-#define LMHEAD_DEBUG_ADDR 0xBEB000ULL
-static int64_t _lmhead_call_count = 0;
-static void _debug_lmhead(int64_t tok, int64_t score, int64_t bits) {
-    volatile int64_t *dbg = (volatile int64_t *)(uintptr_t)LMHEAD_DEBUG_ADDR;
-    dbg[0] = tok;
-    dbg[1] = score;
-    dbg[2] = bits;
-    dbg[3] = ++_lmhead_call_count;
+    if (token_id < 0 || token_id >= vocab_size) return;
+
+    int64_t total = vocab_size * d_model;
+    int64_t packed_bytes = (bits == 8) ? total : total / 2;
+    int64_t n_groups = (total + 127) >> V8_GROUP_SHIFT;
+    int64_t scales_base = embed_base + packed_bytes;
+    int64_t zeros_base = scales_base + n_groups * 4;
+
+    const uint8_t *packed = (const uint8_t *)(uintptr_t)embed_base;
+    const uint32_t *scales = (const uint32_t *)(uintptr_t)scales_base;
+    const uint8_t *zeros_arr = (const uint8_t *)(uintptr_t)zeros_base;
+    int64_t *out = (int64_t *)(uintptr_t)out_addr;
+    int64_t row_start = token_id * d_model;
+
+    if (bits == 8) {
+        for (int64_t i = 0; i < d_model; i++) {
+            int64_t fi = row_start + i;
+            int64_t q = packed[fi];
+            int64_t g = fi >> V8_GROUP_SHIFT;
+            int64_t scale = (int64_t)scales[g];
+            int64_t zero = (int64_t)zeros_arr[g];
+            out[i] = ((q - zero) * scale) / 1000;
+        }
+    } else {
+        for (int64_t i = 0; i < d_model; i++) {
+            int64_t fi = row_start + i;
+            uint8_t raw = packed[fi >> 1];
+            int64_t q = (raw >> ((fi & 1) * 4)) & 15;
+            int64_t g = fi >> V8_GROUP_SHIFT;
+            int64_t scale = (int64_t)scales[g];
+            int64_t zero = (int64_t)zeros_arr[g];
+            out[i] = ((q - zero) * scale) / 1000;
+        }
+    }
+
+    /* Gemma 3 embed scaling: x *= sqrt(d_model).
+     * HF reference: Gemma3TextModel.forward scales by hidden_size**0.5.
+     * sqrt(1152) * 1000 = 33941 in x1000 fixed-point.
+     * Apply only for Gemma 3 models (type 10/11). */
+    if (model_type == 10 || model_type == 11) {
+        int64_t scale_x1000 = c_isqrt(d_model * 1000000);
+        for (int64_t i = 0; i < d_model; i++) {
+            out[i] = (out[i] * scale_x1000) / 1000;
+        }
+    }
+}
+
+/* ── RoPE: Rotary Position Embedding (C bypass) ──────────────────── */
+/* Bhaskara I sin approximation: sin(x) ≈ 16x(π-x) / (5π²-4x(π-x))
+ * x_mrad in [0, π/2] milliradians, returns ×1000. Max error ~0.16%. */
+#define ROPE_PI_MRAD 3142
+#define ROPE_TWO_PI_MRAD 6283
+
+static int64_t c_rope_sin_q1(int64_t x) {
+    int64_t pi = ROPE_PI_MRAD;
+    int64_t px = x * (pi - x);
+    int64_t num = 16 * px;
+    int64_t den = 5 * pi * pi - 4 * px;
+    if (den == 0) return 0;
+    return (num / den) * 1000;
+}
+
+static int64_t c_rope_sin(int64_t angle) {
+    int64_t raw = angle % ROPE_TWO_PI_MRAD;
+    int64_t a = (raw < 0) ? raw + ROPE_TWO_PI_MRAD : raw;
+    int64_t hpi = ROPE_PI_MRAD / 2;
+    if (a <= hpi)                    return  c_rope_sin_q1(a);
+    if (a <= ROPE_PI_MRAD)           return  c_rope_sin_q1(ROPE_PI_MRAD - a);
+    if (a <= ROPE_PI_MRAD + hpi)     return -c_rope_sin_q1(a - ROPE_PI_MRAD);
+    return -c_rope_sin_q1(ROPE_TWO_PI_MRAD - a);
+}
+
+static int64_t c_rope_cos(int64_t angle) {
+    return c_rope_sin(angle + ROPE_PI_MRAD / 2);
+}
+
+/* Mailbox at 0xBEA600:
+ *   +0: q_data    (i64)
+ *   +8: k_data    (i64)
+ *  +16: pos       (i64)
+ *  +24: n_heads   (i64)
+ *  +32: n_kv_heads(i64)
+ *  +40: d_head    (i64)
+ *  +48: freq_base (i64, address of inv_freq table)
+ */
+#define ROPE_MAILBOX (MAILBOX_ADDR + 0x600ULL)
+
+void tfm_rope_apply_c_mailbox(void)
+{
+    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)ROPE_MAILBOX;
+    int64_t q_data     = mb[0];
+    int64_t k_data     = mb[1];
+    int64_t pos        = mb[2];
+    int64_t n_heads    = mb[3];
+    int64_t n_kv_heads = mb[4];
+    int64_t d_head     = mb[5];
+    int64_t freq_base  = mb[6];
+
+    int64_t n_pairs = d_head / 2;
+    const int64_t *freq = (const int64_t *)(uintptr_t)freq_base;
+
+    /* Apply to each Q head */
+    for (int64_t h = 0; h < n_heads; h++) {
+        int64_t *data = (int64_t *)(uintptr_t)(q_data + h * d_head * 8);
+        for (int64_t i = 0; i < n_pairs; i++) {
+            int64_t angle = pos * freq[i];
+            int64_t cos_a = c_rope_cos(angle);
+            int64_t sin_a = c_rope_sin(angle);
+            int64_t x0 = data[2 * i];
+            int64_t x1 = data[2 * i + 1];
+            data[2 * i]     = (x0 * cos_a - x1 * sin_a) / 1000;
+            data[2 * i + 1] = (x0 * sin_a + x1 * cos_a) / 1000;
+        }
+    }
+    /* Apply to each KV head */
+    for (int64_t h = 0; h < n_kv_heads; h++) {
+        int64_t *data = (int64_t *)(uintptr_t)(k_data + h * d_head * 8);
+        for (int64_t i = 0; i < n_pairs; i++) {
+            int64_t angle = pos * freq[i];
+            int64_t cos_a = c_rope_cos(angle);
+            int64_t sin_a = c_rope_sin(angle);
+            int64_t x0 = data[2 * i];
+            int64_t x1 = data[2 * i + 1];
+            data[2 * i]     = (x0 * cos_a - x1 * sin_a) / 1000;
+            data[2 * i + 1] = (x0 * sin_a + x1 * cos_a) / 1000;
+        }
+    }
 }
 
 /* Non-volatile reads for DATA (weight bytes, input vector).
