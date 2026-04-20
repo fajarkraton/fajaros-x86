@@ -893,3 +893,72 @@ Legitimate under-run — V28.1 already shipped full RoPE with dual-theta.
 (Hybrid Sliding Window). The LUT deviation is logged for V31+
 consideration. If pad-collapse root-cause investigation narrows to
 RoPE precision, upgrade to LUT in a P4+ follow-up.
+
+---
+
+## 2026-04-20: V30 Track 2 — P5 Hybrid Sliding Window
+
+Per GEMMA3_UPGRADE_PLAN.md §6 Phase P5. Budget 3.25h (+25% = 4.06h).
+
+### Outcome: 2/3 shipped, 1 architectural deviation (unified ring cache)
+
+| # | Task | Location | Status |
+|---|------|----------|--------|
+| P5.E1 | Global-layer detection | `transformer.fj:525-528` — `(layer+1) % pattern == 0` → globals at 5,11,17,23 | ✅ |
+| P5.E2 | Sliding-window score loop | `transformer.fj:601` + `vecmat_v8.c:544` — `attn_start = seq_len - window` | ✅ |
+| P5.E3 | Dual KV cache (ring local + linear global) | **DEVIATION** — unified ring cache at `TFM_KV_MAX_POS=256` for ALL layers | ⚠️ |
+
+### P5.E3 deviation: unified 256-pos ring cache
+
+Plan specified: "Dual KV cache: 512-ring (local) + linear (global)".
+HEAD uses a single scheme at `transformer.fj:543-554`:
+
+```fajar
+const TFM_KV_MAX_POS: i64 = 256    // max context length
+fn tfm_kv_addr(layer, pos, kv_type) -> i64 {
+    let safe_pos = if pos >= TFM_KV_MAX_POS { pos % TFM_KV_MAX_POS } else { pos }
+    ...
+}
+```
+
+Every layer — local OR global — uses the same 256-position ring. The
+plan's design would split into a 512-ring for sliding-window layers
+and an unbounded linear cache for global layers.
+
+**Implications for current V30 scope:**
+- Prompts ≤256 tokens: no material difference. Gemma3-1B at
+  V28/V30 runs with 9-token prompt + 64 gen = 73 positions → no wrap.
+- Prompts >256: global layers lose long-range context because their
+  cache also wraps at 256. Gemma 3's primary advantage (4 global
+  layers reading full context) is lost. Would need a second cache
+  region keyed on layer-is-global to fix.
+- Sliding-window layers with window=512 but cache=256: window is
+  effectively clamped to 256 without the ring-overflow warning.
+  (Current pattern-6 windows in code use `tfm_sliding_window_size`
+  which reads from v7 header; default fallback 512.)
+
+**Verdict:** Low-impact for the 9+64 prompt in current testing, but
+this deviation blocks the Gemma 3 long-context use case entirely.
+Flag for V30 Track 2 follow-up or V31.
+
+### Gate verification via P0.1
+
+P0.1 ran pattern-6 × 26 layers over 73 positions. Globals at layers
+5/11/17/23 received full attention over 6/12/18/24 positions (prefill
+at that layer), locals received truncated window when cur_pos <
+window size (no truncation needed at 73). No crash.
+
+### Variance vs budget
+
+Budget: 3.25h (+25% = 4.06h). Actual: 0.2h audit. Variance: **-94%**.
+Legitimate under-run — V28.1 shipped tfm_is_global_layer + window
+logic; V28.1 explicitly skipped dual-cache per scope-reduction note.
+
+### Phase P5 Gate Verdict
+
+✅ **PASS with deviation note.** The unified 256-ring cache is
+acceptable for current short-prompt scope but blocks long-context.
+Cleared to enter **Phase P6** (Large Vocab + Extended Memory). P6 is
+where the 262K vocab + 155 MB embedding behaviour is verified — both
+already live via `embed-load` + `tok-load nvme 1054705`, so P6 is
+likely also mostly audit-only.
