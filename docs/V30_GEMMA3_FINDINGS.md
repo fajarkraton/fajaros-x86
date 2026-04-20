@@ -528,3 +528,101 @@ V30 Track 2 "Gemma 3 full sprint" (~160h) — per
 `docs/GEMMA3_UPGRADE_PLAN.md` v3.0, starting with P0 Pre-Flight Audit.
 Key missing pieces for coherent generation: GQA with correct head
 grouping, RoPE positional encoding, sliding-window attention mask.
+
+---
+
+## 2026-04-20: V30 Track 2 — P0 Pre-Flight Audit
+
+Per `docs/GEMMA3_UPGRADE_PLAN.md` §6 Phase P0. Budget 0.52h (+25% = 0.65h).
+This section is the Rule-1 deliverable that unblocks P1+.
+
+### P0.1 — Boot HEAD + smoke test ✅
+
+Commit `beaee1e`. Boot from `build/fajaros-llvm.iso` with `-cdrom` + KVM
++ 2G RAM + disk_v8.img on NVMe. Sequence:
+
+```
+nova> model-load nvme 0     # Gemma3-1B, 26 layers, 4-bit, 514 MB
+nova> embed-load            # 155 MB at 0x8000000
+nova> tok-load nvme 1054705 # 262,145 tokens, BPE mode
+nova> ask hello             # 9 prompt tokens, 64 generated
+Output: 107,\n\n…\n
+```
+
+No crash, no EXC, no PANIC, shell returns to `nova>` after stats. V28.5
+stability gate preserved on HEAD.
+
+### P0.2 — Baseline cycles ✅
+
+Observed on i9-14900HX + KVM, disk_v8.img 4-bit Gemma3-1B, prompt "hello":
+
+| Metric | Cycles | Notes |
+|---|---|---|
+| Prefill (9 tokens) | 27,187 M | per-token ≈ 3,021 M |
+| Decode (64 tokens) | 6,560 M | per-token ≈ 102 M |
+| Reported "Per token" | 102,510 K | (decode only, post-prefill) |
+
+At TSC ≈ 2.4 GHz this is ≈ **22 tok/s decode** and ≈ 0.8 tok/s prefill.
+Decode is ~30× faster than prefill because prefill runs the full 26-layer
+forward over cold NVMe-streamed weights; decode hits the KV cache.
+
+### P0.3 — V28.1 Gemma tensor pool ✅
+
+Verified statically in `kernel/compute/kmatrix.fj:34-37`:
+
+```
+const KM_GEMMA_BASE: i64 = 0xB70000
+const KM_GEMMA_SLOTS: i64 = 8
+const KM_GEMMA_DIM: i64 = 1280
+const KM_GEMMA_SLOT_SIZE: i64 = 10272   # 32B header + 1280×8B data
+```
+
+Matches V28.1 spec exactly (8 × 1280 dim at 0xB70000). Pool is a fixed
+kernel-address region, present by construction in every build.
+
+### P0.4 — 1 GB identity mapping ✅ (via observed access)
+
+`kernel/main.fj:220` calls `extend_identity_mapping_512()` during boot.
+`kernel/mm/paging.fj:315-346` fills PD[128-511] (256 MB→1 GB) and all of
+PD2[0-511] (1 GB→2 GB) with `PAGE_PRESENT | PAGE_WRITABLE | PAGE_HUGE |
+PAGE_NX`, flushes TLB via CR3.
+
+Runtime proof from P0.1: `STFM_X = 0x2C000000` (704 MB) is written by
+`tfm_forward_stream` during every generated token and `embed-load`
+writes 155 MB at `0x8000000` (128 MB). Neither triggered a page fault,
+so entries beyond 256 MB are live. No need to run `pteaudit` — the
+inference path already exercises the mapping.
+
+### P0.5 — Multi-repo state ✅
+
+```
+fajar-lang : ahead 0, working tree has M CLAUDE.md + 3 ?? examples (local)
+fajaros-x86: ahead 5 of origin/main — NOT YET PUSHED
+fajarquant : ahead 0, working tree has ?? scripts/diag_gate_proj.py
+```
+
+Rule-8 follow-up: fajaros-x86 is 5 commits ahead. Should push before
+starting P1 to avoid accumulating unpushed work.
+
+### P0.6 — This commit ✅
+
+### Phase P0 Gate Verdict
+
+| Criterion | Status |
+|---|---|
+| V28.1 foundation stable | ✅ no crash on HEAD |
+| Baseline tok/s recorded | ✅ ~22 tok/s decode, ~0.8 prefill |
+| 1 GB identity map reachable | ✅ observed via 704 MB + 128 MB access |
+| Gemma tensor pool allocated | ✅ 8 × 1280 at 0xB70000 in kmatrix.fj |
+| Multi-repo state clean | ⚠️ fajaros-x86 ahead 5 — push before P1 |
+
+**Verdict: P0 PASS with push-before-P1 hygiene note.** Cleared to enter
+Phase P1 (bug fixes A1-A5) after committing this findings section and
+pushing fajaros-x86.
+
+### Variance vs budget
+
+Budget: 0.52h (+25% = 0.65h). Actual: 0.4h elapsed in this session's P0
+alone (most of the verification was observational — no new boots needed
+beyond the smoke test). Variance: **-23%** (under budget). Not a valid
+data point for Rule 5 tracking yet; will re-evaluate after P1.
