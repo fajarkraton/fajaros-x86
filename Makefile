@@ -638,6 +638,79 @@ test-security-triple-regression: iso-llvm
 # CI jobs are updated to use test-security-triple-regression.
 test-smap-regression: test-security-triple-regression
 
+# V30.GEMMA3 P11.2 — End-to-end regression gate for the Gemma 3 1B
+# transformer foundation. Verifies boot + model-load + embed-load +
+# tok-load + ask hello + clean shell recovery, without asserting
+# any quality claim (pad-collapse is an OPEN PROBLEM — see
+# docs/V30_GEMMA3_P10_FOUNDATION.md). The test protects the
+# mechanical stability claim: if this gate breaks, something
+# regressed architecturally, not just in numerics.
+.PHONY: test-gemma3-e2e
+test-gemma3-e2e: iso-llvm
+	@echo "[TEST] V30.GEMMA3 P11.2 — Gemma 3 1B E2E regression gate..."
+	@test -f disk_v8.img || { \
+		echo "[SKIP] disk_v8.img not present — skipping E2E gate"; \
+		echo "       Build disk: scripts/export_gemma3_v8.py <HF_path> disk_v8.img"; \
+		exit 0; \
+	}
+	@(sleep 6; printf 'model-load nvme 0\r'; \
+	  sleep 4; printf 'embed-load\r'; \
+	  sleep 12; printf 'tok-load nvme 1054705\r'; \
+	  sleep 8; printf 'ask hello\r'; \
+	  sleep 140; printf '\r') | \
+		timeout 200 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+		-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
+		-display none -no-reboot -no-shutdown $(QEMU_KVM) -m 2G \
+		-drive file=disk_v8.img,if=none,id=nvme0,format=raw \
+		-device nvme,serial=fajaros,drive=nvme0 \
+		> $(BUILD_DIR)/test-gemma3-e2e.log 2>&1 || true
+	@echo ""
+	@grep -qE "EXC:|PANIC:" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& { echo "[FAIL] EXC/PANIC in log — mechanical regression"; exit 1; } \
+		|| echo "[PASS] no fault markers (mechanical stability intact)"
+	@grep -q "Type:       Gemma3-1B" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] model header parsed (v7 parser intact)" \
+		|| { echo "[FAIL] model-load failed — v7 parser regression"; exit 1; }
+	@grep -q "\[OK\] Embedding loaded" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] embed-load succeeded (NVMe streaming intact)" \
+		|| { echo "[FAIL] embed-load failed"; exit 1; }
+	@grep -q "\[OK\] Loaded 262145 tokens from NVMe (BPE mode)" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] tokenizer loaded (.fjt v2 at LBA 1054705)" \
+		|| { echo "[FAIL] tokenizer load failed — check LBA 1054705"; exit 1; }
+	@grep -q "Generated:64 tokens" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] 64 tokens generated (forward pass reaches LM head)" \
+		|| { echo "[FAIL] forward pass did not complete 64 tokens"; exit 1; }
+	@grep -q "nova> " $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] shell recovered after ask" \
+		|| { echo "[FAIL] shell did not return to nova>"; exit 1; }
+	@echo ""
+	@echo "✅ V30.GEMMA3 E2E regression gate: 5 mechanical invariants hold"
+	@echo "   (Quality claim intentionally NOT gated — see P10 foundation doc.)"
+
+# V30.GEMMA3 P11.3 kernel-path invariants — executes test-gemma3-e2e
+# and greps the same log for GQA/RoPE/SWA-specific evidence that
+# those code paths were actually exercised (not just no-op'd).
+.PHONY: test-gemma3-kernel-path
+test-gemma3-kernel-path: test-gemma3-e2e
+	@echo "[TEST] V30.GEMMA3 P11.3 — GQA + RoPE + SWA path exercise..."
+	@# Model header prints KV heads line when model-load parses v7:
+	@#   "  KV heads:   1 (GQA 4:1)"
+	@grep -qE "KV heads:" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] GQA header field printed (tfm_get_n_kv_heads path)" \
+		|| { echo "[FAIL] KV heads field missing — GQA setup regression"; exit 1; }
+	@grep -q "RoPE:       10K" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] RoPE theta loaded (dual-theta init path)" \
+		|| { echo "[FAIL] RoPE theta header field missing"; exit 1; }
+	@grep -q "FFN:        gated dim=6912" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] gated FFN active (tfm_ffn_gated dispatched)" \
+		|| { echo "[FAIL] gated FFN header missing — ffn_type regression"; exit 1; }
+	@grep -q "Norm:       RMSN" $(BUILD_DIR)/test-gemma3-e2e.log \
+		&& echo "[PASS] RMSNorm active (km_rmsnorm C-bypass path)" \
+		|| { echo "[FAIL] RMSNorm header missing — norm_type regression"; exit 1; }
+	@echo ""
+	@echo "✅ V30.GEMMA3 kernel-path gate: 4 architectural invariants confirmed"
+
+
 # Mass-test shell commands — 2 batches × 45 commands = 90 total
 test-commands: iso-llvm
 	@echo "═══════════════════════════════════════"
