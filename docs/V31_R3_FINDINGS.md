@@ -214,3 +214,50 @@ mode 1 eliminates the double-shift.
 kept in place. See `V31_R3_H1_DECISION.md`.
 
 ---
+
+## Phase A.P3 — H2 Softmax Saturation (2026-04-20)
+
+### A.P3.1 Attention-output magnitude diagnostic
+
+With H1 fix in place, checked ratio `attn_out / v_proj` across all 26
+layers, token 0:
+
+- Healthy range: [1.0×, 3.0×] (meaning attention distributes across
+  2-4 effective positions)
+- Pathological: ≈1.0× exact (one-hot, saturated) OR ≪1.0× (uniform)
+
+**Observed: 1.04× to 3.14× across all layers.** All healthy.
+Attention is NOT saturating.
+
+### A.P3.2 Softmax math check
+
+`c_exp_approx` clamps:
+- `input > 5000` → `148413` (exp(5)×1000)
+- `input < -7000` → `0`
+
+For saturation to matter, `max - other` must exceed 7000 × 1000 /
+attn_scale = 7000 × 1000 / 62.5 = 112K in dot-product space. Our
+measured Q, K, V magnitudes (~2K-17K at x1000) give dot products of
+1K-10K, varying by hundreds to low-thousands. Nowhere near saturation
+threshold.
+
+### A.P3.3 Surprise finding: hidden-state collapse at L25
+
+Per-token `final_rmsnorm` outputs are nearly IDENTICAL across all 15
+captured tokens (min -30K..-40K, max 7K..18K, mean -150..-260). This
+means early layers DO produce variation but by L25 the forward pass
+converges to a fixed hidden state regardless of input position.
+
+This is the actual remaining pad-collapse signature — representation
+dynamics collapse, not precision. Same input → same argmax → same
+token (whichever the fixed attractor maps to).
+
+### A.P3.4 Decision
+
+**H2 RULED OUT.** No kernel change. Proceed to A.P4 (H4 final LayerNorm
+gamma byte-compare). See `V31_R3_H2_DECISION.md`.
+
+Remaining hypotheses:
+- H4 final LN gamma
+- H1.2 gamma value SCALE (beyond just mode)
+- Quantization noise saturation
