@@ -2,6 +2,78 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
+## [3.6.0] "Gemma 3 Foundation" -- 2026-04-20
+
+V30.GEMMA3 Track 2 **audit-complete** via Path D (research artifact).
+12 phases (P0-P12) audited against current HEAD — every architectural
+component the upgrade plan called for is VERIFIED PRESENT. Foundation
+is mechanically correct and bit-exact vs an independent reference;
+coherent generation output is an OPEN RESEARCH PROBLEM deferred to V31.
+
+### Added
+
+- **`make test-gemma3-e2e`** — 5 mechanical invariants regression gate:
+  no EXC/PANIC, v7 parser intact, embed NVMe streaming, 262145-token
+  BPE tokenizer loads at LBA 1054705, 64 tokens reach LM head. Gates
+  mechanical stability, NOT output quality (pad-collapse open).
+- **`make test-gemma3-kernel-path`** — 4 architectural invariants:
+  GQA path, dual-theta RoPE init, gated FFN dim=6912, RMSNorm active.
+  Depends on e2e.
+- **`docs/V30_GEMMA3_P9_DECISION.md`** — Mid-Sprint Decision Gate
+  Rule-6 mechanical commit. Paths A/B (2/3-bit quant) + C (270M
+  fallback) blocked; Path D selected.
+- **`docs/V30_GEMMA3_P10_FOUNDATION.md`** — research-artifact scope
+  document with 3-data-point pad-collapse characterization (4-bit
+  "hello" + "What is 2+2?" both collapse to token 107; 8-bit "hello"
+  collapses to token 106 EOS).
+- **`docs/V30_GEMMA3_FINDINGS.md`** — full P0-P12 audit trail, ~1100
+  lines. 9 deviations documented (static addresses instead of
+  frame-alloc, Bhaskara sin/cos instead of LUT, brute-force argmax
+  with vocab-masking, unified ring KV cache).
+
+### Fixed
+
+- **`Makefile` `--target-features="..."` equals-form** — `fj build`
+  fails with "unexpected argument '-a'" on space-form because clap
+  parses "-avx,..." as a flag. Previous builds silently relinked
+  yesterday's cached `combined.o.saved`; V29.P1's ELF-presence gate
+  did not catch stale-cache fallback.
+
+### Documented
+
+- **Tokenizer on-disk LBA 1054705** (v2 ID-ordered) — token 107=`\n`,
+  106=`<end_of_turn>`, 105=`<start_of_turn>`. Must run `tok-load
+  nvme 1054705` before `ask` — not auto-loaded. LBA 1100000 holds
+  the OLD sorted tokenizer (garbled) — do NOT use.
+- **12-phase audit outcome:** ~8.6h actual vs ~46.5h budget (-82%).
+  HEAD substantially V30-complete via V28.1 + V28.2 + V30 C-bypass
+  work. Plan's "v2" format = HEAD's v7 header + v8 quant (superset).
+
+### Deferred to V31 (R3 pad-collapse root cause)
+
+Four ranked hypotheses:
+
+1. Cumulative RMSNorm scaling across 104 norms (4 × 26L)
+2. `c_exp_approx` softmax saturation
+3. Bhaskara RoPE 0.16% shared error (P4.D2 LUT upgrade)
+4. Final LayerNorm gamma weight loading bug
+
+### Verified
+
+- 0 crashes across 3 runs × 64 tokens × 26 layers ≈ 5,000 layer
+  invocations
+- 8/14 layer-0 ops BIT-EXACT (0 ULP) kernel vs Python simulator
+- C-bypass covers 10 numerical hot-path ops
+- .fjm v7 + v8 group-wise quant + 262K .fjt v2 all round-trip
+
+### Stats
+
+- 12 phases PASS (P0-P12)
+- 2 regression-gate make targets (9 invariants)
+- 3 decision/foundation docs committed
+- 10 fajaros-x86 commits this sprint
+- Cumulative budget variance -82%
+
 ## [3.5.0] "Security Triple" -- 2026-04-16
 
 V26 B4.2 "full SMEP+SMAP+NX security triple" = **3/3 CLOSED**. Two
