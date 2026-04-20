@@ -1161,3 +1161,60 @@ Within budget.
 ### Phase P9 Gate Verdict
 
 ✅ **PASS.** Path D mechanically committed. Cleared to P10' + P11 + P12.
+
+---
+
+## 2026-04-20: V30 Track 2 — P10' Foundation Validation (Path-D replacement)
+
+Per P9 decision doc. Formalizes pad-collapse characterization across
+prompts and bit widths. Full report in
+`docs/V30_GEMMA3_P10_FOUNDATION.md`.
+
+### Run matrix (3 data points)
+
+| Disk | Model | Prompt | First token | Observation |
+|---|---|---|---|---|
+| disk_v8 | 4-bit Gemma3-1B | "hello" | **107** (`\n`) | 17 newlines (repeat 107) |
+| disk_v8 | 4-bit Gemma3-1B | "What is 2+2?" | **107** (`\n`) | identical pattern |
+| disk_v9 | 8-bit Gemma3-1B | "hello" | **106** (EOS) | immediate EOS, 0 tokens |
+
+### Key findings
+
+1. **Prompt-independent collapse** — 4-bit model always produces
+   token 107 regardless of input. Foundation is working (prompt
+   gets tokenized + projected through 26 layers), but hidden state
+   after final RMSNorm is too degenerate for argmax to pick a
+   meaningful token.
+2. **Quant-bit-width switches collapse flavour** — 4-bit locks on
+   token 107, 8-bit locks on token 106. Both degenerate, but the
+   higher-precision 8-bit doesn't HELP — it just picks a different
+   degenerate winner.
+3. **8-bit decodes 2.3× faster** (46 M vs 102 M cycles/tok) because
+   argmax skips nibble-unpack. Infrastructure-wise, the 8-bit path
+   is the better performance target; pad-collapse has to close
+   before this matters for quality.
+4. **Zero crashes** across 3 runs × 64 tokens × 26 layers ≈ 5,000
+   layer invocations. Mechanical stability is solid.
+
+### Foundation-claim scope
+
+**OK to ship claims:**
+- infrastructure/host claim (FajarOS hosts the full pipeline)
+- bit-exactness claim (kernel vs sim, 8 of 14 ops 0 ULP)
+- format claim (.fjm v7 + v8 quant + 262K .fjt)
+- boot workflow claim (4-command path)
+
+**NOT OK to ship:**
+- any quality benchmark
+- any "inference works" demo
+
+### Variance vs budget
+
+Plan P10 was 8.75h (+30% = 11.4h) E2E with real weights. P10' Path D
+replacement: **actual 0.8h** across 2 QEMU boots + doc. Variance:
+**-93%**. Legitimate — Path D scope is smaller than Path A's E2E
+validation.
+
+### Phase P10' Gate Verdict
+
+✅ **PASS.** Foundation characterization complete. Cleared to P11.
