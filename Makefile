@@ -710,6 +710,97 @@ test-gemma3-kernel-path: test-gemma3-e2e
 	@echo ""
 	@echo "✅ V30.GEMMA3 kernel-path gate: 4 architectural invariants confirmed"
 
+# ═══════════════════════════════════════════════════════════════
+# V30 Track 4 — ext2/FAT32 disk harness (docs/V30_TRACK4_DISK_HARNESS_PLAN.md)
+# ═══════════════════════════════════════════════════════════════
+
+# P2.1 — disk-image targets, built from scripts/build_test_disk.py.
+# Depend on the manifest so any content edit triggers a rebuild.
+$(BUILD_DIR)/test-disks/ext2.img: scripts/build_test_disk.py tests/test-disks/manifest.json
+	@mkdir -p $(BUILD_DIR)/test-disks
+	@command -v mkfs.ext2 >/dev/null 2>&1 && command -v debugfs >/dev/null 2>&1 || { \
+		echo "[SKIP] mkfs.ext2 or debugfs missing — apt install e2fsprogs"; \
+		touch $@; exit 0; \
+	}
+	@python3 scripts/build_test_disk.py --fs ext2 -o $@
+
+$(BUILD_DIR)/test-disks/fat32.img: scripts/build_test_disk.py tests/test-disks/manifest.json
+	@mkdir -p $(BUILD_DIR)/test-disks
+	@command -v mkfs.fat >/dev/null 2>&1 && command -v mcopy >/dev/null 2>&1 || { \
+		echo "[SKIP] mkfs.fat or mcopy missing — apt install dosfstools mtools"; \
+		touch $@; exit 0; \
+	}
+	@python3 scripts/build_test_disk.py --fs fat32 -o $@
+
+# P2.2 — shell-driven QEMU test harness. Boots TWICE (once per
+# filesystem) because the kernel's mount commands hardcode block
+# device 0. Greps serial log for mount + roundtrip invariants.
+# P2.3 — auto-skip if either image is zero-size (tool missing).
+.PHONY: test-fs-roundtrip
+test-fs-roundtrip: iso-llvm $(BUILD_DIR)/test-disks/ext2.img $(BUILD_DIR)/test-disks/fat32.img
+	@echo "[TEST] V30 Track 4 — FS roundtrip harness..."
+	@if [ ! -s $(BUILD_DIR)/test-disks/ext2.img ] && [ ! -s $(BUILD_DIR)/test-disks/fat32.img ]; then \
+		echo "[SKIP] no disk images built (both filesystem toolchains missing)"; \
+		exit 0; \
+	fi
+	@# ───── FAT32 branch ─────
+	@if [ -s $(BUILD_DIR)/test-disks/fat32.img ]; then \
+		echo ""; \
+		echo "── FAT32 branch ──"; \
+		(sleep 8; printf 'mount\r'; \
+		 sleep 3; printf 'fatls\r'; \
+		 sleep 3; printf 'fatcat README.TXT\r'; \
+		 sleep 5; printf '\r') | \
+			timeout 60 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+			-boot order=d \
+			-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
+			-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) \
+			-drive file=$(BUILD_DIR)/test-disks/fat32.img,if=none,id=nvme0,format=raw \
+			-device nvme,serial=fajaros-fat,drive=nvme0 \
+			> $(BUILD_DIR)/test-fs-roundtrip-fat32.log 2>&1 || true; \
+		grep -q "FAT32 mounted!" $(BUILD_DIR)/test-fs-roundtrip-fat32.log \
+			&& echo "[PASS] FAT32 mount succeeded" \
+			|| { echo "[FAIL] FAT32 mount not observed"; exit 1; }; \
+		grep -q "43B README.TXT" $(BUILD_DIR)/test-fs-roundtrip-fat32.log \
+			&& echo "[PASS] README.TXT visible via fatls (43 bytes = manifest)" \
+			|| { echo "[FAIL] README.TXT size mismatch or missing"; exit 1; }; \
+		grep -q "16B DATA.BIN" $(BUILD_DIR)/test-fs-roundtrip-fat32.log \
+			&& echo "[PASS] DATA.BIN visible via fatls (16 bytes = manifest)" \
+			|| { echo "[FAIL] DATA.BIN size mismatch or missing"; exit 1; }; \
+		grep -q "FajarOS Nova" $(BUILD_DIR)/test-fs-roundtrip-fat32.log \
+			&& echo "[PASS] fatcat returns file content (manifest READBACK matches)" \
+			|| { echo "[FAIL] fatcat did not return manifest content"; exit 1; }; \
+		grep -qE "EXC:|PANIC:" $(BUILD_DIR)/test-fs-roundtrip-fat32.log \
+			&& { echo "[FAIL] EXC/PANIC during FAT32 flow"; exit 1; } \
+			|| echo "[PASS] no fault markers (FAT32 branch clean)"; \
+	else \
+		echo "[SKIP] FAT32 image zero-size (toolchain unavailable)"; \
+	fi
+	@# ───── ext2 branch — P3 scope wires the shell commands ─────
+	@if [ -s $(BUILD_DIR)/test-disks/ext2.img ]; then \
+		echo ""; \
+		echo "── ext2 branch (P3 will add mount-ext2 shell command) ──"; \
+		(sleep 8; printf 'ext2-ls\r'; \
+		 sleep 5; printf '\r') | \
+			timeout 45 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+			-boot order=d \
+			-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
+			-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) \
+			-drive file=$(BUILD_DIR)/test-disks/ext2.img,if=none,id=nvme0,format=raw \
+			-device nvme,serial=fajaros-ext2,drive=nvme0 \
+			> $(BUILD_DIR)/test-fs-roundtrip-ext2.log 2>&1 || true; \
+		grep -q "ext2 not mounted" $(BUILD_DIR)/test-fs-roundtrip-ext2.log \
+			&& echo "[INFO] ext2 auto-mount not wired (expected — P3.1 scope)" \
+			|| echo "[INFO] unexpected ext2-ls output — see log"; \
+		grep -qE "EXC:|PANIC:" $(BUILD_DIR)/test-fs-roundtrip-ext2.log \
+			&& { echo "[FAIL] EXC/PANIC during ext2 flow"; exit 1; } \
+			|| echo "[PASS] no fault markers (ext2 branch clean)"; \
+	else \
+		echo "[SKIP] ext2 image zero-size (toolchain unavailable)"; \
+	fi
+	@echo ""
+	@echo "✅ V30 Track 4 P2 gate: harness runs end-to-end, no faults"
+	@echo "   (P3 wires mount-ext2 dispatch + tightens to PASS/FAIL roundtrip.)"
 
 # Mass-test shell commands — 2 batches × 45 commands = 90 total
 test-commands: iso-llvm
