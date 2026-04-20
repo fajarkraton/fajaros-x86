@@ -1303,3 +1303,77 @@ Commands:
 make test-gemma3-e2e            # 5 mechanical invariants, ~3 min
 make test-gemma3-kernel-path    # depends on e2e, adds 4 architectural
 ```
+
+---
+
+## 2026-04-20: V30 Track 2 — P12 Doc Sync (Rule 7)
+
+Per GEMMA3_UPGRADE_PLAN.md §6 Phase P12. Budget 1.25h (+25% = 1.56h).
+
+### Outcome: all 4 subtasks complete
+
+| # | Task | Commit | Status |
+|---|------|--------|--------|
+| P12.1 | `CLAUDE.md` §3 V30.GEMMA3 row | fajar-lang `deb1029` | ✅ |
+| P12.2 | MEMORY.md V30 Track 2 block | in-place edit to `memory/MEMORY.md` | ✅ |
+| P12.3 | `CHANGELOG.md` v3.6.0 "Gemma 3 Foundation" | fajaros-x86 `3583947` | ✅ |
+| P12.4 | GitHub Release v3.6.0 | https://github.com/fajarkraton/fajaros-x86/releases/tag/v3.6.0 | ✅ |
+
+### Multi-repo state after P12 sync
+
+```
+fajar-lang : pushed, main == origin/main
+fajaros-x86: pushed, main == origin/main, tag v3.6.0 live
+fajarquant : unchanged (no V30 Track 2 deltas)
+```
+
+All three repos clean, public artifacts synchronised.
+
+### Variance vs budget
+
+Budget: 1.25h. Actual: 0.4h (4 files edited + tag + release). Variance:
+**-68%**. Scope was well-sized.
+
+### Phase P12 Gate Verdict
+
+✅ **PASS.** P12 closes V30 Track 2. Foundation ship complete.
+
+---
+
+## V30 Track 2 — FINAL SUMMARY
+
+**Status: ALL 12 PHASES PASS.** Ship-readiness: research-artifact M6
+(foundation) via Path D decision. M7 (coherent generation) deferred
+to V31.
+
+| Phase | Budget | Actual | Variance | Gate |
+|---|---:|---:|---:|:---:|
+| P0 Pre-Flight | 0.65h | 0.4h | -38% | ✅ |
+| P1 Bug Fixes | 1.5h | 0.25h | -83% | ✅ |
+| P2 RMSNorm+FFN+Vecs | 5.94h | 0.3h | -95% | ✅ |
+| P3 GQA | 5.2h | 0.25h | -95% | ✅ |
+| P4 RoPE | 4.55h | 0.25h | -95% | ✅ |
+| P5 Sliding Window | 4.06h | 0.2h | -95% | ✅ |
+| P6 Vocab+Memory | 6.88h | 0.15h | -98% | ✅ |
+| P7 Numerical Gate | 8.75h | 5.75h | -34% | ✅ |
+| P8 .fjm v2 Export | 4.69h | 0.1h | -98% | ✅ |
+| P9 Mid-Sprint Gate | 0.3h | 0.25h | -17% | ✅ (Path D) |
+| P10' Foundation | 11.4h | 0.8h | -93% | ✅ |
+| P11 Regression | 3.13h | 0.5h | -84% | ✅ |
+| P12 Doc Sync | 1.56h | 0.4h | -74% | ✅ |
+| **TOTAL** | **58.6h** | **~9.6h** | **-84%** | — |
+
+Driving factor of the large under-run: V28.1 + V28.2 + V30 C-bypass
+sessions shipped most of the "net-new implementation" the plan
+scheduled. Track 2 ended up being primarily an AUDIT of work that
+already existed in HEAD plus the Path D decision framing and
+regression-gate wiring.
+
+Ten architectural deviations documented (5 static-address regions
+instead of frame-alloc, Bhaskara sin/cos instead of LUT, brute-force
+argmax with vocab-mask, unified ring cache, v7/v8 naming instead of
+v2). All deviations are simpler + proven working; flagged as V31+
+candidates only if pad-collapse R3 narrows to them.
+
+Foundation commits: `beaee1e` through `3583947` (11 commits on
+fajaros-x86 main, + 1 commit on fajar-lang CLAUDE.md).
