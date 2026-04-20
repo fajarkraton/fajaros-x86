@@ -750,3 +750,72 @@ dynamic) is documented and acceptable. Cleared to enter **Phase P3**
 (Grouped Query Attention). P3 is where the pad-collapse root-cause
 work begins in earnest — current attention is simplified single-pos,
 needs true GQA with n_heads=4 : n_kv_heads=1 grouping (Gemma 3 1B).
+
+---
+
+## 2026-04-20: V30 Track 2 — P3 Grouped Query Attention
+
+Per GEMMA3_UPGRADE_PLAN.md §6 Phase P3. Budget 4.0h (+30% research = 5.2h).
+
+### Outcome: ALL 4 SUBTASKS ALREADY PRESENT
+
+| # | Task | Location | Status |
+|---|------|----------|--------|
+| P3.C1 | GQA broadcast (4Q:1KV) | `vecmat_v8.c:551,556` — `heads_per_kv = n_heads/n_kv_heads`, `kv_head = h/heads_per_kv` | ✅ |
+| P3.C2 | Q/K/V/O shapes | `transformer.fj:659-669` — Q:1152→1024, K:1152→256, V:1152→256, O:1024→1152 via q_dim/kv_d | ✅ |
+| P3.C3 | KV cache GQA-sized | `transformer.fj:57-58` — `tfm_kv_dim = n_kv_heads*d_head = 256` (not 1024) | ✅ |
+| P3.C4 | .fjm n_kv_heads field | `model_loader.fj:49,261` — v7 header offset 52, parsed at load | ✅ |
+
+### CORRECTION to prior recommendation
+
+My P2 end-of-turn note said "P3 is where the pad-collapse root-cause
+work begins in earnest — current attention is simplified single-pos."
+**That is wrong.** HEAD's `tfm_attention_score_c_mailbox` at
+`vecmat_v8.c:535-602` implements full multi-position attention:
+
+- Q·K dot-product loop over all `attn_len` positions (line 560-571)
+- Full softmax: subtract-max + c_exp_approx + normalize (line 574-588)
+- Weighted-V sum over all positions (line 591-600)
+- GQA broadcast via `kv_head = h / heads_per_kv`
+
+The "simplified single-pos" phrase came from V30 Track 3 P2.1 Python
+sim notes — the simulator simplified attention for sim-vs-kernel
+comparison, but the KERNEL itself has full attention. Mis-carry-over.
+
+### Where pad-collapse actually lives (per prior Track-3 evidence)
+
+V30 Track 3 P3.6 findings (memory snapshot 2026-04-18):
+> "8/14 ops BIT-EXACT at layer 0 … gate_proj is FIRST divergence … min
+> matches (-6636) but max diverges (kernel=3949 vs sim=9251)."
+
+AND later (from the same memory):
+> "Fajar Lang LLVM codegen bug CONFIRMED — same algorithm compiled by
+> gcc produces correct results. C bypass for BOTH vecmat + lmhead
+> argmax committed."
+> "Pad-collapse (best_score=0) persists with correct C bypass →
+> MODEL-LEVEL issue, not codegen."
+
+So the divergence is numerical but the C-bypass fixed the LLVM codegen
+issue, and pad-collapse still persists. Candidate remaining causes:
+
+1. **Fixed-point precision accumulation** across 26 layers. Each layer
+   normalizes + multiplies + exponentiates in x1000 fixed-point. Small
+   per-layer error compounds. LayerNorm at dim=1152 accumulates 1152
+   `diff*diff` terms — a single-percent residual × 26 layers is >30%.
+2. **c_exp_approx** piecewise linear in the softmax may saturate
+   wrongly for large negative scores, collapsing all attention to one
+   position. Needs vector-level comparison against PyTorch softmax.
+3. **RoPE fixed-point drift** (P4 territory) at positions 6-8 of a
+   9-token prompt may produce degenerate Q/K that all alias to the
+   same direction after attention.
+4. **Final LayerNorm gamma** may be wrong-scaled, collapsing output
+   distribution before argmax.
+
+P4 (RoPE) + P5 (SWA) + P6 (memory) audits will narrow this down.
+
+### Phase P3 Gate Verdict
+
+✅ **PASS.** All 4 subtasks verified. Budget 4.0h, actual 0.25h (-94%).
+Cleared to enter **Phase P4** (RoPE). P4 will touch code that is likely
+already 60-80% in place, but with potential precision issues that
+contribute to pad-collapse.
