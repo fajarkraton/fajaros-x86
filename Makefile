@@ -274,7 +274,7 @@ build-llvm: $(COMBINED) $(RUNTIME_O) $(VECMAT_O)
 	@$(FJ) build --no-std --backend llvm \
 		--opt-level $(LLVM_OPT) \
 		--target-cpu $(LLVM_CPU) \
-		--target-features "$(LLVM_FEATURES)" \
+		--target-features="$(LLVM_FEATURES)" \
 		--linker-script $(LINKER_LD) \
 		--code-model kernel \
 		--reloc static \
@@ -433,7 +433,7 @@ build-llvm-custom: $(COMBINED) $(STARTUP_O)
 	$(FJ) build --no-std --backend llvm \
 		--opt-level $(LLVM_OPT) \
 		--target-cpu $(LLVM_CPU) \
-		--target-features "$(LLVM_FEATURES)" \
+		--target-features="$(LLVM_FEATURES)" \
 		--linker-script $(LINKER_LD) \
 		--code-model kernel \
 		--reloc static \

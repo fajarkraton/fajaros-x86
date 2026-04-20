@@ -426,3 +426,105 @@ miscompile, but affecting MORE functions beyond just vecmat.
 remaining 6 functions to gcc-compiled C with the same mailbox convention.
 If the FJTRACE build produces bit-exact results, the production build
 with C bypass should too.
+
+---
+
+## 2026-04-20: Tokenizer + AVX-disable round-trip VERIFIED
+
+### Silent build regression + Makefile bug
+
+Built kernel with `make iso-llvm` on 2026-04-20 to exercise the token-ID
+diagnostic from commit `46d9d6d`. The `fj build` step failed silently:
+
+```
+error: unexpected argument '-a' found
+Usage: fj build [OPTIONS] [FILE]
+[OK] LLVM kernel built: build/fajaros-llvm.elf (O2, native)
+```
+
+Root cause: clap parses `--target-features "-avx,..."` as a flag because
+the value begins with `-a`. Only the separator `=` form works.
+
+`fj build` exited non-zero, so `ld-wrapper.sh` never produced the
+`.o.saved` files — but the Makefile's final `ld` step reused the
+*previous* session's cached `combined.o.saved` (Apr 19), relinked, and
+printed `[OK] LLVM kernel built`. Silent cache fallback.
+
+**Fix** (committed separately): two `--target-features "$(LLVM_FEATURES)"`
+call sites in `Makefile` (lines 277, 436) changed to
+`--target-features="$(LLVM_FEATURES)"`. Fresh build: text=1,417,303
+(vs 1,417,407 cached), `strings` confirms `[ENC]/[/ENC]` debug
+markers gone — those were stale artefacts from the pre-96a5cde build.
+
+This is a new instance of the silent-build-failure class that V29.P1
+was supposed to close. The pre-commit gate checks ELF presence after
+`fj build`, but the Makefile's `ld` fallback defeats that gate when
+`.o.saved` happens to exist. **Follow-up:** add a timestamp check in
+`build-llvm` — fail if `combined.o.saved` is older than `combined.fj`.
+
+### Tokenizer round-trip: ask hello
+
+With the correct `-avx,-avx2,-avx512f` binary and the v2 ID-ordered
+tokenizer loaded from NVMe LBA 1054705 (verified: token 107 = `\n`,
+token 106 = `<end_of_turn>`), `ask hello` now produces:
+
+```
+nova> tok-load nvme 1054705
+[OK] Loaded 262145 tokens from NVMe (BPE mode)
+nova> ask hello
+Output: 107,
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+--- Stats ---
+  Prompt:   9 tokens
+  Generated:64 tokens
+```
+
+Observations:
+
+1. `Prompt: 9 tokens` confirms BPE mode active: 3 prefix
+   (`<start_of_turn>`, `user`, `\n`) + 1 BPE-merged `hello` + 5 suffix
+   (`<end_of_turn>`, `\n`, `<start_of_turn>`, `model`, `\n`). Previous
+   runs without `tok-load` gave 13 tokens (byte-level fallback: 5 bytes
+   for "hello"), confirming encoder routing.
+
+2. First generated token ID = **107** (= `\n` in Gemma 3 vocab). The
+   stream then emits 17 raw newlines with no further decimal IDs. The
+   diagnostic `if gen_count < 10 { cprint_decimal(next, …);
+   console_putchar(44, …) }` prints only on the first iteration; why
+   subsequent iterations skip the diagnostic path but still emit the
+   decoded `\n` is unexplained (possible `;`-separator codegen issue,
+   possible gen_count overflow path — not diagnosed this session).
+
+3. **Model output is pad-collapse expressed as repeated `\n`.** The
+   LM head argmax converges on token 107 over and over. This is the
+   SAME class of collapse previously observed as `best_score=0`
+   (V30 Track 3 P3.6) and "all pad bytes at steady state" (V28.5
+   retest), just rendered differently because the correct tokenizer
+   now decodes IDs properly.
+
+4. The V30 Track 3 closure decision stands: this is a **model-level**
+   issue (simplified single-pos attention without GQA+RoPE+sliding-
+   window), not a codegen or tokenizer issue. Confirmed by the
+   C-bypass path generating the same pad-collapse behaviour.
+
+### Next milestone
+
+V30 Track 2 "Gemma 3 full sprint" (~160h) — per
+`docs/GEMMA3_UPGRADE_PLAN.md` v3.0, starting with P0 Pre-Flight Audit.
+Key missing pieces for coherent generation: GQA with correct head
+grouping, RoPE positional encoding, sliding-window attention mask.
