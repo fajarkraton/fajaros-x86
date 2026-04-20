@@ -2,6 +2,57 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
+## [3.8.0] "R3 Precision Debug" -- 2026-04-21
+
+V31 Track A — Gemma 3 pad-collapse root-cause investigation. Four
+hypotheses (H1 cumulative RMSNorm · H2 softmax saturation · H3 RoPE
+precision · H4 final-LN gamma) triaged in 3.9h across 13 commits.
+**Pad-collapse CLASS broken** — output shifted from single-token lock
+(`107 × 17`) to two-token `<unused>` cycle. Representation collapse at
+L25 persists as an architectural limit of fp16-trained large-gamma
+weights running in x1000 fixed-point, deferred to V32 Track C
+(FajarQuant Phase D IntLLM).
+
+### Added
+
+- **H1 `gamma_mode = 1`** for Gemma 3 post-FFN RMSNorm path
+  (`86d724e`). Post-FFN RMSNorm max dropped from 11.1M to 769K
+  (-93%). Argmax winner shifted from token 107 (`\n`) to token 68
+  (`<unused62>`), breaking the single-token pad-collapse class.
+- **H3 RoPE sin/cos LUT** at ×10000 fixed-point (`1a164ca`). Decode
+  throughput 22 → 52 tok/s (**2.3×**). Minor argmax contribution
+  confirmed via A/B toggle.
+- **V31_R3 documentation set** — `V31_R3_FINDINGS.md`,
+  `V31_R3_H{1,2,3,4}_DECISION.md`, `V31_R3_CLOSE.md`.
+
+### Changed
+
+- Argmax scoreboard: H1 + H3 both ship as contributors. H2
+  c_exp_approx softmax is diagnostic-only (attention ratios were
+  1-3×, healthy). H4 final-LN gamma byte-offset ruled out — the
+  large gamma values (peak 66.5) are authentic HF weights, not a
+  corruption artifact.
+
+### Still open for V32
+
+- `final_rmsnorm` per-token variance is degenerate — 15 tokens
+  produce nearly identical representations. 104 successive
+  large-gamma norm multiplications in x1000 fixed-point compound
+  past the precision envelope. Direction lost; magnitude pattern
+  survives. Three V32 options recorded in `V31_R3_CLOSE.md`:
+  wider fixed-point (~1w, marginal), per-layer gamma rescale at
+  export (~3-5d, verification hard), or **Custom IntLLM Phase D
+  (recommended)** — arch sidesteps the impedance mismatch.
+
+### Stats
+
+- 13 commits, 3.9h actual vs 6-8h budgeted (-50%)
+- 4 hypotheses triaged; 2 shipped, 2 ruled out
+- Post-FFN RMSNorm magnitude: -93%
+- Decode throughput: +130%
+- No regression gate — this is a research milestone; V32 Phase D
+  will add its own `test-intllm-e2e` gate when arch lands
+
 ## [3.7.0] "FS Roundtrip" -- 2026-04-20
 
 V30 Track 4 — ext2 + FAT32 disk harness. 5 phases (P0-P5) complete,
