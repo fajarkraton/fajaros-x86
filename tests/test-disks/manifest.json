@@ -1,0 +1,18 @@
+{
+  "description": "V30 Track 4 test disk manifest — content is intentionally small + deterministic so roundtrip tests can byte-compare against known values.",
+  "size_mb": 8,
+  "files": [
+    {
+      "path": "README.TXT",
+      "content_ascii": "FajarOS Nova — V30 Track 4 disk harness.\n"
+    },
+    {
+      "path": "DATA.BIN",
+      "content_hex": "DEADBEEFCAFEBABE0123456789ABCDEF"
+    },
+    {
+      "path": "SUBDIR/NESTED.TXT",
+      "content_ascii": "nested directory content\n"
+    }
+  ]
+}
