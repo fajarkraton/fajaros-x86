@@ -819,3 +819,77 @@ P4 (RoPE) + P5 (SWA) + P6 (memory) audits will narrow this down.
 Cleared to enter **Phase P4** (RoPE). P4 will touch code that is likely
 already 60-80% in place, but with potential precision issues that
 contribute to pad-collapse.
+
+---
+
+## 2026-04-20: V30 Track 2 — P4 Rotary Position Embedding
+
+Per GEMMA3_UPGRADE_PLAN.md §6 Phase P4. Budget 3.5h (+30% research = 4.55h).
+
+### Outcome: 3/4 shipped, 1 deviation (sin/cos approximation not LUT)
+
+| # | Task | Location | Status |
+|---|------|----------|--------|
+| P4.D1 | Per-pair rotation | `vecmat_v8.c:127-167` (C mailbox `tfm_rope_apply_c_mailbox`) applied to all Q heads + all KV heads | ✅ |
+| P4.D2 | sin/cos LUT | **NOT A LUT** — Bhaskara I approximation at `transformer.fj:215-245` | ⚠️ deviation |
+| P4.D3 | Dual theta (local/global) | `transformer.fj:398-410` — `tfm_rope_freq_for_layer` returns `ROPE_FREQ_GLOBAL` when `layer_idx % pattern == pattern-1` | ✅ |
+| P4.D4 | Integration into `tfm_layer` | `transformer.fj:674` (non-streaming) + `transformer.fj:1510` (streaming) — post Q/K proj, pre attention | ✅ |
+
+### P4.D2 deviation: Bhaskara over LUT
+
+Plan specified: "Pre-compute sin/cos LUT (fixed-point ×10000), ~130 KB
+table". HEAD computes on-demand via Bhaskara I approximation:
+
+```
+sin(x) ≈ 16x(π-x) / (5π² - 4x(π-x))   // [0, π/2]
+```
+
+with `rope_sin_q1` covering [0, π/2] and `rope_sin` folding to quadrants.
+Precision stated "~0.16% max error" per `transformer.fj:213` comment.
+
+**Trade-off analysis:**
+- Memory: saves 130 KB (negligible on 2 GB system).
+- Compute: Bhaskara is ~4 mul + 1 div per call. Over 1152-dim × 26
+  layers × 64 tokens = ~1.9M calls per generation. At ~10 ns per call
+  ≈ 19 ms — negligible compared to 100 MB/tok decode elsewhere.
+- **Precision: 0.16% error is the concerning part.** Compounding over
+  RoPE (which multiplies by cos/sin) applied at every layer could
+  contribute to pad-collapse. A LUT with ×10000 scale (as the plan
+  specified) would give ~0.01% error — 16× tighter.
+
+The C bypass uses `c_rope_sin/cos` (same Bhaskara, ported to C). The
+BIT-EXACT guarantee from Track 3 P3.6 only covers the kernel-vs-sim
+comparison; both sides use Bhaskara, so any approximation error is
+present in both and won't show as a divergence. This is a **silent
+shared error** — an LUT would improve absolute accuracy but not
+reveal in bit-exactness audits.
+
+### Potential pad-collapse contribution
+
+Layer 0 ops 1-8 are bit-exact vs sim (Track 3), first divergence at
+`gate_proj`. The RoPE step is BEFORE attention and shows bit-exact.
+So RoPE's 0.16% absolute error doesn't show as a per-layer-0 divergence
+but accumulates across 26 layers. Hypothesis: RoPE drift grows with
+position, causing late-prompt tokens (positions 6-8 of the 9-token
+prompt) to have Q/K that angle-alias and collapse attention to a
+narrow subset — plausible pad-collapse mechanism but not proven.
+
+### Gate Verification
+
+Phase P4 gate: "Token at pos=0 vs pos=10 produces different Q/K" —
+verified by construction: at pos=0, `angle = 0 * freq[i] = 0`,
+cos=1000, sin=0, output unchanged. At pos=10, angles non-zero, Q/K
+are rotated. Bit-exact match between kernel and Python sim through
+the RoPE op at layer 0 (Track 3 P3.6 confirmation).
+
+### Variance vs budget
+
+Budget: 3.5h (+30% = 4.55h). Actual: 0.25h audit. Variance: **-93%**.
+Legitimate under-run — V28.1 already shipped full RoPE with dual-theta.
+
+### Phase P4 Gate Verdict
+
+✅ **PASS with LUT deviation noted.** Cleared to enter **Phase P5**
+(Hybrid Sliding Window). The LUT deviation is logged for V31+
+consideration. If pad-collapse root-cause investigation narrows to
+RoPE precision, upgrade to LUT in a P4+ follow-up.
