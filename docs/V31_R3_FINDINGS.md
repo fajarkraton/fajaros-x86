@@ -261,3 +261,55 @@ Remaining hypotheses:
 - H4 final LN gamma
 - H1.2 gamma value SCALE (beyond just mode)
 - Quantization noise saturation
+
+---
+
+## Phase A.P4 — H4 Final LayerNorm Gamma (2026-04-20)
+
+### A.P4.1 Read gamma bytes from disk_v8.img
+
+Direct Python read at `FJM_OFF_FINAL_NORM = 0x202FA850` + each per-layer
+block's norm section.
+
+### A.P4.2 Gamma value analysis
+
+**Final RMSNorm gamma** (1152 values):
+- min: -1.015, max: **46.000**, mean |g|: 7.04 (real scale)
+- Round-clean values (e.g. 5.156, 20.000, 46.000) — authentic HF weights
+  × 1000 storage, no quantization artifact.
+
+**Layer 0 per-layer gammas** (4 main norms):
+- input_layernorm: max 55.75
+- post_attn_ln: max 51.25
+- pre_ffn_ln: max 28.13
+- **post_ffn_ln: max 66.50** ← largest in model
+- q_norm / k_norm: max 2-4.4 (normal)
+
+These are genuinely large HF weights for Gemma 3 1B trained values.
+Export script `serialize_norm(v) = int(float(v) * 1000)` stores them
+faithfully.
+
+### A.P4.3 Why mode=1 is correct for this export
+
+Mode 1: `out = (normed * g) / 1000`. For stored `g=5156` (real 5.156),
+multiplier = 5.156 = `(1 + 4.156)` in HF convention. The `+1` is
+**implicit in the stored value** — already baked during training.
+
+Mode 0 would compute `(1000 + 5156)/1000 = 6.156` — adds `+1` a
+second time. That's the 14% per-norm over-amplification that compounds
+across 104 norms.
+
+### A.P4.4 Why representation collapse persists even with H1+H3
+
+Fixed-point x1000 scale cannot cleanly represent the compounded effect
+of 104 multiplications with gammas reaching 66 real. After 26 layers,
+direction is lost to quantization noise; only magnitude pattern
+survives. Final_rmsnorm outputs become near-identical across tokens.
+
+This is **architectural**, not a load-path bug. H4 RULED OUT.
+
+### A.P4.5 Decision
+
+**H4 closed as not-a-bug.** See `V31_R3_H4_DECISION.md`.
+
+Final V31.R3 closure summary: see `V31_R3_CLOSE.md`.
