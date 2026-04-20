@@ -278,14 +278,18 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         }
     }
 
-    // Set gamma convention based on model type:
-    //   Gemma 3 (types 10/11): GemmaRMSNorm, weight is zero-centered → mode 0
-    //   SmolLM/Llama (type 1+): LlamaRMSNorm, weight is direct scale → mode 1
+    // Set gamma convention based on model type.
+    // V31.A.P2 H1 EXPERIMENT: was mode 0 (zero-centered) for Gemma 3 but
+    // FJTRACE shows post_ffn_rmsnorm outputs 1-11M magnitudes (500-6000×
+    // pre_ffn), suggesting the (1+g)*x formula over-amplifies. Try mode 1
+    // (direct scale) to test — HF Gemma3 weight IS stored post-`+1` shift
+    // in some export paths; our exporter may be emitting already-shifted
+    // values, making mode 0 a double-add.
     let mt = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_MODEL_TYPE)
     if mt == 10 || mt == 11 {
-        volatile_write_u64(MDL_GAMMA_MODE, 0)  // zero-centered: (1+g)*x
+        volatile_write_u64(MDL_GAMMA_MODE, 1)  // V31 H1 experiment: direct scale
     } else {
-        volatile_write_u64(MDL_GAMMA_MODE, 1)  // direct-scale: g*x
+        volatile_write_u64(MDL_GAMMA_MODE, 1)  // SmolLM/Llama: direct scale
     }
 
     0  // Success

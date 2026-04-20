@@ -142,3 +142,75 @@ Planned next session:
    implement, re-run, commit G2 decision.
 
 Estimated effort: 2-3h focused (vs plan's A.P2 budget of ~2h +30% = 2.6h).
+
+---
+
+## Phase A.P2 — H1 Cumulative RMSNorm (2026-04-20)
+
+### A.P2.1 FJTRACE capture (with H3 LUT baseline)
+
+`make test-fjtrace-capture FJTRACE_DISK=disk_v8.img FJTRACE_SKIP_RAMLOAD=1`
+produced 5503 JSONL records (15 tokens × 26 layers × 14 ops each).
+
+### A.P2.2 Per-layer magnitude analysis, token 0
+
+Baseline (gamma_mode=0, post-H3 LUT):
+
+- `pre_attn_rmsnorm`: 1K - 136K (variable)
+- `post_attn_rmsnorm`: 40K - 560K
+- `pre_ffn_rmsnorm`: 700 - 26K (tight, but drifting down)
+- **`post_ffn_rmsnorm`: 40K → 11,108,172** (monotonic growth across 26 layers)
+
+Ratio analysis: `post_ffn / pre_ffn` goes from 6× (L1) to 6167× (L24)
+to 5959× (L25). **This is THE cumulative drift predicted by H1.**
+
+### A.P2.3 Root-cause hypothesis — gamma_mode formula
+
+`km_rmsnorm_c_mailbox` applies one of two formulae:
+- Mode 0 (zero-centered): `(normed * (1000 + g)) / 1000`
+- Mode 1 (direct scale):  `(normed * g) / 1000`
+
+Gemma 3 was set to mode 0. But if `export_gemma3_v8.py` already
+stored `gamma` as the `1+w` post-shift value (a common export
+convention), mode 0 adds `+1` a second time → double-amplification
+that compounds across 4 norms × 26 layers.
+
+### A.P2.4 Fix + experiment
+
+Changed `MDL_GAMMA_MODE` 0 → 1 for Gemma 3 (`model_loader.fj:286`).
+
+**Result:**
+
+| | Before (mode 0) | After (mode 1) | Delta |
+|---|---|---|---|
+| post_ffn_rmsnorm L0 | 1,508,065 | 1,373,376 | -9% |
+| post_ffn_rmsnorm L25 | **11,108,172** | **769,500** | **-93%** |
+| post_ffn_rmsnorm worst | 11.1M (L25) | 4.6M (L24) | -59% |
+| pre_ffn_rmsnorm range | 700-26K | 20-30K (stable) | tighter |
+| Output pattern | `107 × 17` | `68, <unused62>, 68, <unused62>, ...` | **collapse class CHANGED** |
+
+Token 68 = `<unused62>` (Gemma 3 reserved), token 92 = `<unused86>`.
+Model now cycles between two unused tokens instead of locking on
+one. The single-token attractor is definitively broken.
+
+### A.P2.5 Interpretation
+
+**H1 is the primary pad-collapse contributor.** Gamma convention
+mismatch between export (mode 0 assumed) and kernel (mode 0 applied)
+created 10-6000× over-amplification at post-FFN norm. Changing to
+mode 1 eliminates the double-shift.
+
+**Not fully closed:** magnitudes still 100-200× expected scale
+(gamma typical ~1-3 at x1000 should give ~3-30K post-RMSNorm; observed
+500K-4.6M). Remaining gap likely splits between:
+
+- Residual gamma scale mismatch
+- `c_isqrt` precision at small inputs
+- H2 softmax saturation compounding into attention outputs
+
+### A.P2.6 Decision
+
+**G2-partial:** PROCEED to A.P3 (H2 softmax saturation) with mode 1
+kept in place. See `V31_R3_H1_DECISION.md`.
+
+---
