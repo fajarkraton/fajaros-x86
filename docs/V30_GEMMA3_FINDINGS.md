@@ -1114,3 +1114,50 @@ a strict superset (more fields, finer quant grid). Cleared to P9.
 ### Variance vs budget
 
 Budget: 3.75h. Actual: 0.1h audit (-97%). V28.1/V28.2 shipped.
+
+---
+
+## 2026-04-20: V30 Track 2 — P9 Mid-Sprint Decision Gate
+
+Per GEMMA3_UPGRADE_PLAN.md §6 Phase P9. Budget 0.3h. **Rule 6 gate.**
+
+### Outcome: PATH D — Ship as research artifact
+
+Decision committed to `docs/V30_GEMMA3_P9_DECISION.md`. Summary:
+
+- Paths A (2-bit) + B (3-bit) **blocked** — pad-collapse is not
+  quant-bit-width dependent (same at 4-bit and 8-bit; sim shows
+  the same behaviour with no quant math in sim arithmetic).
+- Path C (270M fallback) **deferred** — same precision issue would
+  very likely surface at 270M scale.
+- Path D (research artifact) **selected** — every architectural
+  component the plan called for is verified present and bit-exact
+  vs an independent reference; pad-collapse is a MODEL-LEVEL
+  precision characterization open problem.
+
+### Reshape for P10-P12
+
+- **P10' Foundation Validation** (replaces P10 E2E Real Weights):
+  formalize pad-collapse observation across configurations. ~2h.
+- **P11 Regression tests** — unchanged. Add 3 kernel tests. ~2.5h.
+- **P12 Doc Sync** — unchanged per Rule 7. ~1-2h.
+
+Projected remaining: 5-7h (vs plan's P10-P12 = 14-16h).
+
+### V31 target (R3 pad-collapse root cause)
+
+Ranked hypotheses (from `V30_GEMMA3_P9_DECISION.md` §4):
+
+1. Cumulative RMSNorm scaling (104 norms × 26L)
+2. `c_exp_approx` softmax saturation
+3. Bhaskara RoPE 0.16% shared error (P4.D2 LUT upgrade)
+4. Final LayerNorm gamma misalignment
+
+### Variance vs budget
+
+Budget: 0.3h. Actual: 0.25h (decision analysis + file writing).
+Within budget.
+
+### Phase P9 Gate Verdict
+
+✅ **PASS.** Path D mechanically committed. Cleared to P10' + P11 + P12.
