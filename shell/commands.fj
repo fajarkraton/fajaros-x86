@@ -3420,6 +3420,10 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
     if handled == 0 && len == 7 && buf_eq4(101, 120, 116, 50) == 1 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 108 && volatile_read_u8(0x6F806) == 115 { cmd_ext2ls(); handled = 1 }
     // ext2-write — "ext2-write ..." (101,120,116,50,45,119...) len>=12
     if handled == 0 && len >= 12 && buf_eq4(101, 120, 116, 50) == 1 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 119 { cmd_ext2write(); handled = 1 }
+    // V30 Track 4 P3.1: ext2-mount — "ext2-mount" (101,120,116,50,45,109,111,117,110,116) len=10
+    if handled == 0 && len == 10 && buf_eq4(101, 120, 116, 50) == 1 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 109 && volatile_read_u8(0x6F806) == 111 && volatile_read_u8(0x6F807) == 117 && volatile_read_u8(0x6F808) == 110 && volatile_read_u8(0x6F809) == 116 { cmd_mount_ext2(); handled = 1 }
+    // V30 Track 4 P3.1: ext2-mkfs — "ext2-mkfs" (101,120,116,50,45,109,107,102,115) len=9
+    if handled == 0 && len == 9 && buf_eq4(101, 120, 116, 50) == 1 && volatile_read_u8(0x6F804) == 45 && volatile_read_u8(0x6F805) == 109 && volatile_read_u8(0x6F806) == 107 && volatile_read_u8(0x6F807) == 102 && volatile_read_u8(0x6F808) == 115 { cmd_mkfs_ext2(); handled = 1 }
     // pteaudit — "pteaudit" (112,116,101,97,117,100,105,116) len=8, V29.P2.SMEP U-bit leak scan
     if handled == 0 && len == 8 && buf_eq4(112, 116, 101, 97) == 1 && volatile_read_u8(0x6F804) == 117 && volatile_read_u8(0x6F805) == 100 && volatile_read_u8(0x6F806) == 105 && volatile_read_u8(0x6F807) == 116 { cmd_pte_audit(); handled = 1 }
     // mounts — "mounts" (109,111,117,110,116,115)
