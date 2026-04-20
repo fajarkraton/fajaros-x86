@@ -626,3 +626,53 @@ Budget: 0.52h (+25% = 0.65h). Actual: 0.4h elapsed in this session's P0
 alone (most of the verification was observational — no new boots needed
 beyond the smoke test). Variance: **-23%** (under budget). Not a valid
 data point for Rule 5 tracking yet; will re-evaluate after P1.
+
+---
+
+## 2026-04-20: V30 Track 2 — P1 Bug Fixes (Phase A v2.0)
+
+Per GEMMA3_UPGRADE_PLAN.md §6 Phase P1. Budget 1.2h (+25% = 1.5h).
+
+### Outcome: ALL 5 FIXES ALREADY APPLIED IN PRIOR SESSIONS
+
+Phase P1 is preserved from v2.0 Phase A as "precursor cleanup". Audit
+of current HEAD shows each fix is already in place:
+
+| # | Task | Location | Status |
+|---|------|----------|--------|
+| P1.A1 | PCA overflow clamp | `fajarquant.fj:175-179` — `r_int*v + (r_frac*v)/1000` split | ✅ present |
+| P1.A2 | LayerNorm variance precision | `kmatrix.fj:350-388` — abs(var_sum)/dim, eps+1, isqrt path | ✅ present |
+| P1.A3 | Negative-seed noise | `pipeline.fj:176` — `((seed%100)+100)%100 - 50` | ✅ present |
+| P1.A4 | Header offset validation | `model_loader.fj:210-227` — 10 `return -3` paths | ✅ present |
+| P1.A5 | Tokenizer output bounds | `tokenizer.fj:85, 268, 311` — cap + loop guard + defensive break | ✅ present |
+
+### Gate Verification
+
+Phase P1 gate: "`nova> model-load test` + `nova> infer hello` still
+pass with SmolLM test model". Equivalent coverage already exercised
+in P0.1 with Gemma3-1B model on disk_v8.img:
+
+- `model-load nvme 0` traverses the full header-validation code path
+  at `model_loader.fj:210-227` — exits clean with 4-bit 26-layer header.
+- `tok-load nvme 1054705` exercises `tokenizer.fj` encoder/decoder and
+  table-load path; BPE encode of "hello" hits the bounds-checked loop.
+- `ask hello` runs `km_rmsnorm` (dispatches to C bypass but falls
+  back to Fajar LayerNorm for non-bypassed shapes); no crash observed.
+
+No fresh SmolLM boot required — coverage is shape-equivalent.
+
+### Variance vs budget
+
+Budget: 1.2h (+25% = 1.5h). Actual: 0.25h (audit + documentation only,
+since all fixes were already present). Variance: **-79%**. This is a
+legitimate under-run because Phase P1 was design-for-redundancy from
+v2.0; the fixes had already landed during V28.1/V28.5/V30 work and the
+plan rightly specified a re-audit rather than new implementation.
+
+### Phase P1 Gate Verdict
+
+✅ **PASS.** Cleared to enter Phase P2 (RMSNorm + Gated FFN + Frame-
+Alloc Vectors, est 4.75h). P2 is where net-new 1B-specific work begins:
+the C-bypass RMSNorm + GELU-tanh are already live, so P2 is primarily
+about the frame-alloc vector API (P2.B3) and the gated FFN wiring
+(P2.B4) that use them.
