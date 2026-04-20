@@ -2,6 +2,87 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
+## [3.7.0] "FS Roundtrip" -- 2026-04-20
+
+V30 Track 4 — ext2 + FAT32 disk harness. 5 phases (P0-P5) complete,
+9-invariant regression gate live, 1 latent bug surfaced
+(`ext2_create` returns -1 on freshly-mkfs'd disk — deferred to V31
+ext2 fix work). Closes the scope-pin from V29.P2:
+*"ext2/FAT32 tests need disk-backed mount which isn't set up at
+boot-test time."*
+
+### Added
+
+- **`scripts/build_test_disk.py`** — manifest-driven ext2 + FAT32
+  disk-image builder using `mkfs.ext2`+`debugfs` (ext2) and
+  `mkfs.fat`+`mtools` (FAT32). `--self-test` verifies 6/6 byte
+  round-trips against `tests/test-disks/manifest.json`. Exits with
+  install hint (CI-friendly) if host tools missing.
+- **`tests/test-disks/manifest.json`** — 3 deterministic files
+  (README.TXT 43 B, DATA.BIN 16 B, SUBDIR/NESTED.TXT 25 B) with
+  `content_ascii` + `content_hex` encodings.
+- **`make test-fs-roundtrip`** — two-boot QEMU harness (one per
+  filesystem). **9 PASS invariants:**
+  - FAT32 (5): mount · README.TXT 43 B via fatls · DATA.BIN 16 B ·
+    `fatcat` content matches manifest · no EXC/PANIC
+  - ext2 (4): `ext2-mkfs` · `ext2-mount` · `ext2-ls` traverses root
+    inode · no EXC/PANIC
+  - Plus NOTE line surfacing the open `ext2-write` bug
+- **`ext2-mkfs`** + **`ext2-mount`** shell commands — dispatch
+  added in `shell/commands.fj` for `cmd_mkfs_ext2` + `cmd_mount_ext2`
+  (previously defined in `fs/ext2_super.fj` but dead code from
+  shell's perspective).
+- **`docs/V30_TRACK4_DISK_HARNESS_PLAN.md`** — full 5-phase plan
+  with Rule-1/3/6/8 compliance (8/8 Plan Hygiene self-check).
+
+### Fixed
+
+- **QEMU boot order priority** — test disk images built by
+  `mkfs.fat`/`mkfs.ext2` carry the standard `0x55 0xAA` boot
+  signature at byte 510. Without explicit `-boot order=d`, QEMU
+  boots from the NVMe-attached test disk instead of the ISO CDROM,
+  triple-faulting before any serial output. `test-fs-roundtrip`
+  uses `-boot order=d` to force CDROM-first. **This bug would have
+  silently blocked all future multi-disk test harnesses.**
+
+### Documented
+
+- **`fajar-lang CLAUDE.md §6.10`** — "Filesystem Roundtrip Coverage
+  Rule" with 4-invariant pre-[x] checklist (R1-R4): Makefile gate
+  required · `-boot order=d` · in-kernel mkfs preferred · surface
+  bugs as NOTE.
+- **Kernel ext2 custom layout** — `EXT2_INODE_TABLE_SECTOR = 12`
+  is incompatible with standard mkfs.ext2 output. Kernel-side mkfs
+  + mount + ls is the honest roundtrip; host-built images only
+  validate the on-disk magic byte.
+
+### Surfaced (known issue, deferred to V31)
+
+- `ext2_create` returns -1 on a freshly-mkfs'd disk. Symptoms:
+  ```
+  nova> ext2-write hello.txt FajarNova
+  ext2-write: create failed (-1)
+  nova> ext2-ls
+  ext2 root directory:
+    (empty)
+  ```
+  Root cause not investigated this session (Track 4 scope was
+  harness, not fix). Gate surfaces via NOTE line so every CI run
+  is honest about it.
+
+### Stats
+
+- 5 phases PASS (P0-P5)
+- 9 regression invariants + 1 NOTE
+- 6 fajaros-x86 commits this sprint (`3b8a747` plan →
+  `82592a7` builder → `491019b` Makefile target → `1becf90`
+  dispatch → this CHANGELOG)
+- 1 fajar-lang commit (`459a3f6` §6.10 rule)
+- Budget 7.75h (+25%), actual ~2.0h (-74%)
+- Kernel text +336 bytes (2 new dispatch clauses)
+- Host tool prerequisites: `e2fsprogs`, `dosfstools`, `mtools`
+  (all auto-skipped if missing)
+
 ## [3.6.0] "Gemma 3 Foundation" -- 2026-04-20
 
 V30.GEMMA3 Track 2 **audit-complete** via Path D (research artifact).
