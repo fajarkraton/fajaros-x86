@@ -319,6 +319,10 @@
     quant_init()
     fajarquant_init()
     km_init()
+    // V31.C.P1.3d: Phase D σ LUT must be populated before any tfm_mf_*
+    // call since km_mf_sigmoid reads the 257-entry table at KM_MF_SIGMOID_LUT.
+    // Safe to call unconditionally — writes 1 KB to BSS, ~1 ms init cost.
+    km_mf_sigmoid_lut_init()
     tok_init()
     mlsched_init()
     println(53)

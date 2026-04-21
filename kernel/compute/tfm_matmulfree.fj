@@ -49,6 +49,12 @@ const TFM_MF_SCRATCH0: i64 = 0xC70000    // 2048 × 8 = 16 KB
 const TFM_MF_SCRATCH1: i64 = 0xC74000    // 2·2731 × 8 ≈ 44 KB
 const TFM_MF_SCRATCH2: i64 = 0xC80000    // 2048 × 8 = 16 KB
 
+// V31.C.P1.3c: LM head logits buffer — sized for Phase D vocab V=32768 × 8 B = 256 KB.
+// Lives between TFM_MF_SCRATCH2 end (0xC84000) and MDL_LAYER_BASE (0x1200000);
+// that gap is ~9 MB so 256 KB is comfortable. BitLinear outputs logits here,
+// argmax scans once to pick next token.
+const TFM_MF_LOGITS: i64 = 0xC84000      // 32768 × 8 = 256 KB
+
 // ═══════════════════════════════════════════════════════════════
 // MLGRU State Lifecycle
 // ═══════════════════════════════════════════════════════════════
@@ -85,31 +91,108 @@ const TFM_MF_SCRATCH2: i64 = 0xC80000    // 2048 × 8 = 16 KB
 //   6·layer_id + 3  attn.o_proj
 @kernel fn tfm_mf_mlgru_block(layer_id: i64, x_addr: i64) {
     let d = mdl_get_d_model()
-    // STUB — implementation sketch:
-    //   1. Save residual: memcpy(TFM_MF_SCRATCH2, x, d)
-    //   2. RMSNorm in place: km_mf_rmsnorm_no_gamma(x, d)
-    //   3. Quant: gamma_x = km_mf_absmax_quant_i8(x, d)
-    //   4. BitLinear i → c_in (TFM_MF_SCRATCH0)
-    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 0)
-    //      km_mf_bitlinear_packed(W_i, d, d, TFM_MF_SCRATCH0, beta, gamma_x)
-    //   5. BitLinear f → f_logits (reuse TFM_MF_SCRATCH0 + d*8)
-    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 1)
-    //      km_mf_bitlinear_packed(W_f, d, d, TFM_MF_SCRATCH0 + d*8, beta, gamma_x)
-    //   6. BitLinear g → g_logits
-    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 2)
-    //      ...
-    //   7. f_t[i] = km_mf_sigmoid(f_logits[i])  for i in 0..d
-    //   8. c_t[i] = km_mf_silu(c_in[i])         (via SiLU on i-proj output)
-    //   9. km_mf_mlgru_update(f, h_prev=KM_MF_MLGRU_STATE, c, h_new=KM_MF_MLGRU_STATE, d)
-    //  10. g_t[i] = km_mf_sigmoid(g_logits[i])
-    //  11. Hadamard: temp[i] = g_t[i] * KM_MF_MLGRU_STATE[i] / 1000
-    //  12. RMSNorm on temp
-    //  13. Quant temp
-    //  14. BitLinear o → o_out
-    //  15. Residual: x[i] = SCRATCH2[i] + o_out[i]
+
+    // Weight addresses — each layer's weights live at
+    // MDL_LAYER_BASE + layer_id * MDL_LAYER_SLOT_SIZE + 24 (past v9 layer hdr).
+    // The 4 MLGRU BitLinears are back-to-back, each (d, d) ternary → d²/4 bytes.
+    // Order per python/phase_d/intllm/export.py:156: i, f, g, o.
+    let layer_base = MDL_LAYER_BASE + layer_id * MDL_LAYER_SLOT_SIZE + 24
+    let w_mat_bytes = (d * d) / 4
+    let w_i = layer_base + 0 * w_mat_bytes
+    let w_f = layer_base + 1 * w_mat_bytes
+    let w_g = layer_base + 2 * w_mat_bytes
+    let w_o = layer_base + 3 * w_mat_bytes
+
+    let beta_i = mdl_v9_get_beta_x1000(6 * layer_id + 0)
+    let beta_f = mdl_v9_get_beta_x1000(6 * layer_id + 1)
+    let beta_g = mdl_v9_get_beta_x1000(6 * layer_id + 2)
+    let beta_o = mdl_v9_get_beta_x1000(6 * layer_id + 3)
+
+    // Scratch-buffer partitioning (see file header for sizes):
+    //   SCRATCH0[0..d*8]      = c_in      (BitLinear i output)
+    //   SCRATCH0[d*8..2d*8]   = f_logits  (BitLinear f output)
+    //   SCRATCH1[0..d*8]      = g_logits  (BitLinear g output)
+    //   SCRATCH2[0..d*8]      = residual save (x BEFORE RMSNorm)
+    let c_in = TFM_MF_SCRATCH0
+    let f_addr = TFM_MF_SCRATCH0 + d * 8
+    let g_addr = TFM_MF_SCRATCH1
+
+    // Step 1: save residual (x → SCRATCH2)
     let mut i: i64 = 0
     while i < d {
-        // No-op for scaffold — downstream sees unchanged residual
+        volatile_write_u64(TFM_MF_SCRATCH2 + i * 8, volatile_read_u64(x_addr + i * 8))
+        i = i + 1
+    }
+
+    // Step 2: RMSNorm in place on x
+    km_mf_rmsnorm_no_gamma(x_addr, d)
+
+    // Step 3: absmax quantize x → KM_MF_ACT_QUANT_BUF (shared by all 4 BitLinears
+    // below — they all consume the same normalized+quantized input vector).
+    let gamma_x = km_mf_absmax_quant_i8(x_addr, d)
+
+    // Step 4: BitLinear i_proj → c_in
+    km_mf_bitlinear_packed(w_i, d, d, c_in, beta_i, gamma_x)
+
+    // Step 5: BitLinear f_proj → f_logits
+    km_mf_bitlinear_packed(w_f, d, d, f_addr, beta_f, gamma_x)
+
+    // Step 6: BitLinear g_proj → g_logits
+    km_mf_bitlinear_packed(w_g, d, d, g_addr, beta_g, gamma_x)
+
+    // Step 7: f_t = σ(f_logits) in-place
+    i = 0
+    while i < d {
+        let v = volatile_read_u64(f_addr + i * 8)
+        volatile_write_u64(f_addr + i * 8, km_mf_sigmoid(v))
+        i = i + 1
+    }
+
+    // Step 8: c_t = SiLU(c_in) in-place
+    i = 0
+    while i < d {
+        let v = volatile_read_u64(c_in + i * 8)
+        volatile_write_u64(c_in + i * 8, km_mf_silu(v))
+        i = i + 1
+    }
+
+    // Step 9: MLGRU update — h_new = f_t ⊙ h_prev + (1-f_t) ⊙ c_t.
+    // Reads f_addr / KM_MF_MLGRU_STATE / c_in; writes h_new back to state.
+    km_mf_mlgru_update(f_addr, KM_MF_MLGRU_STATE, c_in, KM_MF_MLGRU_STATE, d)
+
+    // Step 10: g_t = σ(g_logits) in-place
+    i = 0
+    while i < d {
+        let v = volatile_read_u64(g_addr + i * 8)
+        volatile_write_u64(g_addr + i * 8, km_mf_sigmoid(v))
+        i = i + 1
+    }
+
+    // Step 11: Hadamard temp[i] = g_t[i] * h_new[i] / 1000.
+    // Write to SCRATCH0 (overwrites c_in — no longer needed).
+    i = 0
+    while i < d {
+        let g_v = volatile_read_u64(g_addr + i * 8)
+        let h_v = volatile_read_u64(KM_MF_MLGRU_STATE + i * 8)
+        volatile_write_u64(TFM_MF_SCRATCH0 + i * 8, (g_v * h_v) / 1000)
+        i = i + 1
+    }
+
+    // Step 12: RMSNorm on temp (in-place at SCRATCH0)
+    km_mf_rmsnorm_no_gamma(TFM_MF_SCRATCH0, d)
+
+    // Step 13: absmax quantize temp → KM_MF_ACT_QUANT_BUF (new γ_x for o_proj)
+    let gamma_temp = km_mf_absmax_quant_i8(TFM_MF_SCRATCH0, d)
+
+    // Step 14: BitLinear o_proj → SCRATCH1 (reusing g_logits slot, no longer needed).
+    km_mf_bitlinear_packed(w_o, d, d, TFM_MF_SCRATCH1, beta_o, gamma_temp)
+
+    // Step 15: residual add — x[i] = SCRATCH2[i] (saved residual) + SCRATCH1[i] (o_out)
+    i = 0
+    while i < d {
+        let res = volatile_read_u64(TFM_MF_SCRATCH2 + i * 8)
+        let o_v = volatile_read_u64(TFM_MF_SCRATCH1 + i * 8)
+        volatile_write_u64(x_addr + i * 8, res + o_v)
         i = i + 1
     }
 }
@@ -129,29 +212,67 @@ const TFM_MF_SCRATCH2: i64 = 0xC80000    // 2048 × 8 = 16 KB
 //   6·layer_id + 5  mlp.down_proj  (output = d)
 @kernel fn tfm_mf_glu_block(layer_id: i64, x_addr: i64) {
     let d = mdl_get_d_model()
-    // intermediate_size computation — HGRN-Bit formula: 8d/3, rounded.
-    // Match upstream's convention by reading from the loaded model's
-    // intermediate_size field (offset TBD in FJM v9).
+    // HGRN-Bit intermediate = 8d/3. Exporter packs gate_proj with out=2·int
+    // (combined gate+up halves) and down_proj with out=d.
     let intermediate: i64 = (8 * d) / 3
 
-    // STUB — implementation sketch:
-    //   1. Save residual: memcpy(TFM_MF_SCRATCH2, x, d)
-    //   2. RMSNorm: km_mf_rmsnorm_no_gamma(x, d)
-    //   3. Quant:  gamma_x = km_mf_absmax_quant_i8(x, d)
-    //   4. BitLinear gate_proj → SCRATCH1 (size 2·intermediate)
-    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 4)
-    //      km_mf_bitlinear_packed(W_gate, d, 2*intermediate, TFM_MF_SCRATCH1, beta, gamma_x)
-    //   5. Split: gate_half = SCRATCH1[0..intermediate]
-    //             up_half   = SCRATCH1[intermediate..2*intermediate]
-    //   6. Element-wise: ffn_hidden[i] = km_mf_silu(gate_half[i]) * up_half[i] / 1000
-    //   7. Quant ffn_hidden
-    //   8. BitLinear down_proj → x (d output)
-    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 5)
-    //      km_mf_bitlinear_packed(W_down, intermediate, d, x, beta, gamma_x)
-    //   9. Residual: x[i] = SCRATCH2[i] + x[i]
+    // Weight addresses — continue past the 4 MLGRU matrices.
+    //   layer_base points past the 24-byte v9 layer header.
+    //   MLGRU occupies 4 × d²/4 = d² bytes.
+    //   GLU has 2 BitLinears (per export.py:156: gate_proj + down_proj):
+    //     gate_proj : (2·int, d)  → 2·int·d/4 bytes
+    //     down_proj : (d, int)    → d·int/4 bytes
+    let layer_base = MDL_LAYER_BASE + layer_id * MDL_LAYER_SLOT_SIZE + 24
+    let mlgru_bytes = d * d                 // 4 × (d·d/4) = d²
+    let gate_bytes = (2 * intermediate * d) / 4
+    let w_gate = layer_base + mlgru_bytes
+    let w_down = layer_base + mlgru_bytes + gate_bytes
+
+    let beta_gate = mdl_v9_get_beta_x1000(6 * layer_id + 4)
+    let beta_down = mdl_v9_get_beta_x1000(6 * layer_id + 5)
+
+    // Step 1: save residual (x → SCRATCH2)
     let mut i: i64 = 0
     while i < d {
-        // No-op for scaffold
+        volatile_write_u64(TFM_MF_SCRATCH2 + i * 8, volatile_read_u64(x_addr + i * 8))
+        i = i + 1
+    }
+
+    // Step 2: RMSNorm in place on x
+    km_mf_rmsnorm_no_gamma(x_addr, d)
+
+    // Step 3: absmax quantize x → KM_MF_ACT_QUANT_BUF
+    let gamma_x = km_mf_absmax_quant_i8(x_addr, d)
+
+    // Step 4: BitLinear gate_proj → SCRATCH1[0..2·int]. Sized for Stretch
+    // 2·2730 ≈ 43.7 KB fits in the 44 KB SCRATCH1 slot.
+    km_mf_bitlinear_packed(w_gate, d, 2 * intermediate, TFM_MF_SCRATCH1, beta_gate, gamma_x)
+
+    // Steps 5 + 6: in-place hidden[i] = SiLU(gate[i]) * up[i] / 1000.
+    // Safe to overwrite SCRATCH1[i] with hidden[i] while still reading up[i]
+    // at SCRATCH1[intermediate + i] — the two strides never collide for
+    // forward iteration (i < intermediate implies intermediate+i ≥ intermediate > i).
+    i = 0
+    while i < intermediate {
+        let gate_v = volatile_read_u64(TFM_MF_SCRATCH1 + i * 8)
+        let up_v = volatile_read_u64(TFM_MF_SCRATCH1 + (intermediate + i) * 8)
+        let h_v = (km_mf_silu(gate_v) * up_v) / 1000
+        volatile_write_u64(TFM_MF_SCRATCH1 + i * 8, h_v)
+        i = i + 1
+    }
+
+    // Step 7: absmax quantize hidden (length = intermediate) → KM_MF_ACT_QUANT_BUF
+    let gamma_h = km_mf_absmax_quant_i8(TFM_MF_SCRATCH1, intermediate)
+
+    // Step 8: BitLinear down_proj → SCRATCH0 (d × 8 ≤ 16 KB fits).
+    km_mf_bitlinear_packed(w_down, intermediate, d, TFM_MF_SCRATCH0, beta_down, gamma_h)
+
+    // Step 9: residual add — x[i] = SCRATCH2[i] + SCRATCH0[i]
+    i = 0
+    while i < d {
+        let res = volatile_read_u64(TFM_MF_SCRATCH2 + i * 8)
+        let down_v = volatile_read_u64(TFM_MF_SCRATCH0 + i * 8)
+        volatile_write_u64(x_addr + i * 8, res + down_v)
         i = i + 1
     }
 }
@@ -200,15 +321,36 @@ const TFM_MF_SCRATCH2: i64 = 0xC80000    // 2048 × 8 = 16 KB
 
     // Step 4: LM head — BitLinear d → V, then argmax.
     // β index: 6L + 0 = `n_layers * 6` (after all per-layer BitLinears).
+    // LM head weight lives past the L per-layer slots in MDL_LAYER_BASE.
+    // Per export.py:249 file layout, LM head is packed ternary shape (V, d),
+    // V·d/4 bytes. For RAM-loaded models the loader concatenates all weights
+    // linearly into MDL_LAYER_BASE; for stream mode the LM head should be
+    // streamed into the same slot past the last layer — we treat the slot
+    // after layer (n_layers-1) as LM head storage.
+    //
+    // Address: MDL_LAYER_BASE + n_layers * MDL_LAYER_SLOT_SIZE  (no +24 hdr
+    // for LM head — it's raw ternary bytes, not a layer block).
     let vocab = mdl_get_vocab_size()
+    let lm_head_addr = MDL_LAYER_BASE + n_layers * MDL_LAYER_SLOT_SIZE
     let lm_head_beta = mdl_v9_get_beta_x1000(n_layers * 6)
     let gamma_x = km_mf_absmax_quant_i8(STFM_X, d_model)
-    // STUB: real call would be
-    //   km_mf_bitlinear_packed(LM_HEAD_ADDR, d_model, vocab,
-    //                          TFM_MF_SCRATCH2, lm_head_beta, gamma_x)
-    //   return km_argmax_i32(TFM_MF_SCRATCH2, vocab)
-    // For scaffold: return a non-error sentinel so callers don't fault.
-    0
+
+    km_mf_bitlinear_packed(lm_head_addr, d_model, vocab, TFM_MF_LOGITS,
+                           lm_head_beta, gamma_x)
+
+    // Argmax over logits — single pass, i64 comparisons.
+    let mut best_idx: i64 = 0
+    let mut best_val: i64 = volatile_read_u64(TFM_MF_LOGITS)
+    let mut v: i64 = 1
+    while v < vocab {
+        let logit = volatile_read_u64(TFM_MF_LOGITS + v * 8)
+        if logit > best_val {
+            best_val = logit
+            best_idx = v
+        }
+        v = v + 1
+    }
+    best_idx
 }
 
 // ═══════════════════════════════════════════════════════════════
