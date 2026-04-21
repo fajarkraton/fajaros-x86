@@ -180,17 +180,31 @@ const KM_MF_GAMMA_X: i64 = 0xC66000         // 8 B i64
 //   Input  x_quant_buf (i8 at KM_MF_ACT_QUANT_BUF, length d_in)
 //          weight_addr (packed 2-bit ternary at .fjm load offset)
 //          d_in, d_out
-//          beta_x1000  : per-matrix β scaled ×1000
+//          beta_x1000    : per-matrix β scaled ×1000
 //          gamma_x_x1000 : activation γ_x from km_mf_absmax_quant_i8
-//   Output y_addr      : output vector i64×x1000 length d_out
+//   Output y_addr        : output vector i64×x1000 length d_out
 //
-// Forward:
-//   Y_j = Σ_{i: W̃[j,i]=+1} x̃_i  -  Σ_{i: W̃[j,i]=-1} x̃_i
-//   y_j = Y_j × β / Q_b   where Q_b = 127, β scaled ×1000
+// Forward (dequantize at the end of the dot product):
+//   Y_j = Σ W̃[j,i] × x̃[i]                   (pure i64 signed-add)
+//   y_j_real = Y_j × (β × γ_x / 127)         (dequant both weight + activation)
+//   y_j_x1000 = Y_j × β × γ_x × 1000 / 127
+//             = (Y_j × β_x1000 × γ_x_x1000) / 127000
 //
 // Ternary packing per FJQ_PHASE_D_FJM_V9_SPEC.md §5:
-//   bits 1-0 of byte k = entry 4k+0, bits 3-2 = 4k+1, etc.
-//   00 = -1, 01 = 0, 10 = +1, 11 = reserved
+//   byte k holds entries 4k..4k+3 at bit offsets 0,2,4,6.
+//   00 = -1, 01 = 0, 10 = +1, 11 = reserved (treat as 0).
+//
+// LLVM O2 miscompile notes (the V30 Track 3 gate_proj bypass class):
+//   - Inner loop has 2-branch if-else per element (encoded==2 vs ==0)
+//     — LLVM's vectorizer typically bails on per-element branches, so
+//     this loop SHOULD emit scalar code by default even at O2.
+//   - V31.B.P2's @no_vectorize annotation landed for user-space
+//     functions only; fajar-lang parser mutex'es it with @kernel as
+//     of commit `dc56f6b`. Real root-cause fix tracked in V31.B.P1.
+//   - If C.P5.5 kernel-path tests show vectorized codegen emerging
+//     despite the branching, fallback: rewrite inner loop as
+//     @noinline wrapper + gcc-compiled C helper (same pattern as
+//     km_vecmat_packed_v8 in V30 Track 3).
 @kernel fn km_mf_bitlinear_packed(
     weight_addr: i64,
     d_in: i64,
@@ -199,19 +213,43 @@ const KM_MF_GAMMA_X: i64 = 0xC66000         // 8 B i64
     beta_x1000: i64,
     gamma_x_x1000: i64
 ) {
-    // STUB ~80 LOC C.P5.1 impl. Inner-loop hot path:
-    //   for j in 0..d_out:
-    //     accum = 0
-    //     for i in 0..d_in:
-    //       w = ((byte[(j*d_in + i)/4] >> (2 * (i & 3))) & 0x3) - 1
-    //       if w != -2 (= reserved → skip):  accum += w * x_quant[i]
-    //     y[j] = (accum × beta) / 127     (post-rescale to x1000)
-    //
-    // Compiled with @no_vectorize per V31.B.P2 (LLVM O2 vecmat
-    // miscompile workaround in fajar-lang until B.P1 lands).
     let mut j: i64 = 0
     while j < d_out {
-        volatile_write_u64(y_addr + j * 8, 0)
+        let row_base: i64 = j * d_in
+        let mut accum: i64 = 0
+        let mut i: i64 = 0
+        while i < d_in {
+            let bit_idx: i64 = row_base + i
+            let byte_idx: i64 = bit_idx >> 2           // / 4
+            let bit_off: i64 = (bit_idx & 3) << 1      // (% 4) * 2
+            let packed: i64 = volatile_read_u8(weight_addr + byte_idx)
+            let encoded: i64 = (packed >> bit_off) & 3
+
+            let x_byte: i64 = volatile_read_u8(KM_MF_ACT_QUANT_BUF + i)
+            // Sign-extend i8 stored as u8: values 128..255 map to -128..-1
+            let x_i: i64 = if x_byte >= 128 { x_byte - 256 } else { x_byte }
+
+            // 00 → weight = -1 → accum -= x_i
+            // 01 → weight =  0 → skip (fall through)
+            // 10 → weight = +1 → accum += x_i
+            // 11 → reserved    → skip (treat as 0; producer MUST never emit)
+            if encoded == 2 {
+                accum = accum + x_i
+            } else if encoded == 0 {
+                accum = accum - x_i
+            }
+            i = i + 1
+        }
+
+        // Dequant: y_x1000 = (accum × β_x1000 × γ_x_x1000) / (127 × 1000)
+        // Overflow analysis (worst case for Stretch d_in=8192):
+        //   accum         ≤ 127 × 8192 = 1,040,384               (~2^20)
+        //   β_x1000       ≤ 2000         (β ≤ 2)                 (~2^11)
+        //   γ_x_x1000     ≤ 1e7          (activation absmax)     (~2^24)
+        //   product       ≤ 2^20 × 2^11 × 2^24 = 2^55            (safe in i64)
+        // Divide by 127000 at the end.
+        let y_x1000: i64 = (accum * beta_x1000 * gamma_x_x1000) / 127000
+        volatile_write_u64(y_addr + j * 8, y_x1000)
         j = j + 1
     }
 }
