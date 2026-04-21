@@ -114,6 +114,7 @@ SOURCES := \
 	kernel/compute/matmulfree.fj \
 	kernel/compute/model_loader.fj \
 	kernel/compute/fjm_v9.fj \
+	kernel/compute/tfm_matmulfree.fj \
 	kernel/compute/tokenizer.fj \
 	kernel/compute/fjtrace.fj \
 	kernel/compute/transformer.fj \

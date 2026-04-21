@@ -1,0 +1,273 @@
+// FajarOS — MatMul-Free LM forward orchestrator (V31 Phase D, IntLLM)
+// Per-token forward pass for .fjm v9 IntLLM models.
+// Peer to `tfm_forward_stream` (Gemma 3 / SmolLM) in transformer.fj.
+//
+// Composes the integer-native ops from matmulfree.fj + model metadata
+// from fjm_v9.fj into the standard HGRN-Bit per-block schedule:
+//
+//   For each of L decoder layers:
+//     [MLGRU block]
+//       1. RMSNorm (no γ)
+//       2. activation absmax quantize → i8
+//       3. BitLinear i_proj / f_proj / g_proj / o_proj (4×)
+//       4. σ gates on f_proj + g_proj outputs
+//       5. SiLU on c_proj (via i_proj reinterpretation)
+//       6. MLGRU update: h_t = f ⊙ h_{t-1} + (1-f) ⊙ c
+//       7. o-projection + residual
+//     [GLU block]
+//       1. RMSNorm (no γ)
+//       2. activation absmax quantize → i8
+//       3. BitLinear gate_proj (combined, out=2·int)
+//       4. SiLU on gate half + Hadamard with up half
+//       5. BitLinear down_proj
+//       6. residual
+//   Final RMSNorm (no γ)
+//   LM head: BitLinear (d → V) + argmax
+//
+// V31.C.P5.3 SCAFFOLD — function shells + documentation. Implementation
+// pass (wire weights + streaming + real tests) is C.P5.5.
+
+// ═══════════════════════════════════════════════════════════════
+// State Memory Layout
+// ═══════════════════════════════════════════════════════════════
+//
+// Residual stream x (per-token hidden state) lives at STFM_X (reuses
+// existing transformer state slot — Phase D and Gemma 3 never run
+// concurrently). Sized for d_max = 2048; actual use is d_model per
+// the loaded model.
+//
+// MLGRU state h_t lives at KM_MF_MLGRU_STATE (matmulfree.fj). Reset
+// to zero on each new generation start; kept across tokens within
+// the same generation.
+//
+// Scratch pools for per-layer BitLinear outputs (reused):
+//   TFM_MF_SCRATCH0  d_max × 8 B  - for i/f/g/o BitLinear outputs in MLGRU
+//   TFM_MF_SCRATCH1  2·(8d/3)·8 B - for combined gate_proj output in GLU
+//   TFM_MF_SCRATCH2  d_max × 8 B  - for residual addition + argmax
+
+const TFM_MF_SCRATCH0: i64 = 0xC70000    // 2048 × 8 = 16 KB
+const TFM_MF_SCRATCH1: i64 = 0xC74000    // 2·2731 × 8 ≈ 44 KB
+const TFM_MF_SCRATCH2: i64 = 0xC80000    // 2048 × 8 = 16 KB
+
+// ═══════════════════════════════════════════════════════════════
+// MLGRU State Lifecycle
+// ═══════════════════════════════════════════════════════════════
+
+// tfm_mf_reset_state: clear MLGRU h_t at generation start.
+@kernel fn tfm_mf_reset_state() {
+    let d_model = mdl_get_d_model()
+    let mut i: i64 = 0
+    while i < d_model {
+        volatile_write_u64(KM_MF_MLGRU_STATE + i * 8, 0)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Per-layer MLGRU block
+// ═══════════════════════════════════════════════════════════════
+
+// tfm_mf_mlgru_block: one MLGRU layer.
+//
+// Inputs:
+//   layer_id     : [0, L)
+//   x_addr       : residual stream, mutated in place
+//
+// Side effects:
+//   - Reads 4 BitLinear weights from per-layer block
+//   - Updates KM_MF_MLGRU_STATE in place
+//   - Updates x_addr with post-residual output
+//
+// BitLinear β indices per FJQ_PHASE_D_FJM_V9_SPEC.md §2:
+//   6·layer_id + 0  attn.i_proj
+//   6·layer_id + 1  attn.f_proj
+//   6·layer_id + 2  attn.g_proj
+//   6·layer_id + 3  attn.o_proj
+@kernel fn tfm_mf_mlgru_block(layer_id: i64, x_addr: i64) {
+    let d = mdl_get_d_model()
+    // STUB — implementation sketch:
+    //   1. Save residual: memcpy(TFM_MF_SCRATCH2, x, d)
+    //   2. RMSNorm in place: km_mf_rmsnorm_no_gamma(x, d)
+    //   3. Quant: gamma_x = km_mf_absmax_quant_i8(x, d)
+    //   4. BitLinear i → c_in (TFM_MF_SCRATCH0)
+    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 0)
+    //      km_mf_bitlinear_packed(W_i, d, d, TFM_MF_SCRATCH0, beta, gamma_x)
+    //   5. BitLinear f → f_logits (reuse TFM_MF_SCRATCH0 + d*8)
+    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 1)
+    //      km_mf_bitlinear_packed(W_f, d, d, TFM_MF_SCRATCH0 + d*8, beta, gamma_x)
+    //   6. BitLinear g → g_logits
+    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 2)
+    //      ...
+    //   7. f_t[i] = km_mf_sigmoid(f_logits[i])  for i in 0..d
+    //   8. c_t[i] = km_mf_silu(c_in[i])         (via SiLU on i-proj output)
+    //   9. km_mf_mlgru_update(f, h_prev=KM_MF_MLGRU_STATE, c, h_new=KM_MF_MLGRU_STATE, d)
+    //  10. g_t[i] = km_mf_sigmoid(g_logits[i])
+    //  11. Hadamard: temp[i] = g_t[i] * KM_MF_MLGRU_STATE[i] / 1000
+    //  12. RMSNorm on temp
+    //  13. Quant temp
+    //  14. BitLinear o → o_out
+    //  15. Residual: x[i] = SCRATCH2[i] + o_out[i]
+    let mut i: i64 = 0
+    while i < d {
+        // No-op for scaffold — downstream sees unchanged residual
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Per-layer GLU block (combined gate+up + down)
+// ═══════════════════════════════════════════════════════════════
+
+// tfm_mf_glu_block: one GLU channel mixer.
+//
+// Per HGRN-Bit convention: mlp.gate_proj outputs (2 × intermediate_size)
+// in a single BitLinear — first half is GATE, second half is UP.
+// After SiLU(gate) ⊙ up, mlp.down_proj projects back to d.
+//
+// BitLinear β indices:
+//   6·layer_id + 4  mlp.gate_proj  (output = 2·intermediate)
+//   6·layer_id + 5  mlp.down_proj  (output = d)
+@kernel fn tfm_mf_glu_block(layer_id: i64, x_addr: i64) {
+    let d = mdl_get_d_model()
+    // intermediate_size computation — HGRN-Bit formula: 8d/3, rounded.
+    // Match upstream's convention by reading from the loaded model's
+    // intermediate_size field (offset TBD in FJM v9).
+    let intermediate: i64 = (8 * d) / 3
+
+    // STUB — implementation sketch:
+    //   1. Save residual: memcpy(TFM_MF_SCRATCH2, x, d)
+    //   2. RMSNorm: km_mf_rmsnorm_no_gamma(x, d)
+    //   3. Quant:  gamma_x = km_mf_absmax_quant_i8(x, d)
+    //   4. BitLinear gate_proj → SCRATCH1 (size 2·intermediate)
+    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 4)
+    //      km_mf_bitlinear_packed(W_gate, d, 2*intermediate, TFM_MF_SCRATCH1, beta, gamma_x)
+    //   5. Split: gate_half = SCRATCH1[0..intermediate]
+    //             up_half   = SCRATCH1[intermediate..2*intermediate]
+    //   6. Element-wise: ffn_hidden[i] = km_mf_silu(gate_half[i]) * up_half[i] / 1000
+    //   7. Quant ffn_hidden
+    //   8. BitLinear down_proj → x (d output)
+    //      beta = mdl_v9_get_beta_x1000(6*layer_id + 5)
+    //      km_mf_bitlinear_packed(W_down, intermediate, d, x, beta, gamma_x)
+    //   9. Residual: x[i] = SCRATCH2[i] + x[i]
+    let mut i: i64 = 0
+    while i < d {
+        // No-op for scaffold
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Top-level forward pass
+// ═══════════════════════════════════════════════════════════════
+
+// tfm_mf_forward: Phase D per-token forward.
+//   Input : token_id (vocab index), pos (position in generation)
+//   Output: next token argmax (vocab index), or -1 on error
+//
+// Called by shell's `ask` command on each generation step.
+// Call tfm_mf_reset_state() before the first token of a new
+// generation to clear MLGRU h_t.
+@kernel fn tfm_mf_forward(token_id: i64, pos: i64) -> i64 {
+    let d_model = mdl_get_d_model()
+    let n_layers = mdl_get_n_layers()
+
+    // Step 1: Embedding lookup (FP16 table → i64 x1000 in STFM_X).
+    // Phase D embedding is NOT ternary — standard FP16 table per
+    // FJQ_PHASE_D_FJM_V9_SPEC.md §6.
+    // STUB: reuses existing mdl_stream_embed_lookup_raw for now
+    //       (may need Phase D-specific variant for FP16 → x1000 scale).
+    mdl_stream_embed_lookup_raw(token_id, STFM_X)
+
+    // Step 2: For each layer — MLGRU block then GLU block.
+    let mut layer_id: i64 = 0
+    while layer_id < n_layers {
+        // Load layer block if streaming (mdl_stream_load_layer handles
+        // codebook paging; here it just streams the ternary weights).
+        if mdl_ram_active() != 1 {
+            let rc = mdl_stream_load_layer(layer_id)
+            if rc != 0 {
+                cprintln("[ERR] mf: stream_load_layer failed", RED_ON_BLACK)
+                return -1
+            }
+        }
+        tfm_mf_mlgru_block(layer_id, STFM_X)
+        tfm_mf_glu_block(layer_id, STFM_X)
+        layer_id = layer_id + 1
+    }
+
+    // Step 3: Final RMSNorm (no γ).
+    km_mf_rmsnorm_no_gamma(STFM_X, d_model)
+
+    // Step 4: LM head — BitLinear d → V, then argmax.
+    // β index: 6L + 0 = `n_layers * 6` (after all per-layer BitLinears).
+    let vocab = mdl_get_vocab_size()
+    let lm_head_beta = mdl_v9_get_beta_x1000(n_layers * 6)
+    let gamma_x = km_mf_absmax_quant_i8(STFM_X, d_model)
+    // STUB: real call would be
+    //   km_mf_bitlinear_packed(LM_HEAD_ADDR, d_model, vocab,
+    //                          TFM_MF_SCRATCH2, lm_head_beta, gamma_x)
+    //   return km_argmax_i32(TFM_MF_SCRATCH2, vocab)
+    // For scaffold: return a non-error sentinel so callers don't fault.
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Shell Integration Entry Points
+// ═══════════════════════════════════════════════════════════════
+//
+// Invoked by `ask` dispatch when mdl_get_version() == 9 AND
+// mdl_get_model_type() == 11 (routing logic lives in the shell
+// command, not here — separation of concerns).
+
+// tfm_mf_generate: multi-token greedy generation.
+//   prompt_addr : i64[] token IDs, length prompt_len
+//   max_new     : maximum tokens to generate
+//   out_addr    : where to write generated tokens (appended after prompt)
+// Returns number of tokens generated (0 to max_new).
+@kernel fn tfm_mf_generate(prompt_addr: i64, prompt_len: i64,
+                            max_new: i64, out_addr: i64) -> i64 {
+    tfm_mf_reset_state()
+
+    // Prefill: run forward on each prompt token; discard outputs except last.
+    let mut i: i64 = 0
+    while i < prompt_len {
+        let tok = volatile_read_u64(prompt_addr + i * 8)
+        let _ = tfm_mf_forward(tok, i)
+        i = i + 1
+    }
+
+    // Generation: read argmax from last prefill → feed back → loop.
+    let mut next_tok = tfm_mf_forward(
+        volatile_read_u64(prompt_addr + (prompt_len - 1) * 8),
+        prompt_len - 1
+    )
+    let mut n_generated: i64 = 0
+    while n_generated < max_new {
+        volatile_write_u64(out_addr + n_generated * 8, next_tok)
+        next_tok = tfm_mf_forward(next_tok, prompt_len + n_generated)
+        n_generated = n_generated + 1
+    }
+    n_generated
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Regression Gate Hooks (C.P5.5 — next session)
+// ═══════════════════════════════════════════════════════════════
+//
+// make test-intllm-kernel-path (to be added):
+//   Boot FajarOS with a .fjm v9 test model (small, bit-exact to Phase D's
+//   Python simulator), then:
+//     - ask "hello" (triggers tfm_mf_forward)
+//     - Check: no saturation, no collapse, 5 argmax matches simulator
+//
+// Gate invariants:
+//   1. mdl_v9_detect_format returns MDL_FORMAT_PHASE_D on test .fjm
+//   2. tfm_mf_forward returns non-error (>=0) for all prompt tokens
+//   3. No EXC: / PANIC: markers during forward
+//   4. Generated tokens match Python simulator bit-exact (proves
+//      kernel parity vs reference impl, §6.9 R3 baseline parity)
+//
+// Skeleton gate to add in Makefile:
+//   test-intllm-kernel-path: iso-llvm test-models/intllm-tiny.fjm
+//       @$(QEMU) ... boot ... ask hello ... > log
+//       @grep "tfm_mf_forward returned" log && ...
