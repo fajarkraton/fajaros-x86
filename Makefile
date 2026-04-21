@@ -111,6 +111,7 @@ SOURCES := \
 	kernel/compute/quantize.fj \
 	kernel/compute/fajarquant.fj \
 	kernel/compute/kmatrix.fj \
+	kernel/compute/matmulfree.fj \
 	kernel/compute/model_loader.fj \
 	kernel/compute/tokenizer.fj \
 	kernel/compute/fjtrace.fj \

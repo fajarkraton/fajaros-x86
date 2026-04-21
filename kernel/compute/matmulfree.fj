@@ -1,0 +1,281 @@
+// FajarOS — MatMul-Free LM kernel ops (V31 Phase D, IntLLM)
+// Implements the integer-native ops cataloged in
+// fajarquant/docs/FJQ_PHASE_D_OPS.md §2.
+//
+// Architecture: HGRN-Bit (Zhu et al. 2024, arXiv:2406.02528) ported to
+// FajarOS x1000 fixed-point.
+//   - 6 BitLinears per layer: attn.{i,f,g,o}_proj + mlp.{gate,down}_proj
+//   - MLGRU token mixer (no attention, no softmax, no RoPE)
+//   - GLU channel mixer (gate+up combined → 2·intermediate, then down)
+//   - RMSNorm without learnable γ (BitNet/MatMul-Free convention)
+//
+// Convention: x1000 fixed-point throughout (matches V28/V29 Gemma 3
+// kmatrix.fj). Real value v stored as i64 v×1000. All ops are
+// @kernel safe — no heap, no float, no transcendentals (σ via LUT).
+//
+// Function prefix: km_mf_ (kernel matmul-free) to distinguish from
+// km_* attention-style ops in kmatrix.fj.
+//
+// V31.C.P5.1 SCAFFOLD — implementation pending. The skeleton commits
+// the public API + memory layout decisions so FJM v9 parser
+// (kernel/model/fjm_v9.fj) and forward orchestration
+// (kernel/model/tfm_matmulfree.fj) can be written against it.
+
+// ═══════════════════════════════════════════════════════════════
+// Memory Layout
+// ═══════════════════════════════════════════════════════════════
+
+// σ LUT: 257 entries × 4 bytes (i32 in x1000 fixed-point) = 1028 B
+// Lives in kernel .rodata; addressable as a flat i64 array.
+// Per FJQ_PHASE_D_OPS.md §2 Op 4: domain [-8, +8], step 1/16, max
+// error ≤ 1 LSB at x1000.
+const KM_MF_SIGMOID_LUT: i64 = 0xC60000     // 1028 B σ LUT
+const KM_MF_SIGMOID_LUT_SIZE: i64 = 257
+const KM_MF_SIGMOID_LUT_MIN: i64 = -8000     // -8 × 1000
+const KM_MF_SIGMOID_LUT_MAX: i64 = 8000      // +8 × 1000
+const KM_MF_SIGMOID_LUT_STEP_X1000: i64 = 62 // 1/16 = 0.0625 → 62.5 ≈ 62 (rounded)
+
+// MLGRU state: per-channel hidden state h_t, x1000 fixed-point.
+// Sized for Stretch (d=1024). Lives in kernel BSS.
+const KM_MF_MLGRU_STATE: i64 = 0xC61000     // 1024 × 8 B = 8 KB
+
+// Per-block RMSNorm scratch — reused across the 6 BitLinears per layer
+const KM_MF_RMSNORM_SCRATCH: i64 = 0xC63000 // 1024 × 8 B = 8 KB
+
+// Activation scratch (post-quantize i8 vector, 8K wide max for FFN
+// hidden = 8d/3 at d=1024 → 2731 elements).
+const KM_MF_ACT_QUANT_BUF: i64 = 0xC65000   // 4 KB i8
+
+// Activation γ_x scalar (per BitLinear, recomputed per-call by
+// default; future periodic-recal QAT will source from .fjm v9
+// γ_x table).
+const KM_MF_GAMMA_X: i64 = 0xC66000         // 8 B i64
+
+// ═══════════════════════════════════════════════════════════════
+// Helpers — little-endian u32 read (no volatile_read_u32_le builtin
+// in fajar-lang yet; compose from byte reads per model_loader.fj:163)
+// ═══════════════════════════════════════════════════════════════
+
+@kernel fn km_mf_read_u32_le(addr: i64) -> i64 {
+    let b0: i64 = volatile_read_u8(addr)
+    let b1: i64 = volatile_read_u8(addr + 1)
+    let b2: i64 = volatile_read_u8(addr + 2)
+    let b3: i64 = volatile_read_u8(addr + 3)
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Op 4 — Sigmoid LUT (FJQ_PHASE_D_OPS.md §2 Op 4)
+// ═══════════════════════════════════════════════════════════════
+
+// km_mf_sigmoid_lut_init: write the 257-entry table to KM_MF_SIGMOID_LUT.
+// Called once at boot. LUT values precomputed offline via Python:
+//   for i in 0..257: lut[i] = round(σ((i - 128)/16) × 1000)
+// where σ(x) = 1/(1+exp(-x)). Boot init avoids storing the table in
+// .rodata (Fajar Lang doesn't yet support large const arrays).
+@kernel fn km_mf_sigmoid_lut_init() {
+    // STUB — table values populated in C.P5.1 implementation.
+    // For now, write a saturating ramp so reads don't fault during
+    // skeleton validation. Real values land in C.P5.1.
+    let mut i: i64 = 0
+    while i < KM_MF_SIGMOID_LUT_SIZE {
+        // Linear ramp 0 → 1000 across 0..256
+        let val: i64 = (i * 1000) / 256
+        volatile_write_u32_le(KM_MF_SIGMOID_LUT + i * 4, val)
+        i = i + 1
+    }
+}
+
+// km_mf_sigmoid: σ(x) via 257-entry LUT + linear interpolation.
+// Input  x: i64, x1000 fixed-point (e.g. 2500 = 2.5)
+// Output y: i64, x1000 fixed-point in [0, 1000]
+@kernel fn km_mf_sigmoid(x: i64) -> i64 {
+    // Saturate to LUT range
+    let mut x_clamped: i64 = x
+    if x_clamped < KM_MF_SIGMOID_LUT_MIN { x_clamped = KM_MF_SIGMOID_LUT_MIN }
+    if x_clamped > KM_MF_SIGMOID_LUT_MAX { x_clamped = KM_MF_SIGMOID_LUT_MAX }
+    // Index: floor((x - min) / step) where step = 1/16 (so 16x scale)
+    let idx_x16: i64 = ((x_clamped - KM_MF_SIGMOID_LUT_MIN) * 16) / 1000
+    let idx_lo: i64 = idx_x16
+    let frac_x1000: i64 = ((x_clamped - KM_MF_SIGMOID_LUT_MIN) * 16 * 1000) / 1000 - idx_lo * 1000
+    let mut idx_hi: i64 = idx_lo + 1
+    if idx_hi >= KM_MF_SIGMOID_LUT_SIZE { idx_hi = KM_MF_SIGMOID_LUT_SIZE - 1 }
+    let lo_val: i64 = km_mf_read_u32_le(KM_MF_SIGMOID_LUT + idx_lo * 4)
+    let hi_val: i64 = km_mf_read_u32_le(KM_MF_SIGMOID_LUT + idx_hi * 4)
+    // y = lo + (hi - lo) * frac
+    lo_val + ((hi_val - lo_val) * frac_x1000) / 1000
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Op 5 — SiLU LUT (composed)
+// ═══════════════════════════════════════════════════════════════
+
+// km_mf_silu: SiLU(x) = x · σ(x) via composed LUT.
+// Input  x: i64, x1000.   Output y: i64, x1000.
+@kernel fn km_mf_silu(x: i64) -> i64 {
+    let s: i64 = km_mf_sigmoid(x)
+    (x * s) / 1000
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Op 10 — Activation absmax quantize (FJQ_PHASE_D_OPS.md §2 Op 10)
+// ═══════════════════════════════════════════════════════════════
+
+// km_mf_absmax_quant_i8:
+//   Input  x_addr  : i64 array of x1000-scaled values, length d
+//   Output buf      : packed i8 at KM_MF_ACT_QUANT_BUF (length d)
+//   Returns         : γ_x (max |x|) stored in i64, x1000 scale
+//
+// Forward (per FJQ_PHASE_D_OPS.md §2 Op 10):
+//   γ_x = max_i |x_i|    (single pass)
+//   s   = 127·1000 / γ_x
+//   x̃_i = clip(round(x_i × s / 1000), -127, 127)
+@kernel fn km_mf_absmax_quant_i8(x_addr: i64, d: i64) -> i64 {
+    // STUB. Find absmax + quantize. ~25 LOC C.P5.1 impl.
+    // For skeleton: returns γ_x = 127000 (a sentinel meaning "scale=1.0").
+    let mut i: i64 = 0
+    let mut gamma: i64 = 1
+    while i < d {
+        let v: i64 = volatile_read_u64(x_addr + i * 8)
+        let abs_v: i64 = if v < 0 { -v } else { v }
+        if abs_v > gamma { gamma = abs_v }
+        i = i + 1
+    }
+    let scale: i64 = (127 * 1000) / gamma  // x1000 / x1000 = unitless × 1000
+    i = 0
+    while i < d {
+        let v: i64 = volatile_read_u64(x_addr + i * 8)
+        let mut q: i64 = (v * scale) / 1000 / 1000   // x → x̃ in [-127, 127]
+        if q > 127 { q = 127 }
+        if q < -127 { q = -127 }
+        // Sign-extend to i8 storage (write byte; reader will sign-extend)
+        volatile_write_u8(KM_MF_ACT_QUANT_BUF + i, q & 0xFF)
+        i = i + 1
+    }
+    gamma
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Op 3 — BitLinear ⊛ (ternary signed-add)
+// ═══════════════════════════════════════════════════════════════
+
+// km_mf_bitlinear_packed:
+//   Input  x_quant_buf (i8 at KM_MF_ACT_QUANT_BUF, length d_in)
+//          weight_addr (packed 2-bit ternary at .fjm load offset)
+//          d_in, d_out
+//          beta_x1000  : per-matrix β scaled ×1000
+//          gamma_x_x1000 : activation γ_x from km_mf_absmax_quant_i8
+//   Output y_addr      : output vector i64×x1000 length d_out
+//
+// Forward:
+//   Y_j = Σ_{i: W̃[j,i]=+1} x̃_i  -  Σ_{i: W̃[j,i]=-1} x̃_i
+//   y_j = Y_j × β / Q_b   where Q_b = 127, β scaled ×1000
+//
+// Ternary packing per FJQ_PHASE_D_FJM_V9_SPEC.md §5:
+//   bits 1-0 of byte k = entry 4k+0, bits 3-2 = 4k+1, etc.
+//   00 = -1, 01 = 0, 10 = +1, 11 = reserved
+@kernel fn km_mf_bitlinear_packed(
+    weight_addr: i64,
+    d_in: i64,
+    d_out: i64,
+    y_addr: i64,
+    beta_x1000: i64,
+    gamma_x_x1000: i64
+) {
+    // STUB ~80 LOC C.P5.1 impl. Inner-loop hot path:
+    //   for j in 0..d_out:
+    //     accum = 0
+    //     for i in 0..d_in:
+    //       w = ((byte[(j*d_in + i)/4] >> (2 * (i & 3))) & 0x3) - 1
+    //       if w != -2 (= reserved → skip):  accum += w * x_quant[i]
+    //     y[j] = (accum × beta) / 127     (post-rescale to x1000)
+    //
+    // Compiled with @no_vectorize per V31.B.P2 (LLVM O2 vecmat
+    // miscompile workaround in fajar-lang until B.P1 lands).
+    let mut j: i64 = 0
+    while j < d_out {
+        volatile_write_u64(y_addr + j * 8, 0)
+        j = j + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Op 8 — MLGRU state update
+// ═══════════════════════════════════════════════════════════════
+
+// km_mf_mlgru_update:
+//   h_t = f_t ⊙ h_{t-1} + (1 - f_t) ⊙ c_t
+//   per element: h_t_i = (f_t_i × h_prev_i + (1000 - f_t_i) × c_t_i) / 1000
+//
+// f_t, h_prev, c_t, h_out all addresses to i64 arrays of length d, x1000.
+@kernel fn km_mf_mlgru_update(
+    f_addr: i64,
+    h_prev_addr: i64,
+    c_addr: i64,
+    h_out_addr: i64,
+    d: i64
+) {
+    let mut i: i64 = 0
+    while i < d {
+        let f: i64 = volatile_read_u64(f_addr + i * 8)
+        let h_prev: i64 = volatile_read_u64(h_prev_addr + i * 8)
+        let c: i64 = volatile_read_u64(c_addr + i * 8)
+        let h_t: i64 = (f * h_prev + (1000 - f) * c) / 1000
+        volatile_write_u64(h_out_addr + i * 8, h_t)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Op 2 — RMSNorm without γ (Phase D variant)
+// ═══════════════════════════════════════════════════════════════
+
+// km_mf_rmsnorm_no_gamma:
+//   Phase D drops the learnable γ multiplication that V31.R3 isolated
+//   as the root cause of Gemma 3 pad-collapse in fixed-point. Scale
+//   absorbed downstream into BitLinear's β/Q_b rescale.
+//
+//   y_i = x_i / sqrt((1/d) × Σ x_i² + ε)
+//
+// Reuses km_isqrt (kmatrix.fj line 335) for reciprocal-sqrt.
+@kernel fn km_mf_rmsnorm_no_gamma(x_addr: i64, d: i64) {
+    // Compute Σ x² (sum-of-squares)
+    let mut sum_sq: i64 = 0
+    let mut i: i64 = 0
+    while i < d {
+        let v: i64 = volatile_read_u64(x_addr + i * 8)
+        // x is x1000 → v² is x1e6; need to keep within i64 range
+        sum_sq = sum_sq + (v * v) / 1000
+        i = i + 1
+    }
+    let mean_sq: i64 = sum_sq / d
+    let denom: i64 = km_isqrt(mean_sq + 1)  // reuses kmatrix.fj helper
+    if denom == 0 { return }                 // guard against div-by-zero
+    // In-place normalize
+    i = 0
+    while i < d {
+        let v: i64 = volatile_read_u64(x_addr + i * 8)
+        let y: i64 = (v * 1000) / denom
+        volatile_write_u64(x_addr + i * 8, y)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Public API summary (for tfm_matmulfree.fj orchestrator)
+// ═══════════════════════════════════════════════════════════════
+// Boot-time init:
+//   km_mf_sigmoid_lut_init()
+//
+// Per-token forward (called from tfm_matmulfree.fj for each layer):
+//   1. km_mf_rmsnorm_no_gamma(x)               for input + each BitLinear
+//   2. km_mf_absmax_quant_i8(x, d)             produces KM_MF_ACT_QUANT_BUF + γ_x
+//   3. km_mf_bitlinear_packed(W_addr, d_in, d_out, y, β, γ_x)
+//   4. km_mf_sigmoid(z) / km_mf_silu(z)        for MLGRU gates / GLU activation
+//   5. km_mf_mlgru_update(f, h_prev, c, h_out, d)
+//
+// Per-token sequence inside one MLGRU+GLU layer:
+//   norm → quant → 4 BitLinears (i,f,g,o) → σ ×2 + SiLU
+//                                          → MLGRU update → o-projection
+//   norm → quant → BitLinear gate_proj (out=2·int) → split + SiLU + Hadamard
+//                → BitLinear down_proj
