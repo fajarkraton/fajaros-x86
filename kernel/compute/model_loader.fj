@@ -185,11 +185,13 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
         return -1  // Bad magic
     }
 
-    // Check version (support v1, v2, v3, v4, v5, v6, v7, v8)
+    // Check version (support v1, v2, v3, v4, v5, v6, v7, v8, v9)
     // v7 adds Gemma 3 1B fields: rope_theta_global, sliding_window, sliding_pattern, n_kv_heads
     // v8 reuses v7 header slot + adds quant_format (group-wise 4-bit) at offset 172
+    // v9 (V31 Phase D IntLLM): version=9, model_type=11, quant_format=2 (ternary)
+    //     reuses v7 header skeleton + appends β/γ_x/layer tables (parsed by fjm_v9.fj)
     let version = mdl_read_u32(src_addr + FJM_OFF_VERSION)
-    if version < 1 || version > 8 {
+    if version < 1 || version > 9 {
         return -2  // Unsupported version
     }
 
@@ -291,6 +293,12 @@ const MDL_LAYER_SLOT_SIZE: i64 = 0x200000  // 2 MB per layer
     } else {
         volatile_write_u64(MDL_GAMMA_MODE, 1)  // SmolLM/Llama: direct scale
     }
+
+    // V31.C.P1.2c wire-up: detect v9 IntLLM format + parse β/γ_x/layer tables
+    // if present. Caches format code in MDL_V9_FORMAT_CACHE for shell dispatch.
+    // Non-v9 models no-op after caching.
+    let v9_rc = mdl_v9_init_after_header(src_addr)
+    if v9_rc < 0 { return -4 }
 
     0  // Success
 }

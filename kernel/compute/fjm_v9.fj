@@ -58,6 +58,11 @@ const MDL_V9_GAMMA_COUNT: i64 = 0xBEB400
 const MDL_V9_LAYER_OFFSETS: i64 = 0xBEB408
 const MDL_V9_MAX_BETAS: i64 = 145    // 6L+1 at L=24 (Stretch)
 const MDL_V9_MAX_LAYERS_OFFSET_TABLE: i64 = 32  // headroom past Stretch L=24
+// V31.C.P1.2c: cached format code written by mdl_v9_init_after_header.
+// Read by shell dispatch to route `ask` to tfm_mf_generate vs tfm_forward_stream.
+// Layout: 8 B slot after LAYER_OFFSETS (96 B at 0xBEB408 ends at 0xBEB468).
+// Placed at 0xBEB470 with headroom to 0xBEF200 (MDL_V7_EXTRA).
+const MDL_V9_FORMAT_CACHE: i64 = 0xBEB470
 
 // ═══════════════════════════════════════════════════════════════
 // Per-layer block header (24 bytes per FJQ_PHASE_D_FJM_V9_SPEC.md §4)
@@ -252,6 +257,13 @@ const FJM_V9_LAYER_HDR_SIZE: i64 = 24
 //
 // Returns 0 on success, -1 on parse error.
 @kernel fn mdl_v9_init_after_header(src_addr: i64) -> i64 {
+    // V31.C.P1.2c: detect + cache format code regardless of path. Shell
+    // dispatch reads MDL_V9_FORMAT_CACHE to route `ask` to the v9
+    // orchestrator. Non-v9 models return early after caching the format.
+    let fmt = mdl_v9_detect_format()
+    volatile_write_u64(MDL_V9_FORMAT_CACHE, fmt)
+    if fmt != MDL_FORMAT_PHASE_D { return 0 }
+
     let mut cursor: i64 = src_addr + 176  // past v9 header
 
     let beta_consumed = mdl_v9_parse_beta_table(cursor)
@@ -263,7 +275,7 @@ const FJM_V9_LAYER_HDR_SIZE: i64 = 24
 
     // Record per-layer block offsets — uses the layer block header
     // total_size to advance the cursor.
-    let n_layers = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LAYERS)
+    let n_layers = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_N_LAYERS)
     let mut layer_id: i64 = 0
     while layer_id < n_layers {
         let file_offset = cursor - src_addr
