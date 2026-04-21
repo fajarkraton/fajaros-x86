@@ -1,0 +1,243 @@
+// FajarOS — .fjm v9 parser (V31 Phase D, IntLLM)
+// Implements the byte layout specified in
+// fajarquant/docs/FJQ_PHASE_D_FJM_V9_SPEC.md.
+//
+// v9 is purely additive over v7/v8 — the 176-byte header skeleton is
+// unchanged, only `version=9 + model_type=11 + quant_format=2`
+// flags Phase D models. After the header, v9 introduces:
+//   - β table         (per-matrix absmean scalars, baked at QAT freeze)
+//   - γ_x table       (optional, periodic-recal QAT contribution)
+//   - per-layer blocks with 24-byte header + 6 BitLinears + RMSNorm.eps
+//   - embedding (FP16)
+//   - LM head (ternary, like a layer block)
+//
+// This file's responsibility: detect v9 + parse the v9-specific
+// sections into kernel BSS so tfm_matmulfree.fj forward orchestration
+// can read them by direct address.
+//
+// V31.C.P5.4 SCAFFOLD — public API + memory layout decisions.
+// Implementation (real reads from NVMe / RAM source) lands in
+// the C.P5.4 implementation pass.
+
+// ═══════════════════════════════════════════════════════════════
+// v9 detection constants (per FJQ_PHASE_D_FJM_V9_SPEC.md §1)
+// ═══════════════════════════════════════════════════════════════
+
+const FJM_V9_VERSION: i64 = 9
+const FJM_V9_MODEL_TYPE_INTLLM: i64 = 11
+const FJM_V9_QUANT_FORMAT_TERNARY: i64 = 2
+
+// Format-detection return codes (extends model_loader.fj routing)
+const MDL_FORMAT_LEGACY: i64 = 1     // v3-v6
+const MDL_FORMAT_V7_SMOLLM: i64 = 2  // v7 SmolLM
+const MDL_FORMAT_GEMMA3_V8: i64 = 3  // v8 Gemma 3
+const MDL_FORMAT_PHASE_D: i64 = 4    // v9 IntLLM (this file)
+const MDL_FORMAT_UNSUPPORTED: i64 = -1
+
+// ═══════════════════════════════════════════════════════════════
+// v9 BSS Memory Layout
+// ═══════════════════════════════════════════════════════════════
+// Lives above the V7_EXTRA region (0xBEF200 + 24 = 0xBEF218) and
+// below MDL_HDR_BASE (0xC00000). Total budget ~64 KB.
+//
+//   MDL_V9_BETA_TABLE       0xBE9000  4 × 145 B = 580 B (Stretch worst case)
+//   MDL_V9_BETA_COUNT       0xBE9300  8 B (i64 count = 6L+1)
+//   MDL_V9_GAMMA_TABLE      0xBE9400  ~8 KB γ_x entries (optional)
+//   MDL_V9_GAMMA_COUNT      0xBEB400  8 B (i64 count, 0 if absent)
+//   MDL_V9_LAYER_OFFSETS    0xBEB408  4 × 24 = 96 B (Stretch L=24)
+//
+// The actual layer weight blocks live in MDL_LAYER_BASE
+// (0x1200000+) per the existing model_loader.fj layout. v9 just
+// records WHERE each block starts so tfm_matmulfree.fj can
+// stream to MDL_LAYER_SLOT for inference.
+
+const MDL_V9_BETA_TABLE: i64 = 0xBE9000
+const MDL_V9_BETA_COUNT: i64 = 0xBE9300
+const MDL_V9_GAMMA_TABLE: i64 = 0xBE9400
+const MDL_V9_GAMMA_COUNT: i64 = 0xBEB400
+const MDL_V9_LAYER_OFFSETS: i64 = 0xBEB408
+const MDL_V9_MAX_BETAS: i64 = 145    // 6L+1 at L=24 (Stretch)
+const MDL_V9_MAX_LAYERS_OFFSET_TABLE: i64 = 32  // headroom past Stretch L=24
+
+// ═══════════════════════════════════════════════════════════════
+// Per-layer block header (24 bytes per FJQ_PHASE_D_FJM_V9_SPEC.md §4)
+// ═══════════════════════════════════════════════════════════════
+const FJM_V9_LAYER_OFF_ID: i64 = 0           // 4B layer index
+const FJM_V9_LAYER_OFF_TOTAL_SIZE: i64 = 4   // 4B block bytes incl header
+const FJM_V9_LAYER_OFF_MLGRU_SIZE: i64 = 8   // 4B MLGRU 4 BitLinears bytes
+const FJM_V9_LAYER_OFF_GLU_SIZE: i64 = 12    // 4B GLU 2 BitLinears bytes
+const FJM_V9_LAYER_OFF_RMSNORM_OFF: i64 = 16 // 4B offset to RMSNorm.eps
+const FJM_V9_LAYER_OFF_RESERVED: i64 = 20    // 4B reserved padding
+const FJM_V9_LAYER_HDR_SIZE: i64 = 24
+
+// ═══════════════════════════════════════════════════════════════
+// v9 Format Detection
+// ═══════════════════════════════════════════════════════════════
+
+// mdl_v9_detect_format: return MDL_FORMAT_PHASE_D if header at
+// MDL_HDR_BASE is a v9 IntLLM model. Call AFTER mdl_parse_header
+// has loaded the 176-byte header. Cheap (3 word reads).
+@kernel fn mdl_v9_detect_format() -> i64 {
+    let version = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_VERSION) & 0xFF
+    let model_type = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_MODEL_TYPE) & 0xFF
+    // quant_format lives at MDL_V7_EXTRA + 20 (per the V8 layout
+    // memo at model_loader.fj:250)
+    let quant_lo = volatile_read_u8(MDL_V7_EXTRA + 20)
+    let quant_hi = volatile_read_u8(MDL_V7_EXTRA + 21)
+    let quant_format = quant_lo | (quant_hi << 8)
+    if version == FJM_V9_VERSION
+       && model_type == FJM_V9_MODEL_TYPE_INTLLM
+       && quant_format == FJM_V9_QUANT_FORMAT_TERNARY {
+        return MDL_FORMAT_PHASE_D
+    }
+    MDL_FORMAT_UNSUPPORTED
+}
+
+// ═══════════════════════════════════════════════════════════════
+// β Table Parser (per FJQ_PHASE_D_FJM_V9_SPEC.md §2)
+// ═══════════════════════════════════════════════════════════════
+
+// mdl_v9_parse_beta_table: read β table starting at `src_addr` (just
+// past the 176-byte header) into MDL_V9_BETA_TABLE. Stores count at
+// MDL_V9_BETA_COUNT.
+//
+// Layout: u32 table_size, u32 n_betas, then n_betas × f32.
+//
+// Returns: number of bytes consumed (= 8 + 4·n_betas), or -1 on
+// invalid count (>MDL_V9_MAX_BETAS).
+@kernel fn mdl_v9_parse_beta_table(src_addr: i64) -> i64 {
+    let n_betas = mdl_read_u32(src_addr + 4)
+    if n_betas <= 0 || n_betas > MDL_V9_MAX_BETAS { return -1 }
+    volatile_write_u64(MDL_V9_BETA_COUNT, n_betas)
+    // Copy the f32 table (raw bytes — caller interprets)
+    let mut i: i64 = 0
+    let copy_bytes = 4 * n_betas
+    while i < copy_bytes {
+        volatile_write_u8(MDL_V9_BETA_TABLE + i, volatile_read_u8(src_addr + 8 + i))
+        i = i + 1
+    }
+    8 + copy_bytes
+}
+
+// ═══════════════════════════════════════════════════════════════
+// γ_x Table Parser (per FJQ_PHASE_D_FJM_V9_SPEC.md §3, optional)
+// ═══════════════════════════════════════════════════════════════
+
+// mdl_v9_parse_gamma_table: read γ_x table starting at `src_addr`.
+// Stores raw bytes at MDL_V9_GAMMA_TABLE + count at MDL_V9_GAMMA_COUNT.
+// If n_entries == 0 (empty table written explicitly), this is a
+// no-op marker meaning "compute γ_x per-call at inference"
+// (BitNet baseline).
+//
+// Returns: number of bytes consumed.
+@kernel fn mdl_v9_parse_gamma_table(src_addr: i64) -> i64 {
+    let n_entries = mdl_read_u32(src_addr + 4)
+    volatile_write_u64(MDL_V9_GAMMA_COUNT, n_entries)
+    if n_entries == 0 { return 8 }
+    let copy_bytes = 4 * n_entries
+    let mut i: i64 = 0
+    while i < copy_bytes {
+        volatile_write_u8(MDL_V9_GAMMA_TABLE + i, volatile_read_u8(src_addr + 8 + i))
+        i = i + 1
+    }
+    8 + copy_bytes
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Per-layer Block Parser (header read; weight pointers stored)
+// ═══════════════════════════════════════════════════════════════
+
+// mdl_v9_record_layer_block: record where layer N's block starts
+// (offset from start of file). Layer weight data itself is
+// streamed-in by the existing mdl_load_layer machinery.
+@kernel fn mdl_v9_record_layer_block(layer_id: i64, file_offset: i64) {
+    if layer_id < 0 || layer_id >= MDL_V9_MAX_LAYERS_OFFSET_TABLE { return }
+    volatile_write_u64(MDL_V9_LAYER_OFFSETS + layer_id * 8, file_offset)
+}
+
+// mdl_v9_get_layer_offset: retrieve recorded block offset for layer N.
+// Returns 0 if not recorded.
+@kernel fn mdl_v9_get_layer_offset(layer_id: i64) -> i64 {
+    if layer_id < 0 || layer_id >= MDL_V9_MAX_LAYERS_OFFSET_TABLE { return 0 }
+    volatile_read_u64(MDL_V9_LAYER_OFFSETS + layer_id * 8)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// β Lookup (called by km_mf_bitlinear_packed during forward)
+// ═══════════════════════════════════════════════════════════════
+
+// mdl_v9_get_beta_x1000: return β scaled ×1000 for matrix index `idx`.
+// Indexing per FJQ_PHASE_D_FJM_V9_SPEC.md §2:
+//   For layer ℓ in 0..L:
+//     6ℓ+0 attn.i_proj   6ℓ+1 attn.f_proj   6ℓ+2 attn.g_proj
+//     6ℓ+3 attn.o_proj   6ℓ+4 mlp.gate_proj 6ℓ+5 mlp.down_proj
+//   6L+0 lm_head
+//
+// β is stored as f32 in the .fjm; we read 4 bytes + convert to a
+// scaled i64 (β × 1000) for the kernel's x1000 fixed-point path.
+@kernel fn mdl_v9_get_beta_x1000(idx: i64) -> i64 {
+    let n_betas = volatile_read_u64(MDL_V9_BETA_COUNT)
+    if idx < 0 || idx >= n_betas { return 1000 }  // safe default β=1.0
+    // Read 4 bytes as raw u32 — interpret as IEEE 754 fp32 mantissa+exp.
+    // STUB: full f32→i64 conversion lands in C.P5.4 implementation.
+    // For scaffold, return a sentinel β=0.5 (=500) so callers don't
+    // divide by zero. Real impl: extract sign+exp+mantissa, multiply
+    // by 1000, integer-round.
+    500
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Top-level v9 Loader (orchestrator — called from mdl_load_*)
+// ═══════════════════════════════════════════════════════════════
+
+// mdl_v9_init_after_header: invoked from mdl_load_from_nvme /
+// mdl_load_from_ramfs after mdl_parse_header succeeds AND
+// mdl_v9_detect_format == MDL_FORMAT_PHASE_D.
+//
+// Reads β table + γ_x table + records all layer offsets so
+// downstream forward code (tfm_matmulfree.fj) can stream layers
+// + look up scaling factors.
+//
+// Returns 0 on success, -1 on parse error.
+@kernel fn mdl_v9_init_after_header(src_addr: i64) -> i64 {
+    let mut cursor: i64 = src_addr + 176  // past v9 header
+
+    let beta_consumed = mdl_v9_parse_beta_table(cursor)
+    if beta_consumed < 0 { return -1 }
+    cursor = cursor + beta_consumed
+
+    let gamma_consumed = mdl_v9_parse_gamma_table(cursor)
+    cursor = cursor + gamma_consumed
+
+    // Record per-layer block offsets — uses the layer block header
+    // total_size to advance the cursor.
+    let n_layers = mdl_read_u32(MDL_HDR_BASE + FJM_OFF_LAYERS)
+    let mut layer_id: i64 = 0
+    while layer_id < n_layers {
+        let file_offset = cursor - src_addr
+        mdl_v9_record_layer_block(layer_id, file_offset)
+        let total_size = mdl_read_u32(cursor + FJM_V9_LAYER_OFF_TOTAL_SIZE)
+        if total_size <= 0 { return -1 }
+        cursor = cursor + total_size
+        layer_id = layer_id + 1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Public API summary (for tfm_matmulfree.fj orchestrator)
+// ═══════════════════════════════════════════════════════════════
+// Boot/load time:
+//   mdl_parse_header(src)            existing — parses 176-byte header
+//   mdl_v9_detect_format()           NEW — returns MDL_FORMAT_PHASE_D
+//   mdl_v9_init_after_header(src)    NEW — parses β/γ_x/layer offsets
+//
+// Inference time (called from tfm_matmulfree per BitLinear):
+//   beta = mdl_v9_get_beta_x1000(linear_idx)
+//   layer_off = mdl_v9_get_layer_offset(layer_id)
+//
+// γ_x lookup pattern:
+//   if MDL_V9_GAMMA_COUNT > 0:
+//       use frozen γ_x at MDL_V9_GAMMA_TABLE + entry_offset
+//   else:
+//       compute γ_x per-call via km_mf_absmax_quant_i8
