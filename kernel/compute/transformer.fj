@@ -1171,6 +1171,34 @@ const TFM_EOS_TOKEN: i64 = 2
         return
     }
 
+    // V31.C.P1.4: Phase D (v9 IntLLM) dispatch — routes to matmul-free
+    // orchestrator. Reads format cache populated by mdl_v9_init_after_header.
+    // Runs regardless of RAM vs NVMe source since tfm_mf_generate handles
+    // streaming internally (via mdl_stream_load_layer in tfm_mf_forward).
+    let v9_fmt = volatile_read_u64(MDL_V9_FORMAT_CACHE)
+    if v9_fmt == MDL_FORMAT_PHASE_D {
+        let pd_text_addr: i64 = 0x6F800 + 4
+        let pd_text_len = len - 4
+        let pd_tok_buf = TFM_SCRATCH + 16384
+        let pd_out_buf = TFM_SCRATCH + 20480    // 512 tok slot past tok_buf
+        let pd_n_prompt = tok_encode(pd_text_addr, pd_text_len, pd_tok_buf)
+        if pd_n_prompt <= 0 {
+            cprintln("[ERR] Phase D: tokenization failed", RED_ON_BLACK)
+            return
+        }
+        cprint("Output (tokens): ", WHITE_ON_BLACK)
+        let pd_n_gen = tfm_mf_generate(pd_tok_buf, pd_n_prompt, 64, pd_out_buf)
+        let mut pd_gi: i64 = 0
+        while pd_gi < pd_n_gen {
+            let pd_tid = volatile_read_u64(pd_out_buf + pd_gi * 8)
+            cprint_decimal(pd_tid, WHITE_ON_BLACK)
+            cprint(" ", WHITE_ON_BLACK)
+            pd_gi = pd_gi + 1
+        }
+        cprintln("", WHITE_ON_BLACK)
+        return
+    }
+
     // NVMe source → use streaming path
     let src_type = volatile_read_u64(MDL_STATE_BASE + MDL_ST_SRC_TYPE)
     if src_type == 2 {
