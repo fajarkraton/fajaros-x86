@@ -173,17 +173,69 @@ const FJM_V9_LAYER_HDR_SIZE: i64 = 24
 //     6ℓ+3 attn.o_proj   6ℓ+4 mlp.gate_proj 6ℓ+5 mlp.down_proj
 //   6L+0 lm_head
 //
-// β is stored as f32 in the .fjm; we read 4 bytes + convert to a
-// scaled i64 (β × 1000) for the kernel's x1000 fixed-point path.
+// β is stored as IEEE 754 fp32 little-endian in the .fjm; we read 4
+// bytes and decode without using floating-point ops (kernel is
+// @kernel = no FP). Output scaled ×1000 for the kernel's x1000
+// fixed-point path.
+//
+// Algorithm (pure integer):
+//   raw        = u32 bits
+//   sign       = bit 31
+//   exp_biased = bits 23-30
+//   mantissa   = bits 0-22
+//
+//   value = (-1)^sign × (1 + mantissa/2^23) × 2^(exp_biased - 127)
+//         = (-1)^sign × (mantissa | 2^23) × 2^(exp_biased - 127 - 23)
+//
+//   result = sign_applied(mantissa_full × 1000 × 2^shift)
+//
+// Edge cases:
+//   exp_biased = 0   → subnormal or zero → treat as 0 (β≈0 weights
+//                      would make the layer a no-op; safe)
+//   exp_biased = 255 → inf/nan → return 1000 (β=1.0 safe default)
+//
+// Precision: β values in Phase D are absmean of ternary-coded matrix
+// weights, typically in [0.05, 1.5]. For β=0.5 (= 2^-1) the integer
+// result is exactly 500. For β=0.333 the result is 333 (±1 LSB).
+// This is 0.3% relative precision — well within the ternary
+// quantization error floor.
 @kernel fn mdl_v9_get_beta_x1000(idx: i64) -> i64 {
     let n_betas = volatile_read_u64(MDL_V9_BETA_COUNT)
-    if idx < 0 || idx >= n_betas { return 1000 }  // safe default β=1.0
-    // Read 4 bytes as raw u32 — interpret as IEEE 754 fp32 mantissa+exp.
-    // STUB: full f32→i64 conversion lands in C.P5.4 implementation.
-    // For scaffold, return a sentinel β=0.5 (=500) so callers don't
-    // divide by zero. Real impl: extract sign+exp+mantissa, multiply
-    // by 1000, integer-round.
-    500
+    if idx < 0 || idx >= n_betas { return 1000 }
+    let raw = mdl_read_u32(MDL_V9_BETA_TABLE + idx * 4)
+
+    let sign: i64 = (raw >> 31) & 1
+    let exp_biased: i64 = (raw >> 23) & 0xFF
+    let mantissa: i64 = raw & 0x7FFFFF
+
+    // Subnormal / zero: β≈0 → return 0 (safe: downstream BitLinear
+    // output collapses to zero, layer becomes identity up to residual)
+    if exp_biased == 0 { return 0 }
+    // Inf / NaN: corrupted weight → return 1000 (β=1.0 safe default
+    // that keeps the layer functional with no additional scaling)
+    if exp_biased == 255 { return 1000 }
+
+    // Reconstruct mantissa with implicit leading 1: (1.xxx × 2^23)
+    let mantissa_full: i64 = mantissa | 0x800000
+
+    // shift = exponent - 127 (unbias) - 23 (mantissa scaling)
+    //   For β=0.5: exp_biased=126 → shift = 126 - 127 - 23 = -24
+    //   For β=1.0: exp_biased=127 → shift = 127 - 127 - 23 = -23
+    //   For β=2.0: exp_biased=128 → shift = 128 - 127 - 23 = -22
+    // Negative shift → right-shift. Positive shift → left-shift
+    // (only happens for |β| ≥ 2^24 ≈ 16.8M, not relevant for Phase D).
+    let shift: i64 = exp_biased - 127 - 23
+
+    // Multiply first by 1000 to preserve precision across the shift
+    let product: i64 = mantissa_full * 1000
+
+    let mut result: i64 = if shift >= 0 {
+        product << shift
+    } else {
+        product >> (-shift)
+    }
+
+    if sign == 1 { -result } else { result }
 }
 
 // ═══════════════════════════════════════════════════════════════
