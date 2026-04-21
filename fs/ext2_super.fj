@@ -163,29 +163,52 @@ const EXT2_STATE: i64 = 0xA01000
     volatile_write_u8(EXT2_BUF + EXT2_SB_OFF_MAGIC + 1, (EXT2_SB_MAGIC >> 8) & 0xFF)
     blk_write(blk_dev, EXT2_SUPERBLOCK_SECTOR, 2, EXT2_BUF)
 
-    // Clear bitmaps
-    i = 0
-    while i < 2048 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
-    blk_write(blk_dev, EXT2_BLOCK_BITMAP_SECTOR, 4, EXT2_BUF)
-    blk_write(blk_dev, EXT2_INODE_BITMAP_SECTOR, 4, EXT2_BUF)
-
-    // Create root inode (inode 2)
-    i = 0
-    while i < 512 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
-    volatile_write_u8(EXT2_BUF + EXT2_INO_OFF_MODE, 0xED)
-    volatile_write_u8(EXT2_BUF + EXT2_INO_OFF_MODE + 1, 0x41)
-    volatile_write_u8(EXT2_BUF + EXT2_INO_OFF_LINKS, 2)
-    blk_write(blk_dev, EXT2_INODE_TABLE_SECTOR + 1, 1, EXT2_BUF)
-
-    // Mark inode 1+2 as used
+    // Clear inode bitmap, mark inodes 1+2 as used (pre-allocated).
     i = 0
     while i < 2048 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
     volatile_write_u8(EXT2_BUF, 0x03)
     blk_write(blk_dev, EXT2_INODE_BITMAP_SECTOR, 4, EXT2_BUF)
+    // V31.D: Block bitmap — pre-mark block 0 as USED so the allocator
+    // never returns it (readers treat BLOCK0=0 as the "unallocated"
+    // sentinel; a real allocation of physical block 0 would conflict).
+    // This is half of the latent bug V30.T4 surfaced.
+    i = 0
+    while i < 2048 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
+    volatile_write_u8(EXT2_BUF, 0x01)  // bit 0 of byte 0 → block 0 reserved
+    blk_write(blk_dev, EXT2_BLOCK_BITMAP_SECTOR, 4, EXT2_BUF)
+
+    // V31.D: Allocate + zero root directory's data block FIRST so we can
+    // bake BLOCK0 into the root inode in a single sector-12 write below.
+    let root_data_block = ext2_block_alloc()
+    if root_data_block < 0 {
+        cprintln("ext2 mkfs failed: block alloc for root dir", RED_ON_BLACK)
+        return
+    }
+    i = 0
+    while i < EXT2_BLOCK_SIZE { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
+    blk_write(blk_dev, EXT2_DATA_START_SECTOR + root_data_block * EXT2_SECTORS_PER_BLOCK, EXT2_SECTORS_PER_BLOCK, EXT2_BUF)
+
+    // V31.D: Initialize the inode table sector that holds inode 2. The
+    // pre-V31 mkfs wrote inode 2 to sector 13 at offset 0, but
+    // ext2_read_inode(2) reads sector 12 at offset 128 (inode_num-1
+    // → idx=1 → sector = 12 + (1 * 128) / 512 = 12, offset = 128).
+    // Sectors 13/12 mismatch meant reads found all zeros even though
+    // mkfs "wrote" the inode. Two-bug fix bundled: write to the
+    // CORRECT sector at the CORRECT offset, AND populate BLOCK0
+    // pointing at the data block we allocated above.
+    i = 0
+    while i < 512 { volatile_write_u8(EXT2_BUF + i, 0); i = i + 1 }
+    let root_off: i64 = 128       // inode 2 lives at offset 128 within sector 12
+    volatile_write_u8(EXT2_BUF + root_off + EXT2_INO_OFF_MODE, 0xED)
+    volatile_write_u8(EXT2_BUF + root_off + EXT2_INO_OFF_MODE + 1, 0x41)
+    volatile_write_u8(EXT2_BUF + root_off + EXT2_INO_OFF_LINKS, 2)
+    volatile_write_u8(EXT2_BUF + root_off + EXT2_INO_OFF_BLOCK0, root_data_block & 0xFF)
+    volatile_write_u8(EXT2_BUF + root_off + EXT2_INO_OFF_BLOCK0 + 1, (root_data_block >> 8) & 0xFF)
+    blk_write(blk_dev, EXT2_INODE_TABLE_SECTOR, 1, EXT2_BUF)  // sector 12
 
     volatile_write_u64(EXT2_STATE, 1)
     volatile_write_u64(EXT2_STATE + 16, EXT2_MAX_BLOCKS)
-    volatile_write_u64(EXT2_STATE + 24, EXT2_MAX_BLOCKS - 1)
+    volatile_write_u64(EXT2_STATE + 24, EXT2_MAX_BLOCKS - 2)  // -2: block 0 reserved + root dir block
 
     cprintln("ext2 formatted:", GREEN_ON_BLACK)
     cprint("  Inodes: ", WHITE_ON_BLACK); cprint_decimal(EXT2_MAX_INODES, CYAN_ON_BLACK); console_putchar(10, WHITE_ON_BLACK)

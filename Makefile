@@ -789,6 +789,7 @@ test-fs-roundtrip: iso-llvm $(BUILD_DIR)/test-disks/ext2.img $(BUILD_DIR)/test-d
 		truncate -s 64M $(BUILD_DIR)/test-disks/ext2-blank.img; \
 		(sleep 8;  printf 'ext2-mkfs\r'; \
 		 sleep 3;  printf 'ext2-mount\r'; \
+		 sleep 2;  printf 'ext2-write README.TXT hello\r'; \
 		 sleep 2;  printf 'ext2-ls\r'; \
 		 sleep 5;  printf '\r') | \
 			timeout 60 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
@@ -804,22 +805,28 @@ test-fs-roundtrip: iso-llvm $(BUILD_DIR)/test-disks/ext2.img $(BUILD_DIR)/test-d
 		grep -q "ext2 mounted" $(BUILD_DIR)/test-fs-roundtrip-ext2.log \
 			&& echo "[PASS] ext2-mount succeeded (superblock magic verified)" \
 			|| { echo "[FAIL] ext2-mount failed"; exit 1; }; \
+		grep -q "Created: README.TXT" $(BUILD_DIR)/test-fs-roundtrip-ext2.log \
+			&& echo "[PASS] ext2-write README.TXT succeeded (V31.D fix verified — write path closed)" \
+			|| { echo "[FAIL] ext2-write README.TXT did not complete (V31.D fix regression?)"; exit 1; }; \
+		grep -q "ext2-write: create failed" $(BUILD_DIR)/test-fs-roundtrip-ext2.log \
+			&& { echo "[FAIL] ext2_create still returning -1 (V31.D fix did not stick)"; exit 1; } \
+			|| echo "[PASS] no 'create failed' marker (ext2_create returns valid inode)"; \
 		grep -qE "^ext2 root directory:$$" $(BUILD_DIR)/test-fs-roundtrip-ext2.log \
 			&& echo "[PASS] ext2-ls traversed root inode (read path exercised)" \
 			|| { echo "[FAIL] ext2-ls did not reach root inode"; exit 1; }; \
+		grep -q "README.TXT" $(BUILD_DIR)/test-fs-roundtrip-ext2.log \
+			&& echo "[PASS] README.TXT visible in ext2-ls output (write→ls roundtrip)" \
+			|| { echo "[FAIL] README.TXT missing from ext2-ls output"; exit 1; }; \
 		grep -qE "EXC:|PANIC:" $(BUILD_DIR)/test-fs-roundtrip-ext2.log \
 			&& { echo "[FAIL] EXC/PANIC during ext2 flow"; exit 1; } \
 			|| echo "[PASS] no fault markers (ext2 branch clean)"; \
-		echo "[NOTE] ext2 write path has a pre-existing bug"; \
-		echo "       (ext2_create returns -1 on freshly-mkfs'd disk)."; \
-		echo "       Write roundtrip deferred to V31 ext2 fix work."; \
 	else \
 		echo "[SKIP] ext2 image zero-size (toolchain unavailable)"; \
 	fi
 	@echo ""
-	@echo "✅ V30 Track 4 FS-roundtrip gate: 9 PASS invariants"
-	@echo "   (FAT32 full roundtrip + ext2 mkfs/mount/ls-path exercised;"
-	@echo "    ext2 write path is a known-open V31 bug surfaced by this gate.)"
+	@echo "✅ V30 Track 4 + V31.D FS-roundtrip gate: 11 PASS invariants"
+	@echo "   (FAT32 full roundtrip + ext2 mkfs/mount/write/ls exercised;"
+	@echo "    V31.D fix verified — ext2 write path closed.)"
 
 # Mass-test shell commands — 2 batches × 45 commands = 90 total
 test-commands: iso-llvm

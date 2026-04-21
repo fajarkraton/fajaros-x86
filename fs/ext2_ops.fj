@@ -251,9 +251,13 @@ const EXT2_FILE_BUF: i64 = 0xA03000
         return
     }
 
-    // Write content
+    // Write content. ext2_write_file returns the number of bytes written
+    // on success (== content_len), or -1 on failure. The original check
+    // (r == 0) was inverted: it only treated zero-byte writes as success,
+    // which is the unreachable case (we early-return on content_len <= 0
+    // above). V31.D fix: success is r >= 0 (any non-error return).
     let r = ext2_write_file(inode, content_buf, content_len)
-    if r == 0 {
+    if r >= 0 {
         cprint("Created: ", GREEN_ON_BLACK)
         let mut k: i64 = 0
         while k < name_len { console_putchar(volatile_read_u8(name_buf + k), CYAN_ON_BLACK); k = k + 1 }
