@@ -1,15 +1,15 @@
 # FajarOS Nova -- x86_64 Operating System Written 100% in Fajar Lang
 
-[![Version](https://img.shields.io/badge/version-v3.4.0_V28.5_Multilingual-blue)](https://github.com/fajarkraton/fajaros-x86/releases/tag/v3.4.0)
+[![Version](https://img.shields.io/badge/version-v3.9.0_IntLLM_Kernel_Path-blue)](https://github.com/fajarkraton/fajaros-x86/releases/tag/v3.9.0)
 [![Files](https://img.shields.io/badge/modules-183_.fj_files-green)](https://github.com/fajarkraton/fajaros-x86)
 [![LOC](https://img.shields.io/badge/LOC-108K-orange)](https://github.com/fajarkraton/fajaros-x86)
-[![Compiler](https://img.shields.io/badge/compiler-Fajar_Lang_v27.5.0-blueviolet)](https://github.com/fajarkraton/fajar-lang)
+[![Compiler](https://img.shields.io/badge/compiler-Fajar_Lang_v31.0.0-blueviolet)](https://github.com/fajarkraton/fajar-lang)
 [![Shell](https://img.shields.io/badge/shell-302_commands-purple)](https://github.com/fajarkraton/fajaros-x86)
-[![Kernel Tests](https://img.shields.io/badge/kernel_tests-32-brightgreen)](https://github.com/fajarkraton/fajaros-x86)
+[![Kernel Tests](https://img.shields.io/badge/kernel_tests-35-brightgreen)](https://github.com/fajarkraton/fajaros-x86)
 [![Security](https://img.shields.io/badge/security-SMEP%2BSMAP%2BNX%2BASLR-success)](https://github.com/fajarkraton/fajaros-x86)
-[![LLM E2E](https://img.shields.io/badge/LLM_E2E-Gemma_3_1B_stable_64_tokens-success)](https://github.com/fajarkraton/fajaros-x86/blob/main/docs/V28_5_RETEST.md)
+[![LLM E2E](https://img.shields.io/badge/LLM_E2E-Gemma_3_1B_+_IntLLM_kernel--path-success)](https://github.com/fajarkraton/fajaros-x86/blob/main/docs/V28_5_RETEST.md)
 [![Ring 3](https://img.shields.io/badge/Ring_3-user_mode_works-success)](https://github.com/fajarkraton/fajaros-x86)
-[![FajarQuant](https://img.shields.io/badge/FajarQuant-Phase_1%2B2_kernel_native-orange)](https://github.com/fajarkraton/fajaros-x86)
+[![FajarQuant](https://img.shields.io/badge/FajarQuant-Phase_D_IntLLM_kernel--path-orange)](https://github.com/fajarkraton/fajarquant)
 [![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
 [![Made in](https://img.shields.io/badge/made_in-Indonesia-red)](https://primecore.id)
 

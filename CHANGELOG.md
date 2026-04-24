@@ -2,6 +2,93 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
+## [3.9.0] "IntLLM Kernel Path" -- 2026-04-24
+
+V31.C Phase D IntLLM (MatMul-Free LLM) integrated into FajarOS Nova kernel.
+End-to-end pipeline from `cmd_ask` shell input → v9 model parser → ternary
+BitLinear kernels → `tfm_mf_generate` decode → token output. Kernel-path
+regression gate `make test-intllm-kernel-path` green (4 invariants). Plus
+V31.D Track D ext2 write-path bug fix (3 bugs in `cmd_mkfs_ext2` closed,
+surfaced by V30.T4 disk roundtrip harness).
+
+### Added
+
+- **`matmulfree.fj`** kernel ops module (V31.C.P5.1 — `cc61817` scaffold,
+  `fe43d59` σ LUT real values, `afd9ec2` `km_mf_bitlinear_packed` inner
+  loop with ternary signed-add). Foundation for MatMul-Free LLM in @kernel
+  context — no heap, no FP arithmetic, all i64 fixed-point.
+- **`fjm_v9.fj`** Phase D model parser (V31.C.P5.4 — `da954b5` scaffold,
+  `a7608b0` IEEE 754 f32→i64×1000 decoder for v9 weight format). Handles
+  HGRNBitForCausalLM checkpoints converted to fixed-point ternary.
+- **`tfm_matmulfree.fj`** forward orchestrator (V31.C.P5.3-scaffold
+  `619dbfb`). Wires `matmulfree` ops into a transformer-shaped decode loop.
+- **`mdl_parse_header` v9 format detection** (V31.C.P1.2c, `2103b94`).
+  Accepts both v8 (RWKV) and v9 (HGRNBit) magic numbers + version fields,
+  dispatches to the right parser branch.
+- **Phase D forward-path real bodies** (V31.C.P1.3, `bbe9846`). Replaces
+  scaffold stubs with real implementations: embedding lookup, RoPE apply,
+  attention block, FFN block, RMSNorm — all in @kernel context, exercising
+  `matmulfree` kernel ops.
+- **`shell cmd_ask` dispatches Phase D to `tfm_mf_generate`** (V31.C.P1.4,
+  `be69a5b`). Shell `ask <prompt>` now routes Phase D models (v9 magic)
+  through the IntLLM kernel-path; v8 RWKV models continue through legacy
+  `tfm_generate`. User-visible: type `ask hello` after `model-load nvme 0`,
+  get IntLLM-generated tokens back.
+- **`make test-intllm-kernel-path` regression gate** (V31.C.P1.5,
+  `2179298`). 4 invariants: (1) no fault markers / mechanical stability,
+  (2) v9 header parsed, (3) shell `cmd_ask` dispatched to
+  `tfm_mf_generate` (verified via serial log markers), (4) shell recovered
+  after ask (kernel state intact). Token coherence NOT gated — tiny
+  synthetic test model is for path verification, not quality. Real
+  coherence verified in fajarquant Phase D Mini/Base/Medium runs.
+
+### Fixed
+
+- **`ext2_create` returning -1 on freshly-mkfs'd disk** (V31.D Track D,
+  `c2d6be7`, root cause located 2026-04-21 in `8705f14`). Three bugs in
+  `cmd_mkfs_ext2`:
+  1. Root inode missing `BLOCK0` allocation — `ext2_create` for the
+     first file in `/` would fall through the `dblock == 0` guard
+     and return -1.
+  2. Root inode `links` field not incremented when adding `.` and `..`
+     dirent stubs.
+  3. Block bitmap not updated when allocating root data block.
+  Plus 1 UI bug in the shell `mkfs` command. Surfaced by V30.T4 disk
+  roundtrip harness (`make test-fs-roundtrip` 9-invariant gate, v3.7.0).
+  Now passes 11/11 invariants (gate extended with 2 new ones for `create`
+  on root and dirent listing).
+
+### Stats
+
+```
+Build:          fajaros-llvm.elf 1.66 MB | fajaros-llvm.iso 13.8 MB
+Modules:        183 .fj files | 108K LOC
+Kernel tests:   35 (was 32 in v3.4.0)
+Security:       SMEP+SMAP+NX security triple closed (V29.P3.P6, v3.5.0)
+                ASLR enabled
+Disk:           VFS write — RamFS + FAT32 + ext2 (write path now fully
+                functional after V31.D fix)
+LLM E2E:        Gemma 3 1B foundation (V30.GEMMA3, v3.6.0, audit-complete)
+                + IntLLM kernel-path (V31.C, this release)
+                + SmolLM-135M v5/v6 E2E (legacy, V26.x)
+                14 LLM-related shell commands
+Compiler:       Fajar Lang v31.0.0 (was v27.5.0 at v3.4.0)
+Gates green:    test-security-triple-regression (6-invariant)
+                test-fs-roundtrip (11/11 after V31.D fix)
+                test-gemma3-{e2e,kernel-path}
+                test-intllm-kernel-path (4-invariant, NEW this release)
+Hardware:       Intel i9-14900HX | NVIDIA RTX 4090 Laptop | QEMU x86_64
+```
+
+### Cross-Repo Linkage
+
+- This release pairs with `fajarkraton/fajarquant` Phase D Mini+Base+Medium
+  c.1 runs (commits `6fca0a8` Base + `5504d3d` Medium). FajarOS Nova
+  provides the kernel-path that runs the trained checkpoints; FajarQuant
+  provides the trained checkpoints + paper Table 2 evaluation infrastructure.
+- Both repos must be at this version pair (FajarOS v3.9.0 + FajarQuant
+  Phase D weights post-`5504d3d`) to run end-to-end IntLLM inside the OS.
+
 ## [3.8.0] "R3 Precision Debug" -- 2026-04-21
 
 V31 Track A — Gemma 3 pad-collapse root-cause investigation. Four
