@@ -10,7 +10,7 @@
 [![LLM E2E](https://img.shields.io/badge/LLM_E2E-Gemma_3_1B_+_IntLLM_kernel--path-success)](https://github.com/fajarkraton/fajaros-x86/blob/main/docs/V28_5_RETEST.md)
 [![Ring 3](https://img.shields.io/badge/Ring_3-user_mode_works-success)](https://github.com/fajarkraton/fajaros-x86)
 [![FajarQuant](https://img.shields.io/badge/FajarQuant-Phase_D_IntLLM_kernel--path-orange)](https://github.com/fajarkraton/fajarquant)
-[![License](https://img.shields.io/badge/license-MIT-brightgreen)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache_2.0-brightgreen)](LICENSE)
 [![Made in](https://img.shields.io/badge/made_in-Indonesia-red)](https://primecore.id)
 
 > **The world's first operating system with compiler-enforced privilege isolation.**
@@ -537,9 +537,15 @@ See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). We follow the Contributor Covenant
 
 ## License
 
-MIT License -- Copyright (c) 2026 Fajar (TaxPrime / PrimeCore.id)
+Apache License 2.0 -- Copyright 2026 Muhamad Fajar Putranto
 
-See [LICENSE](LICENSE) for details.
+See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
+
+Relicensed from MIT to Apache 2.0 on 2026-04-24 (sibling repo to
+[fajar-lang](https://github.com/fajarkraton/fajar-lang) which underwent the same
+transition that day; matches sibling [fajarquant](https://github.com/fajarkraton/fajarquant)
+which has been Apache 2.0 since inception). Past commits remain MIT per
+their original terms; future commits are Apache 2.0.
 
 ---
 
