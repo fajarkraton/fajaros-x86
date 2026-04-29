@@ -52,6 +52,62 @@ const KM_MF_ACT_QUANT_BUF: i64 = 0xC65000   // 4 KB i8
 const KM_MF_GAMMA_X: i64 = 0xC66000         // 8 B i64
 
 // ═══════════════════════════════════════════════════════════════
+// V32-prep F.11.4(b).4 — TL2 AVX2 kernel FFI declarations
+// ═══════════════════════════════════════════════════════════════
+//
+// External symbols from `fajarquant_bitnet_tl2.o` — vendored
+// microsoft/BitNet x86 TL2 ternary GEMV kernel. Build:
+//   ../fajarquant/cpu_kernels/bitnet_tl2/wrapper.cpp →
+//   build/fajarquant_bitnet_tl2.o (Makefile $(TL2_O))
+// Symbols resolved at link time by the LLVM-backend Step 2 ld
+// invocation.
+//
+// **Runtime contract:** these functions execute AVX2 instructions
+// (vpshufb, vpmaddubsw, etc.). The kernel boot path MUST enable
+// AVX2 (CR4.OSXSAVE + XCR0.AVX bits) BEFORE calling them, OR the
+// caller must guard with a CPUID check that falls back to the
+// scalar `km_mf_bitlinear_packed` (Op 3). F.11.4(b).6 dispatch
+// site adds the guard; F.11.4(b).7 kernel-path test confirms.
+//
+// Both args use the matmulfree.fj convention: scalars as i32/i64,
+// pointers as i64 byte addresses.
+
+// fjq_tl2_qgemm_lut(bs, m, k, BK, A, sign, LUT, Scales, LUT_Scales, C)
+//
+// Quantized GEMM via 14-entry LUT lookup (the TL2 hot path).
+// Shape-locked to the codegen'd preset shapes (256×256, 1536×256,
+// 256×768, 32768×256). Calling with mismatched (m, k) is UB.
+@ffi extern("C") fn fjq_tl2_qgemm_lut(
+    bs: i32,
+    m: i32,
+    k: i32,
+    bk: i32,
+    a_addr: i64,
+    sign_addr: i64,
+    lut_addr: i64,
+    scales_addr: i64,
+    lut_scales_addr: i64,
+    c_addr: i64,
+)
+
+// fjq_tl2_preprocessor(bs, m, three_k, two_k, B, LUT_Scales,
+//                      Three_QLUT, Two_QLUT)
+//
+// Builds the per-batch 14-entry magnitude LUT + 9-entry tail LUT
+// for one activation block. Must be called BEFORE
+// fjq_tl2_qgemm_lut for that batch.
+@ffi extern("C") fn fjq_tl2_preprocessor(
+    bs: i32,
+    m: i32,
+    three_k: i32,
+    two_k: i32,
+    b_addr: i64,
+    lut_scales_addr: i64,
+    three_qlut_addr: i64,
+    two_qlut_addr: i64,
+)
+
+// ═══════════════════════════════════════════════════════════════
 // Helpers — little-endian u32 read (no volatile_read_u32_le builtin
 // in fajar-lang yet; compose from byte reads per model_loader.fj:163)
 // ═══════════════════════════════════════════════════════════════
