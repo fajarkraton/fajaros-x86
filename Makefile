@@ -19,6 +19,17 @@ RUNTIME_O := $(BUILD_DIR)/runtime_stubs.o
 # the Python reference simulator. See kernel/compute/vecmat_v8.c.
 VECMAT_C   := kernel/compute/vecmat_v8.c
 VECMAT_O   := $(BUILD_DIR)/vecmat_v8_c.o
+# V32-prep F.11.4(b): vendored microsoft/BitNet TL2 AVX2 ternary
+# kernel from sibling fajarquant repo. Compiled with -mavx2 +
+# -ffreestanding so it links into the no-std kernel ELF. AVX2
+# instructions execute only if the kernel has enabled OSXSAVE +
+# XCR0.AVX at boot — F.11.4(b).6 dispatch site must guard the
+# call, F.11.4(b).7 kernel-path test confirms or surfaces a
+# regression. See ~/Documents/fajarquant/docs/
+# FJQ_PHASE_F_F11_4B_INTEGRATION_AUDIT.md.
+TL2_SRC    := ../fajarquant/cpu_kernels/bitnet_tl2/wrapper.cpp
+TL2_INC    := ../fajarquant/cpu_kernels/bitnet_tl2
+TL2_O      := $(BUILD_DIR)/fajarquant_bitnet_tl2.o
 LINKER_LD := linker.ld
 ISO_FILE := $(BUILD_DIR)/fajaros.iso
 GRUB_CFG := grub.cfg
@@ -263,6 +274,30 @@ $(VECMAT_O): $(VECMAT_C)
 		-c -o $(VECMAT_O) $(VECMAT_C)
 	@echo "[OK] Compiled C vecmat: $(VECMAT_O)"
 
+# V32-prep F.11.4(b).3: compile vendored microsoft/BitNet TL2 AVX2
+# kernel for FajarOS Nova kernel-mode linkage. Distinct flags from
+# VECMAT_O — TL2 REQUIRES AVX2 (the whole point), and uses
+# `BITNET_OMIT_TRANSFORM` to suppress libc-calling dead code (the
+# ggml_bitnet_transform_tensor function); see fajarquant
+# wrapper.cpp + bitnet-lut-kernels-tl2.h for the gates.
+# `_MM_MALLOC_H_INCLUDED` skips gcc's <immintrin.h> →
+# <mm_malloc.h> chain that pulls malloc/free.
+TL2_HEADER_DEPS := $(TL2_SRC) \
+                   $(TL2_INC)/bitnet-lut-kernels-tl2.h \
+                   $(TL2_INC)/ggml-bitnet-stub.h
+
+$(TL2_O): $(TL2_HEADER_DEPS)
+	@mkdir -p $(BUILD_DIR)
+	g++ -O3 -mavx2 -std=c++17 \
+		-ffreestanding -nostdlib -fno-exceptions -fno-rtti \
+		-fno-pic -mno-red-zone -mcmodel=small -fcf-protection=none \
+		-DGGML_BITNET_X86_TL2 \
+		-DBITNET_OMIT_TRANSFORM \
+		-D_MM_MALLOC_H_INCLUDED \
+		-I $(TL2_INC) \
+		-c -o $(TL2_O) $(TL2_SRC)
+	@echo "[OK] Compiled TL2 AVX2 kernel: $(TL2_O)"
+
 # Build kernel with LLVM backend (optimized, uses hardware features)
 # Auto-generates startup.S + linker script internally
 #
@@ -272,7 +307,7 @@ $(VECMAT_O): $(VECMAT_C)
 #
 # V29.P1.P3 prevention layer: after `fj build`, verify that the ELF
 # was actually produced.
-build-llvm: $(COMBINED) $(RUNTIME_O) $(VECMAT_O)
+build-llvm: $(COMBINED) $(RUNTIME_O) $(VECMAT_O) $(TL2_O)
 	@# Step 1: compile FJ to .o + capture via ld wrapper
 	@$(FJ) build --no-std --backend llvm \
 		--opt-level $(LLVM_OPT) \
@@ -284,10 +319,13 @@ build-llvm: $(COMBINED) $(RUNTIME_O) $(VECMAT_O)
 		--extra-objects $(RUNTIME_O) \
 		--linker scripts/ld-wrapper.sh \
 		$(COMBINED) -o /dev/null 2>&1 | { grep -v "SE009\|SE010\|prefix with underscore\|unused variable\|^  \|undefined reference.*mailbox\|error: linker" || true; }
-	@# Step 2: relink with C vecmat (no gc-sections — C symbol must survive)
+	@# Step 2: relink with C vecmat + TL2 AVX2 kernel (no gc-sections —
+	@# their symbols may have no Fajar Lang call sites yet, but must survive
+	@# for runtime FFI / dlsym-style lookup)
 	@ld -T $(LINKER_LD) -nostdlib \
 		$(BUILD_DIR)/combined.start.o.saved \
 		$(VECMAT_O) \
+		$(TL2_O) \
 		$(BUILD_DIR)/combined.o.saved \
 		$(RUNTIME_O) \
 		-o $(KERNEL_LLVM) 2>&1 | { grep -v "missing .note.GNU-stack\|deprecated" || true; }
