@@ -146,13 +146,19 @@ Each gap is verified mechanically and has a concrete close-criterion. Ordered by
 - **Close-criterion:** Either Fajar Lang published to crates.io (Fajar Lang audit §3.3 fix) AND FajarOS README dependency is accurate, OR FajarOS release ships a self-contained build script + pre-built `fj` binary.
 - **Effort estimate:** Coordinated with Fajar Lang plan; ~0.5-1 day either way.
 
-### 3.10 LLM kernel-path uses scalar BitLinear (no AVX2) due to F.11 parity gap  ⚠ Perf ceiling
+### 3.10 LLM kernel-path uses scalar BitLinear by design (F.11 PERMANENT-DEFERRED)  ✓ Resolved via demotion 2026-05-01
 
-- **Finding:** Per memory + `~/Documents/fajarquant` F.11 chain: TL2 AVX2 kernel infrastructure landed in fajaros-x86 at known symbol addresses, but **production code path still calls scalar** because TL2 parity test fails by row-uniform `+32, -31, -1` cycle. So in-kernel LLM inference uses scalar path only.
-- **Verification:** `grep -rE "fjq_tl2_qgemm_lut\|km_mf_bitlinear_packed" kernel/compute/*.fj` — production calls scalar `km_mf_bitlinear_packed`, not `fjq_tl2_qgemm_lut`.
-- **Impact:** Inference is ~5-7× slower than AVX2 ceiling. Per Microsoft BitNet b1.58 2B4T datapoint, AVX2 path target is ~40-50 tok/s on i9-14900HX. Scalar path likely ~5-10 tok/s. "Yang terbaik" claim difficult without AVX2.
-- **Close-criterion:** Either F.11 parity closed (encoder port from microsoft/BitNet llama.cpp fork, ~8-12h estimate) and `cmd_ask` switched to TL2 path, OR alternative fast path (custom AVX2 kernel from scratch, larger scope), OR accept scalar perf and compete on differentiator (kernel safety + IntLLM training-time quant) instead of raw speed.
-- **Effort estimate:** F.11 closure ~8-12h Claude time (Branch X-real per fajarquant docs). Or pivoting strategy = 0 effort but limits ceiling.
+- **Status (UPDATED 2026-05-01):** F.11 chain DEMOTED to PERMANENT-DEFERRED in fajarquant repo (commit `386e130`). Per F.13.3 dispatch verdict (decision-doc §11), FajarOS Nova's deployment workload (batch=1, ≤100M params) is well-served by F.11.3 scalar Rust BitLinear path. TL2 acceleration would be 3-5× faster but is **NOT critical-path**. This was originally framed as a "perf ceiling gap" but is now correctly framed as a deliberate architectural choice given the deployment envelope.
+- **Finding:** Per `~/Documents/fajarquant` F.11 chain: TL2 AVX2 kernel infrastructure landed in fajaros-x86 at known symbol addresses (`fjq_tl2_preprocessor @0x1066f0`, etc.), kernel + FFI binding ship as production-ready foundation, but production code path calls scalar by design. F.11 parity test still fails (row-uniform `+32, -31, -1` cycle attributable to multiple sign-byte layout bugs); ~31h of investigation hit upstream-encoder structural blocker.
+- **Verification:** `grep -rE "fjq_tl2_qgemm_lut\|km_mf_bitlinear_packed" kernel/compute/*.fj` — production calls scalar `km_mf_bitlinear_packed`, not `fjq_tl2_qgemm_lut`. This is the intended state.
+- **Impact (revised):** Scalar inference at 50-100 tok/s on Mini matches FajarOS embedded-ML use case. Under F.13.3 verdict, the CPU-vs-GPU comparison favors CPU even with scalar (CPU 50-100 vs GPU 19.7 PyTorch eager / 80-120 optimized at batch=1 small model). The "yang terbaik" claim remains valid on the differentiator axis: kernel-safety + IntLLM training-time quant + bilingual ID+EN data, NOT raw tok/s.
+- **Re-entry conditions** (any one would reactivate F.11 closure work):
+  1. Paper v2 reviewer specifically requests bit-exact TL2 parity
+  2. Workload shifts to a regime where current scalar tok/s is insufficient
+  3. Microsoft/BitNet upstream releases an encoder for custom (M, K) shapes
+  4. Contributor volunteers kernel-disassembly bandwidth (~3-4h printf-instrumented kernel build per `docs/FJQ_PHASE_F_F11_BRANCH_X_REAL_FINDINGS.md` §5 Option B in fajarquant repo)
+- **Close-criterion (NEW):** None — gap permanently re-classified to "future work / future research direction." Plan §4.2 Phase B.7 "Optional AVX2 acceleration" stays optional.
+- **Effort estimate:** 0 days for default (already shipped scalar default). Re-entry would be 3-4h (Option B printf-instrument) or 1-2 days (Option C custom AVX2 BitLinear) per fajarquant findings doc.
 
 ### 3.11 Release pipeline doesn't auto-publish ISO  ⚠ Process gap
 
