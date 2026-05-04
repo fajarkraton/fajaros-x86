@@ -679,6 +679,35 @@ test-security-triple-regression: iso-llvm
 # CI jobs are updated to use test-security-triple-regression.
 test-smap-regression: test-security-triple-regression
 
+# FAJAROS_100PCT_FJ_PLAN — non-fj inventory audit.
+# Lists every .S/.c/.cpp file in the kernel build path. Plan target:
+# zero files at end of Phase 4. See docs/FAJAROS_100PCT_FJ_PLAN.md.
+.PHONY: audit-100pct-fj
+audit-100pct-fj:
+	@bash scripts/audit_fajaros_non_fj.sh
+
+# FAJAROS_100PCT_FJ_PLAN Phase 1 — spinlock SMP regression gate.
+# Boot kernel under -smp 4, exercise `spinlock` shell command, verify
+# completion. Validates: (a) new LOCK CMPXCHG inline-asm parses + lowers
+# correctly via fj-lang LLVM backend, (b) acquire/release path runs to
+# completion under SMP-enabled boot (single-CPU exercise; AP-contention
+# test is a Phase 1.5 enhancement). The "Spinlock verified (LOCK
+# CMPXCHG path)" success line is emitted by cmd_spinlock in
+# kernel/sched/spinlock.fj.
+.PHONY: test-spinlock-smp-regression
+test-spinlock-smp-regression: iso-llvm
+	@echo "[TEST] FAJAROS_100PCT_FJ_PLAN Phase 1 — spinlock SMP regression..."
+	@(sleep 6; printf 'spinlock\r'; sleep 3) | \
+		timeout 15 $(QEMU) -cdrom $(BUILD_DIR)/fajaros-llvm.iso \
+		-chardev stdio,id=ch0,signal=off -serial chardev:ch0 \
+		-display none -no-reboot -no-shutdown $(QEMU_KVM) $(QEMU_MEM) $(QEMU_SMP) 2>/dev/null \
+		> $(BUILD_DIR)/test-spinlock-smp-regression.log || true
+	@echo ""
+	@grep -q "Spinlock verified (LOCK CMPXCHG path)" $(BUILD_DIR)/test-spinlock-smp-regression.log \
+		&& echo "[PASS] LOCK CMPXCHG spinlock runs to completion under -smp 4" \
+		|| { echo "[FAIL] spinlock test did not complete — asm syntax error, hang, or boot failure"; \
+		     echo "       Inspect: $(BUILD_DIR)/test-spinlock-smp-regression.log"; exit 1; }
+
 # V30.GEMMA3 P11.2 — End-to-end regression gate for the Gemma 3 1B
 # transformer foundation. Verifies boot + model-load + embed-load +
 # tok-load + ask hello + clean shell recovery, without asserting

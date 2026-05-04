@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# fajaros-x86 pre-push hook — FAJAROS_100PCT_FJ_PLAN Phase 1.4
+#
+# Runs regression gates conditionally based on what's being pushed:
+#
+#   1. test-spinlock-smp-regression — if kernel/sched/spinlock.fj OR
+#      Makefile changed since origin/main. Validates the LOCK CMPXCHG
+#      atomic spinlock (V0.5.1, Phase 1 of FAJAROS_100PCT_FJ_PLAN)
+#      compiles and runs to completion under -smp 4 boot.
+#
+# Bypass with --no-verify if absolutely necessary (discouraged —
+# leaves SMP-correctness invariant unverified before push). Per
+# CLAUDE.md §6.8 R3 (prevention layer per phase).
+#
+# Skips test if QEMU or KVM are unavailable (e.g. CI runner without
+# /dev/kvm); pre-commit hook on main CI re-runs the actual gate.
+
+set -e
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# Detect changed files since origin/main (or HEAD~1 if origin not reachable)
+if git rev-parse --verify origin/main >/dev/null 2>&1; then
+    CHANGED=$(git diff --name-only origin/main..HEAD 2>/dev/null || git diff --name-only HEAD~1..HEAD)
+else
+    CHANGED=$(git diff --name-only HEAD~1..HEAD 2>/dev/null || true)
+fi
+
+# ─────────────────────────────────────────────────────────────────
+# Gate 1: test-spinlock-smp-regression
+# ─────────────────────────────────────────────────────────────────
+if echo "$CHANGED" | grep -qE 'kernel/sched/spinlock\.fj|^Makefile$'; then
+    # QEMU + KVM availability check
+    if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
+        echo "[pre-push] qemu-system-x86_64 not installed — skipping test-spinlock-smp-regression"
+        echo "           Install with: sudo apt-get install qemu-system-x86"
+    elif [ ! -e /dev/kvm ] && ! grep -q '\-enable-kvm' Makefile 2>/dev/null; then
+        echo "[pre-push] /dev/kvm unavailable — skipping test-spinlock-smp-regression (CI gate runs separately)"
+    else
+        printf '[pre-push] kernel/sched/spinlock.fj changed → test-spinlock-smp-regression ... '
+        if make test-spinlock-smp-regression > /tmp/fajaros_prepush_spinlock.log 2>&1; then
+            echo "✅"
+        else
+            echo "❌"
+            echo ""
+            echo "test-spinlock-smp-regression FAILED. Last 25 lines:"
+            echo "─────────────────────────────────────────────────────────"
+            tail -25 /tmp/fajaros_prepush_spinlock.log
+            echo "─────────────────────────────────────────────────────────"
+            echo ""
+            echo "Spinlock SMP-regression broken. Either:"
+            echo "  (a) the inline-asm template has a syntax error;"
+            echo "  (b) acquire/release semantics broke (kernel hangs);"
+            echo "  (c) build-llvm path is broken (cascading from elsewhere)."
+            echo ""
+            echo "Bypass with --no-verify ONLY if you know what you're doing."
+            exit 1
+        fi
+    fi
+else
+    echo "[pre-push] no spinlock/Makefile changes — skipping test-spinlock-smp-regression"
+fi
+
+echo ""
+echo "✅ fajaros-x86 pre-push OK"
