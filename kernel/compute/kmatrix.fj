@@ -823,6 +823,15 @@ const V8_SCALE_FP: i64 = 1000000  // scales stored as int32(round(scale × this)
 // V30 P3.6: dispatch to gcc-compiled C vecmat via mailbox.
 // Fajar Lang's LLVM codegen produces wrong gate_proj results.
 // gcc C version produces bit-exact results matching the sim.
+//
+// Phase 4.D port attempt 2026-05-04 (FAJAROS_100PCT_FJ_PLAN): reverted.
+// The km_rmsnorm/km_gelu_tanh recipe (volatile_read_u64 + @noinline)
+// did NOT generalize to km_vecmat_packed_v8 — gemma3-e2e EXC:13'd at
+// 0x164C2A inside the SIBLING `km_vecmat_packed_raw` function (which
+// the port did NOT modify). Pre-existing function compilation drifted
+// once the new ~50-LOC fj body landed in the same module — likely an
+// LLVM O2 cross-function context effect on inner-branch heuristics.
+// Documented as Gap G-M for future debug. Reverted to mailbox dispatch.
 @noinline
 @kernel fn km_vecmat_packed_v8(x_addr: i64, mat_addr: i64, m: i64, n: i64,
                                  out_addr: i64) {
