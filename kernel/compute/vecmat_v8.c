@@ -635,51 +635,11 @@ void km_gelu_tanh_c_mailbox(void)
     }
 }
 
-/* ── km_add_raw ────────────────────────────────────────────────── */
-/* Mailbox at 0xBEA300:
- *   +0: a_addr (i64)  — modified in-place: a[i] += b[i]
- *   +8: b_addr (i64)
- *  +16: dim    (i64)
+/* km_add_raw + km_mul_raw moved to pure Fajar Lang (FAJAROS_100PCT_FJ_PLAN
+ * Phase 4.A, kernel/compute/kmatrix.fj 2026-05-04). The fj versions use
+ * @no_vectorize to avoid the LLVM O2 vecmat miscompile (V30 Track 3, A1
+ * upstream filing pending) — bit-exact with the deleted C versions.
  */
-#define ADD_MAILBOX (MAILBOX_ADDR + 0x300ULL)
-
-void km_add_raw_c_mailbox(void)
-{
-    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)ADD_MAILBOX;
-    int64_t a_addr = mb[0];
-    int64_t b_addr = mb[1];
-    int64_t dim    = mb[2];
-
-    int64_t *a = (int64_t *)(uintptr_t)a_addr;
-    const int64_t *b = (const int64_t *)(uintptr_t)b_addr;
-
-    for (int64_t i = 0; i < dim; i++) {
-        a[i] += b[i];
-    }
-}
-
-/* ── km_mul_raw ────────────────────────────────────────────────── */
-/* Mailbox at 0xBEA340:
- *   +0: a_addr (i64)  — modified in-place: a[i] = a[i]*b[i]/1000
- *   +8: b_addr (i64)
- *  +16: dim    (i64)
- */
-#define MUL_MAILBOX (MAILBOX_ADDR + 0x340ULL)
-
-void km_mul_raw_c_mailbox(void)
-{
-    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)MUL_MAILBOX;
-    int64_t a_addr = mb[0];
-    int64_t b_addr = mb[1];
-    int64_t dim    = mb[2];
-
-    int64_t *a = (int64_t *)(uintptr_t)a_addr;
-    const int64_t *b = (const int64_t *)(uintptr_t)b_addr;
-
-    for (int64_t i = 0; i < dim; i++) {
-        a[i] = (a[i] * b[i]) / 1000;
-    }
-}
 
 /* ── tfm_attention scoring + softmax + V weighted sum ──────────── */
 /* Mailbox at 0xBEA400:

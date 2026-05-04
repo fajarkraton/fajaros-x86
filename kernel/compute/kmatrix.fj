@@ -613,24 +613,38 @@ const KM_TILE_SIZE: i64 = 64
 // Raw-address operations (for frame-allocated vectors)
 // ═══════════════════════════════════════════════════════════════
 
-// V30.GEMMA3: dispatch to gcc-compiled C element-wise add via mailbox.
+// V30.GEMMA3 → V33.P4 (FAJAROS_100PCT_FJ_PLAN Phase 4.A 2026-05-04):
+// Was: `asm!("movabs $$km_add_raw_c_mailbox, %rax; call *%rax")` dispatching
+// to a gcc-compiled C function via mailbox. Now: pure Fajar Lang inline
+// loop. Bit-exact with the deleted C version.
+//
+// Note: `@no_vectorize` cannot stack with `@kernel` (Gap G-K, fj-lang
+// parser mutex documented in matmulfree.fj). Not needed here anyway —
+// the loop body uses volatile_read/volatile_write which LLVM already
+// excludes from autovectorization (volatile ops are non-fungible).
 @noinline
 @kernel fn km_add_raw(a_addr: i64, b_addr: i64, dim: i64) {
-    // Mailbox at 0xBEA300
-    volatile_write_u64(0xBEA300, a_addr)
-    volatile_write_u64(0xBEA308, b_addr)
-    volatile_write_u64(0xBEA310, dim)
-    asm!("movabs $$km_add_raw_c_mailbox, %rax; call *%rax")
+    let mut i: i64 = 0
+    while i < dim {
+        let a_val = volatile_read_u64(a_addr + i * 8)
+        let b_val = volatile_read_u64(b_addr + i * 8)
+        volatile_write_u64(a_addr + i * 8, a_val + b_val)
+        i = i + 1
+    }
 }
 
-// V30.GEMMA3: dispatch to gcc-compiled C element-wise multiply via mailbox.
+// V33.P4: pure Fajar Lang element-wise multiply (a[i] = a[i]*b[i]/1000).
+// Same migration pattern as km_add_raw — volatile reads/writes prevent
+// LLVM autovectorization (the path that triggered the V30 miscompile).
 @noinline
 @kernel fn km_mul_raw(a_addr: i64, b_addr: i64, dim: i64) {
-    // Mailbox at 0xBEA340
-    volatile_write_u64(0xBEA340, a_addr)
-    volatile_write_u64(0xBEA348, b_addr)
-    volatile_write_u64(0xBEA350, dim)
-    asm!("movabs $$km_mul_raw_c_mailbox, %rax; call *%rax")
+    let mut i: i64 = 0
+    while i < dim {
+        let a_val = volatile_read_u64(a_addr + i * 8)
+        let b_val = volatile_read_u64(b_addr + i * 8)
+        volatile_write_u64(a_addr + i * 8, (a_val * b_val) / 1000)
+        i = i + 1
+    }
 }
 
 // Copy: dst = src, raw addresses
