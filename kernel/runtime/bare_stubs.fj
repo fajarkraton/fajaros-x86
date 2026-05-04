@@ -1,3 +1,26 @@
+// FajarOS Nova v3.0 "Nusantara" — bare-metal runtime stubs
+// (Phase 3 of FAJAROS_100PCT_FJ_PLAN, was boot/runtime_stubs.S)
+//
+// 15 symbols providing the minimal runtime needed by compiled .fj
+// code on x86_64 bare metal. All embedded as a single global_asm!()
+// block; fj-lang LLVM backend (commit 4b115d45 + 7a59ad0d) emits
+// the asm verbatim into the kernel ELF via LLVMSetModuleInlineAsm2.
+//
+// Symbols by group:
+//   VGA console:    fj_rt_bare_console_putchar
+//   String ops:     fj_rt_bare_str_len, fj_rt_bare_str_byte_at
+//   Buffer LE/BE:   fj_rt_bare_buffer_{read,write}_u{16,32}_{le,be}
+//                   fj_rt_bare_buffer_read_u64_le (10 total)
+//   Hardware init:  fj_rt_bare_idt_init, fj_rt_bare_tss_init,
+//                   fj_rt_bare_pit_init
+//                   (auto-gen has weak versions; these strong versions win)
+//   Internal:       __isr_32_timer, __sched_exit
+//
+// Section directives in the asm (`.section .text`, `.text.start`, etc.)
+// preserve linker.ld layout — physical placement unchanged from when
+// this lived in boot/runtime_stubs.S.
+
+global_asm!(r#"
 /* FajarOS Nova v3.0 — Bare-Metal Runtime Stubs for LLVM Backend
    These symbols are referenced by compiled .fj code via fj_rt_bare_* calls.
    Linked with the kernel .o to produce the final ELF.
@@ -409,38 +432,38 @@ __isr_\vec :
 
 /* ─── Exception Stubs (vectors 0–31) ────────────────────────────── */
 
-ISR_NOERR 0                     /* #DE  Divide Error */
-ISR_NOERR 1                     /* #DB  Debug */
-ISR_NOERR 2                     /* NMI */
-ISR_NOERR 3                     /* #BP  Breakpoint */
-ISR_NOERR 4                     /* #OF  Overflow */
-ISR_NOERR 5                     /* #BR  Bound Range */
-ISR_NOERR 6                     /* #UD  Invalid Opcode */
-ISR_NOERR 7                     /* #NM  Device Not Available */
-ISR_ERR   8                     /* #DF  Double Fault */
-ISR_NOERR 9                     /* Coprocessor Segment (legacy) */
-ISR_ERR   10                    /* #TS  Invalid TSS */
-ISR_ERR   11                    /* #NP  Segment Not Present */
-ISR_ERR   12                    /* #SS  Stack-Segment Fault */
-ISR_ERR   13                    /* #GP  General Protection */
-ISR_ERR   14                    /* #PF  Page Fault */
-ISR_NOERR 15                    /* Reserved */
-ISR_NOERR 16                    /* #MF  x87 FP Exception */
-ISR_ERR   17                    /* #AC  Alignment Check */
-ISR_NOERR 18                    /* #MC  Machine Check */
-ISR_NOERR 19                    /* #XM  SIMD FP Exception */
-ISR_NOERR 20                    /* #VE  Virtualization */
-ISR_ERR   21                    /* #CP  Control Protection */
+ISR_NOERR 0                     # #DE  Divide Error
+ISR_NOERR 1                     # #DB  Debug
+ISR_NOERR 2                     # NMI
+ISR_NOERR 3                     # #BP  Breakpoint
+ISR_NOERR 4                     # #OF  Overflow
+ISR_NOERR 5                     # #BR  Bound Range
+ISR_NOERR 6                     # #UD  Invalid Opcode
+ISR_NOERR 7                     # #NM  Device Not Available
+ISR_ERR   8                     # #DF  Double Fault
+ISR_NOERR 9                     # Coprocessor Segment (legacy)
+ISR_ERR   10                    # #TS  Invalid TSS
+ISR_ERR   11                    # #NP  Segment Not Present
+ISR_ERR   12                    # #SS  Stack-Segment Fault
+ISR_ERR   13                    # #GP  General Protection
+ISR_ERR   14                    # #PF  Page Fault
+ISR_NOERR 15                    # Reserved
+ISR_NOERR 16                    # #MF  x87 FP Exception
+ISR_ERR   17                    # #AC  Alignment Check
+ISR_NOERR 18                    # #MC  Machine Check
+ISR_NOERR 19                    # #XM  SIMD FP Exception
+ISR_NOERR 20                    # #VE  Virtualization
+ISR_ERR   21                    # #CP  Control Protection
 ISR_NOERR 22
 ISR_NOERR 23
 ISR_NOERR 24
 ISR_NOERR 25
 ISR_NOERR 26
 ISR_NOERR 27
-ISR_NOERR 28                    /* #HV  Hypervisor Injection */
-ISR_ERR   29                    /* #VC  VMM Communication */
-ISR_ERR   30                    /* #SX  Security Exception */
-ISR_NOERR 31                    /* Reserved */
+ISR_NOERR 28                    # #HV  Hypervisor Injection
+ISR_ERR   29                    # #VC  VMM Communication
+ISR_ERR   30                    # #SX  Security Exception
+ISR_NOERR 31                    # Reserved
 
 /* ─── Common Exception Handler ──────────────────────────────────── */
 /* Stack on entry from stub:                                         */
@@ -807,7 +830,8 @@ fj_rt_bare_idt_init:
 
     /* 10. Serial confirmation */
     lea     rdi, [rip + .Lidt_msg]
-    mov     rsi, .Lidt_msg_end - .Lidt_msg
+
+    mov     rsi, 25
     call    __serial_out
 
     pop     r13
@@ -866,7 +890,8 @@ fj_rt_bare_tss_init:
 
     /* 7. Serial confirmation */
     lea     rdi, [rip + .Ltss_msg]
-    mov     rsi, .Ltss_msg_end - .Ltss_msg
+
+    mov     rsi, 27
     call    __serial_out
 
     pop     rbx
@@ -901,7 +926,8 @@ fj_rt_bare_pit_init:
     /* Serial confirmation */
     push    rcx
     lea     rdi, [rip + .Lpit_msg]
-    mov     rsi, .Lpit_msg_end - .Lpit_msg
+
+    mov     rsi, 23
     call    __serial_out
     pop     rcx
 
@@ -910,3 +936,4 @@ fj_rt_bare_pit_init:
 .Lpit_msg:      .ascii  "[PIT] Timer configured\n"
 .Lpit_msg_end:
 .size fj_rt_bare_pit_init, . - fj_rt_bare_pit_init
+"#)

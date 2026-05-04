@@ -19,6 +19,12 @@ KERNEL_LLVM := $(BUILD_DIR)/fajaros-llvm.elf
 #   bit-equivalent to the deleted boot/startup.S for fajaros's needs.
 RUNTIME_S := boot/runtime_stubs.S
 RUNTIME_O := $(BUILD_DIR)/runtime_stubs.o
+# NOTE (FAJAROS_100PCT_FJ_PLAN Phase 3 2026-05-04):
+# RUNTIME_S/RUNTIME_O are kept for backward-compat reference only.
+# The actual runtime stubs now live in kernel/runtime/bare_stubs.fj
+# (15 symbols embedded as global_asm!() block, compiled into combined.o).
+# build-llvm no longer depends on RUNTIME_O — fj-lang LLVM emits the
+# asm via LLVMSetModuleInlineAsm2 (commit 4b115d45 fajar-lang).
 # V30 P3.6: gcc-compiled C vecmat bypasses Fajar Lang LLVM codegen bug.
 # The Fajar Lang LLVM backend produces wrong results for km_vecmat_packed_v8
 # (gate_proj max=3949 vs correct max=9251). The C version is bit-exact with
@@ -55,6 +61,7 @@ LLVM_FEATURES := -avx,-avx2,-avx512f,+popcnt,+aes
 # 7. Main entry point (MUST be last)
 SOURCES := \
 	kernel/boot/constants.fj \
+	kernel/runtime/bare_stubs.fj \
 	kernel/hw/msr.fj \
 	kernel/hw/cpuid.fj \
 	kernel/mm/frames.fj \
@@ -265,11 +272,10 @@ build: $(COMBINED)
 	$(FJ) build --target x86_64-none $(COMBINED) -o $(KERNEL_ELF)
 	@echo "[OK] Kernel built: $(KERNEL_ELF) ($(shell wc -l < $(COMBINED)) lines)"
 
-# Assemble runtime stubs for LLVM bare-metal builds
-$(RUNTIME_O): $(RUNTIME_S)
-	@mkdir -p $(BUILD_DIR)
-	as --64 -o $(RUNTIME_O) $(RUNTIME_S)
-	@echo "[OK] Assembled runtime stubs: $(RUNTIME_O)"
+# NOTE: $(RUNTIME_O) build rule removed (FAJAROS_100PCT_FJ_PLAN Phase 3
+# 2026-05-04). Runtime stubs now live in kernel/runtime/bare_stubs.fj
+# as a global_asm!() block; fj-lang LLVM backend emits the asm via
+# LLVMSetModuleInlineAsm2. boot/runtime_stubs.S has been deleted.
 
 # V30 P3.6: compile C vecmat (gcc, bypasses Fajar Lang LLVM codegen bug)
 $(VECMAT_O): $(VECMAT_C)
@@ -313,7 +319,7 @@ $(TL2_O): $(TL2_HEADER_DEPS)
 #
 # V29.P1.P3 prevention layer: after `fj build`, verify that the ELF
 # was actually produced.
-build-llvm: $(COMBINED) $(RUNTIME_O) $(VECMAT_O) $(TL2_O)
+build-llvm: $(COMBINED) $(VECMAT_O) $(TL2_O)
 	@# Step 1: compile FJ to .o + capture via ld wrapper
 	@$(FJ) build --no-std --backend llvm \
 		--opt-level $(LLVM_OPT) \
@@ -322,18 +328,18 @@ build-llvm: $(COMBINED) $(RUNTIME_O) $(VECMAT_O) $(TL2_O)
 		--linker-script $(LINKER_LD) \
 		--code-model kernel \
 		--reloc static \
-		--extra-objects $(RUNTIME_O) \
 		--linker scripts/ld-wrapper.sh \
 		$(COMBINED) -o /dev/null 2>&1 | { grep -v "SE009\|SE010\|prefix with underscore\|unused variable\|^  \|undefined reference.*mailbox\|error: linker" || true; }
 	@# Step 2: relink with C vecmat + TL2 AVX2 kernel (no gc-sections —
 	@# their symbols may have no Fajar Lang call sites yet, but must survive
-	@# for runtime FFI / dlsym-style lookup)
+	@# for runtime FFI / dlsym-style lookup). Runtime stubs (was RUNTIME_O)
+	@# now embedded in combined.o via kernel/runtime/bare_stubs.fj
+	@# global_asm!() block (Phase 3, 2026-05-04).
 	@ld -T $(LINKER_LD) -nostdlib \
 		$(BUILD_DIR)/combined.start.o.saved \
 		$(VECMAT_O) \
 		$(TL2_O) \
 		$(BUILD_DIR)/combined.o.saved \
-		$(RUNTIME_O) \
 		-o $(KERNEL_LLVM) 2>&1 | { grep -v "missing .note.GNU-stack\|deprecated" || true; }
 	@test -f $(KERNEL_LLVM) || { \
 		echo ""; \
