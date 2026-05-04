@@ -9,8 +9,14 @@ BUILD_DIR := build
 COMBINED := $(BUILD_DIR)/combined.fj
 KERNEL_ELF := $(BUILD_DIR)/fajaros.elf
 KERNEL_LLVM := $(BUILD_DIR)/fajaros-llvm.elf
-STARTUP_S := boot/startup.S
-STARTUP_O := $(BUILD_DIR)/startup.o
+# Removed (FAJAROS_100PCT_FJ_PLAN Phase 2.B 2026-05-04):
+#   STARTUP_S/STARTUP_O were dead code — main build-llvm uses
+#   fj-lang's auto-generated x86_64 startup (combined.start.o.saved
+#   from fj's `--no-std --linker-script` path). boot/startup.S was
+#   only consumed by the `build-llvm-custom` alternate target which
+#   was also removed in this commit. Auto-gen produces multiboot2
+#   header + 32→64 transition + GDT + serial init + entry-call,
+#   bit-equivalent to the deleted boot/startup.S for fajaros's needs.
 RUNTIME_S := boot/runtime_stubs.S
 RUNTIME_O := $(BUILD_DIR)/runtime_stubs.o
 # V30 P3.6: gcc-compiled C vecmat bypasses Fajar Lang LLVM codegen bug.
@@ -232,7 +238,7 @@ QEMU_USB := -device qemu-xhci
 QEMU_SOUND := -audiodev pa,id=snd0 -device intel-hda -device hda-duplex,audiodev=snd0
 QEMU_FULL := $(QEMU_KVM) $(QEMU_SMP) $(QEMU_NET) $(QEMU_USB) -device virtio-gpu-pci
 
-.PHONY: all build build-llvm build-llvm-custom run run-kvm run-vga run-smp run-nvme run-net \
+.PHONY: all build build-llvm run run-kvm run-vga run-smp run-nvme run-net \
        run-llvm run-kvm-llvm debug debug-llvm iso run-iso test clean help loc \
        run-iso-kvm run-iso-tcg run-iso-vga run-iso-full debug-iso test-serial test-commands
 
@@ -464,22 +470,15 @@ test-fjtrace-capture:
 			echo "[OK] $$n JSONL records in $(BUILD_DIR)/fjtrace-capture.jsonl"; \
 		fi
 
-# Build with custom startup.S (manual link — for advanced use)
-$(STARTUP_O): $(STARTUP_S)
-	@mkdir -p $(BUILD_DIR)
-	as --64 -o $(STARTUP_O) $(STARTUP_S)
-	@echo "[OK] Assembled: $(STARTUP_O)"
-
-build-llvm-custom: $(COMBINED) $(STARTUP_O)
-	$(FJ) build --no-std --backend llvm \
-		--opt-level $(LLVM_OPT) \
-		--target-cpu $(LLVM_CPU) \
-		--target-features="$(LLVM_FEATURES)" \
-		--linker-script $(LINKER_LD) \
-		--code-model kernel \
-		--reloc static \
-		$(COMBINED) -o $(KERNEL_LLVM)
-	@echo "[OK] LLVM kernel (custom startup): $(KERNEL_LLVM)"
+# Removed (FAJAROS_100PCT_FJ_PLAN Phase 2.B 2026-05-04):
+#   build-llvm-custom and the $(STARTUP_O) rule were dead-path code that
+#   compiled boot/startup.S separately and linked it. Audit showed main
+#   build-llvm has never depended on STARTUP_O — fj-lang auto-generates
+#   equivalent startup. Deleted both, plus boot/startup.S itself. If a
+#   future use case needs custom startup, restore via git history at
+#   commit 6cbafc95 or write a fresh global_asm!() block in a kernel
+#   .fj file (fajar-lang commit 4b115d45 added LLVM emission for
+#   global_asm!() — Gap G-G fix).
 
 # Run in QEMU (serial only, no graphics)
 run: build
