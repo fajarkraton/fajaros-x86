@@ -144,13 +144,10 @@ fj_rt_bare_buffer_read_u32_le:
     ret
 .size fj_rt_bare_buffer_read_u32_le, . - fj_rt_bare_buffer_read_u32_le
 
-/* fj_rt_bare_buffer_read_u64_le(addr: rdi) -> rax */
-.global fj_rt_bare_buffer_read_u64_le
-.type fj_rt_bare_buffer_read_u64_le, @function
-fj_rt_bare_buffer_read_u64_le:
-    mov     rax, QWORD PTR [rdi]
-    ret
-.size fj_rt_bare_buffer_read_u64_le, . - fj_rt_bare_buffer_read_u64_le
+/* fj_rt_bare_buffer_read_u64_le moved to @naked fn in
+ * kernel/runtime/bare_stubs_naked.fj (FAJAROS_100PCT_FJ_PLAN Phase 6.6
+ * — Gap G-N closed by fj-lang adding `noinline` + `ret undef` to
+ * @naked fn codegen). */
 
 /* --- Big-Endian Reads (byte-swap on x86) --- */
 

@@ -1,0 +1,23 @@
+// FajarOS Nova — Bare-Metal Runtime Stubs (@naked fn migration)
+// FAJAROS_100PCT_FJ_PLAN Phase 6.6 — incremental migration of stubs from
+// the global_asm!() block in bare_stubs.fj to individual @naked fn forms.
+//
+// Each @naked fn replaces an asm stub from bare_stubs.fj's global_asm!()
+// block, with bit-equivalent codegen verified by `objdump -d`. fj-lang
+// LLVM backend emits `naked` + `noinline` attribute pair (per @interrupt
+// pattern) so the asm body's `ret` instruction is never inlined into
+// callers — which would cause callers to return prematurely after the
+// first call site.
+//
+// SysV x86_64 ABI: arg0 in %rdi, arg1 in %rsi, returns in %rax.
+// AT&T syntax matches other fajaros asm!() blocks (e.g. kmatrix.fj
+// km_vecmat_packed_v8 dispatch).
+
+// fj_rt_bare_buffer_read_u64_le(addr: %rdi) -> u64 in %rax
+// Native LE u64 read — single mov.
+// SAFETY: caller must guarantee `addr` is a valid readable 8-byte-aligned
+// address within the kernel's identity-mapped region. Bare-metal runtime
+// stub — no bounds check possible at this layer.
+@naked @unsafe fn fj_rt_bare_buffer_read_u64_le(addr: i64) -> i64 {
+    asm!("movq (%rdi), %rax\n\tret")
+}

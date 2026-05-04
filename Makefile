@@ -62,6 +62,7 @@ LLVM_FEATURES := -avx,-avx2,-avx512f,+popcnt,+aes
 SOURCES := \
 	kernel/boot/constants.fj \
 	kernel/runtime/bare_stubs.fj \
+	kernel/runtime/bare_stubs_naked.fj \
 	kernel/hw/msr.fj \
 	kernel/hw/cpuid.fj \
 	kernel/mm/frames.fj \
