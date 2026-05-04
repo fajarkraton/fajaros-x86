@@ -508,16 +508,8 @@ static int64_t c_isqrt(int64_t x) {
     return prev == 0 ? 1 : prev;
 }
 
-/* ── Piecewise tanh approximation (×1000 fixed-point) ──────────── */
-static int64_t c_tanh_approx(int64_t x) {
-    if (x > 2500) return 1000;
-    if (x > 1500) return 900 + (x - 1500) / 10;
-    if (x > 500)  return 500 + (x - 500) * 400 / 1000;
-    if (x > -500) return x;
-    if (x > -1500) return -500 + (x + 500) * 400 / 1000;
-    if (x > -2500) return -900 + (x + 1500) / 10;
-    return -1000;
-}
+/* c_tanh_approx removed (Phase 4.B): only caller was km_gelu_tanh_c_mailbox,
+ * which now lives in fj as km_tanh_approx (kmatrix.fj). */
 
 /* ── Exponential lookup tables ──────────────────────────────────── */
 static int64_t c_exp_pos_lookup(int64_t q) {
@@ -549,91 +541,13 @@ static int64_t c_exp_approx(int64_t x) {
     return result < 1 ? 1 : result;
 }
 
-/* ── km_rmsnorm ────────────────────────────────────────────────── */
-/* Mailbox at 0xBEA200:
- *   +0: data_addr (i64)
- *   +8: dim       (i64)
- *  +16: gamma_addr (i64, 0 = no gamma)
- *  +24: gamma_mode (i64, 0 = Gemma (1+g), 1 = Llama (g))
+/* km_rmsnorm + km_gelu_tanh moved to pure Fajar Lang (FAJAROS_100PCT_FJ_PLAN
+ * Phase 4.B, kernel/compute/kmatrix.fj 2026-05-04). Bit-exact with the
+ * deleted C versions; 5/5 Gemma 3 1B E2E gates PASS incl. "64 tokens
+ * generated (forward pass reaches LM head)". c_tanh_approx helper
+ * removed (was used only by km_gelu_tanh_c_mailbox); c_isqrt kept
+ * (still used by mdl_embed_lookup_c_mailbox until Phase 4.C).
  */
-#define RMSNORM_MAILBOX (MAILBOX_ADDR + 0x200ULL)
-
-void km_rmsnorm_c_mailbox(void)
-{
-    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)RMSNORM_MAILBOX;
-    int64_t data_addr  = mb[0];
-    int64_t dim        = mb[1];
-    int64_t gamma_addr = mb[2];
-    int64_t gamma_mode = mb[3];
-
-    if (dim <= 0 || dim > 8192) return;
-    if (data_addr <= 0 || data_addr > 0x40000000LL) return;
-
-    int64_t *data = (int64_t *)(uintptr_t)data_addr;
-    const int64_t *gamma = gamma_addr ? (const int64_t *)(uintptr_t)gamma_addr : 0;
-
-    /* Pass 1: find max|x| */
-    int64_t max_abs = 0;
-    for (int64_t i = 0; i < dim; i++) {
-        int64_t x = data[i];
-        int64_t ax = x < 0 ? -x : x;
-        if (ax > max_abs) max_abs = ax;
-    }
-    if (max_abs <= 0) return;
-
-    int64_t k_scale = 10000;
-
-    /* Pass 2: accumulate rescaled sum-of-squares / dim */
-    int64_t rss = 0;
-    for (int64_t i = 0; i < dim; i++) {
-        int64_t x_rs = data[i] * k_scale / max_abs;
-        rss += (x_rs * x_rs) / dim;
-    }
-
-    int64_t rms_rs = c_isqrt(rss + 1);
-    if (rms_rs <= 0) return;
-
-    /* Pass 3: normalize and apply gamma */
-    for (int64_t i = 0; i < dim; i++) {
-        int64_t x_rs = data[i] * k_scale / max_abs;
-        int64_t normed = (x_rs * 1000) / rms_rs;
-        if (gamma) {
-            int64_t g = gamma[i];
-            if (gamma_mode == 1) {
-                data[i] = (normed * g) / 1000;
-            } else {
-                data[i] = (normed * (1000 + g)) / 1000;
-            }
-        } else {
-            data[i] = normed;
-        }
-    }
-}
-
-/* ── km_gelu_tanh ──────────────────────────────────────────────── */
-/* Mailbox at 0xBEA280:
- *   +0: data_addr (i64)
- *   +8: dim       (i64)
- */
-#define GELU_MAILBOX (MAILBOX_ADDR + 0x280ULL)
-
-void km_gelu_tanh_c_mailbox(void)
-{
-    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)GELU_MAILBOX;
-    int64_t data_addr = mb[0];
-    int64_t dim       = mb[1];
-
-    int64_t *data = (int64_t *)(uintptr_t)data_addr;
-
-    for (int64_t i = 0; i < dim; i++) {
-        int64_t x = data[i];
-        int64_t x2 = (x * x) / 1000;
-        int64_t x3 = (x2 * x) / 1000;
-        int64_t inner = (798 * (x + (45 * x3) / 1000)) / 1000;
-        int64_t t = c_tanh_approx(inner);
-        data[i] = (x * (1000 + t)) / 2000;
-    }
-}
 
 /* km_add_raw + km_mul_raw moved to pure Fajar Lang (FAJAROS_100PCT_FJ_PLAN
  * Phase 4.A, kernel/compute/kmatrix.fj 2026-05-04). The fj versions use

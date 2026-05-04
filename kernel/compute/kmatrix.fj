@@ -558,14 +558,68 @@ const KM_TILE_SIZE: i64 = 64
 // V30.GEMMA3: dispatch to gcc-compiled C RMSNorm via mailbox.
 // Avoids LLVM O2 sensitivity that causes different numerical results
 // depending on code context (FJTRACE present vs absent).
+// V33.P4 (FAJAROS_100PCT_FJ_PLAN Phase 4.B 2026-05-04): pure fj inline.
+// Was: dispatch to gcc-compiled C km_rmsnorm_c_mailbox via mailbox.
+// Now: inline 3-pass implementation (find max|x|, accumulate
+// rescaled SS/dim, normalize+gamma) using km_isqrt helper (defined
+// ~line 335 above; bit-exact mirror of the deleted c_isqrt).
+// volatile reads/writes suppress LLVM autovectorization.
+//
+// gamma_mode read from model header at 0xC00558:
+//   0 = Gemma (1+gamma) | 1 = Llama (gamma)
 @noinline
 @kernel fn km_rmsnorm(data_addr: i64, dim: i64, gamma_addr: i64) {
-    // Mailbox at 0xBEA200
-    volatile_write_u64(0xBEA200, data_addr)
-    volatile_write_u64(0xBEA208, dim)
-    volatile_write_u64(0xBEA210, gamma_addr)
-    volatile_write_u64(0xBEA218, volatile_read_u64(0xC00558))
-    asm!("movabs $$km_rmsnorm_c_mailbox, %rax; call *%rax")
+    if dim <= 0 { return }
+    if dim > 8192 { return }
+    if data_addr <= 0 { return }
+    if data_addr > 0x40000000 { return }
+
+    let gamma_mode = volatile_read_u64(0xC00558)
+
+    // Pass 1: find max|x|
+    let mut max_abs: i64 = 0
+    let mut i: i64 = 0
+    while i < dim {
+        let x = volatile_read_u64(data_addr + i * 8)
+        let ax = if x < 0 { -x } else { x }
+        if ax > max_abs { max_abs = ax }
+        i = i + 1
+    }
+    if max_abs <= 0 { return }
+
+    let k_scale: i64 = 10000
+
+    // Pass 2: accumulate rescaled sum-of-squares / dim
+    let mut rss: i64 = 0
+    i = 0
+    while i < dim {
+        let x = volatile_read_u64(data_addr + i * 8)
+        let x_rs = x * k_scale / max_abs
+        rss = rss + (x_rs * x_rs) / dim
+        i = i + 1
+    }
+
+    let rms_rs = km_isqrt(rss + 1)
+    if rms_rs <= 0 { return }
+
+    // Pass 3: normalize and apply gamma
+    i = 0
+    while i < dim {
+        let x = volatile_read_u64(data_addr + i * 8)
+        let x_rs = x * k_scale / max_abs
+        let normed = (x_rs * 1000) / rms_rs
+        if gamma_addr != 0 {
+            let g = volatile_read_u64(gamma_addr + i * 8)
+            if gamma_mode == 1 {
+                volatile_write_u64(data_addr + i * 8, (normed * g) / 1000)
+            } else {
+                volatile_write_u64(data_addr + i * 8, (normed * (1000 + g)) / 1000)
+            }
+        } else {
+            volatile_write_u64(data_addr + i * 8, normed)
+        }
+        i = i + 1
+    }
 }
 
 // Convenience wrapper for km_ slot-based RMSNorm
@@ -595,13 +649,26 @@ const KM_TILE_SIZE: i64 = 64
     else { -1000 }
 }
 
-// V30.GEMMA3: dispatch to gcc-compiled C GELU-tanh via mailbox.
+// V33.P4 (FAJAROS_100PCT_FJ_PLAN Phase 4.B 2026-05-04): pure fj inline.
+// Was: dispatch to gcc-compiled C km_gelu_tanh_c_mailbox. Now: inline
+// loop using km_tanh_approx helper (defined ~line 587 above; bit-exact
+// mirror of the deleted c_tanh_approx). volatile_read/write suppress
+// LLVM autovectorization (V30 miscompile path avoided).
+//
+// GELU_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x³)))
+// Fixed-point: sqrt(2/pi) ≈ 798 / 1000, 0.044715 ≈ 45 / 1000.
 @noinline
 @kernel fn km_gelu_tanh(data_addr: i64, dim: i64) {
-    // Mailbox at 0xBEA280
-    volatile_write_u64(0xBEA280, data_addr)
-    volatile_write_u64(0xBEA288, dim)
-    asm!("movabs $$km_gelu_tanh_c_mailbox, %rax; call *%rax")
+    let mut i: i64 = 0
+    while i < dim {
+        let x = volatile_read_u64(data_addr + i * 8)
+        let x2 = (x * x) / 1000
+        let x3 = (x2 * x) / 1000
+        let inner = (798 * (x + (45 * x3) / 1000)) / 1000
+        let t = km_tanh_approx(inner)
+        volatile_write_u64(data_addr + i * 8, (x * (1000 + t)) / 2000)
+        i = i + 1
+    }
 }
 
 // Convenience wrapper for km_ slot
