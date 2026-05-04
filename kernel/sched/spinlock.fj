@@ -1,51 +1,34 @@
-// FajarOS Nova v0.5.1 — Spinlock (Phase 1 of FAJAROS_100PCT_FJ_PLAN)
-// Atomic test-and-set lock via x86 LOCK CMPXCHG instruction.
-// Replaces V0.5.0 volatile-only impl which had a TOCTOU race.
+// FajarOS Nova v0.5.2 — Spinlock (Phase 5 of FAJAROS_100PCT_FJ_PLAN)
+// Atomic test-and-set via fj-lang `atomic_cas_u64` builtin (Gap G-A
+// closure, fajar-lang Phase 5). Replaces V0.5.1 inline-asm CMPXCHG with
+// a higher-level atomic primitive that LLVM lowers to the same LOCK
+// CMPXCHG instruction (verified by ELF disasm test).
 //
-// ═══════════════════════════════════════════════
-// V0.5.0 race (BUG, fixed in V0.5.1):
-//   while volatile_read(addr) != 0 {}    // CPU A reads 0
-//   volatile_write(addr, 1)               // CPU B reads 0; both write 1
-// → both CPUs pass the check, both write 1, both think they own the lock.
-// Latent until SMP enabled. Surfaced 2026-05-04 audit.
+// V0.5.0 race (FIXED V0.5.1, simplified V0.5.2):
+//   while volatile_read(addr) != 0 {}; volatile_write(addr, 1)
+//   → both CPUs could pass the read-check, both write 1, both think
+//     they own the lock. Silent until SMP enabled.
 //
-// V0.5.1 fix uses LOCK CMPXCHG (atomic across CPUs).
-// CMPXCHG dst, src semantics:
-//   if (RAX == dst): dst = src, ZF = 1, RAX unchanged (= 0 in our case)
-//   else:            RAX = dst, ZF = 0
-// LOCK prefix makes the read-modify-write atomic.
-// ═══════════════════════════════════════════════
+// V0.5.2 uses fj's atomic_cas_u64(addr, expected=0, new=1):
+//   - Returns 0 if we acquired (CAS succeeded)
+//   - Returns non-zero if held (CAS failed; prev value returned)
+// LLVM emits `lock cmpxchgq` with SeqCst ordering — strongest available.
 
 @kernel fn spinlock_try_acquire(lock_addr: i64) -> i64 {
-    // Returns 0 if newly acquired; non-zero if was already held.
-    // RAX = 0 (expected = unlocked)
-    // RCX = 1 (desired = locked)
-    // RSI = lock_addr
-    // After CMPXCHG: RAX holds previous value at lock_addr.
-    asm("xor %eax, %eax\n\tlock cmpxchgq %rcx, (%rsi)",
-        in("rcx") 1,
-        in("rsi") lock_addr,
-        out("rax") -> i64,
-        clobber("memory"),
-        volatile)
+    // Returns 0 on acquire, non-zero (the previous value) if held.
+    atomic_cas_u64(lock_addr, 0, 1)
 }
 
 @kernel fn spinlock_acquire(lock_addr: i64) {
     while spinlock_try_acquire(lock_addr) != 0 {
-        // PAUSE hint: cuts power + bus traffic on spin-wait.
-        // Required on Hyper-Threading; recommended on all x86_64.
+        // PAUSE hint via inline asm (no fj builtin yet for this).
         asm("pause", volatile)
     }
 }
 
 @kernel fn spinlock_release(lock_addr: i64) {
-    // Release semantics: ensure all prior writes visible before unlock.
-    // mfence is the strongest memory barrier on x86_64.
-    // Aligned 64-bit store at the end is atomic on x86_64.
-    asm("mfence\n\tmovq $$0, (%rdi)",
-        in("rdi") lock_addr,
-        clobber("memory"),
-        volatile)
+    // SeqCst atomic store handles the memory barrier + write atomically.
+    atomic_store_u64(lock_addr, 0)
 }
 
 @kernel fn cmd_spinlock() {
