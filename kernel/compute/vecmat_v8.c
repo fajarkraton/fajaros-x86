@@ -16,73 +16,16 @@ static inline int64_t get_model_embed_bits(void) {
     return (int64_t)(*(const uint32_t *)(uintptr_t)0xC00090ULL);
 }
 
-/* ── Embedding lookup (C bypass for 8-bit LLVM O2 sensitivity) ───── */
-/* Mailbox at 0xBEA500:
- *   +0: token_id (i64)
- *   +8: out_addr (i64)
- *  +16: embed_base (i64) = STREAM_EMBED_BASE
- *  +24: vocab_size (i64)
- *  +32: d_model (i64)
+/* mdl_embed_lookup_c_mailbox moved to pure Fajar Lang
+ * (FAJAROS_100PCT_FJ_PLAN Phase 4.C, kernel/compute/model_loader.fj
+ * 2026-05-04). The fj version uses km_isqrt helper for Gemma sqrt
+ * scaling. Bit-exact verified via 6/6 Gemma 3 1B E2E gates incl.
+ * "64 tokens generated" and "shell recovered after ask".
+ *
+ * mdl_lmhead_argmax_v8_tied_mailbox INTENTIONALLY KEPT — fj port
+ * triggers EXC:14 (Gap G-L) due to 295M-iteration vocab×d_model
+ * loop. Defer until G-L root cause is fixed in fj-lang LLVM codegen.
  */
-#define EMBED_MAILBOX (MAILBOX_ADDR + 0x500ULL)
-
-void mdl_embed_lookup_c_mailbox(void)
-{
-    volatile int64_t *mb = (volatile int64_t *)(uintptr_t)EMBED_MAILBOX;
-    int64_t token_id   = mb[0];
-    int64_t out_addr   = mb[1];
-    int64_t embed_base = mb[2];
-    int64_t vocab_size = mb[3];
-    int64_t d_model    = mb[4];
-    int64_t model_type = mb[5];  /* 10/11 = Gemma 3 (apply sqrt scaling) */
-    int64_t bits       = get_model_embed_bits();
-
-    if (token_id < 0 || token_id >= vocab_size) return;
-
-    int64_t total = vocab_size * d_model;
-    int64_t packed_bytes = (bits == 8) ? total : total / 2;
-    int64_t n_groups = (total + 127) >> V8_GROUP_SHIFT;
-    int64_t scales_base = embed_base + packed_bytes;
-    int64_t zeros_base = scales_base + n_groups * 4;
-
-    const uint8_t *packed = (const uint8_t *)(uintptr_t)embed_base;
-    const uint32_t *scales = (const uint32_t *)(uintptr_t)scales_base;
-    const uint8_t *zeros_arr = (const uint8_t *)(uintptr_t)zeros_base;
-    int64_t *out = (int64_t *)(uintptr_t)out_addr;
-    int64_t row_start = token_id * d_model;
-
-    if (bits == 8) {
-        for (int64_t i = 0; i < d_model; i++) {
-            int64_t fi = row_start + i;
-            int64_t q = packed[fi];
-            int64_t g = fi >> V8_GROUP_SHIFT;
-            int64_t scale = (int64_t)scales[g];
-            int64_t zero = (int64_t)zeros_arr[g];
-            out[i] = ((q - zero) * scale) / 1000;
-        }
-    } else {
-        for (int64_t i = 0; i < d_model; i++) {
-            int64_t fi = row_start + i;
-            uint8_t raw = packed[fi >> 1];
-            int64_t q = (raw >> ((fi & 1) * 4)) & 15;
-            int64_t g = fi >> V8_GROUP_SHIFT;
-            int64_t scale = (int64_t)scales[g];
-            int64_t zero = (int64_t)zeros_arr[g];
-            out[i] = ((q - zero) * scale) / 1000;
-        }
-    }
-
-    /* Gemma 3 embed scaling: x *= sqrt(d_model).
-     * HF reference: Gemma3TextModel.forward scales by hidden_size**0.5.
-     * sqrt(1152) * 1000 = 33941 in x1000 fixed-point.
-     * Apply only for Gemma 3 models (type 10/11). */
-    if (model_type == 10 || model_type == 11) {
-        int64_t scale_x1000 = c_isqrt(d_model * 1000000);
-        for (int64_t i = 0; i < d_model; i++) {
-            out[i] = (out[i] * scale_x1000) / 1000;
-        }
-    }
-}
 
 /* ── RoPE: Rotary Position Embedding (C bypass) ──────────────────── */
 /* V31.A.P1 (H3 precision hypothesis): replace Bhaskara I sin approx
