@@ -13,6 +13,19 @@
 // AT&T syntax matches other fajaros asm!() blocks (e.g. kmatrix.fj
 // km_vecmat_packed_v8 dispatch).
 
+// ── VGA Console (text buffer at 0xB8000, 80x25 cells) ────────────────
+
+// fj_rt_bare_console_putchar(ch: %rdi) -> void
+// Writes one character to VGA text buffer with white-on-black.
+// Handles newline by advancing to next row. Wraps after row 24.
+// Uses `vga_cursor_pos` symbol defined in bare_stubs.fj global_asm
+// data section (visible within the same compilation unit).
+// SAFETY: pure write to VGA MMIO region (0xB8000 identity-mapped at
+// boot). No memory safety concerns for this stub.
+@naked @unsafe fn fj_rt_bare_console_putchar(ch: i64) {
+    asm!("push %rbx\n\tmov vga_cursor_pos(%rip), %rbx\n\tcmpb $0x0A, %dil\n\tjne 1f\n\tmov %rbx, %rax\n\txor %rdx, %rdx\n\tmov $80, %rcx\n\tdiv %rcx\n\tinc %rax\n\timul $80, %rax\n\tmov %rax, %rbx\n\tjmp 2f\n1:\n\tmov $0xB8000, %rax\n\tlea (%rax, %rbx, 2), %rdx\n\tmovb %dil, (%rdx)\n\tmovb $0x0F, 1(%rdx)\n\tinc %rbx\n2:\n\tcmp $2000, %rbx\n\tjl 3f\n\tmov $1920, %rbx\n3:\n\tmov %rbx, vga_cursor_pos(%rip)\n\tpop %rbx\n\tret")
+}
+
 // ── String Operations (null-terminated C strings, ptr as i64) ────────
 
 // fj_rt_bare_str_len(ptr: %rdi) -> length in %rax

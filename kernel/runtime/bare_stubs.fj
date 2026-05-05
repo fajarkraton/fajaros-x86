@@ -43,48 +43,11 @@ vga_cursor_pos:
 
 .section .text
 
-/* fj_rt_bare_console_putchar(char: rdi) -> void
-   Write one character to VGA text buffer with white-on-black attribute.
-   Handles newline by advancing to next row. */
-.global fj_rt_bare_console_putchar
-.type fj_rt_bare_console_putchar, @function
-fj_rt_bare_console_putchar:
-    push    rbx
-    mov     rbx, QWORD PTR [rip + vga_cursor_pos]
-
-    /* Handle newline */
-    cmp     dil, 0x0A
-    jne     .Lputc_normal
-    /* Advance to start of next line: pos = ((pos / 80) + 1) * 80 */
-    mov     rax, rbx
-    xor     rdx, rdx
-    mov     rcx, 80
-    div     rcx                 /* rax = row */
-    inc     rax
-    imul    rax, 80
-    mov     rbx, rax
-    jmp     .Lputc_scroll
-
-.Lputc_normal:
-    /* Write char + attribute at VGA address */
-    mov     rax, 0xB8000
-    lea     rdx, [rax + rbx * 2]
-    mov     BYTE PTR [rdx], dil     /* character */
-    mov     BYTE PTR [rdx + 1], 0x0F   /* white on black */
-    inc     rbx
-
-.Lputc_scroll:
-    /* Scroll if past bottom (pos >= 2000) */
-    cmp     rbx, 2000
-    jl      .Lputc_done
-    /* Simple scroll: reset to line 24 start */
-    mov     rbx, 1920              /* row 24, col 0 */
-
-.Lputc_done:
-    mov     QWORD PTR [rip + vga_cursor_pos], rbx
-    pop     rbx
-    ret
-.size fj_rt_bare_console_putchar, . - fj_rt_bare_console_putchar
+/* fj_rt_bare_console_putchar migrated to @naked fn in
+ * bare_stubs_naked.fj. The vga_cursor_pos data symbol below
+ * remains here (defined as part of this global_asm block's .data
+ * section) and is referenced by the migrated @naked fn via
+ * vga_cursor_pos(%rip) RIP-relative addressing. */
 
 /* ═══════════════════════════════════════════════════════════════════
    String Operations — operate on null-terminated C strings (ptr as i64)
