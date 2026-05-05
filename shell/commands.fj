@@ -206,22 +206,33 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("Shift/CapsLock Up/Down=hist Tab", YELLOW_ON_BLACK)
 }
 
+// FAJAROS_VERSION strings synced 2026-05-05 to git tag v3.8.0+ post
+// FAJAROS_100PCT_FJ_PLAN TERMINAL COMPLETE (vecmat_v8.c deleted; ZERO
+// non-fj LOC in kernel build path). Version string previously hardcoded
+// at v0.1.0 — drifted from release tags. Plan §3.6 close-criterion:
+// regenerate from `git describe --tags` at build time. For now, kept
+// as a literal updated per release; future Makefile auto-regen target
+// can replace the lines bracketed by VERSION_AUTOGEN_{BEGIN,END} markers
+// without touching surrounding code.
+
+// VERSION_AUTOGEN_BEGIN
 @kernel fn cmd_version() {
-    cprintln("FajarOS Nova v0.1.0 \"Nova\"", WHITE_ON_BLUE)
+    cprintln("FajarOS Nova v3.8.0+ \"FAJAROS_100PCT_COMPLETE\"", WHITE_ON_BLUE)
     cprintln("  Kernel:   x86_64 bare-metal", WHITE_ON_BLACK)
-    cprintln("  Language: 100% Fajar Lang", WHITE_ON_BLACK)
-    cprintln("  Compiler: Fajar Lang + Cranelift", WHITE_ON_BLACK)
+    cprintln("  Language: 100% Fajar Lang (vecmat_v8.c deleted 2026-05-05)", WHITE_ON_BLACK)
+    cprintln("  Compiler: Fajar Lang + LLVM (--code-model kernel)", WHITE_ON_BLACK)
     cprintln("  Boot:     Multiboot2 (GRUB2)", WHITE_ON_BLACK)
     cprintln("  Paging:   128MB identity (2MB pages)", WHITE_ON_BLACK)
     cprintln("  Timer:    PIT 100Hz preemptive", WHITE_ON_BLACK)
-    cprintln("  Shell:    100 commands", WHITE_ON_BLACK)
+    cprintln("  Shell:    136 commands", WHITE_ON_BLACK)
     cprintln("  Author:   Fajar (TaxPrime/PrimeCore.id)", WHITE_ON_BLACK)
-    cprintln("  Built with Claude Opus 4.6", CYAN_ON_BLACK)
+    cprintln("  Built with Claude Opus 4.7", CYAN_ON_BLACK)
 }
 
 @kernel fn cmd_uname() {
-    cprintln("FajarOS Nova v0.1.0 x86_64 (Fajar Lang)", CYAN_ON_BLACK)
+    cprintln("FajarOS Nova v3.8.0+ x86_64 (Fajar Lang)", CYAN_ON_BLACK)
 }
+// VERSION_AUTOGEN_END
 
 @kernel fn cmd_uptime() {
     cprint("Uptime: ", WHITE_ON_BLACK)
@@ -895,17 +906,17 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 }
 
 @kernel fn cmd_about() {
-    cprintln("FajarOS Nova v0.1.0", WHITE_ON_BLUE)
+    cprintln("FajarOS Nova v3.8.0+", WHITE_ON_BLUE)
     cprintln("", WHITE_ON_BLACK)
     cprintln("  The world's first OS written 100% in a single", WHITE_ON_BLACK)
     cprintln("  language that unifies kernel (@kernel), AI", WHITE_ON_BLACK)
     cprintln("  inference (@device), and userspace (@safe).", WHITE_ON_BLACK)
     cprintln("", WHITE_ON_BLACK)
-    cprintln("  Language:  Fajar Lang (fj)", CYAN_ON_BLACK)
-    cprintln("  Compiler:  Cranelift native codegen", CYAN_ON_BLACK)
+    cprintln("  Language:  Fajar Lang (fj) — 100% Fajar Lang as of 2026-05-05", CYAN_ON_BLACK)
+    cprintln("  Compiler:  LLVM backend (--code-model kernel + noredzone)", CYAN_ON_BLACK)
     cprintln("  Target:    x86_64-unknown-none", CYAN_ON_BLACK)
     cprintln("  Author:    Fajar (TaxPrime/PrimeCore.id)", CYAN_ON_BLACK)
-    cprintln("  Built:     Claude Opus 4.6", CYAN_ON_BLACK)
+    cprintln("  Built:     Claude Opus 4.7", CYAN_ON_BLACK)
     cprintln("", WHITE_ON_BLACK)
     cprintln("  github.com/fajarkraton/fajaros-x86", YELLOW_ON_BLACK)
 }
