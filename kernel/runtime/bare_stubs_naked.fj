@@ -10,8 +10,11 @@
 // first call site.
 //
 // SysV x86_64 ABI: arg0 in %rdi, arg1 in %rsi, returns in %rax.
-// AT&T syntax matches other fajaros asm!() blocks (e.g. kmatrix.fj
-// km_vecmat_packed_v8 dispatch).
+// AT&T syntax (options(att_syntax)) matches other fajaros asm!() blocks.
+//
+// IMPORTANT: in LLVM inline asm template syntax, literal `$` must be
+// escaped as `$$` to avoid being interpreted as a constraint reference
+// (`$0`, `$1`, etc.). Hence `cmpb $$0x0A, %dil` rather than `cmpb $0x0A, %dil`.
 
 // ── VGA Console (text buffer at 0xB8000, 80x25 cells) ────────────────
 
@@ -23,7 +26,7 @@
 // SAFETY: pure write to VGA MMIO region (0xB8000 identity-mapped at
 // boot). No memory safety concerns for this stub.
 @naked @unsafe fn fj_rt_bare_console_putchar(ch: i64) {
-    asm!("push %rbx\n\tmov vga_cursor_pos(%rip), %rbx\n\tcmpb $0x0A, %dil\n\tjne 1f\n\tmov %rbx, %rax\n\txor %rdx, %rdx\n\tmov $80, %rcx\n\tdiv %rcx\n\tinc %rax\n\timul $80, %rax\n\tmov %rax, %rbx\n\tjmp 2f\n1:\n\tmov $0xB8000, %rax\n\tlea (%rax, %rbx, 2), %rdx\n\tmovb %dil, (%rdx)\n\tmovb $0x0F, 1(%rdx)\n\tinc %rbx\n2:\n\tcmp $2000, %rbx\n\tjl 3f\n\tmov $1920, %rbx\n3:\n\tmov %rbx, vga_cursor_pos(%rip)\n\tpop %rbx\n\tret")
+    asm!("push %rbx\n\tmov vga_cursor_pos(%rip), %rbx\n\tcmpb $$0x0A, %dil\n\tjne 1f\n\tmov %rbx, %rax\n\txor %rdx, %rdx\n\tmov $$80, %rcx\n\tdiv %rcx\n\tinc %rax\n\timul $$80, %rax\n\tmov %rax, %rbx\n\tjmp 2f\n1:\n\tmov $$0xB8000, %rax\n\tlea (%rax, %rbx, 2), %rdx\n\tmovb %dil, (%rdx)\n\tmovb $$0x0F, 1(%rdx)\n\tinc %rbx\n2:\n\tcmp $$2000, %rbx\n\tjl 3f\n\tmov $$1920, %rbx\n3:\n\tmov %rbx, vga_cursor_pos(%rip)\n\tpop %rbx\n\tret", options(att_syntax))
 }
 
 // ── String Operations (null-terminated C strings, ptr as i64) ────────
@@ -34,7 +37,7 @@
 // null-terminated readable byte sequence within the kernel's
 // identity-mapped region.
 @naked @unsafe fn fj_rt_bare_str_len(ptr: i64) -> i64 {
-    asm!("xor %rax, %rax\n\ttest %rdi, %rdi\n\tjz 2f\n1:\n\tcmpb $0, (%rdi, %rax)\n\tje 2f\n\tinc %rax\n\tcmp $65536, %rax\n\tjl 1b\n2:\n\tret")
+    asm!("xor %rax, %rax\n\ttest %rdi, %rdi\n\tjz 2f\n1:\n\tcmpb $$0, (%rdi, %rax)\n\tje 2f\n\tinc %rax\n\tcmp $$65536, %rax\n\tjl 1b\n2:\n\tret", options(att_syntax))
 }
 
 // fj_rt_bare_str_byte_at(ptr: %rdi, idx: %rsi) -> byte in %rax
@@ -42,7 +45,7 @@
 // SAFETY: caller must guarantee `ptr+idx` is null OR points to a
 // readable byte within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_str_byte_at(ptr: i64, idx: i64) -> i64 {
-    asm!("xor %rax, %rax\n\ttest %rdi, %rdi\n\tjz 1f\n\tmovzbl (%rdi, %rsi), %eax\n1:\n\tret")
+    asm!("xor %rax, %rax\n\ttest %rdi, %rdi\n\tjz 1f\n\tmovzbl (%rdi, %rsi), %eax\n1:\n\tret", options(att_syntax))
 }
 
 // ── Little-Endian Reads (native on x86) ──────────────────────────────
@@ -52,7 +55,7 @@
 // SAFETY: caller must guarantee `addr` is a valid readable 2-byte-aligned
 // address within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_buffer_read_u16_le(addr: i64) -> i64 {
-    asm!("xor %rax, %rax\n\tmov (%rdi), %ax\n\tret")
+    asm!("xor %rax, %rax\n\tmov (%rdi), %ax\n\tret", options(att_syntax))
 }
 
 // fj_rt_bare_buffer_read_u32_le(addr: %rdi) -> u32 in %rax
@@ -60,7 +63,7 @@
 // SAFETY: caller must guarantee `addr` is a valid readable 4-byte-aligned
 // address within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_buffer_read_u32_le(addr: i64) -> i64 {
-    asm!("xor %rax, %rax\n\tmov (%rdi), %eax\n\tret")
+    asm!("xor %rax, %rax\n\tmov (%rdi), %eax\n\tret", options(att_syntax))
 }
 
 // fj_rt_bare_buffer_read_u64_le(addr: %rdi) -> u64 in %rax
@@ -69,7 +72,7 @@
 // address within the kernel's identity-mapped region. Bare-metal runtime
 // stub — no bounds check possible at this layer.
 @naked @unsafe fn fj_rt_bare_buffer_read_u64_le(addr: i64) -> i64 {
-    asm!("movq (%rdi), %rax\n\tret")
+    asm!("movq (%rdi), %rax\n\tret", options(att_syntax))
 }
 
 // ── Big-Endian Reads (byte-swap on x86) ──────────────────────────────
@@ -79,7 +82,7 @@
 // SAFETY: caller must guarantee `addr` is a valid readable 2-byte-aligned
 // address within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_buffer_read_u16_be(addr: i64) -> i64 {
-    asm!("xor %rax, %rax\n\tmov (%rdi), %ax\n\txchg %al, %ah\n\tret")
+    asm!("xor %rax, %rax\n\tmov (%rdi), %ax\n\txchg %al, %ah\n\tret", options(att_syntax))
 }
 
 // fj_rt_bare_buffer_read_u32_be(addr: %rdi) -> u32 in %rax
@@ -87,7 +90,7 @@
 // SAFETY: caller must guarantee `addr` is a valid readable 4-byte-aligned
 // address within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_buffer_read_u32_be(addr: i64) -> i64 {
-    asm!("xor %rax, %rax\n\tmov (%rdi), %eax\n\tbswap %eax\n\tret")
+    asm!("xor %rax, %rax\n\tmov (%rdi), %eax\n\tbswap %eax\n\tret", options(att_syntax))
 }
 
 // ── Little-Endian Writes (native on x86) ─────────────────────────────
@@ -97,7 +100,7 @@
 // SAFETY: caller must guarantee `addr` is a valid writable 2-byte-aligned
 // address within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_buffer_write_u16_le(addr: i64, val: i64) -> i64 {
-    asm!("mov %si, (%rdi)\n\txor %rax, %rax\n\tret")
+    asm!("mov %si, (%rdi)\n\txor %rax, %rax\n\tret", options(att_syntax))
 }
 
 // fj_rt_bare_buffer_write_u32_le(addr: %rdi, val: %rsi) -> 0 in %rax
@@ -105,7 +108,7 @@
 // SAFETY: caller must guarantee `addr` is a valid writable 4-byte-aligned
 // address within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_buffer_write_u32_le(addr: i64, val: i64) -> i64 {
-    asm!("mov %esi, (%rdi)\n\txor %rax, %rax\n\tret")
+    asm!("mov %esi, (%rdi)\n\txor %rax, %rax\n\tret", options(att_syntax))
 }
 
 // ── Big-Endian Writes (byte-swap on x86) ─────────────────────────────
@@ -115,7 +118,7 @@
 // SAFETY: caller must guarantee `addr` is a valid writable 2-byte-aligned
 // address within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_buffer_write_u16_be(addr: i64, val: i64) -> i64 {
-    asm!("mov %si, %ax\n\txchg %al, %ah\n\tmov %ax, (%rdi)\n\txor %rax, %rax\n\tret")
+    asm!("mov %si, %ax\n\txchg %al, %ah\n\tmov %ax, (%rdi)\n\txor %rax, %rax\n\tret", options(att_syntax))
 }
 
 // fj_rt_bare_buffer_write_u32_be(addr: %rdi, val: %rsi) -> 0 in %rax
@@ -123,5 +126,5 @@
 // SAFETY: caller must guarantee `addr` is a valid writable 4-byte-aligned
 // address within the kernel's identity-mapped region.
 @naked @unsafe fn fj_rt_bare_buffer_write_u32_be(addr: i64, val: i64) -> i64 {
-    asm!("mov %esi, %eax\n\tbswap %eax\n\tmov %eax, (%rdi)\n\txor %rax, %rax\n\tret")
+    asm!("mov %esi, %eax\n\tbswap %eax\n\tmov %eax, (%rdi)\n\txor %rax, %rax\n\tret", options(att_syntax))
 }
