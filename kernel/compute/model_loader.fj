@@ -2259,22 +2259,66 @@ const LM_TOPK_K: i64 = 8
 // x_addr: hidden state (d_model × i64 fixed-point ×1000)
 // Returns: best_token (argmax over vocab_size).
 //
-// V28.5 audit fix: @noinline prevents LLVM from inlining this 262K×1152
-// loop into call sites where O2 over-aggressively reorders memory accesses,
-// producing the EXC:13 GP fault observed at offset 0x164C35. Same approach
-// is used for the existing v5_4bit hot path.
-// V30 P3.6: dispatch to gcc-compiled C lmhead argmax via mailbox.
-// Same Fajar Lang LLVM codegen bug as km_vecmat_packed_v8.
+// V33.P4 (FAJAROS_100PCT_FJ_PLAN Phase 4.G 2026-05-05): pure fj inline.
+// Was: dispatch to gcc-compiled C mdl_lmhead_argmax_v8_tied_mailbox.
+// 262K vocab × 1152 d_model = ~302M iterations. Built on G-M closure
+// (--code-model kernel implies noredzone) — earlier "G-L EXC:14" was
+// the same red-zone-corruption-under-IRQ class as G-M, just with a
+// longer outer loop that exposed it more frequently.
+@no_vectorize
 @noinline
 @kernel fn mdl_ram_lmhead_argmax_v8_tied(x_addr: i64) -> i64 {
-    // Mailbox at 0xBEA100 (separate from vecmat mailbox at 0xBEA000)
-    volatile_write_u64(0xBEA100, x_addr)
-    volatile_write_u64(0xBEA108, STREAM_EMBED_BASE)
-    volatile_write_u64(0xBEA110, mdl_get_vocab_size())
-    volatile_write_u64(0xBEA118, mdl_get_d_model())
-    asm!("movabs $$mdl_lmhead_argmax_v8_tied_mailbox, %rax; call *%rax")
-    // Read best_token from mailbox result slot
-    volatile_read_u64(0xBEA120)
+    let vocab_size = mdl_get_vocab_size()
+    let d_model = mdl_get_d_model()
+    let embed_base = STREAM_EMBED_BASE
+    let bits = volatile_read_u8(0xC00090)
+
+    let total: i64 = vocab_size * d_model
+    let packed_bytes: i64 = if bits == 8 { total } else { total / 2 }
+    let n_groups: i64 = (total + 127) >> 7
+    let scales_base: i64 = embed_base + packed_bytes
+    let zeros_base: i64 = scales_base + n_groups * 4
+
+    // Gemma 3 vocab: 255902 real tokens + 6242 <unused>. Quantization
+    // noise on untrained <unused> weights produces spurious high scores;
+    // mask to real tokens only.
+    let effective_vocab = if vocab_size < 255902 { vocab_size } else { 255902 }
+
+    let mut best_token: i64 = 0
+    let mut best_score: i64 = -999999999
+
+    let mut v: i64 = 0
+    while v < effective_vocab {
+        let row_start = v * d_model
+        let mut sum: i64 = 0
+        let mut i: i64 = 0
+        while i < d_model {
+            let fi: i64 = row_start + i
+            let g: i64 = fi >> 7
+            let s0: i64 = volatile_read_u8(scales_base + g * 4)
+            let s1: i64 = volatile_read_u8(scales_base + g * 4 + 1)
+            let s2: i64 = volatile_read_u8(scales_base + g * 4 + 2)
+            let s3: i64 = volatile_read_u8(scales_base + g * 4 + 3)
+            let scale: i64 = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24)
+            let zero: i64 = volatile_read_u8(zeros_base + g)
+            let q: i64 = if bits == 8 {
+                volatile_read_u8(embed_base + fi)
+            } else {
+                let raw: i64 = volatile_read_u8(embed_base + (fi >> 1))
+                (raw >> ((fi & 1) * 4)) & 15
+            }
+            let w: i64 = (q - zero) * scale
+            let xi: i64 = volatile_read_u64(x_addr + i * 8)
+            sum = sum + (xi * w) / 1000000
+            i = i + 1
+        }
+        if sum > best_score {
+            best_score = sum
+            best_token = v
+        }
+        v = v + 1
+    }
+    best_token
 }
 
 // Shell command: ram-load

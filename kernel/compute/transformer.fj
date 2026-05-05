@@ -369,20 +369,59 @@ const ROPE_TWO_PI: i64 = 6283   // 2π in milliradians
 // V28.1: freq_base is the inv_freq table to use for this layer. For Gemma 3,
 // caller picks ROPE_FREQ_BASE (local, 10K) or ROPE_FREQ_GLOBAL (global, 1M)
 // based on the layer's position in the sliding_pattern cycle.
-// V30 Path B: C bypass for RoPE (LLVM O2 sensitivity on 8-bit models).
-// @noinline wrapper calls gcc-compiled tfm_rope_apply_c_mailbox.
+// V33.P4 (FAJAROS_100PCT_FJ_PLAN Phase 4.F 2026-05-05): pure fj inline.
+// Was: dispatch to gcc-compiled C tfm_rope_apply_c_mailbox via mailbox.
+// Uses km_rope_sin/km_rope_cos from rope_lut.fj. cos/sin are x10000 scale
+// → divide by 10000.
+@no_vectorize
 @noinline
 @kernel fn tfm_rope_apply_at(q_data: i64, k_data: i64, pos: i64,
                               n_heads: i64, n_kv_heads: i64, d_head: i64,
                               freq_base: i64) {
-    volatile_write_u64(0xBEA600, q_data)
-    volatile_write_u64(0xBEA608, k_data)
-    volatile_write_u64(0xBEA610, pos)
-    volatile_write_u64(0xBEA618, n_heads)
-    volatile_write_u64(0xBEA620, n_kv_heads)
-    volatile_write_u64(0xBEA628, d_head)
-    volatile_write_u64(0xBEA630, freq_base)
-    asm!("movabs $$tfm_rope_apply_c_mailbox, %rax; call *%rax")
+    if d_head <= 0 { return }
+    let n_pairs = d_head / 2
+
+    // Apply to each Q head
+    let mut h: i64 = 0
+    while h < n_heads {
+        let head_data = q_data + h * d_head * 8
+        let mut i: i64 = 0
+        while i < n_pairs {
+            let freq = volatile_read_u64(freq_base + i * 8)
+            let angle = pos * freq
+            let cos_a = km_rope_cos(angle)
+            let sin_a = km_rope_sin(angle)
+            let x0 = volatile_read_u64(head_data + 2 * i * 8)
+            let x1 = volatile_read_u64(head_data + (2 * i + 1) * 8)
+            volatile_write_u64(head_data + 2 * i * 8,
+                               (x0 * cos_a - x1 * sin_a) / 10000)
+            volatile_write_u64(head_data + (2 * i + 1) * 8,
+                               (x0 * sin_a + x1 * cos_a) / 10000)
+            i = i + 1
+        }
+        h = h + 1
+    }
+
+    // Apply to each KV head
+    h = 0
+    while h < n_kv_heads {
+        let head_data = k_data + h * d_head * 8
+        let mut i: i64 = 0
+        while i < n_pairs {
+            let freq = volatile_read_u64(freq_base + i * 8)
+            let angle = pos * freq
+            let cos_a = km_rope_cos(angle)
+            let sin_a = km_rope_sin(angle)
+            let x0 = volatile_read_u64(head_data + 2 * i * 8)
+            let x1 = volatile_read_u64(head_data + (2 * i + 1) * 8)
+            volatile_write_u64(head_data + 2 * i * 8,
+                               (x0 * cos_a - x1 * sin_a) / 10000)
+            volatile_write_u64(head_data + (2 * i + 1) * 8,
+                               (x0 * sin_a + x1 * cos_a) / 10000)
+            i = i + 1
+        }
+        h = h + 1
+    }
 }
 
 // Legacy wrapper — uses ROPE_FREQ_BASE (local) for all layers.
@@ -607,21 +646,98 @@ const TFM_GLOBAL_PATTERN: i64 = 6      // fallback: every Nth layer is global
     let kv_pos_stride = 2 * kv_d * 8
     let kv_layer_off = TFM_KV_BASE + layer * TFM_KV_MAX_POS * kv_pos_stride
 
-    // V30.GEMMA3: dispatch scoring + softmax + V weighted sum to gcc C
-    // via mailbox at 0xBEA400 (avoids LLVM O2 sensitivity)
-    volatile_write_u64(0xBEA400, q_data)
-    volatile_write_u64(0xBEA408, out_data)
-    volatile_write_u64(0xBEA410, kv_layer_off)
-    volatile_write_u64(0xBEA418, n_heads)
-    volatile_write_u64(0xBEA420, n_kv_heads)
-    volatile_write_u64(0xBEA428, d_head)
-    volatile_write_u64(0xBEA430, attn_start)
-    volatile_write_u64(0xBEA438, attn_len)
-    volatile_write_u64(0xBEA440, attn_scale)
-    volatile_write_u64(0xBEA448, TFM_SCRATCH)
-    volatile_write_u64(0xBEA450, kv_pos_stride)
-    volatile_write_u64(0xBEA458, kv_d)
-    asm!("movabs $$tfm_attention_score_c_mailbox, %rax; call *%rax")
+    // V33.P4 (FAJAROS_100PCT_FJ_PLAN Phase 4.E 2026-05-05): pure fj inline.
+    // Was: dispatch to gcc-compiled C tfm_attention_score_c_mailbox via mailbox.
+    // Now: inline scoring + softmax + V-weighted-sum using @no_vectorize @noinline
+    // recipe (Gap G-K closure) and km_exp_approx (km_matrix.fj). Built on G-M
+    // closure (--code-model kernel implies noredzone, fj-lang 211cb8d1).
+    tfm_attention_score(q_data, out_data, kv_layer_off, n_heads, n_kv_heads,
+                        d_head, attn_start, attn_len, attn_scale, TFM_SCRATCH,
+                        kv_pos_stride, kv_d)
+}
+
+@no_vectorize
+@noinline
+@kernel fn tfm_attention_score(q_data: i64, out_data: i64, kv_layer_off: i64,
+                                 n_heads: i64, n_kv_heads: i64, d_head: i64,
+                                 attn_start: i64, attn_len: i64, attn_scale: i64,
+                                 scores: i64, kv_pos_stride: i64, kv_d: i64) {
+    if n_heads <= 0 { return }
+    if n_kv_heads <= 0 { return }
+    if attn_len <= 0 { return }
+
+    let heads_per_kv = n_heads / n_kv_heads
+
+    let mut h: i64 = 0
+    while h < n_heads {
+        let q_head_off = h * d_head
+        let kv_head = h / heads_per_kv
+        let kv_head_off = kv_head * d_head
+
+        // Dot-product scoring: Q · K for each position
+        let mut si: i64 = 0
+        while si < attn_len {
+            let p = attn_start + si
+            let k_cache = kv_layer_off + p * kv_pos_stride
+            let mut dot: i64 = 0
+            let mut d: i64 = 0
+            while d < d_head {
+                let qi = volatile_read_u64(q_data + (q_head_off + d) * 8)
+                let ki = volatile_read_u64(k_cache + (kv_head_off + d) * 8)
+                dot = dot + (qi * ki) / 1000
+                d = d + 1
+            }
+            volatile_write_u64(scores + si * 8, (dot * attn_scale) / 1000)
+            si = si + 1
+        }
+
+        // Softmax: max → exp → normalize
+        let mut max_score = volatile_read_u64(scores)
+        si = 1
+        while si < attn_len {
+            let s = volatile_read_u64(scores + si * 8)
+            if s > max_score { max_score = s }
+            si = si + 1
+        }
+
+        let mut exp_sum: i64 = 0
+        si = 0
+        while si < attn_len {
+            let s = volatile_read_u64(scores + si * 8)
+            let e = km_exp_approx(s - max_score)
+            volatile_write_u64(scores + si * 8, e)
+            exp_sum = exp_sum + e
+            si = si + 1
+        }
+
+        if exp_sum > 0 {
+            si = 0
+            while si < attn_len {
+                let e = volatile_read_u64(scores + si * 8)
+                volatile_write_u64(scores + si * 8, (e * 1000) / exp_sum)
+                si = si + 1
+            }
+        }
+
+        // Weighted sum of V
+        let mut d: i64 = 0
+        while d < d_head {
+            let mut weighted: i64 = 0
+            si = 0
+            while si < attn_len {
+                let p = attn_start + si
+                let v_cache = kv_layer_off + p * kv_pos_stride + kv_d * 8
+                let s = volatile_read_u64(scores + si * 8)
+                let v = volatile_read_u64(v_cache + (kv_head_off + d) * 8)
+                weighted = weighted + (s * v) / 1000
+                si = si + 1
+            }
+            volatile_write_u64(out_data + (q_head_off + d) * 8, weighted)
+            d = d + 1
+        }
+
+        h = h + 1
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════

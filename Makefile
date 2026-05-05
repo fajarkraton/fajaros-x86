@@ -136,6 +136,7 @@ SOURCES := \
 	kernel/compute/quantize.fj \
 	kernel/compute/fajarquant.fj \
 	kernel/compute/kmatrix.fj \
+	kernel/compute/rope_lut.fj \
 	kernel/compute/matmulfree.fj \
 	kernel/compute/model_loader.fj \
 	kernel/compute/fjm_v9.fj \
@@ -278,14 +279,13 @@ build: $(COMBINED)
 # as a global_asm!() block; fj-lang LLVM backend emits the asm via
 # LLVMSetModuleInlineAsm2. boot/runtime_stubs.S has been deleted.
 
-# V30 P3.6: compile C vecmat (gcc, bypasses Fajar Lang LLVM codegen bug)
-$(VECMAT_O): $(VECMAT_C)
-	@mkdir -p $(BUILD_DIR)
-	gcc -O3 -march=native -mno-avx -mno-avx2 -mno-avx512f \
-		-ffreestanding -nostdlib -fno-pic -mno-red-zone \
-		-mcmodel=small -fcf-protection=none \
-		-c -o $(VECMAT_O) $(VECMAT_C)
-	@echo "[OK] Compiled C vecmat: $(VECMAT_O)"
+# FAJAROS_100PCT_FJ_PLAN Phase 4.D-F (2026-05-05): C vecmat deleted.
+# All 3 mailbox functions migrated to pure fj:
+#   - km_vecmat_packed_v8 → kernel/compute/kmatrix.fj (Phase 4.D)
+#   - tfm_attention_score → kernel/compute/transformer.fj (Phase 4.E)
+#   - tfm_rope_apply_at   → kernel/compute/transformer.fj +
+#                            kernel/compute/rope_lut.fj (Phase 4.F)
+# Built on G-M closure (fj-lang --code-model kernel implies noredzone).
 
 # V32-prep F.11.4(b).3: compile vendored microsoft/BitNet TL2 AVX2
 # kernel for FajarOS Nova kernel-mode linkage. Distinct flags from
@@ -320,7 +320,7 @@ $(TL2_O): $(TL2_HEADER_DEPS)
 #
 # V29.P1.P3 prevention layer: after `fj build`, verify that the ELF
 # was actually produced.
-build-llvm: $(COMBINED) $(VECMAT_O) $(TL2_O)
+build-llvm: $(COMBINED) $(TL2_O)
 	@# Step 1: compile FJ to .o + capture via ld wrapper
 	@$(FJ) build --no-std --backend llvm \
 		--opt-level $(LLVM_OPT) \
@@ -338,7 +338,6 @@ build-llvm: $(COMBINED) $(VECMAT_O) $(TL2_O)
 	@# global_asm!() block (Phase 3, 2026-05-04).
 	@ld -T $(LINKER_LD) -nostdlib \
 		$(BUILD_DIR)/combined.start.o.saved \
-		$(VECMAT_O) \
 		$(TL2_O) \
 		$(BUILD_DIR)/combined.o.saved \
 		-o $(KERNEL_LLVM) 2>&1 | { grep -v "missing .note.GNU-stack\|deprecated" || true; }
