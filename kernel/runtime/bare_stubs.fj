@@ -90,130 +90,16 @@ fj_rt_bare_console_putchar:
    String Operations — operate on null-terminated C strings (ptr as i64)
    ═══════════════════════════════════════════════════════════════════ */
 
-/* fj_rt_bare_str_len(ptr: rdi) -> rax = length */
-.global fj_rt_bare_str_len
-.type fj_rt_bare_str_len, @function
-fj_rt_bare_str_len:
-    xor     rax, rax
-    test    rdi, rdi
-    jz      .Lslen_done
-.Lslen_loop:
-    cmp     BYTE PTR [rdi + rax], 0
-    je      .Lslen_done
-    inc     rax
-    cmp     rax, 65536          /* safety limit */
-    jl      .Lslen_loop
-.Lslen_done:
-    ret
-.size fj_rt_bare_str_len, . - fj_rt_bare_str_len
-
-/* fj_rt_bare_str_byte_at(ptr: rdi, idx: rsi) -> rax = byte */
-.global fj_rt_bare_str_byte_at
-.type fj_rt_bare_str_byte_at, @function
-fj_rt_bare_str_byte_at:
-    xor     rax, rax
-    test    rdi, rdi
-    jz      .Lsbat_done
-    movzx   eax, BYTE PTR [rdi + rsi]
-.Lsbat_done:
-    ret
-.size fj_rt_bare_str_byte_at, . - fj_rt_bare_str_byte_at
+/* fj_rt_bare_str_len + fj_rt_bare_str_byte_at migrated to @naked fns
+ * in bare_stubs_naked.fj */
 
 /* ═══════════════════════════════════════════════════════════════════
-   Buffer Read/Write — Little-Endian and Big-Endian Memory Access
-   All take address in rdi, value (for write) in rsi
+   Buffer Read/Write stubs migrated to @naked fns in
+   kernel/runtime/bare_stubs_naked.fj (FAJAROS_100PCT_FJ_PLAN Phase 6.6).
+   All 9 buffer ops now live as @naked fn declarations.
+   Gap G-N closed in fj-lang via naked + noinline attribute pair +
+   ret-undef terminator (commit df865161).
    ═══════════════════════════════════════════════════════════════════ */
-
-/* --- Little-Endian Reads (native on x86) --- */
-
-/* fj_rt_bare_buffer_read_u16_le(addr: rdi) -> rax */
-.global fj_rt_bare_buffer_read_u16_le
-.type fj_rt_bare_buffer_read_u16_le, @function
-fj_rt_bare_buffer_read_u16_le:
-    xor     rax, rax
-    mov     ax, WORD PTR [rdi]
-    ret
-.size fj_rt_bare_buffer_read_u16_le, . - fj_rt_bare_buffer_read_u16_le
-
-/* fj_rt_bare_buffer_read_u32_le(addr: rdi) -> rax */
-.global fj_rt_bare_buffer_read_u32_le
-.type fj_rt_bare_buffer_read_u32_le, @function
-fj_rt_bare_buffer_read_u32_le:
-    xor     rax, rax
-    mov     eax, DWORD PTR [rdi]
-    ret
-.size fj_rt_bare_buffer_read_u32_le, . - fj_rt_bare_buffer_read_u32_le
-
-/* fj_rt_bare_buffer_read_u64_le moved to @naked fn in
- * kernel/runtime/bare_stubs_naked.fj (FAJAROS_100PCT_FJ_PLAN Phase 6.6
- * — Gap G-N closed by fj-lang adding `noinline` + `ret undef` to
- * @naked fn codegen). */
-
-/* --- Big-Endian Reads (byte-swap on x86) --- */
-
-/* fj_rt_bare_buffer_read_u16_be(addr: rdi) -> rax */
-.global fj_rt_bare_buffer_read_u16_be
-.type fj_rt_bare_buffer_read_u16_be, @function
-fj_rt_bare_buffer_read_u16_be:
-    xor     rax, rax
-    mov     ax, WORD PTR [rdi]
-    xchg    al, ah              /* byte swap 16-bit */
-    ret
-.size fj_rt_bare_buffer_read_u16_be, . - fj_rt_bare_buffer_read_u16_be
-
-/* fj_rt_bare_buffer_read_u32_be(addr: rdi) -> rax */
-.global fj_rt_bare_buffer_read_u32_be
-.type fj_rt_bare_buffer_read_u32_be, @function
-fj_rt_bare_buffer_read_u32_be:
-    xor     rax, rax
-    mov     eax, DWORD PTR [rdi]
-    bswap   eax                 /* byte swap 32-bit */
-    ret
-.size fj_rt_bare_buffer_read_u32_be, . - fj_rt_bare_buffer_read_u32_be
-
-/* --- Little-Endian Writes (native on x86) --- */
-
-/* fj_rt_bare_buffer_write_u16_le(addr: rdi, val: rsi) -> rax=0 */
-.global fj_rt_bare_buffer_write_u16_le
-.type fj_rt_bare_buffer_write_u16_le, @function
-fj_rt_bare_buffer_write_u16_le:
-    mov     WORD PTR [rdi], si
-    xor     rax, rax
-    ret
-.size fj_rt_bare_buffer_write_u16_le, . - fj_rt_bare_buffer_write_u16_le
-
-/* fj_rt_bare_buffer_write_u32_le(addr: rdi, val: rsi) -> rax=0 */
-.global fj_rt_bare_buffer_write_u32_le
-.type fj_rt_bare_buffer_write_u32_le, @function
-fj_rt_bare_buffer_write_u32_le:
-    mov     DWORD PTR [rdi], esi
-    xor     rax, rax
-    ret
-.size fj_rt_bare_buffer_write_u32_le, . - fj_rt_bare_buffer_write_u32_le
-
-/* --- Big-Endian Writes (byte-swap on x86) --- */
-
-/* fj_rt_bare_buffer_write_u16_be(addr: rdi, val: rsi) -> rax=0 */
-.global fj_rt_bare_buffer_write_u16_be
-.type fj_rt_bare_buffer_write_u16_be, @function
-fj_rt_bare_buffer_write_u16_be:
-    mov     ax, si
-    xchg    al, ah
-    mov     WORD PTR [rdi], ax
-    xor     rax, rax
-    ret
-.size fj_rt_bare_buffer_write_u16_be, . - fj_rt_bare_buffer_write_u16_be
-
-/* fj_rt_bare_buffer_write_u32_be(addr: rdi, val: rsi) -> rax=0 */
-.global fj_rt_bare_buffer_write_u32_be
-.type fj_rt_bare_buffer_write_u32_be, @function
-fj_rt_bare_buffer_write_u32_be:
-    mov     eax, esi
-    bswap   eax
-    mov     DWORD PTR [rdi], eax
-    xor     rax, rax
-    ret
-.size fj_rt_bare_buffer_write_u32_be, . - fj_rt_bare_buffer_write_u32_be
 
 /* ════════════════════════════════════════════════════════════════════
    Missing stubs — added to resolve all 24 bare-metal symbols

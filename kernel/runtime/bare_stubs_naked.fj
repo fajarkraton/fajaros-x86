@@ -13,6 +13,43 @@
 // AT&T syntax matches other fajaros asm!() blocks (e.g. kmatrix.fj
 // km_vecmat_packed_v8 dispatch).
 
+// ── String Operations (null-terminated C strings, ptr as i64) ────────
+
+// fj_rt_bare_str_len(ptr: %rdi) -> length in %rax
+// Returns 0 if ptr is null. Hard cap at 65536 bytes for safety.
+// SAFETY: caller must guarantee `ptr` is null OR points to a
+// null-terminated readable byte sequence within the kernel's
+// identity-mapped region.
+@naked @unsafe fn fj_rt_bare_str_len(ptr: i64) -> i64 {
+    asm!("xor %rax, %rax\n\ttest %rdi, %rdi\n\tjz 2f\n1:\n\tcmpb $0, (%rdi, %rax)\n\tje 2f\n\tinc %rax\n\tcmp $65536, %rax\n\tjl 1b\n2:\n\tret")
+}
+
+// fj_rt_bare_str_byte_at(ptr: %rdi, idx: %rsi) -> byte in %rax
+// Returns 0 if ptr is null. Zero-extends the byte to 64 bits.
+// SAFETY: caller must guarantee `ptr+idx` is null OR points to a
+// readable byte within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_str_byte_at(ptr: i64, idx: i64) -> i64 {
+    asm!("xor %rax, %rax\n\ttest %rdi, %rdi\n\tjz 1f\n\tmovzbl (%rdi, %rsi), %eax\n1:\n\tret")
+}
+
+// ── Little-Endian Reads (native on x86) ──────────────────────────────
+
+// fj_rt_bare_buffer_read_u16_le(addr: %rdi) -> u16 in %rax
+// Native LE u16 read with zero-extension.
+// SAFETY: caller must guarantee `addr` is a valid readable 2-byte-aligned
+// address within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_buffer_read_u16_le(addr: i64) -> i64 {
+    asm!("xor %rax, %rax\n\tmov (%rdi), %ax\n\tret")
+}
+
+// fj_rt_bare_buffer_read_u32_le(addr: %rdi) -> u32 in %rax
+// Native LE u32 read; mov to eax auto-zeros upper 32 bits.
+// SAFETY: caller must guarantee `addr` is a valid readable 4-byte-aligned
+// address within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_buffer_read_u32_le(addr: i64) -> i64 {
+    asm!("xor %rax, %rax\n\tmov (%rdi), %eax\n\tret")
+}
+
 // fj_rt_bare_buffer_read_u64_le(addr: %rdi) -> u64 in %rax
 // Native LE u64 read — single mov.
 // SAFETY: caller must guarantee `addr` is a valid readable 8-byte-aligned
@@ -20,4 +57,58 @@
 // stub — no bounds check possible at this layer.
 @naked @unsafe fn fj_rt_bare_buffer_read_u64_le(addr: i64) -> i64 {
     asm!("movq (%rdi), %rax\n\tret")
+}
+
+// ── Big-Endian Reads (byte-swap on x86) ──────────────────────────────
+
+// fj_rt_bare_buffer_read_u16_be(addr: %rdi) -> u16 in %rax
+// LE u16 read followed by xchg %al,%ah for byte swap.
+// SAFETY: caller must guarantee `addr` is a valid readable 2-byte-aligned
+// address within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_buffer_read_u16_be(addr: i64) -> i64 {
+    asm!("xor %rax, %rax\n\tmov (%rdi), %ax\n\txchg %al, %ah\n\tret")
+}
+
+// fj_rt_bare_buffer_read_u32_be(addr: %rdi) -> u32 in %rax
+// LE u32 read followed by bswap for byte swap.
+// SAFETY: caller must guarantee `addr` is a valid readable 4-byte-aligned
+// address within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_buffer_read_u32_be(addr: i64) -> i64 {
+    asm!("xor %rax, %rax\n\tmov (%rdi), %eax\n\tbswap %eax\n\tret")
+}
+
+// ── Little-Endian Writes (native on x86) ─────────────────────────────
+
+// fj_rt_bare_buffer_write_u16_le(addr: %rdi, val: %rsi) -> 0 in %rax
+// Native LE u16 store; returns 0 sentinel.
+// SAFETY: caller must guarantee `addr` is a valid writable 2-byte-aligned
+// address within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_buffer_write_u16_le(addr: i64, val: i64) -> i64 {
+    asm!("mov %si, (%rdi)\n\txor %rax, %rax\n\tret")
+}
+
+// fj_rt_bare_buffer_write_u32_le(addr: %rdi, val: %rsi) -> 0 in %rax
+// Native LE u32 store; returns 0 sentinel.
+// SAFETY: caller must guarantee `addr` is a valid writable 4-byte-aligned
+// address within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_buffer_write_u32_le(addr: i64, val: i64) -> i64 {
+    asm!("mov %esi, (%rdi)\n\txor %rax, %rax\n\tret")
+}
+
+// ── Big-Endian Writes (byte-swap on x86) ─────────────────────────────
+
+// fj_rt_bare_buffer_write_u16_be(addr: %rdi, val: %rsi) -> 0 in %rax
+// LE u16 byte-swap store; returns 0 sentinel.
+// SAFETY: caller must guarantee `addr` is a valid writable 2-byte-aligned
+// address within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_buffer_write_u16_be(addr: i64, val: i64) -> i64 {
+    asm!("mov %si, %ax\n\txchg %al, %ah\n\tmov %ax, (%rdi)\n\txor %rax, %rax\n\tret")
+}
+
+// fj_rt_bare_buffer_write_u32_be(addr: %rdi, val: %rsi) -> 0 in %rax
+// LE u32 byte-swap store; returns 0 sentinel.
+// SAFETY: caller must guarantee `addr` is a valid writable 4-byte-aligned
+// address within the kernel's identity-mapped region.
+@naked @unsafe fn fj_rt_bare_buffer_write_u32_be(addr: i64, val: i64) -> i64 {
+    asm!("mov %esi, %eax\n\tbswap %eax\n\tmov %eax, (%rdi)\n\txor %rax, %rax\n\tret")
 }
