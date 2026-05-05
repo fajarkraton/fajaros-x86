@@ -206,7 +206,7 @@ const HIST_SLOT_SIZE: i64 = 64
     cprintln("Shift/CapsLock Up/Down=hist Tab", YELLOW_ON_BLACK)
 }
 
-// FAJAROS_VERSION strings synced 2026-05-05 to git tag v3.8.0+ post
+// FAJAROS_VERSION strings synced 2026-05-05 to git tag v4.0.0 post
 // FAJAROS_100PCT_FJ_PLAN TERMINAL COMPLETE (vecmat_v8.c deleted; ZERO
 // non-fj LOC in kernel build path). Version string previously hardcoded
 // at v0.1.0 — drifted from release tags. Plan §3.6 close-criterion:
@@ -217,7 +217,7 @@ const HIST_SLOT_SIZE: i64 = 64
 
 // VERSION_AUTOGEN_BEGIN
 @kernel fn cmd_version() {
-    cprintln("FajarOS Nova v3.8.0+ \"FAJAROS_100PCT_COMPLETE\"", WHITE_ON_BLUE)
+    cprintln("FajarOS Nova v4.0.0 \"Pure Fajar\"", WHITE_ON_BLUE)
     cprintln("  Kernel:   x86_64 bare-metal", WHITE_ON_BLACK)
     cprintln("  Language: 100% Fajar Lang (vecmat_v8.c deleted 2026-05-05)", WHITE_ON_BLACK)
     cprintln("  Compiler: Fajar Lang + LLVM (--code-model kernel)", WHITE_ON_BLACK)
@@ -230,7 +230,7 @@ const HIST_SLOT_SIZE: i64 = 64
 }
 
 @kernel fn cmd_uname() {
-    cprintln("FajarOS Nova v3.8.0+ x86_64 (Fajar Lang)", CYAN_ON_BLACK)
+    cprintln("FajarOS Nova v4.0.0 x86_64 (Fajar Lang)", CYAN_ON_BLACK)
 }
 // VERSION_AUTOGEN_END
 
@@ -906,7 +906,7 @@ const MNIST_PIXELS: i64 = 0x560000   // 7×7 = 49 pixel values per digit
 }
 
 @kernel fn cmd_about() {
-    cprintln("FajarOS Nova v3.8.0+", WHITE_ON_BLUE)
+    cprintln("FajarOS Nova v4.0.0", WHITE_ON_BLUE)
     cprintln("", WHITE_ON_BLACK)
     cprintln("  The world's first OS written 100% in a single", WHITE_ON_BLACK)
     cprintln("  language that unifies kernel (@kernel), AI", WHITE_ON_BLACK)

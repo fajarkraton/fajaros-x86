@@ -1,6 +1,6 @@
 # FajarOS Nova -- x86_64 Operating System Written 100% in Fajar Lang
 
-[![Version](https://img.shields.io/badge/version-v3.8.0_FAJAROS__100PCT__COMPLETE-brightgreen)](https://github.com/fajarkraton/fajaros-x86/releases/tag/v3.8.0)
+[![Version](https://img.shields.io/badge/version-v4.0.0_FAJAROS__100PCT__COMPLETE-brightgreen)](https://github.com/fajarkraton/fajaros-x86/releases/tag/v4.0.0)
 [![Files](https://img.shields.io/badge/modules-183_.fj_files-green)](https://github.com/fajarkraton/fajaros-x86)
 [![LOC](https://img.shields.io/badge/LOC-108K-orange)](https://github.com/fajarkraton/fajaros-x86)
 [![Compiler](https://img.shields.io/badge/compiler-Fajar_Lang_v33.2.0-blueviolet)](https://github.com/fajarkraton/fajar-lang)
@@ -549,6 +549,6 @@ their original terms; future commits are Apache 2.0.
 
 ---
 
-*FajarOS Nova v3.0.0 "Nusantara" -- 47,821 LOC | 163 modules | 119 commands (incl. 14 LLM) | 34 syscalls | LLM E2E (SmolLM-135M v5/v6 in kernel) | 100% Fajar Lang*
+*FajarOS Nova v4.0.0 "Pure Fajar" -- 108K LOC | 183 .fj modules | 266 commands (incl. 14 LLM) | 34 syscalls | LLM E2E (SmolLM-135M v5/v6 in kernel) | TRUE 100% Fajar Lang (ZERO non-fj LOC in kernel build path)*
 *Compiler-enforced safety: if it compiles, it's safe to deploy.*
 *Built with [Fajar Lang](https://github.com/fajarkraton/fajar-lang) + Claude Opus 4.6*

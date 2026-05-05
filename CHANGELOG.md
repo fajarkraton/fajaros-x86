@@ -2,6 +2,95 @@
 
 All notable changes to FajarOS Nova are documented in this file.
 
+## [4.0.0] "Pure Fajar" -- 2026-05-05 (FAJAROS_100PCT_COMPLETE — MAJOR)
+
+**MAJOR version bump.** TRUE 100% Fajar Lang achieved: ZERO non-fj
+LOC remaining in kernel build path. The original promise from
+project inception ("100% Fajar Lang OS") is now LITERALLY true,
+verifiable via `find kernel -name '*.S' -o -name '*.c' -o -name
+'*.cpp'` returning 0 hits.
+
+Plus license change MIT → Apache 2.0 also justifies major bump.
+
+Companion fajar-lang work: 9 LLVM compiler gaps closed (G-A through
+G-N), shipped in fajar-lang v33.2.0. Without those compiler closures,
+TRUE 100% Fajar Lang would have remained blocked.
+
+### Migrated to pure fj (FAJAROS_100PCT_FJ_PLAN closure)
+
+- **Phase 1**: spinlock atomic LOCK CMPXCHG via `atomic_cas_u64`
+  builtin (V0.5.0 → V0.5.2 across Phases 1+5)
+- **Phase 2.B**: `boot/startup.S` deleted (dead code)
+- **Phase 3**: `boot/runtime_stubs.S` ported to
+  `kernel/runtime/bare_stubs.fj` (~1h actual vs 3-5d est, -95%)
+- **Phase 4.A-G**: all kmatrix/transformer/model_loader compute fns
+  ported (km_add, km_mul, km_rmsnorm, km_gelu_tanh, mdl_embed_lookup,
+  km_vecmat_packed_v8, tfm_attention_score, tfm_rope_apply_at,
+  mdl_ram_lmhead_argmax_v8_tied)
+- **Phase 4.D blocker resolved**: G-M red-zone fix in fj-lang
+  unblocked vecmat-shaped kernels
+- **Phase 6.6**: 12/17 bare runtime stubs migrated to `@naked` fns
+  in `kernel/runtime/bare_stubs_naked.fj`. 5 cluster-stubs
+  (idt_init, tss_init, pit_init, __isr_32_timer, __sched_exit)
+  intentionally retained in `global_asm!()` — they have internal
+  helper calls + rodata tables + shared data, canonical
+  global_asm!() use cases.
+
+### Critical bugs discovered + fixed
+
+- **fj-lang inline asm `$` escape**: literal `$` requires `$$` in
+  asm! templates (LLVM uses `$0`/`$1` for constraint refs). Without
+  escape, `cmpb $0x0A, %dil` parsed as "constraint reference 0
+  followed by `x0A`", emitting silent "error: invalid operand in
+  inline asm" + producing 0-byte combined.o. Phase 6.6 console_putchar
+  was previously building only because of cached `.o.saved` artifacts.
+- **fj-lang kernel red-zone violation (G-M)**: `--code-model kernel`
+  was NOT implying LLVM `noredzone` attribute. Kernel mode CANNOT use
+  red zone — interrupt frames push BELOW current rsp, corrupting
+  anything stashed there. Fix in fj-lang `211cb8d1`: emit `noredzone`
+  enum attribute on every fn when code_model == Kernel.
+
+### Deleted (post-migration cleanup)
+
+- `kernel/compute/vecmat_v8.c` (585 LOC) — dead after Phase 4.D-G
+  migrated all callers to fj. 5/5 gemma3-e2e PASS at every closure
+  commit.
+
+### License change
+
+- MIT → Apache 2.0 (`09db7fe`). Apache 2.0 includes patent grant +
+  contribution clauses preferred for OS / kernel projects. License
+  boundary change warrants major version bump under semver
+  convention on its own.
+
+### Housekeeping
+
+- `cmd_version` / `cmd_about` / `cmd_uname` updated from hardcoded
+  v0.1.0 → current v4.0.0
+- README badge: v3.8.0 → v4.0.0
+- Shell command count badge: 302 (inflated) → 266 (verified)
+- fj-lang compiler badge: v31.0.0 (outdated) → v33.2.0+
+
+### Stats
+
+- LOC: 108K (was ~99K at v3.9.0)
+- Modules: 183 .fj files
+- Commands: 266 unique `cmd_*` fns
+- Non-fj LOC: 642 → **0** (in kernel build path)
+- Tests: 5/5 gemma3-e2e PASS (regression preserved through every
+  migration commit)
+
+### Honest scope (CLAUDE.md §6.6 R3)
+
+- ✅ ZERO non-fj LOC in **kernel build path**
+- ❌ NOT zero non-fj LOC in support tooling: scripts/, tests/,
+  examples/ still use Python + bash for QEMU harnessing, ELF
+  inspection, etc. Those are honest tooling separate from kernel
+  proper.
+- ❌ Sister Rust compiler (fajar-lang) still required to build the
+  kernel — fajaros-x86 is not self-bootstrapping. That's
+  intentional: build-time toolchain ≠ runtime kernel.
+
 ## [3.9.0] "IntLLM Kernel Path" -- 2026-04-24
 
 V31.C Phase D IntLLM (MatMul-Free LLM) integrated into FajarOS Nova kernel.
