@@ -832,15 +832,49 @@ const V8_SCALE_FP: i64 = 1000000  // scales stored as int32(round(scale × this)
 // once the new ~50-LOC fj body landed in the same module — likely an
 // LLVM O2 cross-function context effect on inner-branch heuristics.
 // Documented as Gap G-M for future debug. Reverted to mailbox dispatch.
+// G-M debug: Phase 4.D-A2 port (canonical recipe @no_vectorize @noinline @kernel)
+@no_vectorize
 @noinline
 @kernel fn km_vecmat_packed_v8(x_addr: i64, mat_addr: i64, m: i64, n: i64,
                                  out_addr: i64) {
-    volatile_write_u64(0xBEA000, x_addr)
-    volatile_write_u64(0xBEA008, mat_addr)
-    volatile_write_u64(0xBEA010, m)
-    volatile_write_u64(0xBEA018, n)
-    volatile_write_u64(0xBEA020, out_addr)
-    asm!("movabs $$km_vecmat_packed_v8_mailbox, %rax; call *%rax")
+    if m <= 0 { return }
+    if n <= 0 { return }
+
+    let bits = volatile_read_u8(0xC00090)
+
+    let total: i64 = m * n
+    let packed_bytes: i64 = if bits == 8 { total } else { total / 2 }
+    let n_groups: i64 = (total + 127) >> 7
+    let scales_base: i64 = mat_addr + packed_bytes
+    let zeros_base: i64 = scales_base + n_groups * 4
+
+    let mut j: i64 = 0
+    while j < n {
+        let mut sum: i64 = 0
+        let mut k: i64 = 0
+        while k < m {
+            let fi: i64 = k * n + j
+            let g: i64 = fi >> 7
+            let s0: i64 = volatile_read_u8(scales_base + g * 4)
+            let s1: i64 = volatile_read_u8(scales_base + g * 4 + 1)
+            let s2: i64 = volatile_read_u8(scales_base + g * 4 + 2)
+            let s3: i64 = volatile_read_u8(scales_base + g * 4 + 3)
+            let scale: i64 = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24)
+            let zero: i64 = volatile_read_u8(zeros_base + g)
+            let q: i64 = if bits == 8 {
+                volatile_read_u8(mat_addr + fi)
+            } else {
+                let raw: i64 = volatile_read_u8(mat_addr + (fi >> 1))
+                (raw >> ((fi & 1) * 4)) & 15
+            }
+            let w: i64 = (q - zero) * scale
+            let xk: i64 = volatile_read_u64(x_addr + k * 8)
+            sum = sum + (xk * w) / 1000000
+            k = k + 1
+        }
+        volatile_write_u64(out_addr + j * 8, sum)
+        j = j + 1
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════
