@@ -55,6 +55,43 @@ The **niche where FajarOS Nova can genuinely be best** is `@kernel`-context AI i
 
 Each gap is verified mechanically and has a concrete close-criterion. Ordered by impact-to-adoption.
 
+### 3.0 Live status refresh 2026-05-13 (post v4.0.0 release + fajar-lang v36.0.0 release)
+
+Re-verified all 12 gaps with bash. Delta vs 2026-04-30 baseline:
+
+| Gap | 2026-04-30 status | 2026-05-13 status | Closed by |
+|---|---|---|---|
+| §3.1 real hw boot | 10/10 unchecked | 10/10 still unchecked | — |
+| §3.2 release 0 assets | v3.9.0 | **v4.0.0 also 0 assets** (still gap; version moved forward) | — |
+| §3.3 LLM coherence not gated | — | no `test-*-coherence` Makefile target found | — |
+| §3.4 LLM benchmarks doc | missing | `docs/LLM_BENCHMARKS.md` still missing | — |
+| §3.5 stars/forks | 0/0/1 author | re-check live | — |
+| §3.6 `uname` v0.1.0 | hardcoded | ✅ **FIXED** via housekeeping commit `f0c9b0d` (2026-05-05 — "uname v0.1.0 → v3.8.0+") | `f0c9b0d` |
+| §3.7 README 302 vs `fn cmd_` 136 | mismatch 2.22× | ⚠️ **PARTIALLY FIXED**: badge updated `302 → 266` via `f0c9b0d`, but live `grep -rc "fn cmd_" kernel/` = 136 — 266 likely counts dispatcher entries (not raw `fn cmd_`). Investigate if discrepancy still material | `f0c9b0d` (partial) |
+| §3.8 Sprint 30 unchecked | 10 tasks | `grep -c '\[ \]' docs/PLAN.md` = 346 across all sprints — scope is broader than just Sprint 30 | — |
+| §3.9 Cross-dep fajar-lang publishing | crates.io blocked | ⚠️ **STILL BLOCKED**: fajar-lang v36.0.0 LIVE on GitHub Releases (2026-05-13, with 5 platform binaries + SHA256SUMS), but crates.io publish chain (Phase 2 of `docs/PATH_A_FOUNDER_ACTION_BURST.md` in fajar-lang repo) NOT YET EXECUTED. README still says `cargo install fajar-lang` which will fail until F3 closes. Workaround: README could document GitHub-Releases download path as alternative until crates.io publish is done. | partial |
+| §3.10 F.11 PERMANENT-DEFERRED | resolved by demotion | unchanged ✅ | — |
+| §3.11 No release.yml | absent | ⛔ **STILL OPEN**: only `qemu-boot-stress.yml` + `qemu-test.yml` in `.github/workflows/`. No release auto-publish. v4.0.0 was hand-tagged without binary upload | — |
+| §3.12 No vs Linux/Redox/SerenityOS docs | only vs macOS | unchanged — only `COMPARISON_VS_MACOS.md` exists | — |
+
+**Tally:** 1 fully closed (§3.6), 1 partially closed (§3.7), 9 still open, 1 resolved-by-demotion (§3.10) unchanged. Net live punch list = **10 open items (4 BLOCKER + 5 polish + 1 ⛔ adoption)**.
+
+**§2 live stats refresh** (verified 2026-05-13):
+- `.fj` file count: **189** (was 186; +3 since plan)
+- Total fj LOC: **58,240** (was 56,822; +1,418)
+- Latest tag: **v4.0.0** "Pure Fajar — FAJAROS_100PCT_COMPLETE" (2026-05-05)
+- Working tree: clean, `main...origin/main 0/0`
+- Companion repo (fajar-lang): **v36.0.0 LIVE** on GitHub Releases as of 2026-05-13; crates.io publish chain still gated
+
+**Priority recommendation for next session-tractable work:**
+1. **§3.11 release.yml** + **§3.2 v4.0.0 ISO upload** — combined ~1 day; unblocks distribution and mirrors the pattern that just shipped fajar-lang v36.0.0 binaries successfully
+2. **§3.7 cmd-count investigation** (~30 min): reconcile 266 (badge) vs 136 (grep) — either the badge is still wrong or 266 includes dispatcher aliases that should be documented
+3. **§3.3 LLM coherence gates** — most engineering-meaty, ~2-3 days; requires Python reference baseline plumbing
+
+§3.1, §3.4, §3.5, §3.8, §3.9 (full close), §3.12 remain multi-day or external-action gaps.
+
+---
+
 ### 3.1 Never booted on real x86 hardware  ⛔ BLOCKER for "user dunia bisa pakai"
 
 - **Finding:** Sprint 29 "Real Hardware Boot" has **10 tasks, all unchecked `[ ]`** in `docs/PLAN.md`. Tasks include creating bootable USB, booting on Lenovo Legion Pro, detecting real CPU/RAM/NVMe/GPU, running MNIST on real HW, taking a boot photo for documentation.
