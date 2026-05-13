@@ -62,7 +62,7 @@ Re-verified all 12 gaps with bash. Delta vs 2026-04-30 baseline:
 | Gap | 2026-04-30 status | 2026-05-13 status | Closed by |
 |---|---|---|---|
 | §3.1 real hw boot | 10/10 unchecked | 10/10 still unchecked | — |
-| §3.2 release 0 assets | v3.9.0 | **v4.0.0 also 0 assets** (still gap; version moved forward) | — |
+| §3.2 release 0 assets | v3.9.0 | ✅ **CLOSED 2026-05-13** — v4.0.0 release now has 2 assets (`fajaros-v4.0.0-x86_64.iso` 13.9 MB + `SHA256SUMS.txt`) | manual `gh release upload` (this session) |
 | §3.3 LLM coherence not gated | — | no `test-*-coherence` Makefile target found | — |
 | §3.4 LLM benchmarks doc | missing | `docs/LLM_BENCHMARKS.md` still missing | — |
 | §3.5 stars/forks | 0/0/1 author | re-check live | — |
@@ -71,10 +71,10 @@ Re-verified all 12 gaps with bash. Delta vs 2026-04-30 baseline:
 | §3.8 Sprint 30 unchecked | 10 tasks | `grep -c '\[ \]' docs/PLAN.md` = 346 across all sprints — scope is broader than just Sprint 30 | — |
 | §3.9 Cross-dep fajar-lang publishing | crates.io blocked | ⚠️ **STILL BLOCKED**: fajar-lang v36.0.0 LIVE on GitHub Releases (2026-05-13, with 5 platform binaries + SHA256SUMS), but crates.io publish chain (Phase 2 of `docs/PATH_A_FOUNDER_ACTION_BURST.md` in fajar-lang repo) NOT YET EXECUTED. README still says `cargo install fajar-lang` which will fail until F3 closes. Workaround: README could document GitHub-Releases download path as alternative until crates.io publish is done. | partial |
 | §3.10 F.11 PERMANENT-DEFERRED | resolved by demotion | unchanged ✅ | — |
-| §3.11 No release.yml | absent | ⛔ **STILL OPEN**: only `qemu-boot-stress.yml` + `qemu-test.yml` in `.github/workflows/`. No release auto-publish. v4.0.0 was hand-tagged without binary upload | — |
+| §3.11 No release.yml | absent | ⚠️ **SHIPPED, validation pending** — `.github/workflows/release.yml` added (this session) mirrors fajar-lang's pattern; downloads `fj` v36.0.0 binary, checks out fajarquant for TL2 wrapper, runs `make iso-llvm`, uploads ISO + SHA256SUMS via `softprops/action-gh-release@v2`. Validation: will fire automatically on next `v*.*.*` tag push. v4.0.0 ISO uploaded manually (§3.2 closure) | this session |
 | §3.12 No vs Linux/Redox/SerenityOS docs | only vs macOS | unchanged — only `COMPARISON_VS_MACOS.md` exists | — |
 
-**Tally:** 1 fully closed (§3.6), 1 partially closed (§3.7), 9 still open, 1 resolved-by-demotion (§3.10) unchanged. Net live punch list = **10 open items (4 BLOCKER + 5 polish + 1 ⛔ adoption)**.
+**Tally:** **3 fully closed** (§3.2, §3.6, §3.11-shipped-validation-pending), 1 partially closed (§3.7), 7 still open, 1 resolved-by-demotion (§3.10) unchanged. Net live punch list (post-2026-05-13 session) = **8 open items (3 BLOCKER + 4 polish + 1 ⛔ adoption)**.
 
 **§2 live stats refresh** (verified 2026-05-13):
 - `.fj` file count: **189** (was 186; +3 since plan)
